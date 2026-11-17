@@ -881,11 +881,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         pzero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
         qsa_c.pzero = pzero;
     }
-    ggml_tensor * packed = ggml_reshape_3d(ctx0, ggml_concat(ctx0, k_raw, pzero, 0), 2*idx_dim, 1, n_tokens);
-    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
-
     // the raw keys and the persistent pooled slots, see llama_memory_hybrid_idx::mem_idx_stale
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
+
+    if (kpool_cache.split()) {
+        // k19-kvsel: the raw key into the cache row, the zero pooled key into the pooled row of the same cell
+        ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens), inp_kpool->k_idxs, il));
+        ggml_build_forward_expand(gf, kpool_cache.set_pooled_rows(pzero, inp_kpool->k_idxs));
+    } else {
+        ggml_tensor * packed = ggml_reshape_3d(ctx0, ggml_concat(ctx0, k_raw, pzero, 0), 2*idx_dim, 1, n_tokens);
+        ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
+    }
 
     // pool only the blocks this ubatch completes or regroups
     ggml_tensor * rows = kpool_cache.gather_key_gate(inp_kpool->new_pool_flat);
@@ -1127,6 +1133,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il, nullptr, src2.k ? &src2 : nullptr);
     cb(cur, "kqv_out", il);
+
+    // k19-kvsel: with K/V cells in host chunks (LLAMA_KV_SEL_HOST=1) and more cells than the device holds, a kernel that attends
+    // densely would read every host cell: decode / verify rows below CUDA's sparse bound (2 x rows x n_sel cells), and on Ada and newer
+    // the vector kernel of 1-2 row quantized decode at any length. Ask for the selected-cell gather (op_params[5] = 1, the sparse
+    // preference). Off at n_kv <= the device cells, so the attention is then the default one; past them the kernel may change
+    // (rounding-class vs the default path). LLAMA_KV_SEL_SPARSE_GUARD=0: off (bit-exact vs the default, every cell read)
+    {
+        static const bool guard = getenv("LLAMA_KV_SEL_SPARSE_GUARD") == nullptr || atoi(getenv("LLAMA_KV_SEL_SPARSE_GUARD")) != 0;
+        const uint32_t r = mctx_cur->get_sel_dev_cells();
+        const int64_t n_kv_cur = sel->ne[0]; // the cells the mask spans (n_kv)
+        if (guard && r > 0 && n_tokens <= 16 && n_kv_cur > (int64_t) r && src2.k == nullptr) {
+            ggml_tensor * fa = cur;
+            while (fa && fa->op != GGML_OP_FLASH_ATTN_EXT) {
+                fa = fa->src[0];
+            }
+            if (fa) {
+                fa->op_params[5] = 1;
+            }
+        }
+    }
 
     // the rotation is its own inverse, so undo it on the value side of the output
     if (inp->self_v_rot) {

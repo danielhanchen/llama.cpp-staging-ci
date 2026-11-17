@@ -55,6 +55,23 @@ static ggml_type idx_cache_type(ggml_type t) {
     return r;
 }
 
+// k19-kvsel: arm the attention cache built next (by llama_memory_hybrid) for host chunks (LLAMA_KV_SEL_HOST=1) when every attention
+// layer reads only the cells the indexer selects (QSA with an indexer cache); a dense attention layer would read every cell each token
+static uint32_t kv_sel_arm(const llama_model & model, const llama_memory_i::layer_filter_cb & filter_attn,
+        const llama_memory_i::layer_filter_cb & filter_idx, uint32_t kv_size) {
+    const auto & hp = model.hparams;
+    bool all = filter_idx != nullptr && hp.indexer_kpool > 0 && hp.indexer_top_k > 0;
+    bool any = false;
+    for (uint32_t il = 0; all && il < hp.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
+        if (filter_attn == nullptr || filter_attn(il)) {
+            any = true;
+            all = hp.dsv4_compress_ratios[il] > 0;
+        }
+    }
+    llama_kv_cache_sel_arm(all && any);
+    return kv_size;
+}
+
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
                             /* attn */
@@ -80,17 +97,31 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     const layer_filter_cb & filter_idx) :
     llama_memory_hybrid(
         model,
-        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+        type_k, type_v, v_trans, kv_sel_arm(model, filter_attn, filter_idx, kv_size), n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
+        // k19-kvsel (LLAMA_KV_SEL_IDX=0 off): with the attention K/V in host chunks, the qwen4exp indexer cache splits its rows: the raw
+        // keys (read only to pool the blocks a ubatch completes or regroups) go to an armed cache of their own with
+        // LLAMA_KV_SEL_IDX_DEV_CELLS (4096) cells of every layer in device memory and the rest in host chunks, and the pooled keys
+        // (every one read by the scoring of each row) to a per-cell device tensor beside it (aux_init). The same values are written and
+        // read at the same rows, so the results are unchanged; the pooled keys are not saved with the state, which rebuilds them from
+        // the raw keys (a restore stales the pools). Otherwise the indexer cache stays whole in device memory
+        // (LLAMA_KV_SEL_IDX=2: split also without host chunks, a test setting)
+        static const int idx_split_env = getenv("LLAMA_KV_SEL_IDX") != nullptr ? atoi(getenv("LLAMA_KV_SEL_IDX")) : 1;
+        static const uint32_t idx_dev_cells = getenv("LLAMA_KV_SEL_IDX_DEV_CELLS") != nullptr ?
+            (uint32_t) std::max(1, atoi(getenv("LLAMA_KV_SEL_IDX_DEV_CELLS"))) : 4096;
+        idx_split = (idx_split_env == 2 || (idx_split_env != 0 && get_mem_attn()->sel_engaged())) && model.hparams.indexer_kpool > 0 &&
+            model.hparams.indexer_kpool_row == 2 && model.hparams.indexer_kpool_by_order;
+        llama_kv_cache_sel_arm(idx_split, idx_dev_cells);
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         // a k-pool indexer caches its per-token rows and the pooled key side by side
-        // (glm5-next: key | gate | pooled, qwen4exp: key | pooled)
-        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size * (model.hparams.indexer_kpool > 0 ? model.hparams.indexer_kpool_row : 1);
+        // (glm5-next: key | gate | pooled, qwen4exp: key | pooled; split: key, the pooled keys in the aux tensors)
+        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size *
+            (model.hparams.indexer_kpool > 0 && !idx_split ? model.hparams.indexer_kpool_row : 1);
 
         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
         // K-shift must not rotate them while the stream copies in the same update still apply
@@ -107,6 +138,13 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
+    if (idx_split) {
+        mem_idx->aux_init(model.hparams.indexer_head_size);
+        if (!model.hparams.no_alloc) {
+            LLAMA_LOG_INFO("%s: kv sel: indexer raw keys in their own cache (%s), pooled keys in device memory (LLAMA_KV_SEL_IDX=0: "
+                "one row each)\n", __func__, mem_idx->sel_engaged() ? "host chunks past its device cells" : "all in device memory");
+        }
+    }
     // k19-vgraph (LLAMA_KV_BUCKET=0: off, the 256 cell padding of every ubatch): a decode or verify ubatch of qwen4exp, whose every
     // attention layer is QSA, pads n_kv to an eighth of its octave instead of 256 cells, and the k-pool count with it, so its graph
     // and CUDA graph are not rebuilt and captured again each time the context grows past 256 cells (G4 Flash-Next: 8-10 verify
@@ -791,6 +829,19 @@ llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, 
     pooled   = ggml_view_2d(ctx, k, n_embd, n_cells, k->nb[1], ggml_row_size(k->type, n_tok));
 }
 
+llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, ggml_tensor * aux) : ctx(ctx) {
+    // every stream's rows as one, as the packed views (the indices are global)
+    GGML_ASSERT(aux->ne[1] == k->ne[1]*k->ne[2]);
+    is_split = true;
+    key_gate = ggml_view_2d(ctx, k, k->ne[0], k->ne[1]*k->ne[2], k->nb[1], 0);
+    pooled   = aux;
+}
+
+ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::set_pooled_rows(ggml_tensor * values, ggml_tensor * idxs) const {
+    GGML_ASSERT(is_split);
+    return ggml_set_rows(ctx, pooled, values, idxs);
+}
+
 ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::gather_key_gate(ggml_tensor * idxs) const {
     return ggml_get_rows(ctx, key_gate, idxs);
 }
@@ -807,6 +858,11 @@ llama_memory_hybrid_idx_context::kpool_access llama_memory_hybrid_idx_context::g
         ggml_context * ctx, int32_t il, int64_t n_embd) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
+    ggml_tensor * aux = mem->get_mem_idx()->get_k_aux(il);
+    if (aux != nullptr) {
+        GGML_ASSERT(aux->ne[0] == n_embd);
+        return kpool_access(ctx, mem->get_mem_idx()->get_k_storage(il), aux);
+    }
     return kpool_access(ctx, mem->get_mem_idx()->get_k_storage(il), n_embd);
 }
 

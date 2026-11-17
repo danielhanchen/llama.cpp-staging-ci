@@ -888,6 +888,7 @@ struct llama_moe_cache::impl {
     bool   refill_routed   = false; // LLAMA_MOE_CACHE_REFILL_ROUTED=1 (opt-in): else the slots get back the experts they held before they were lent
     size_t n_refill_routed = 0;    // refills that used the routing of a prompt
     bool   refill_routed_once = false; // k13-small: the next restore refills by the routing (set_refill_routed_once)
+    size_t refill_cap_once    = SIZE_MAX; // k19-kvsel: bytes the next restore refills at most (set_refill_cap_once)
     bool  verify_enabled = false; // LLAMA_MOE_CACHE_VERIFY=1 (debug): compare the cached experts with host memory
     stats stats_refill;
     std::vector<std::vector<int32_t>> seed_counts; // [n_layer] routing of an earlier ubatch of the prompt, see set_seed_counts
@@ -12123,6 +12124,7 @@ struct llama_moe_cache::impl {
             }
         }
         refill_routed_once = false;
+        refill_cap_once    = SIZE_MAX;
         return true;
     }
 
@@ -12209,7 +12211,12 @@ struct llama_moe_cache::impl {
         }
         n_refill_routed += routed ? 1 : 0;
         // at most the n slots that came back are filled, so the refill never evicts an expert that stayed cached
+        // (k19-kvsel: and at most refill_cap_once bytes over the groups of this restore, in layer order)
         size_t budget = (size_t) n;
+        if (refill_cap_once != SIZE_MAX && g.expert_bytes > 0) {
+            budget = std::min(budget, refill_cap_once / g.expert_bytes);
+        }
+        const size_t budget0 = budget;
         for (int32_t il : g.layers) {
             if ((size_t) il >= refill.size() || refill[il].empty()) {
                 continue;
@@ -12231,6 +12238,9 @@ struct llama_moe_cache::impl {
                 stats_refill.misses += fills.size();
             }
             ids_il.clear();
+        }
+        if (refill_cap_once != SIZE_MAX) {
+            refill_cap_once -= std::min(refill_cap_once, (budget0 - budget)*g.expert_bytes);
         }
         if (verify_enabled) {
             verify(g, "after refill");
@@ -15031,6 +15041,10 @@ bool llama_moe_cache::take_graphs_stale() {
 
 void llama_moe_cache::set_refill_routed_once(bool on) {
     pimpl->refill_routed_once = on;
+}
+
+void llama_moe_cache::set_refill_cap_once(size_t bytes) {
+    pimpl->refill_cap_once = bytes;
 }
 
 bool llama_moe_cache::released() const {

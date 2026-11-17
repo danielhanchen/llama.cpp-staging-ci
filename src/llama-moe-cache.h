@@ -294,6 +294,9 @@ public:
     bool take_graphs_stale();
     // the next restore refills the slots with the experts the recorded routing used most (set_refill_counts), as LLAMA_MOE_CACHE_REFILL_ROUTED=1
     void set_refill_routed_once(bool on);
+    // k19-kvsel: the next restore refills at most bytes of experts over every group (SIZE_MAX: all the slots that came back); the slots past
+    // it come back empty and misses fill them
+    void set_refill_cap_once(size_t bytes);
     // the cache lends slots on some device (decided by the first large graph)
     bool lends_on_any() const;
     // lends_on_any, or a device whose lending is off for the staging copies that still lends to a merged layer-major graph (k15-pp)

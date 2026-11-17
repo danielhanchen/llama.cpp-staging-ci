@@ -72,6 +72,7 @@ struct llama_memory_breakdown_data {
     size_t compute = 0; // memory allocated for temporary compute buffers
     size_t lend_freed = 0; // k15-fn: of a measurement (no_alloc), the staging arena the MoE cache lends for, not in total() (see sched_reserve)
     size_t kv_lazy    = 0; // k17-small: the bytes of context a lazy KV cache leaves unbacked (a measurement: at load), in total()
+    size_t kv_sel     = 0; // k19-kvsel: the K/V bytes of this device's caches held in host chunks (counted on the host), not in total()
 
     size_t total() const {
         return model + context + compute;
@@ -87,6 +88,14 @@ int  llama_kv_lazy_mode();
 bool llama_kv_lazy_alloc_on();
 // whether a measurement (no_alloc) reports the KV bytes a lazy KV cache leaves unbacked at load (mb.kv_lazy)
 bool llama_kv_lazy_measure_on();
+
+// k19-kvsel: K/V cells of QSA attention caches in host chunks (LLAMA_KV_SEL_HOST): 0 = off (=0, the kill switch), 1 = on (=1, wherever
+// the cache is armed and the backend maps host memory), 2 = auto (unset or =auto: a measurement reports the bytes host chunks would take,
+// and a cache allocated for running uses them only where common set LLAMA_KV_SEL_GRANTED=1 for its fit, see common_fit_kv_sel_granted)
+int  llama_kv_sel_mode();
+// auto mode: whether a measurement (no_alloc) on any thread places the K/V in host chunks (set by the fit around the measurements of a
+// placement that uses them; off: measurements as with LLAMA_KV_SEL_HOST=0)
+void llama_kv_sel_measure(bool on);
 
 struct llama_device_memory_data {
     int64_t total;

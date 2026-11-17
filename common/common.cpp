@@ -3321,6 +3321,12 @@ uma_restart:
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        // k19-kvsel auto: no fit of a launch that asks for a drafter places K/V in host chunks, so its fits (the drafter's placement, the
+        // drop rules, the K/V type) are those of LLAMA_KV_SEL_HOST=0
+        common_fit_kv_sel_allow(!has_draft && !spec_mtp);
+        common_fit_kv_sel_granted(true);
+        const bool kv_sel_draft_fit_off_in = params.speculative.draft.fit_off; // (the drafter left out by the caller, not by a fit)
+        size_t     kv_sel_pre_cache        = SIZE_MAX; // the MoE cache of the placement without host chunks (the after-drop refit)
 
         common_params params_dft = common_base_params_to_speculative(params);
 
@@ -4746,6 +4752,69 @@ uma_restart:
 
         // --moe-cache-mib auto that the fit did not size (a failed or skipped fit, no host experts on a device) is no cache, as with
         // the release: the unbounded request must never reach the context
+        // k19-kvsel auto, a launch that asked for a drafter which the fit dropped (Studio's MTP heads on G4 10 / 12 GB, k19-mtpkeep refusing
+        // the host-expert drafter): every fit so far, the drop decision included, ran without host chunks (common_fit_kv_sel_allow), and
+        // the placement taken is the one of the launch without the drafter. That plain fit runs once more from the same inputs with
+        // host chunks allowed and replaces it where it granted them and keeps every layer it had; the drafter stays dropped either way.
+        // Where it grants nothing it is the same fit as before (same inputs, same measurements). LLAMA_KV_SEL_AFTER_DROP=0 off
+        if (llama_kv_sel_mode() == 2 && (has_draft || spec_mtp) && !kv_sel_draft_fit_off_in && params.speculative.draft.fit_off &&
+                fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (getenv("LLAMA_KV_SEL_AFTER_DROP") == nullptr || atoi(getenv("LLAMA_KV_SEL_AFTER_DROP")) != 0)) {
+            llama_model_params   mp  = mparams_in;
+            llama_context_params cp  = cparams_in;
+            std::vector<float>   ts  = ts_in;
+            std::vector<llama_model_tensor_buft_override> tbo = tbo_in;
+            std::vector<size_t>  mg  = margins_in;
+            mp.tensor_split = ts.data();
+            if (mparams_in.tensor_buft_overrides != nullptr && !tbo.empty()) {
+                mp.tensor_buft_overrides = tbo.data();
+            }
+            mp.load_mtp = params.load_mtp;
+            // the inputs of the fit that placed the launch: a drafter dropped before the fit (draft_off, the small device's draft rule)
+            // was fitted from these inputs as they are (they already run as without it, cparams.spec_draft kept for the layer-major
+            // prompts); one dropped after it by the plain fit of a launch without it (common_fit_plain_launch)
+            if (!draft_off) {
+                common_params params_plain_ks = params;
+                common_fit_plain_launch(params_plain_ks, cp);
+            }
+            const auto lay_of = [&](const llama_model_params & m) { return m.n_gpu_layers < 0 ? n_layer + 1 : (int64_t) m.n_gpu_layers; };
+            common_fit_kv_sel_allow(true);
+            common_fit_kv_sel_granted(true);
+            common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+            const common_params_fit_status st_ks = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
+                mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
+            const bool got = st_ks == COMMON_PARAMS_FIT_STATUS_SUCCESS && common_fit_kv_sel_granted(false) && lay_of(mp) >= lay_of(mparams);
+            if (got) {
+                kv_sel_pre_cache = cparams.moe_cache_size;
+                COM_INF("%s: kv sel (auto): the drafter was dropped; the launch without it is fitted again with K/V in host chunks: MoE cache "
+                    "%zu -> %zu MiB (LLAMA_KV_SEL_AFTER_DROP=0 keeps the first fit)\n", __func__, cparams.moe_cache_size/(1024*1024),
+                    cp.moe_cache_size/(1024*1024));
+                std::copy(ts.begin(), ts.end(), params.tensor_split);
+                if (params.tensor_buft_overrides.size() == tbo.size()) {
+                    std::copy(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin());
+                } else {
+                    params.tensor_buft_overrides = tbo;
+                }
+                params.fit_params_target = mg;
+                const bool tbo_ours = mp.tensor_buft_overrides != nullptr && mp.tensor_buft_overrides == tbo.data();
+                mparams = mp;
+                cparams = cp;
+                mparams.tensor_split = params.tensor_split;
+                if (tbo_ours) {   // the fit points the overrides at the buffer it wrote: the copy now lives in params
+                    mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+                }
+                fit_status = st_ks;
+                if (!draft_off) {
+                    llama_context_params cp_plain = cparams;
+                    common_fit_plain_launch(params, cp_plain);
+                }
+            } else {
+                common_fit_kv_sel_granted(true);
+                COM_INF("%s: kv sel (auto): the drafter was dropped; the launch without it fitted again grants no host chunks, the first fit "
+                    "stays\n", __func__);
+            }
+            common_fit_kv_sel_allow(false);
+        }
+
         if (moe_cache_auto && (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams.moe_cache_size >= COMMON_MOE_CACHE_AUTO_BYTES)) {
             COM_WRN("%s: --moe-cache-mib auto: the fit did not size the MoE cache, not using one\n", __func__);
             cparams.moe_cache_size = 0;
@@ -4808,6 +4877,41 @@ uma_restart:
                 COM_INF("%s: lazy KV %s: the KV cache backs the cells in use, the MoE cache (%zu MiB) holds the %zu MiB of KV cells not backed "
                     "yet and gives them back as the context grows (LLAMA_KV_LAZY=0 to disable)\n", __func__, lazy_auto ? "on (auto)" : "on",
                     cparams.moe_cache_size/(1024*1024), grant_now/(1024*1024));
+            }
+        }
+
+        // k19-kvsel auto (LLAMA_KV_SEL_HOST unset or =auto): the K/V of an armed QSA cache goes to host chunks only where a fit placed it
+        // there (a small device without a drafter, see common_fit_impl) and no drafter is kept; everywhere else the K/V cache is the one of
+        // LLAMA_KV_SEL_HOST=0 (the kill switch). =1: always, as before
+        if (llama_kv_sel_mode() == 2) {
+            const bool draft_on = !params.speculative.draft.fit_off && !params.speculative.draft.fit_on_cpu && (params.speculative.has_dft() ||
+                std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end());
+            const bool granted  = common_fit_kv_sel_granted(true) && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && !draft_on;
+            common_set_env("LLAMA_KV_SEL_GRANTED", granted ? "1" : "0");
+            // the refill after a released prompt ubatch (llama_context::tiny_rel_leave) is capped at LLAMA_KV_SEL_SHORT_REFILL MiB: unset
+            // = 0 (the slots come back empty, misses fill them), N = N MiB, "pre" = the cache of the placement without host chunks (the first
+            // fit beside a dropped drafter, else this cache less the host-chunk bytes), "off" = every slot refilled. G4 Flash-Next Studio
+            // MTP argv (drafter dropped), 42-token chat prompt, 3 launches: HOST=0 112 / 112 / 111 tok/s at 10 / 12 / 16 GB; auto with
+            // the cap 0: 110 / 109 / 106, "pre" 110 / 97 / 91, "off" 110 / 86 / 75; decode with 0 vs "off": chat 81.0 / 84.4 / 91.4 vs
+            // 81.1 / 85.3 / 93.4, 8k 78.1 / 80.3 / 88.0 vs 77.0 / 83.7 / 90.3 (HOST=0 75.1 / 74.0 / 78.5)
+            std::string cap;
+            if (granted) {
+                const char * e_sr = getenv("LLAMA_KV_SEL_SHORT_REFILL");
+                if (e_sr == nullptr) {
+                    cap = "0";
+                } else if (strcmp(e_sr, "pre") == 0) {
+                    const size_t pre = kv_sel_pre_cache != SIZE_MAX ? kv_sel_pre_cache :
+                        cparams.moe_cache_size - std::min(cparams.moe_cache_size, common_fit_kv_sel_host_bytes());
+                    cap = std::to_string(pre/(1024*1024));
+                } else if (strcmp(e_sr, "off") != 0) {
+                    cap = std::to_string(std::max<long long>(0, atoll(e_sr)));
+                }
+            }
+            common_set_env("LLAMA_MOE_SHORT_REFILL_CAP_MIB", cap);
+            if (granted) {
+                COM_INF("%s: kv sel (auto): K/V cells past the device cells of the QSA attention cache in host memory, MoE cache %zu MiB, "
+                    "refill after a released prompt ubatch capped at %s MiB (LLAMA_KV_SEL_SHORT_REFILL; LLAMA_KV_SEL_HOST=0 off)\n", __func__,
+                    cparams.moe_cache_size/(1024*1024), cap.empty() ? "no" : cap.c_str());
             }
         }
 

@@ -127,6 +127,8 @@ private:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
 
+    // k19-kvsel: the indexer raw keys in the cache, the pooled keys in its aux tensors (see the constructor); set while mem_idx is built
+    bool idx_split = false;
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
     // unique_ptr because kpool_layout is incomplete here
@@ -149,11 +151,17 @@ public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+        // k19-kvsel: the pooled keys are a tensor of their own (the cache rows hold the per-token part only)
+        bool split() const { return is_split; }
+        // split: write values (the zero pooled keys of the ubatch's rows) into the pooled rows idxs, as the packed row write does
+        ggml_tensor * set_pooled_rows(ggml_tensor * values, ggml_tensor * idxs) const;
 
     private:
         friend class llama_memory_hybrid_idx_context;
 
         kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
+        kpool_access(ggml_context * ctx, ggml_tensor * k, ggml_tensor * aux);
+        bool is_split = false;
 
         ggml_context * ctx;
         ggml_tensor  * key_gate;

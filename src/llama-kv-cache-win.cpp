@@ -92,7 +92,10 @@ bool llama_kv_cache::win_init(const llama_kv_win_params & p) {
     GGML_ASSERT(!win_on() && "win_init called twice");
 
     const char * why = nullptr;
-    if (other) {
+    if (!sel_bufs.empty()) {
+        // k19-kvsel: the two-source attention reads the body densely, which would read every host chunk each token
+        why = "its K/V cells are partly in host memory (LLAMA_KV_SEL_HOST)";
+    } else if (other) {
         why = "the cache shares the cells of another context";
     } else if (v_trans) {
         why = "flash attention is off (the V cache is transposed)";

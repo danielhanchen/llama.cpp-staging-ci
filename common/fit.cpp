@@ -49,6 +49,13 @@ class common_params_fit_exception : public std::runtime_error {
 
 static bool    g_moe_margin_auto = true;
 static int64_t g_moe_margin_gain = 0;
+// k19-kvsel: measurements count the K/V bytes of host chunks (mb.kv_sel) on their device, as without LLAMA_KV_SEL_HOST (see common_fit_impl)
+static bool    g_fit_sel_as_dev  = false;
+// k19-kvsel auto: this fit placed the K/V of host chunks (common_fit_impl), and whether any fit of the process did (common_fit_kv_sel_granted)
+static bool    g_fit_sel_granted = false;
+static bool    g_fit_sel_any     = false;
+static bool    g_fit_sel_allow   = true;  // common: false for a launch that asks for a drafter (common_fit_kv_sel_allow)
+static size_t  g_fit_sel_bytes   = 0;     // the K/V bytes in host chunks of the last grant (common_fit_kv_sel_host_bytes)
 
 // k19-fitfaoff: the last measured context ran attention without flash attention (-fa off, or auto resolved off)
 static bool    g_fit_fa_off      = false;
@@ -264,6 +271,22 @@ int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, in
 
 // k17-small (lazy KV): the MoE cache sizes a fit raised by the unbacked KV, and by how much (every fit of the process)
 static std::vector<std::pair<size_t, size_t>> g_kv_lazy_grants;
+
+size_t common_fit_kv_sel_host_bytes() {
+    return g_fit_sel_bytes;
+}
+
+void common_fit_kv_sel_allow(bool allow) {
+    g_fit_sel_allow = allow;
+}
+
+bool common_fit_kv_sel_granted(bool reset) {
+    const bool r = g_fit_sel_any;
+    if (reset) {
+        g_fit_sel_any = false;
+    }
+    return r;
+}
 
 size_t common_fit_kv_lazy_grant(size_t moe_cache_size) {
     for (const auto & [after, grant] : g_kv_lazy_grants) {
@@ -521,8 +544,14 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.compute += mb.compute;
                 ret[i].mb.lend_freed += mb.lend_freed;
                 ret[i].mb.kv_lazy    += mb.kv_lazy;
+                ret[i].mb.kv_sel     += mb.kv_sel;
                 break;
             }
+        }
+    }
+    if (g_fit_sel_as_dev) {
+        for (size_t i = 0; i < nd; i++) {
+            ret[i].mb.context += ret[i].mb.kv_sel;
         }
     }
 
@@ -1635,19 +1664,96 @@ static void common_params_fit_impl(
         if (fit_moe_cache) {
             // order: the dense weights of all layers, then the cache (up to the requested size), then experts in device memory
             const size_t size_before = cparams->moe_cache_size;
-            const dmds_t dmds_cpu_moe_req = dmds_cpu_moe; // k13-small: the measurement at the requested cache size, for the retry below
+            dmds_t dmds_cpu_moe_req = dmds_cpu_moe; // k13-small: the measurement at the requested cache size, for the retry below
             fit_moe_cache_size(dmds_cpu_moe, mparams, true);
             bool fits_per_device = cparams->moe_cache_size > 0;
             for (size_t id = 0; id < nd; id++) {
                 fits_per_device = fits_per_device && int64_t(dmds_cpu_moe[id].free) - int64_t(dmds_cpu_moe[id].mb.total()) >= margins[id];
+            }
+            // k19-kvsel auto (LLAMA_KV_SEL_HOST unset or =auto; =0 off, =1 always): every measurement so far was the one without host
+            // chunks, so this fit is the LLAMA_KV_SEL_HOST=0 fit up to here. Where that fit takes the small-device placement (no cache
+            // beside every layer at the default margin) on one device, without a draft model or MTP heads, the K/V of an armed QSA cache
+            // past its device cells goes to host chunks (LLAMA_KV_SEL_GRANTED, set by common from common_fit_kv_sel_granted): the cache
+            // is measured again with them and the small-device placement below runs on that measurement. Anywhere else nothing changes:
+            // the measurements, the placement and the K/V stay those of LLAMA_KV_SEL_HOST=0
+            // Not on a disk tier (the host experts take more than 0.8 of the available RAM and the file is not on a memory file system,
+            // the rule of k19-l4gap): there the larger cache only adds bank refills from the disk to every released prompt ubatch while
+            // the decode stays disk-bound (Colab L4 12 GB, Flash-Next ctx 262144 from the VM disk: cache 4075 -> 5275 MiB, decode 4.4 ->
+            // 4.4 tok/s, 8k prompt 88 -> 80 tok/s; T4 / L4 whole card with =1: prompt -10% / -30%)
+            bool sel_granted = false;
+            const auto sel_disk_tier = [&]() {
+                const uint64_t exp_b = common_moe_expert_bytes(path_model);
+                const uint64_t avail = llama_available_memory();
+                return exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && !common_fit_file_in_ram_fs(path_model);
+            };
+            if (llama_kv_sel_mode() == 2 && g_fit_sel_allow && !fits_per_device && nd == 1 && size_before > 0 && !has_drafter && !sel_disk_tier()) {
+                const size_t  size_off = cparams->moe_cache_size;
+                const int64_t gain_off = g_moe_margin_gain;
+                cparams->moe_cache_size = size_before;
+                llama_kv_sel_measure(true);
+                dmds_t d_sel;
+                bool   measured = true;
+                try {
+                    d_sel = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                } catch (const std::runtime_error &) {
+                    measured = false;
+                }
+                if (measured && d_sel[0].mb.kv_sel > 0) {
+                    add_extra_memory(d_sel);
+                    sel_granted       = true;
+                    g_fit_sel_granted = true;
+                    g_fit_sel_bytes   = d_sel[0].mb.kv_sel;
+                    dmds_cpu_moe_req  = d_sel;
+                    dmds_cpu_moe      = d_sel;
+                    fit_moe_cache_size(dmds_cpu_moe, mparams, true);
+                    fits_per_device = cparams->moe_cache_size > 0;
+                    for (size_t id = 0; id < nd; id++) {
+                        fits_per_device = fits_per_device && int64_t(dmds_cpu_moe[id].free) - int64_t(dmds_cpu_moe[id].mb.total()) >= margins[id];
+                    }
+                    LOG_INF("%s: kv sel (auto): the small-device placement, with %zu MiB of K/V in host chunks: the cache is fitted on that "
+                        "measurement (LLAMA_KV_SEL_HOST=0 off)\n", __func__, d_sel[0].mb.kv_sel/MiB);
+                } else {
+                    llama_kv_sel_measure(false);
+                    cparams->moe_cache_size = size_off;
+                    g_moe_margin_gain       = gain_off;
+                }
             }
             // k19-l4poly: a host-bound small device (see common_fit_hostbound_place): every layer fits within the default margin, but
             // beside a cache of at most a tenth of the host experts, so the host computes most misses of every token. It takes the
             // small-device placement below (smaller margin, the k19-place8 decode-sized cache) although it fits
             const size_t  size_fit_hb = cparams->moe_cache_size;
             const int64_t gain_fit_hb = g_moe_margin_gain;
+            // k19-kvsel: K/V cells in host chunks (LLAMA_KV_SEL_HOST=1) leave device memory free that the cache should get, but a device
+            // that fits only because of them would take the regular path at the default margin (G4 10 GB, Qwen3.8-Flash-Next ctx 131K
+            // q8_0: of 1200 MiB freed, k19-placemid gave the cache 560). The path is chosen as without host chunks: the cache is sized
+            // once more with their bytes counted on the device, and where that leaves no cache the small-device placement below runs on
+            // the real measurement, so the cache gets what the host chunks free. LLAMA_KV_SEL_FIT=0: the path of the real measurement
+            bool sel_small = sel_granted && fits_per_device; // (auto: the small-device placement is the one granted for)
+            if (!sel_granted && fits_per_device && nd == 1 && size_before > 0 && dmds_cpu_moe_req[0].mb.kv_sel > 0) {
+                static const bool sel_fit_on = getenv("LLAMA_KV_SEL_FIT") == nullptr || atoi(getenv("LLAMA_KV_SEL_FIT")) != 0;
+                if (sel_fit_on) {
+                    dmds_t d_dev = dmds_cpu_moe_req;
+                    for (size_t id = 0; id < nd; id++) {
+                        d_dev[id].mb.context += d_dev[id].mb.kv_sel;
+                    }
+                    cparams->moe_cache_size = size_before;
+                    g_fit_sel_as_dev = true;
+                    fit_moe_cache_size(d_dev, mparams, true);
+                    g_fit_sel_as_dev = false;
+                    bool fits_dev = cparams->moe_cache_size > 0;
+                    for (size_t id = 0; id < nd; id++) {
+                        fits_dev = fits_dev && int64_t(d_dev[id].free) - int64_t(d_dev[id].mb.total()) >= margins[id];
+                    }
+                    sel_small = !fits_dev;
+                    LOG_INF("%s: kv sel: %zu MiB of K/V in host chunks; counted on the device the cache would be %zu MiB (%s), so the %s "
+                        "placement runs (LLAMA_KV_SEL_FIT=0: the regular one)\n", __func__, dmds_cpu_moe_req[0].mb.kv_sel/MiB,
+                        cparams->moe_cache_size/MiB, fits_dev ? "fits" : "does not fit", sel_small ? "small-device" : "regular");
+                    cparams->moe_cache_size = size_fit_hb;
+                    g_moe_margin_gain       = gain_fit_hb;
+                }
+            }
             // not beside a draft model or MTP heads (as the k18 margin rule): their run-time pools were never measured at this margin
-            const bool    hostbound   = fits_per_device && nd == 1 && size_before > 0 && !has_drafter &&
+            const bool    hostbound   = fits_per_device && nd == 1 && size_before > 0 && !has_drafter && !sel_granted &&
                 common_fit_hostbound_place(int64_t(dmds_cpu_moe[0].free), int64_t(size_fit_hb),
                     int64_t(dmds_cpu_moe.back().mb.model) - int64_t(dmds_full.back().mb.model));
             // k13-small: a small device (G4 ballasted to 4 GB, Qwen3.6-35B-A3B Q3_K_M + MTP: the dense weights of every layer, the context and
@@ -1657,7 +1763,7 @@ static void common_params_fit_impl(
             // LLAMA_FIT_SMALL_MARGIN_MIB (256) instead: every layer stays on the device beside a small cache, whose host misses the
             // single-graph path computes (no graph split). The placement is the one of -fitt 256; one GPU only, default margin only (an
             // explicit smaller -fitt is the user's), LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps the k12 placement.
-            if ((!fits_per_device || hostbound) && nd == 1 && size_before > 0) {
+            if ((!fits_per_device || hostbound || sel_small) && nd == 1 && size_before > 0) {
                 const char * e_sm = getenv("LLAMA_FIT_SMALL_MARGIN_MIB");
                 const int64_t small_mib = e_sm != nullptr ? std::max<int64_t>(0, atoll(e_sm)) : 256;
                 constexpr int64_t m_default = 1024*MiB;
@@ -1898,12 +2004,12 @@ static void common_params_fit_impl(
                         fits_per_device = true;
                         g_small_device  = true;
                     } else {
-                        // k19-l4poly: a host-bound device that fitted keeps that placement
+                        // k19-l4poly: a host-bound device that fitted keeps that placement (k19-kvsel: as does one with host chunks)
                         common_fit_place8_env(0);
                         margins[0] = margin_saved;
                         dmds_cpu_moe = dmds_nc_saved;
-                        cparams->moe_cache_size = hostbound ? size_fit_hb : 0;
-                        g_moe_margin_gain = hostbound ? gain_fit_hb : 0;
+                        cparams->moe_cache_size = hostbound || sel_small ? size_fit_hb : 0;
+                        g_moe_margin_gain = hostbound || sel_small ? gain_fit_hb : 0;
                     }
                 }
             }
@@ -2476,6 +2582,8 @@ enum common_params_fit_status common_fit_params(
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     g_moe_margin_gain = 0;
+    g_fit_sel_granted = false;
+    llama_kv_sel_measure(false);
     try {
         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level, kv_resident);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
@@ -2486,6 +2594,8 @@ enum common_params_fit_status common_fit_params(
         LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_ERROR;
     }
+    llama_kv_sel_measure(false);
+    g_fit_sel_any = g_fit_sel_any || (g_fit_sel_granted && status == COMMON_PARAMS_FIT_STATUS_SUCCESS);
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
     return status;
