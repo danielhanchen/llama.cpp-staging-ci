@@ -5849,6 +5849,11 @@ struct llama_moe_cache::impl {
         }
         ahead_ticket.assign(host->n_slots(), 0);
         ahead_key.assign(host->n_slots(), -1);
+        // at most N reads ahead on the disk at once (LLAMA_MOE_HOST_CACHE_AHEAD_PARALLEL, unset or 0: no limit); with
+        // LLAMA_WEIGHT_STREAM_SPEC_CHUNK_KIB the demand reads of a lookup then wait behind at most N pieces
+        if (const char * e = getenv("LLAMA_MOE_HOST_CACHE_AHEAD_PARALLEL"); e != nullptr && atoi(e) > 0 && wstore != nullptr) {
+            wstore->set_spec_parallel(atoi(e));
+        }
         LLAMA_LOG_INFO("%s: MoE host cache: reads ahead of %d layer%s (top %d experts per token, LLAMA_MOE_HOST_CACHE_AHEAD=0 off), host routers of %zu layers = %.1f MiB in %.1f ms\n",
                 __func__, ahead_depth, ahead_depth > 1 ? "s" : "", ahead_topk, n_layers, ahead_router_bytes/1048576.0, (ggml_time_us() - t0)/1000.0);
     }
