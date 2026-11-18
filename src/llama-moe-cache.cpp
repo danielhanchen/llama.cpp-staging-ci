@@ -4134,6 +4134,19 @@ struct llama_moe_cache::impl {
                 plan.budget = lean;
                 plan.spare  = lean + v_bytes >= e_bytes;
             }
+            // the inclusive tier of the disk-tier rule (below the device minimum) plans the same way: it holds the device's experts
+            // too, so its cap is every streamed expert. L4 12 GB, Flash-Next UD-IQ4_XS from the disk: the auto budget left 13.9 GB of
+            // MemAvailable beside 35.6 GB of slots in every launch while each decode pass read ~155 MB from the disk.
+            // LLAMA_MOE_HOST_LEAN_INCLUSIVE=0 off
+            const char * e_li = getenv("LLAMA_MOE_HOST_LEAN_INCLUSIVE");
+            const size_t lean_incl = std::min(e_bytes + ((size_t) 64 << 20), avail_plan > keep ? avail_plan - keep : 0);
+            if ((e_lean == nullptr || atoi(e_lean) != 0) && (e_li == nullptr || atoi(e_li) != 0) && host_mib < 0 && mapped > avail &&
+                    plan.on && plan.policy == LLAMA_MOE_HOST_INCLUSIVE && plan.budget < lean_incl) {
+                LLAMA_LOG_INFO("%s: MoE host cache: disk tier, inclusive: the budget plans into %.1f MiB available minus the %.1f MiB reserve, "
+                        "%.1f MiB of other mapped weights and a %.1f MiB room: %.1f -> %.1f MiB (LLAMA_MOE_HOST_LEAN_INCLUSIVE=0 off)\n", __func__,
+                        avail/1048576.0, reserve/1048576.0, other/1048576.0, room_lean/1048576.0, plan.budget/1048576.0, lean_incl/1048576.0);
+                plan.budget = lean_incl;
+            }
         }
         if (reserve > 0 && host_mib < 0) {
             LLAMA_LOG_INFO("%s: MoE host cache: %.1f MiB available, %.1f MiB kept as the host reserve (LLAMA_MOE_HOST_RESERVE_MIB)\n", __func__,
