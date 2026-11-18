@@ -117,6 +117,10 @@ static llama_token argmax(const float * x, int n) {
     return best;
 }
 
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC 19.44 /O2 hits an internal compiler error (C1001) in main; the tool's results do not depend on optimization
+#pragma optimize("", off)
+#endif
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
