@@ -55,6 +55,7 @@ llama_moe_host_plan llama_moe_host_decide(size_t e_bytes, size_t v_bytes, size_t
             p.policy = LLAMA_MOE_HOST_INCLUSIVE;
             p.spare  = false;
             p.on     = true;
+            p.disk   = true;
             p.why    = "auto, disk tier below the device minimum: inclusive (LLAMA_MOE_HOST_DISK_INCLUSIVE=0 off)";
             return p;
         }

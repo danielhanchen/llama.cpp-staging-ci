@@ -46,6 +46,7 @@ struct llama_moe_host_plan {
     int         policy   = 1;    // llama_moe_host_policy
     double      tokens   = 0.0;  // device slots / token_bytes
     bool        spare    = false; // exclusive: the budget and the device slots together exceed the streamed experts (see set_dup)
+    bool        disk     = false; // on by the disk-tier rule below the device minimum (inclusive)
     const char * why     = "";
 };
 

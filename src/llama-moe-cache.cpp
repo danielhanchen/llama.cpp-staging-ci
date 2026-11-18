@@ -4105,6 +4105,29 @@ struct llama_moe_cache::impl {
                         "the budget is that complement + 1 GiB (%.1f MiB), the reserve gets the rest\n", __func__, reserve/1048576.0, need/1048576.0);
             }
         }
+        // below the device minimum on a disk tier (the inclusive rule above), the tier is exclusive where the copies back of the device's
+        // evictions go out on a side stream of the device (CUDA, LLAMA_MOE_D2H_STREAM): RAM and the device slots then hold distinct
+        // experts, and the copies back run beside the disk reads the pass waits for. The inclusive policy was chosen when the copies back
+        // ran on the compute stream. L4 12 GB, Flash-Next UD-IQ4_XS from the disk, same VM, same text: inclusive 87.4% RAM hits, exclusive
+        // (lean budget below) 91.4%, -32% experts read from the disk. LLAMA_MOE_HOST_DISK_EXCLUSIVE=0 keeps the inclusive tier
+        if (plan.on && plan.disk && policy_env < 0 && d2h_on) {
+            const char * e_dx = getenv("LLAMA_MOE_HOST_DISK_EXCLUSIVE");
+            bool side = true; // every streamed group on a CUDA device (any device with LLAMA_MOE_D2H_STREAM=1)
+            for (size_t ig = 0; ig < groups.size() && side && !d2h_forced; ++ig) {
+                if (!host_group[ig]) {
+                    continue;
+                }
+                ggml_backend_dev_t dev = ggml_backend_get_device(devices[groups[ig].id].backend);
+                ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                const char * rn = reg != nullptr ? ggml_backend_reg_name(reg) : nullptr;
+                side = rn != nullptr && strcmp(rn, "CUDA") == 0;
+            }
+            if ((e_dx == nullptr || atoi(e_dx) != 0) && side) {
+                plan.policy = LLAMA_MOE_HOST_EXCLUSIVE;
+                plan.spare  = plan.budget + v_bytes >= e_bytes;
+                plan.why    = "auto, disk tier below the device minimum: exclusive, copies back on a side stream (LLAMA_MOE_HOST_DISK_EXCLUSIVE=0: inclusive)";
+            }
+        }
         // k19-l4df2: on a disk tier (the mapped host weights exceed what is available, so the page cache cannot hold the streamed experts
         // the tier leaves out) the auto budget's planning room (max(4 GiB, 15%) + min(4 GiB, 1/16) of the available RAM, ~9.7 GB of a
         // 52 GB host) mostly buys page cache that cannot serve those experts: each device miss outside RAM is read from the disk. There
@@ -4133,6 +4156,18 @@ struct llama_moe_cache::impl {
                         (comp > plan.budget ? comp - plan.budget : 0)/1048576.0, (comp > lean ? comp - lean : 0)/1048576.0);
                 plan.budget = lean;
                 plan.spare  = lean + v_bytes >= e_bytes;
+            }
+            // LLAMA_MOE_HOST_LEAN_INCLUSIVE=1: the inclusive tier of the disk-tier rule (where it stays inclusive, see above) plans the same
+            // way, capped at every streamed expert (it holds the device's experts too). L4 12 GB, Flash-Next UD-IQ4_XS from the disk:
+            // 35.6 -> 39.5 GiB, 87.4% -> 89.7% RAM hits. Measured on CUDA only, where the exclusive tier is the default; off by default
+            const char * e_li = getenv("LLAMA_MOE_HOST_LEAN_INCLUSIVE");
+            const size_t lean_incl = std::min(e_bytes + ((size_t) 64 << 20), avail_plan > keep ? avail_plan - keep : 0);
+            if ((e_lean == nullptr || atoi(e_lean) != 0) && e_li != nullptr && atoi(e_li) != 0 && host_mib < 0 && mapped > avail &&
+                    plan.on && plan.policy == LLAMA_MOE_HOST_INCLUSIVE && plan.budget < lean_incl) {
+                LLAMA_LOG_INFO("%s: MoE host cache: disk tier, inclusive: the budget plans into %.1f MiB available minus the %.1f MiB reserve, "
+                        "%.1f MiB of other mapped weights and a %.1f MiB room: %.1f -> %.1f MiB (LLAMA_MOE_HOST_LEAN_INCLUSIVE=1)\n", __func__,
+                        avail/1048576.0, reserve/1048576.0, other/1048576.0, room_lean/1048576.0, plan.budget/1048576.0, lean_incl/1048576.0);
+                plan.budget = lean_incl;
             }
         }
         if (reserve > 0 && host_mib < 0) {
@@ -5849,6 +5884,11 @@ struct llama_moe_cache::impl {
         }
         ahead_ticket.assign(host->n_slots(), 0);
         ahead_key.assign(host->n_slots(), -1);
+        // at most N reads ahead on the disk at once (LLAMA_MOE_HOST_CACHE_AHEAD_PARALLEL, unset or 0: no limit); with
+        // LLAMA_WEIGHT_STREAM_SPEC_CHUNK_KIB the demand reads of a lookup then wait behind at most N pieces
+        if (const char * e = getenv("LLAMA_MOE_HOST_CACHE_AHEAD_PARALLEL"); e != nullptr && atoi(e) > 0 && wstore != nullptr) {
+            wstore->set_spec_parallel(atoi(e));
+        }
         LLAMA_LOG_INFO("%s: MoE host cache: reads ahead of %d layer%s (top %d experts per token, LLAMA_MOE_HOST_CACHE_AHEAD=0 off), host routers of %zu layers = %.1f MiB in %.1f ms\n",
                 __func__, ahead_depth, ahead_depth > 1 ? "s" : "", ahead_topk, n_layers, ahead_router_bytes/1048576.0, (ggml_time_us() - t0)/1000.0);
     }

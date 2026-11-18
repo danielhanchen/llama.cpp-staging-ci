@@ -363,6 +363,17 @@ struct llama_weight_store::impl {
     };
     std::deque<ws_task *> spec;
     int spec_parallel = 0; // k19-l4fill: at most this many speculative reads at once (0: no limit)
+    // speculative reads split into pieces of at most this many bytes (LLAMA_WEIGHT_STREAM_SPEC_CHUNK_KIB, a multiple of 4 KiB; unset or 0:
+    // whole reads)
+    size_t spec_chunk = spec_chunk_bytes();
+    static size_t spec_chunk_bytes() {
+        static const size_t v = [] {
+            const char * e = getenv("LLAMA_WEIGHT_STREAM_SPEC_CHUNK_KIB");
+            const long long kib = e != nullptr ? atoll(e) : 0;
+            return kib > 0 ? (size_t) std::max<long long>(4, kib / 4 * 4) << 10 : (size_t) 0;
+        }();
+        return v;
+    }
     int spec_running  = 0;
     std::unordered_map<uint64_t, std::unique_ptr<spec_req>> spec_reqs; // tickets not collected yet (main thread)
     uint64_t spec_next = 1;
@@ -1079,6 +1090,9 @@ struct llama_weight_store::impl {
     uint64_t read_host_async(host_read * reads, size_t n, bool direct) {
         auto req = std::make_unique<spec_req>();
         req->tasks.reserve(n);
+        // reads of at most spec_chunk bytes (aligned pieces of one read, see spec_chunk_bytes): a demand read then waits for at most
+        // one piece behind a speculative read on a device that serves one request at a time
+        const size_t chunk = spec_chunk;
         for (size_t i = 0; i < n; ++i) {
             uint64_t offs = 0;
             const llama_weight_extent * e = ext->find(reads[i].src, &offs);
@@ -1088,13 +1102,23 @@ struct llama_weight_store::impl {
             }
             const uint64_t foff = offs + reads[i].src_off;
             reads[i].lead = (size_t) (foff % k_align);
-            req->tasks.push_back({ e->file, foff, reads[i].size, reads[i].lead, reads[i].area, direct, &req->remaining });
+            if (chunk == 0 || reads[i].lead + reads[i].size <= chunk) {
+                req->tasks.push_back({ e->file, foff, reads[i].size, reads[i].lead, reads[i].area, direct, &req->remaining });
+            } else {
+                const uint64_t start = foff - reads[i].lead; // aligned, at area
+                const uint64_t end   = foff + reads[i].size;
+                for (uint64_t c0 = start; c0 < end; c0 += chunk) {
+                    const uint64_t f0 = std::max<uint64_t>(foff, c0);
+                    const uint64_t f1 = std::min<uint64_t>(end, c0 + chunk);
+                    req->tasks.push_back({ e->file, f0, (size_t) (f1 - f0), (size_t) (f0 - c0), reads[i].area + (c0 - start), direct, &req->remaining });
+                }
+            }
             req->bytes += reads[i].size;
         }
         if (n == 0) {
             return 0;
         }
-        req->remaining.store((int) n);
+        req->remaining.store((int) req->tasks.size());
         std::lock_guard<std::mutex> lock(mtx);
         const uint64_t id = spec_next++;
         for (auto & t : req->tasks) {
@@ -1551,6 +1575,11 @@ uint64_t llama_weight_store::read_host_async(host_read * reads, size_t n, bool d
 
 bool llama_weight_store::host_done(uint64_t ticket) {
     return ticket == 0 || pimpl->host_done(ticket);
+}
+
+void llama_weight_store::set_spec_chunk(size_t bytes) {
+    std::lock_guard<std::mutex> lock(pimpl->mtx);
+    pimpl->spec_chunk = bytes / 4096 * 4096;
 }
 
 void llama_weight_store::set_spec_parallel(int n) {
