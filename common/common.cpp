@@ -3791,6 +3791,13 @@ uma_restart:
                 }
             }
         }
+        // a DFlash / DSpark draft borrows the target's token embeddings and lm head (device tensors) whatever path the fit took above
+        // (the small-device placement returns before the draft is priced): G4 10 GB Qwen3.8-Flash-Next + DFlash2 with
+        // LLAMA_FIT_DRAFT_CPU=1 aborted in the draft's first graph reservation (output.weight on CUDA0, the draft context on the CPU)
+        if (draft_cpu && std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; })) {
+            draft_needs_target = true;
+        }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
         // k15-small4: a draft that runs on the target's context (a gemma-4 assistant reads the target's KV cache) cannot run on the CPU
         // while that cache is on the device: T4 4 GB with LLAMA_FIT_DRAFT_CPU=1 aborted in its first graph reservation (a CPU context
