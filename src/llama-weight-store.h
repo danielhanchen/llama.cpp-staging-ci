@@ -156,9 +156,6 @@ public:
     // k19-l4fill: at most n IO threads read speculative reads at once (0: any number, the default); the others stay free for the demand
     // reads, which the disk then serves after at most n speculative reads
     void     set_spec_parallel(int n);
-    // speculative reads in aligned pieces of at most this many bytes (rounded down to 4 KiB; 0: whole reads); the default is
-    // LLAMA_WEIGHT_STREAM_SPEC_CHUNK_KIB (unset: 0)
-    void     set_spec_chunk(size_t bytes);
 
     // the tier in front of the model files, nullptr = none
     void set_tier(llama_weight_tier * tier);
