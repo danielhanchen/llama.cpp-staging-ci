@@ -2373,6 +2373,21 @@ private:
                         "host path is off, misses are fetched (LLAMA_SPEC_HOSTPATH_OFF_SHARE=%.2f; =0: the host path rule as before)\n",
                         100.0*share, hp_share);
                 }
+                // In the same band the MTP drafter's restricted head keeps 32768 rows instead of 65536: each draft step's lm head is
+                // the largest kernel of the step there, and the deep windows draft 4-6 steps per pass. Colab G4, Qwen3.8-Flash-Next
+                // UD-IQ4_XS + its MTP drafter, Studio argv, 48 GB, 2 launches: 8k 210.4 -> 215.7 tok/s (+2.5%, 16.22 -> 16.04 ms per
+                // pass at 3.46 tokens), chat level (256.3 / 256.6), the same text. LLAMA_SPEC_MTP_VOCAB_WIDE=0: off; an explicit
+                // LLAMA_MTP_DRAFT_VOCAB keeps its value
+                const bool mtp_vocab_wide = [] {
+                    const char * x = getenv("LLAMA_SPEC_MTP_VOCAB_WIDE");
+                    return x == nullptr || atoi(x) != 0;
+                }();
+                if (def_on && mtp_vocab_wide && share >= 0.60 && cc_min == 1200 && cc_max == 1200 &&
+                        getenv("LLAMA_MTP_DRAFT_VOCAB") == nullptr) {
+                    common_set_env("LLAMA_MTP_DRAFT_VOCAB", "32768");
+                    SRV_INF("MoE cache expected to hold %.1f%% of the routed experts beside the MTP drafter (compute capability 12.0): "
+                        "the drafter's restricted head keeps 32768 rows (LLAMA_SPEC_MTP_VOCAB_WIDE=0: 65536)\n", 100.0*share);
+                }
                 if (g4t && getenv("LLAMA_MOE_PREFETCH") == nullptr && getenv("LLAMA_MOE_PREFETCH_AUTO") == nullptr) {
                     common_set_env("LLAMA_MOE_PREFETCH_AUTO", "2");
                 }
