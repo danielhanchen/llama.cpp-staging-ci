@@ -365,6 +365,7 @@ struct llama_weight_store::impl {
     int spec_parallel = 0; // k19-l4fill: at most this many speculative reads at once (0: no limit)
     // speculative reads split into pieces of at most this many bytes (LLAMA_WEIGHT_STREAM_SPEC_CHUNK_KIB, a multiple of 4 KiB; unset or 0:
     // whole reads)
+    size_t spec_chunk = spec_chunk_bytes();
     static size_t spec_chunk_bytes() {
         static const size_t v = [] {
             const char * e = getenv("LLAMA_WEIGHT_STREAM_SPEC_CHUNK_KIB");
@@ -1091,7 +1092,7 @@ struct llama_weight_store::impl {
         req->tasks.reserve(n);
         // reads of at most spec_chunk bytes (aligned pieces of one read, see spec_chunk_bytes): a demand read then waits for at most
         // one piece behind a speculative read on a device that serves one request at a time
-        const size_t chunk = spec_chunk_bytes();
+        const size_t chunk = spec_chunk;
         for (size_t i = 0; i < n; ++i) {
             uint64_t offs = 0;
             const llama_weight_extent * e = ext->find(reads[i].src, &offs);
@@ -1574,6 +1575,11 @@ uint64_t llama_weight_store::read_host_async(host_read * reads, size_t n, bool d
 
 bool llama_weight_store::host_done(uint64_t ticket) {
     return ticket == 0 || pimpl->host_done(ticket);
+}
+
+void llama_weight_store::set_spec_chunk(size_t bytes) {
+    std::lock_guard<std::mutex> lock(pimpl->mtx);
+    pimpl->spec_chunk = bytes / 4096 * 4096;
 }
 
 void llama_weight_store::set_spec_parallel(int n) {
