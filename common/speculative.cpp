@@ -2298,6 +2298,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    cost_on   = false; // spec_cost || tpp_floor > 0: the round times and draft probabilities are recorded
     common_spec_mtp_cost cost_pol;
     common_spec_tpp_cost tpp_cost;
+    // the deep windows' own depth past the chat bucket (LLAMA_SPEC_DEPTH_MAIN_N, set by the server where the chat bucket's windows draft
+    // n_max: from LLAMA_SPEC_DEPTH_CHAT_POS, 1536, on they end at depth_main drafts; 0: n_max everywhere)
+    int32_t depth_main     = 0;
+    int64_t depth_chat_pos = 1536;
     // k19-adraft (params.adraft > 0: the greedy window's drafts). Sampled requests, LLAMA_SPEC_ADRAFT=1: confidence gate, the 2nd draft
     // is kept when its probability is at least adraft_p2 (LLAMA_SPEC_ADRAFT_P2, default 0: always), every later one when at least adraft_p
     // (LLAMA_SPEC_ADRAFT_P, default 0.9), the window ending at the first draft below its bar (a function of the text: no timing).
@@ -2437,6 +2441,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!chain_heads && !is_mem_shared && !spec_cost && this->params.n_max >= this->params.n_floor + 1) {
                 tpp_floor = this->params.n_floor;
                 tpp_cost.deep_extra = this->params.n_max - this->params.n_floor - 1;
+                if (const char * e = getenv("LLAMA_SPEC_DEPTH_MAIN_N")) {
+                    depth_main = std::clamp(atoi(e), 0, this->params.n_max);
+                    depth_main = depth_main > tpp_floor && depth_main < this->params.n_max ? depth_main : 0;
+                }
+                if (const char * e = getenv("LLAMA_SPEC_DEPTH_CHAT_POS")) {
+                    depth_chat_pos = std::max<int64_t>(0, atoll(e));
+                }
             } else {
                 this->params.n_max = std::min(this->params.n_max, this->params.n_floor);
             }
@@ -3174,6 +3185,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 } else if (adraft_keep > 0 && !gated(dp) && (int) result.size() >= adraft_cap(seq_id, dp)) {
                     // k19-adraft: a greedy request's window, as with n_max = adraft_keep (modes 3 / 4: the stretch's width)
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
+                }
+
+                // past the chat bucket a deep window ends at the deep windows' own depth (see depth_main)
+                if (depth_main > 0 && tpp_floor > 0 && tpp_cost.deep() && tpp_cost.pos_cur >= depth_chat_pos && (int) result.size() >= depth_main) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

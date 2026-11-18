@@ -2015,6 +2015,7 @@ private:
     bool sleeping = false;
     int32_t spec_active_cap = 0; // k19-small1115: drafts per window while another slot is active (0: no cut; load_model)
     bool    spec_g4t_raised = false; // k19-g4tail: the rule raised the MTP windows to n_def drafts (load_model)
+    bool    spec_chat_deep  = false; // the MTP windows of the chat bucket draft deeper (load_model)
     int32_t spec_g4t_cap    = 0;     // k19-g4tail2: drafts per window when the placed MoE cache is outside the band (0: no cut)
 
     int64_t t_last_load_progress_ms = 0;
@@ -2356,6 +2357,7 @@ private:
                     const char * x = getenv("LLAMA_SPEC_HOSTPATH_OFF_SHARE");
                     return x != nullptr ? atof(x) : 0.60;
                 }();
+                spec_chat_deep = def_on && share >= 0.60 && cc_min == 1200 && cc_max == 1200;
                 if (def_on && hp_share > 0.0 && share >= hp_share && cc_min == 1200 && cc_max == 1200 && getenv("LLAMA_MOE_CPU_MISS") == nullptr) {
                     common_set_env("LLAMA_MOE_CPU_MISS", "0");
                     SRV_INF("MoE cache expected to hold %.1f%% of the routed experts beside the MTP drafter (compute capability 12.0): the CPU-miss "
@@ -2375,6 +2377,26 @@ private:
                     short_b/1048576.0, exp_b/1048576.0, tgt_bytes/1048576.0, in_ram_fs ? "on a memory file system" : resident ? "fits in RAM" :
                     "does not fit in RAM", ram_avail/1048576.0, def_on || g4t ? "deeper MTP windows by default" : "MTP windows of 2 drafts", share_min);
             }
+            // The windows of the chat bucket (KV positions below LLAMA_SPEC_DEPTH_CHAT_POS, 1536) draft LLAMA_SPEC_DEPTH_CHAT_N (6; 0: off)
+            // where the deep windows are on and a verify row is cheap: the full card and a cache expected to hold at least 60% of the
+            // routed experts, compute capability 12.0 only. Longer contexts keep the deep windows' own depth (LLAMA_SPEC_DEPTH_MAIN_N for
+            // the drafter), so an 8k request keeps its windows; the windows are sized for the deeper one. MoE targets only. A request
+            // below 1536 tokens has one verify width, one that crosses 1536 two. Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS + its MTP
+            // drafter, 6 drafts in every window: 48 GB chat +2.5% (5.22 vs 4.06 tokens per pass), full card chat +1.7%, the same text;
+            // at 16 GB chat -7% (not there)
+            const int chat_n = [] {
+                const char * x = getenv("LLAMA_SPEC_DEPTH_CHAT_N");
+                return x != nullptr ? std::clamp(atoi(x), 0, 8) : 6;
+            }();
+            auto chat_deepen = [&](int n_main) -> int {
+                if (chat_n <= n_main || getenv("LLAMA_SPEC_DEPTH_MAIN_N") != nullptr) {
+                    return n_main;
+                }
+                common_set_env("LLAMA_SPEC_DEPTH_MAIN_N", std::to_string(n_main).c_str());
+                SRV_INF("MTP windows below position %s draft %d, the deep windows from there %d (LLAMA_SPEC_DEPTH_CHAT_N=0: %d everywhere)\n",
+                    getenv("LLAMA_SPEC_DEPTH_CHAT_POS") != nullptr ? getenv("LLAMA_SPEC_DEPTH_CHAT_POS") : "1536", chat_n, n_main, n_main);
+                return chat_n;
+            };
             const uint64_t expert_bytes = mtp_shape && !on && cache_expected && depth_cached >= 3 ? common_moe_expert_bytes(params.model.path) : 0;
             const bool ram_fits = ram_avail == 0 || expert_bytes <= ram_avail;
             // (the device rule as k19-tpp's: NVIDIA Ampere or newer, LLAMA_SPEC_TPP=1 forces past it, =0 turns this off too)
@@ -2396,7 +2418,7 @@ private:
                     sp.draft.fit_n_max = sp.draft.n_max;
                 }
                 sp.draft.n_floor     = 2;
-                sp.draft.n_max       = std::min(depth_cached, 8);
+                sp.draft.n_max       = spec_chat_deep ? chat_deepen(std::min(depth_cached, 8)) : std::min(depth_cached, 8);
                 sp.draft.deep_cached = true;
                 if (getenv("LLAMA_SPEC_VERIFY4_CACHED") == nullptr) {
                     common_set_env("LLAMA_SPEC_VERIFY4_CACHED", "1");
@@ -2413,7 +2435,9 @@ private:
                 // (k19-sharegate: beside the cache the deep windows stay opt-in, LLAMA_SPEC_DEPTH=1)
                 const bool deep = de != nullptr ? atoi(de) != 0 : sp.has_dft() && !share_ok;
                 sp.draft.n_floor = 2;
-                sp.draft.n_max   = deep ? 4 : 3;
+                // (the chat bucket's deeper windows on a MoE target only: a dense one keeps 4)
+                const bool chat_ok = cc_min == 1200 && cc_max == 1200 && de == nullptr && common_moe_expert_bytes(params.model.path) > 0;
+                sp.draft.n_max   = deep ? (chat_ok ? chat_deepen(4) : 4) : 3;
                 SRV_INF("k19-tpp: MTP drafts 2, a 3rd where it pays (need %.0f MiB for model + drafter, %.0f MiB free on %d GPUs%s; "
                     "LLAMA_SPEC_TPP=0: off)\n", need/1048576.0, dev_free/1048576.0, n_gpu, n_gpu == 0 ? ", no GPU: forced" : "");
                 if (deep) {
