@@ -118,6 +118,22 @@ static bool run_fused(ffn_case & c, int n_threads, std::vector<float> & out) {
     std::vector<uint8_t> wbuf(ws);
     out.assign((size_t) n_embd*n_used*n_tokens, 12345.0f);
     auto fn = g_team ? ggml_cpu_moe_host_ffn_team : ggml_cpu_moe_host_ffn;
+    // GGML_MOE_HOST_PF=1: a read-ahead of every expert runs on the team when the batch starts (the batch stops it first)
+    if (g_team && getenv("GGML_MOE_HOST_PF") != nullptr && atoi(getenv("GGML_MOE_HOST_PF")) != 0) {
+        std::vector<int32_t> all((size_t) c.up->ne[2]);
+        for (size_t e = 0; e < all.size(); ++e) {
+            all[e] = (int32_t) e;
+        }
+        ggml_cpu_moe_host_team_prefetch(c.up, c.gate, c.down, all.data(), (int) all.size(), n_threads);
+    } else if (!g_team && getenv("GGML_MOE_HOST_PF") != nullptr && atoi(getenv("GGML_MOE_HOST_PF")) != 0) {
+        // the OpenMP form: a read-ahead region that ends when its reads are done or after 200 us
+        std::vector<int32_t> all((size_t) c.up->ne[2]);
+        for (size_t e = 0; e < all.size(); ++e) {
+            all[e] = (int32_t) e;
+        }
+        auto never = [](void *) { return false; };
+        ggml_cpu_moe_host_prefetch_sync(c.up, c.gate, c.down, all.data(), (int) all.size(), n_threads, never, nullptr, 200);
+    }
     return fn(c.up, c.gate, c.down, (const float *) c.x->data, (const int32_t *) c.ids->data, out.data(), n_used, n_tokens,
         n_threads, wbuf.data(), wbuf.size());
 }

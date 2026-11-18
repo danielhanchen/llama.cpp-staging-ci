@@ -1629,7 +1629,8 @@ size_t ggml_cpu_moe_host_ffn_wsize(const struct ggml_tensor * up, const struct g
         return 0;
     }
     const int64_t rows = ggml_moe_host_pad((int64_t) n_used*n_tokens*up->ne[1]*(int64_t) sizeof(float));
-    return (size_t) (2*rows + ggml_moe_host_per_thread(up, gate, down, n_tokens)*n_threads + 64);
+    const int64_t qact = (int64_t) n_used*n_tokens*ggml_moe_host_pad((int64_t) ggml_row_size(type_traits_cpu[down->type].vec_dot_type, up->ne[1]));
+    return (size_t) (2*rows + qact + ggml_moe_host_per_thread(up, gate, down, n_tokens)*n_threads + 64);
 }
 
 // k19-l4b: the shared state of one batch, read by every thread that computes it (the OpenMP region or the host team below)
@@ -1667,9 +1668,123 @@ struct ggml_moe_host_job {
     atomic_int next_gu;
     atomic_int next_dn;
     atomic_int done_gu;
+    // GGML_MOE_HOST_PF (sliced form): every thread computes the same row slice of every expert (thread i: up / gate rows
+    // [i*n_ff/n_thr, (i+1)*n_ff/n_thr), down rows [i*n_embd/n_thr, ...)), so the rows a thread reads are known before the batch and can
+    // be read ahead into its caches (ggml_cpu_moe_host_team_prefetch); the SwiGLU rows are formed once per pair into qact. Each output
+    // is the same kernel on the same bytes as in the ranges above
+    bool   sliced;
+    int    n_thr;
+    char * qact;
+    atomic_int done_act;
+    // 1: a read-ahead job (ggml_moe_host_pf_thread), not a batch
+    int    kind;
 };
 
+// one up or gate row r (matrix m) of group g for every pair of the group: the computation of the ranges below
+static inline void ggml_moe_host_gu_row(const struct ggml_moe_host_job * j, int g, int m, int64_t r, const char * xu, const char * xg) {
+    const int32_t * pe = j->pe; const int32_t * pt = j->pt;
+    const int32_t * gstart = j->gstart; const int32_t * glist = j->glist;
+    const int64_t n_embd = j->n_embd;
+    const int64_t n_ff   = j->n_ff;
+    const struct ggml_tensor * wt = m == 0 ? j->up : j->gate;
+    const char * row = (const char *) wt->data + (int64_t) pe[glist[gstart[g]]]*wt->nb[2] + r*wt->nb[1];
+    float      * dst = m == 0 ? j->ub : j->gb;
+    const char * xq  = m == 0 ? xu : xg;
+    const size_t rs  = m == 0 ? j->rsu : j->rsg;
+    const int    nc  = gstart[g + 1] - gstart[g];
+    ggml_vec_dot_multi_t const vdm = m == 0 ? j->vdm_u : j->vdm_g;
+    if (nc >= 2 && vdm != NULL) {
+        for (int c0 = 0; c0 < nc; c0 += GGML_MOE_HOST_COLS) {
+            const int ncc = MIN(GGML_MOE_HOST_COLS, nc - c0);
+            const void * cols[GGML_MOE_HOST_COLS];
+            float res[GGML_MOE_HOST_COLS];
+            for (int c = 0; c < ncc; ++c) {
+                cols[c] = xq + (size_t) pt[glist[gstart[g] + c0 + c]]*rs;
+            }
+            vdm((int) n_embd, res, row, cols, ncc);
+            for (int c = 0; c < ncc; ++c) {
+                dst[(int64_t) glist[gstart[g] + c0 + c]*n_ff + r] = res[c];
+            }
+        }
+    } else {
+        ggml_vec_dot_t const dot = m == 0 ? j->dot_u : j->dot_g;
+        for (int c = 0; c < nc; ++c) {
+            const int p = glist[gstart[g] + c];
+            dot((int) n_embd, dst + (int64_t) p*n_ff + r, 0, row, 0, xq + (size_t) pt[p]*rs, 0, 1);
+        }
+    }
+}
+
+// the sliced form (GGML_MOE_HOST_PF): two barriers instead of one, the SwiGLU rows formed once per pair
+static void ggml_moe_host_ffn_thread_sliced(struct ggml_moe_host_job * j, int ith, char * xu, char * xg, float * act) {
+    const int64_t n_embd = j->n_embd;
+    const int64_t n_ff   = j->n_ff;
+    const int     n_grp  = j->n_grp;
+    const int     n_thr  = j->n_thr;
+    const int32_t * po = j->po;
+    const int32_t * gstart = j->gstart; const int32_t * glist = j->glist;
+    const int64_t qstride = ggml_moe_host_pad((int64_t) j->rsd);
+
+    const int64_t r0 = n_ff*ith/n_thr;
+    const int64_t r1 = n_ff*(ith + 1)/n_thr;
+    for (int g = 0; g < n_grp; ++g) {
+        for (int m = 0; m < 2; ++m) {
+            for (int64_t r = r0; r < r1; ++r) {
+                ggml_moe_host_gu_row(j, g, m, r, xu, xg);
+            }
+        }
+    }
+    atomic_fetch_add_explicit(&j->done_gu, 1, memory_order_acq_rel);
+    while (atomic_load_explicit(&j->done_gu, memory_order_acquire) < n_thr) {
+        ggml_thread_cpu_relax();
+    }
+    for (int p = ith; p < j->n_pair; p += n_thr) {
+        ggml_vec_swiglu_f32((int) n_ff, act, j->gb + (int64_t) p*n_ff, j->ub + (int64_t) p*n_ff);
+        j->q_d(act, j->qact + (int64_t) p*qstride, n_ff);
+    }
+    atomic_fetch_add_explicit(&j->done_act, 1, memory_order_acq_rel);
+    while (atomic_load_explicit(&j->done_act, memory_order_acquire) < n_thr) {
+        ggml_thread_cpu_relax();
+    }
+    const int64_t d0 = n_embd*ith/n_thr;
+    const int64_t d1 = n_embd*(ith + 1)/n_thr;
+    for (int g = 0; g < n_grp; ++g) {
+        const int    nc = gstart[g + 1] - gstart[g];
+        const char * w0 = (const char *) j->down->data + (int64_t) j->pe[glist[gstart[g]]]*j->down->nb[2];
+        for (int c0 = 0; c0 < nc; c0 += GGML_MOE_HOST_COLS) {
+            const int ncc = MIN(GGML_MOE_HOST_COLS, nc - c0);
+            const void * cols[GGML_MOE_HOST_COLS];
+            for (int c = 0; c < ncc; ++c) {
+                cols[c] = j->qact + (int64_t) glist[gstart[g] + c0 + c]*qstride;
+            }
+            if (ncc >= 2 && j->vdm_d != NULL) {
+                for (int64_t r = d0; r < d1; ++r) {
+                    float res[GGML_MOE_HOST_COLS];
+                    j->vdm_d((int) n_ff, res, w0 + r*j->down->nb[1], cols, ncc);
+                    for (int c = 0; c < ncc; ++c) {
+                        j->out[(int64_t) po[glist[gstart[g] + c0 + c]]*n_embd + r] = res[c];
+                    }
+                }
+            } else {
+                for (int c = 0; c < ncc; ++c) {
+                    float * o = j->out + (int64_t) po[glist[gstart[g] + c0 + c]]*n_embd;
+                    for (int64_t r = d0; r < d1; ++r) {
+                        j->dot_d((int) n_ff, o + r, 0, w0 + r*j->down->nb[1], 0, cols[c], 0, 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void ggml_moe_host_ffn_thread_impl(struct ggml_moe_host_job * j, int ith, bool sliced);
+
 static void ggml_moe_host_ffn_thread(struct ggml_moe_host_job * j, int ith) {
+    ggml_moe_host_ffn_thread_impl(j, ith, j->sliced);
+}
+
+// sliced: every one of the j->n_thr threads runs (the team, or an OpenMP region that got all of its threads)
+static void ggml_moe_host_ffn_thread_impl(struct ggml_moe_host_job * j, int ith, bool sliced) {
     const int64_t n_embd = j->n_embd;
     const int64_t n_ff   = j->n_ff;
     const int     n_grp  = j->n_grp;
@@ -1688,6 +1803,11 @@ static void ggml_moe_host_ffn_thread(struct ggml_moe_host_job * j, int ith) {
         if (!j->qshare) {
             j->q_g(j->x + (int64_t) t*n_embd, xg + (size_t) t*j->rsg, n_embd);
         }
+    }
+
+    if (sliced) {
+        ggml_moe_host_ffn_thread_sliced(j, ith, xu, xg, act);
+        return;
     }
 
     // 2. up and gate rows: items (group, matrix, row), ranges of equal weight
@@ -1824,6 +1944,65 @@ struct ggml_moe_team {
 static struct ggml_moe_team ggml_moe_team_g;
 static atomic_int ggml_moe_team_init = 0; // 0: not yet, 1: ready
 
+// GGML_MOE_HOST_PF (the team form opt-in with =1, the OpenMP form below on by default, =0 off): a read-ahead of the row slices of experts
+// a later batch is expected to compute, run by the team's workers while the caller goes on (ggml_cpu_moe_host_team_prefetch). Worker i reads the slices it computes in the sliced form of a batch
+// on n_thr threads, so they are in its caches when the batch comes; the next batch (or read-ahead) stops it first. Only bytes are read:
+// what a batch computes does not depend on it
+struct ggml_moe_host_pf {
+    const struct ggml_tensor * up;
+    const struct ggml_tensor * gate;
+    const struct ggml_tensor * down;
+    int32_t exps[GGML_MOE_HOST_MAX_PAIRS];
+    int     n_exp;
+    int     n_thr;
+    atomic_int   abort;
+    atomic_llong sink;
+};
+static struct ggml_moe_host_pf  ggml_moe_pf_g;
+static struct ggml_moe_host_job ggml_moe_pf_job;   // kind 1: the workers run ggml_moe_host_pf_thread
+static bool                     ggml_moe_pf_pending = false; // under ggml_moe_team_g.call
+
+// -1 (unset): the OpenMP form only (the batches of a host without the host team), 0: off, 1: both forms
+static int ggml_moe_host_pf_mode(void) {
+    static int mode = -2;
+    if (mode == -2) {
+        const char * e = getenv("GGML_MOE_HOST_PF");
+        mode = e != NULL ? (atoi(e) != 0 ? 1 : 0) : -1;
+    }
+    return mode;
+}
+
+static inline uint64_t ggml_moe_host_pf_read(const char * p, size_t n) {
+    uint64_t v = 0;
+    for (size_t o = 0; o < n; o += 64) {
+        v += *(const volatile unsigned char *) (p + o);
+    }
+    return v;
+}
+
+static void ggml_moe_host_pf_thread(int ith) {
+    struct ggml_moe_host_pf * f = &ggml_moe_pf_g;
+    const int64_t n_ff   = f->up->ne[1];
+    const int64_t n_embd = f->up->ne[0];
+    const int64_t r0 = n_ff*ith/f->n_thr,   r1 = n_ff*(ith + 1)/f->n_thr;
+    const int64_t d0 = n_embd*ith/f->n_thr, d1 = n_embd*(ith + 1)/f->n_thr;
+    uint64_t v = 0;
+    for (int k = 0; k < f->n_exp; ++k) {
+        if (atomic_load_explicit(&f->abort, memory_order_relaxed)) {
+            break;
+        }
+        const int64_t e = f->exps[k];
+        const struct ggml_tensor * w2[2] = { f->up, f->gate };
+        for (int m = 0; m < 2; ++m) {
+            const char * b = (const char *) w2[m]->data + e*w2[m]->nb[2];
+            v += ggml_moe_host_pf_read(b + r0*w2[m]->nb[1], (size_t) ((r1 - r0)*w2[m]->nb[1]));
+        }
+        const char * b = (const char *) f->down->data + e*f->down->nb[2];
+        v += ggml_moe_host_pf_read(b + d0*f->down->nb[1], (size_t) ((d1 - d0)*f->down->nb[1]));
+    }
+    atomic_fetch_add_explicit(&f->sink, (long long) v, memory_order_relaxed);
+}
+
 static int ggml_moe_host_team_mode(void) {
     static int mode = -1;
     if (mode < 0) {
@@ -1876,7 +2055,11 @@ static thread_ret_t ggml_moe_team_worker(void * arg) {
             // a batch on fewer threads: this worker neither computes nor counts down, and its spin time runs from its last batch.
             // The poster writes the next batch only after the batch's own workers have finished this one
             if (i < (g & GGML_MOE_TEAM_NMASK)) {
-                ggml_moe_host_ffn_thread(t->job, i);
+                if (t->job->kind == 1) {
+                    ggml_moe_host_pf_thread(i);
+                } else {
+                    ggml_moe_host_ffn_thread(t->job, i);
+                }
                 atomic_fetch_add_explicit(&t->left, -1, memory_order_acq_rel);
                 last = ggml_time_us();
                 spins = 0;
@@ -1931,6 +2114,19 @@ static void ggml_moe_team_ensure_init(void) {
     ggml_critical_section_end();
 }
 
+// under t->call: a read-ahead still running is stopped and waited for
+static void ggml_moe_pf_finish(struct ggml_moe_team * t) {
+    if (!ggml_moe_pf_pending) {
+        return;
+    }
+    atomic_store_explicit(&ggml_moe_pf_g.abort, 1, memory_order_relaxed);
+    while (atomic_load_explicit(&t->left, memory_order_acquire) != 0) {
+        ggml_thread_cpu_relax();
+    }
+    atomic_store_explicit(&ggml_moe_pf_g.abort, 0, memory_order_relaxed);
+    ggml_moe_pf_pending = false;
+}
+
 // stops and joins the workers (the next batch starts them again)
 void ggml_cpu_moe_host_team_stop(void) {
     if (atomic_load_explicit(&ggml_moe_team_init, memory_order_acquire) != 1) {
@@ -1938,6 +2134,7 @@ void ggml_cpu_moe_host_team_stop(void) {
     }
     struct ggml_moe_team * t = &ggml_moe_team_g;
     ggml_mutex_lock(&t->call);
+    ggml_moe_pf_finish(t);
     if (t->n > 0) {
         ggml_mutex_lock(&t->mtx);
         atomic_store(&t->stop, true);
@@ -1968,6 +2165,7 @@ static bool ggml_moe_team_run(struct ggml_moe_host_job * j, int n_threads) {
     ggml_moe_team_ensure_init();
     struct ggml_moe_team * t = &ggml_moe_team_g;
     ggml_mutex_lock(&t->call);
+    ggml_moe_pf_finish(t);
     while (t->n < n_threads - 1) {
         const int i = t->n + 1;
         t->start_gen[i] = atomic_load(&t->gen);
@@ -1996,6 +2194,105 @@ static bool ggml_moe_team_run(struct ggml_moe_host_job * j, int n_threads) {
     }
     ggml_mutex_unlock(&t->call);
     return true;
+}
+
+// GGML_MOE_HOST_PF: starts a read-ahead of the slices of experts exps[0..n) on workers 1..n_threads-1 (the slices of a sliced batch on
+// n_threads threads) and returns; false if it did not start (no team, the form off, the workers not running yet)
+bool ggml_cpu_moe_host_team_prefetch(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+        const int32_t * exps, int n, int n_threads) {
+    if (ggml_moe_host_pf_mode() != 1 || ggml_moe_host_team_mode() != 1 || up == NULL || gate == NULL || down == NULL || exps == NULL ||
+            n <= 0 || n_threads < 2 || n_threads > GGML_MOE_TEAM_MAX) {
+        return false;
+    }
+    ggml_moe_team_ensure_init();
+    struct ggml_moe_team * t = &ggml_moe_team_g;
+    ggml_mutex_lock(&t->call);
+    ggml_moe_pf_finish(t);
+    if (t->n < n_threads - 1) {
+        ggml_mutex_unlock(&t->call);
+        return false;
+    }
+    struct ggml_moe_host_pf * f = &ggml_moe_pf_g;
+    f->up = up; f->gate = gate; f->down = down;
+    f->n_exp = 0;
+    for (int k = 0; k < n && f->n_exp < GGML_MOE_HOST_MAX_PAIRS; ++k) {
+        if (exps[k] >= 0 && exps[k] < up->ne[2]) {
+            f->exps[f->n_exp++] = exps[k];
+        }
+    }
+    f->n_thr = n_threads;
+    if (f->n_exp == 0) {
+        ggml_mutex_unlock(&t->call);
+        return false;
+    }
+    ggml_moe_pf_job.kind = 1;
+    t->job   = &ggml_moe_pf_job;
+    t->job_n = n_threads;
+    atomic_store_explicit(&t->left, n_threads - 1, memory_order_relaxed);
+    const unsigned g0 = (unsigned) atomic_load(&t->gen);
+    atomic_store(&t->gen, (int) ((((g0 >> GGML_MOE_TEAM_NBITS) + 1u) << GGML_MOE_TEAM_NBITS) | (unsigned) n_threads));
+    if (atomic_load(&t->sleepers) > 0) {
+        ggml_mutex_lock(&t->mtx);
+        ggml_cond_broadcast(&t->cv);
+        ggml_mutex_unlock(&t->mtx);
+    }
+    ggml_moe_pf_pending = true;
+    ggml_mutex_unlock(&t->call);
+    return true;
+}
+
+// GGML_MOE_HOST_PF where the batches run in the OpenMP region: the caller runs the read-ahead itself after it signalled a batch's
+// completion, as one region: thread 0 calls stop(stop_data) and ends the region once it returns true (a batch was published) or
+// after max_us, the other threads read their slices of experts exps[0..n)
+bool ggml_cpu_moe_host_prefetch_sync(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+        const int32_t * exps, int n, int n_threads, bool (*stop)(void *), void * stop_data, int64_t max_us) {
+#if defined(GGML_USE_OPENMP)
+    if (ggml_moe_host_pf_mode() == 0 || up == NULL || gate == NULL || down == NULL || exps == NULL || stop == NULL || n <= 0 ||
+            n_threads < 2) {
+        return false;
+    }
+    struct ggml_moe_host_pf * f = &ggml_moe_pf_g;
+    f->up = up; f->gate = gate; f->down = down;
+    f->n_exp = 0;
+    for (int k = 0; k < n && f->n_exp < GGML_MOE_HOST_MAX_PAIRS; ++k) {
+        if (exps[k] >= 0 && exps[k] < up->ne[2]) {
+            f->exps[f->n_exp++] = exps[k];
+        }
+    }
+    f->n_thr = n_threads;
+    if (f->n_exp == 0) {
+        return false;
+    }
+    atomic_store_explicit(&f->abort, 0, memory_order_relaxed);
+    atomic_int done;
+    atomic_store_explicit(&done, 0, memory_order_relaxed);
+    const int64_t t0 = ggml_time_us();
+    #pragma omp parallel num_threads(n_threads)
+    {
+        const int ith = omp_get_thread_num();
+        const int nth = omp_get_num_threads();
+        if (ith == 0) {
+            while (atomic_load_explicit(&done, memory_order_acquire) < nth - 1) {
+                if (stop(stop_data) || ggml_time_us() - t0 > max_us) {
+                    atomic_store_explicit(&f->abort, 1, memory_order_relaxed);
+                    break;
+                }
+                ggml_thread_cpu_relax();
+            }
+        } else {
+            if (nth == n_threads) {
+                ggml_moe_host_pf_thread(ith);
+            }
+            atomic_fetch_add_explicit(&done, 1, memory_order_acq_rel);
+        }
+    }
+    atomic_store_explicit(&f->abort, 0, memory_order_relaxed);
+    return true;
+#else
+    GGML_UNUSED(up); GGML_UNUSED(gate); GGML_UNUSED(down); GGML_UNUSED(exps); GGML_UNUSED(n); GGML_UNUSED(n_threads);
+    GGML_UNUSED(stop); GGML_UNUSED(stop_data); GGML_UNUSED(max_us);
+    return false;
+#endif
 }
 
 static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
@@ -2113,9 +2410,17 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
     const int64_t rows_b = ggml_moe_host_pad((int64_t) n_used*n_tokens*n_ff*(int64_t) sizeof(float));
     job.per = ggml_moe_host_per_thread(up, gate, down, n_tokens);
     char * base = (char *) GGML_PAD((uintptr_t) wbuf, 64);
+    const int64_t qact_b = (int64_t) n_used*n_tokens*ggml_moe_host_pad((int64_t) job.rsd);
     job.ub   = (float *) base;
     job.gb   = (float *) (base + rows_b);
-    job.thr0 = base + 2*rows_b;
+    job.qact = base + 2*rows_b;
+    job.thr0 = base + 2*rows_b + qact_b;
+    job.kind  = 0;
+    // (by default only batches of 6+ tokens: the wide verify windows of a block drafter, whose host experts the read-ahead covers best;
+    // at 5 tokens and fewer the sliced form's second barrier cost as much as the read-ahead saved on some hosts)
+    job.sliced = n_threads > 1 && (ggml_moe_host_pf_mode() == 1 || (ggml_moe_host_pf_mode() < 0 && !team && n_threads >= 16 && n_tokens >= 6));
+    job.n_thr  = n_threads;
+    atomic_store_explicit(&job.done_act, 0, memory_order_relaxed);
     job.dot_u = type_traits_cpu[up->type].vec_dot;
     job.dot_g = type_traits_cpu[gate->type].vec_dot;
     job.dot_d = type_traits_cpu[down->type].vec_dot;
@@ -2151,13 +2456,15 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
         atomic_store_explicit(&job.next_gu, 0, memory_order_relaxed);
         atomic_store_explicit(&job.next_dn, 0, memory_order_relaxed);
         atomic_store_explicit(&job.done_gu, 0, memory_order_relaxed);
+        atomic_store_explicit(&job.done_act, 0, memory_order_relaxed);
     }
 #if defined(GGML_USE_OPENMP)
     // k18 ranges: one per thread
     job.n_task = n_threads;
     #pragma omp parallel num_threads(n_threads)
     {
-        ggml_moe_host_ffn_thread(&job, omp_get_thread_num());
+        // (an OpenMP region with fewer threads than asked takes the ranges, whose tasks any thread can take)
+        ggml_moe_host_ffn_thread_impl(&job, omp_get_thread_num(), job.sliced && omp_get_num_threads() == job.n_thr);
     }
     return true;
 #else

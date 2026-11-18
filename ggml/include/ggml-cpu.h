@@ -96,6 +96,15 @@ extern "C" {
     // k19-hostovl: how long an idle team worker spins before it sleeps when GGML_MOE_HOST_TEAM_SPIN_US is unset (default 2000 us);
     // only before the first batch
     GGML_BACKEND_API void   ggml_cpu_moe_host_team_set_spin_us(int64_t us);
+    // GGML_MOE_HOST_PF=1 (opt-in on the team): starts a read-ahead, on the team's workers, of the row slices of the given experts that a
+    // batch on n_threads threads reads in its sliced form, and returns at once; the next batch stops it first. false: not started
+    GGML_BACKEND_API bool   ggml_cpu_moe_host_team_prefetch(const struct ggml_tensor * up, const struct ggml_tensor * gate,
+            const struct ggml_tensor * down, const int32_t * exps, int n, int n_threads);
+    // the same read-ahead where the batches run in the OpenMP region (on unless GGML_MOE_HOST_PF=0): run by the caller as one region
+    // until stop(stop_data) returns true, the slices are read or max_us passed
+    GGML_BACKEND_API bool   ggml_cpu_moe_host_prefetch_sync(const struct ggml_tensor * up, const struct ggml_tensor * gate,
+            const struct ggml_tensor * down, const int32_t * exps, int n, int n_threads, bool (*stop)(void *), void * stop_data,
+            int64_t max_us);
 
     GGML_BACKEND_API int ggml_cpu_has_sse3       (void);
     GGML_BACKEND_API int ggml_cpu_has_ssse3      (void);
