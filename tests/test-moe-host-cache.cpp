@@ -97,8 +97,9 @@ static void test_decide() {
     // weights, with a forced exclusive policy, without routing (token_bytes 0) or with the kill switch (disk_incl false, the cases below)
     {
         const llama_moe_host_plan p = decide(1020.4, 29212.6, -1, -1, false, true);
-        CHECK(p.on && p.policy == 0 && !p.spare);
+        CHECK(p.on && p.policy == 0 && !p.spare && p.disk);
         CHECK(p.budget > mib(22790) && p.budget < mib(22810));
+        CHECK( decide(1020.4, 29212.6, -1, 0, false, true).disk); // a forced inclusive policy takes the same rule (llama_moe_cache keeps it inclusive)
         CHECK( decide(LLAMA_MOE_HOST_MIN_TOKENS*744.0 - 8, 29000, -1, -1, false, true).on);
         CHECK(!decide(LLAMA_MOE_HOST_MIN_TOKENS*744.0 - 8, 60000, -1, -1, false, true).on);
         CHECK(!decide(1020.4, 29212.6, -1, 1, false, true).on);
@@ -106,7 +107,7 @@ static void test_decide() {
         CHECK(!llama_moe_host_decide(e, mib(1020.4), mapped, mib(29212.6), 0, -1, -1, false, true).on);
         // above the minimum: unchanged (exclusive)
         const llama_moe_host_plan l = decide(5114.7, 29299.5, -1, -1, false, true);
-        CHECK(l.on && l.policy == 1 && l.budget > mib(22858) && l.budget < mib(22878));
+        CHECK(l.on && l.policy == 1 && l.budget > mib(22858) && l.budget < mib(22878) && !l.disk);
         // the default argument is the new rule
         CHECK(llama_moe_host_decide(e, mib(1020.4), mapped, mib(29212.6), tok, -1, -1, false).on);
         // a budget below LLAMA_MOE_HOST_DISK_MIN_FRAC of the experts: off (22.8 of 38 GiB = 60%: on at 0.6, off at 0.61; the Kaggle
