@@ -11,6 +11,9 @@
 #include <string>
 #include <vector>
 
+// ggml-cpu.c: the runner of the graph computes' OpenMP regions (runner(fn, arg, user) runs fn(arg) and returns once it returned)
+extern "C" void ggml_cpu_set_region_runner(void (*runner)(void (*fn)(void *), void * arg, void * user), void * user);
+
 #ifdef GGML_USE_CPU_HBM
 #    include "hbm.h"
 #endif
@@ -725,6 +728,10 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_cpu_moe_host_prefetch_sync") == 0) {
         return (void *)ggml_cpu_moe_host_prefetch_sync;
+    }
+    // the runner of the graph computes' OpenMP regions (ggml-cpu.c)
+    if (strcmp(name, "ggml_cpu_set_region_runner") == 0) {
+        return (void *)ggml_cpu_set_region_runner;
     }
 
     // threadpool - TODO:  move to ggml-base

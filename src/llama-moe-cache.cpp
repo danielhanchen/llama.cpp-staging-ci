@@ -2967,6 +2967,18 @@ struct llama_moe_cache::impl {
         std::atomic<int64_t> kick_us{0};
         std::mutex              mtx;
         std::condition_variable cv;
+        // the OpenMP regions of the CPU backend's graph computes started by the thread that runs the decode graphs (a draft model's
+        // host experts, the token embeddings) run on this thread's OpenMP team (single_region_run), so the process keeps one team of
+        // busy-waiting threads instead of two
+        std::mutex              run_mtx;              // one region at a time; held by the caller until its region is done
+        std::atomic<bool>       run_on{false};        // this thread takes regions (cleared before it stops)
+        std::atomic<uint64_t>   run_caller{0};        // the thread whose regions it takes: the one that kicks the decode graphs
+        std::atomic<int>        run_state{0};         // 0 idle, 1 posted, 2 done
+        void                  (*run_fn)(void *) = nullptr;
+        void *                  run_arg = nullptr;
+        uint64_t                run_n  = 0;           // regions taken
+        int64_t                 run_us = 0;           // time in them
+        void (*set_runner)(void (*)(void (*)(void *), void *, void *), void *) = nullptr; // the CPU backend's ggml_cpu_set_region_runner
     };
     static single_hub_t & single_hub() {
         static single_hub_t h;
@@ -3331,6 +3343,7 @@ struct llama_moe_cache::impl {
             if (set_n != nullptr) {
                 set_n(h.cpu.get(), h.threads);
             }
+            h.set_runner = (decltype(h.set_runner)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_set_region_runner");
             const char * ef = getenv("LLAMA_MOE_SINGLE_FUSED");
             if (ef == nullptr || atoi(ef) != 0) {
                 h.fused       = (decltype(h.fused))       ggml_backend_reg_get_proc_address(creg, h.team ? "ggml_cpu_moe_host_ffn_team" : "ggml_cpu_moe_host_ffn");
@@ -3389,6 +3402,21 @@ struct llama_moe_cache::impl {
         if (!h.thr.joinable()) {
             h.stop.store(false, std::memory_order_relaxed);
             h.thr = std::thread(single_service);
+            // LLAMA_MOE_SINGLE_REGIONS (default 1; 0 = off): where the batches run in this thread's OpenMP region (not the host team), the
+            // CPU backend's graph regions started by the thread that runs the decode graphs run here too: a draft model whose experts
+            // stay in host memory (Qwen3.8-Flash-Next's MTP drafter on a small device) computes them in an OpenMP region of that thread
+            // between the target's graphs, and with libgomp each thread that starts regions keeps its own team, whose threads busy-wait
+            // after each region while this thread's team computes the next host batches: two teams of about the cores' size on the
+            // same cores. Same regions, threads and kernels: the results are the same
+            static const bool regions = getenv("LLAMA_MOE_SINGLE_REGIONS") == nullptr || atoi(getenv("LLAMA_MOE_SINGLE_REGIONS")) != 0;
+            if (regions && !h.team && h.set_runner != nullptr) {
+                h.run_n  = 0;
+                h.run_us = 0;
+                h.run_on.store(true, std::memory_order_release);
+                h.set_runner(single_region_run, &h);
+                LLAMA_LOG_INFO("llama_moe_cache%s: the CPU graph regions of the thread that runs the decode graphs run on the host thread's "
+                    "OpenMP team (one team of waiting threads in the process; LLAMA_MOE_SINGLE_REGIONS=0 off)\n", tag);
+            }
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
             "(one host thread for every cache of the process%s), slow-batch warning above %d ms (merges never time out), %s%s\n", tag, single_max(), h.threads,
@@ -3774,11 +3802,51 @@ struct llama_moe_cache::impl {
     }
 
 
+    static uint64_t single_thread_key() {
+        return (uint64_t) std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1;
+    }
+
+    // the CPU backend's region runner (ggml_cpu_set_region_runner): a region started by the thread that kicks the decode graphs runs
+    // on the host thread, which serves the mailboxes between the graphs (that thread is idle then: its regions start where the device
+    // finished); other threads' regions, and every region while the host thread is not taking them, run on their caller as before
+    static void single_region_run(void (*fn)(void *), void * arg, void * user) {
+        single_hub_t & h = *(single_hub_t *) user;
+        if (!h.run_on.load(std::memory_order_acquire) || h.run_caller.load(std::memory_order_relaxed) != single_thread_key()) {
+            fn(arg);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(h.run_mtx);
+        if (!h.run_on.load(std::memory_order_acquire)) {
+            fn(arg);
+            return;
+        }
+        h.run_fn  = fn;
+        h.run_arg = arg;
+        h.run_state.store(1, std::memory_order_release);
+        {
+            // under the thread's sleep mutex: it checks for a posted region before it sleeps, so the wake-up is not lost
+            std::lock_guard<std::mutex> wl(h.mtx);
+        }
+        h.cv.notify_one();
+        while (h.run_state.load(std::memory_order_acquire) != 2) {
+            llama_mb_spin_pause();
+        }
+        h.run_state.store(0, std::memory_order_relaxed);
+    }
+
     static void single_service() {
         single_hub_t & h = single_hub();
         int64_t last_work = 0;
         while (!h.stop.load(std::memory_order_acquire)) {
             bool work = false;
+            if (h.run_state.load(std::memory_order_acquire) == 1) {
+                const int64_t t0 = single_now_us();
+                h.run_fn(h.run_arg);
+                h.run_us += single_now_us() - t0;
+                h.run_n++;
+                h.run_state.store(2, std::memory_order_release);
+                work = true;
+            }
             {
                 std::lock_guard<std::mutex> lock(h.reg_mtx);
                 for (impl * o : h.owners) {
@@ -3793,7 +3861,7 @@ struct llama_moe_cache::impl {
                 // that publishes without a kick (layer-major, a draft context's first graph) would wait for this sleep (G4 nsys: the
                 // first decode forward after an 8k prompt waited 100 ms in the merges with a 100 ms sleep, -8.6% prompt)
                 std::unique_lock<std::mutex> lock(h.mtx);
-                h.cv.wait_for(lock, std::chrono::milliseconds(1));
+                h.cv.wait_for(lock, std::chrono::milliseconds(1), [&h] { return h.run_state.load(std::memory_order_acquire) == 1; });
             } else {
                 llama_mb_spin_pause();
             }
@@ -3826,6 +3894,7 @@ struct llama_moe_cache::impl {
             return;
         }
         single_hub_t & h = single_hub();
+        h.run_caller.store(single_thread_key(), std::memory_order_relaxed);
         const int64_t now  = single_now_us();
         const int64_t prev = h.kick_us.exchange(now, std::memory_order_relaxed);
         if (now - prev > 20000) {
@@ -3846,6 +3915,11 @@ struct llama_moe_cache::impl {
                 last = h.owners.empty();
             }
             if (last && h.thr.joinable()) {
+                {
+                    // a region in flight completes first (its caller holds run_mtx until the thread ran it)
+                    std::lock_guard<std::mutex> rl(h.run_mtx);
+                    h.run_on.store(false, std::memory_order_release);
+                }
                 h.stop.store(true, std::memory_order_release);
                 h.cv.notify_one();
                 h.thr.join();
@@ -3854,6 +3928,10 @@ struct llama_moe_cache::impl {
                 }
                 if (h.blocking && single_wait_blocking() != nullptr) {
                     single_wait_blocking()(false);
+                }
+                if (h.run_n > 0) {
+                    LLAMA_LOG_INFO("llama_moe_cache%s: %" PRIu64 " CPU graph regions of the decode thread ran on the host thread's OpenMP team, "
+                        "%.1f us each\n", tag, h.run_n, (double) h.run_us/h.run_n);
                 }
                 h.blocking = false;
                 h.team = false;

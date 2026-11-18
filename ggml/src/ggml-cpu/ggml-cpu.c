@@ -4603,6 +4603,63 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
+// ggml_cpu_set_region_runner: a runner for the OpenMP regions of the graph computes. When set, ggml_graph_compute hands its region to
+// runner(fn, arg, user), which runs fn(arg) on a thread of its choice (or on the caller) and returns once fn returned. A process whose
+// graphs are computed from several threads then has them share one thread's OpenMP team: with libgomp each thread that starts a
+// region keeps its own team, whose threads busy-wait for the next region after each one, so two teams of the size of the cores keep
+// every core busy and slow each other down. The region's threads, its work and its results are the same whichever thread starts it
+typedef void (*ggml_cpu_region_runner_t)(void (*fn)(void *), void * arg, void * user);
+static ggml_cpu_region_runner_t ggml_cpu_region_runner      = NULL;
+static void *                   ggml_cpu_region_runner_user = NULL;
+
+#if defined(__GNUC__) || defined(__clang__)
+#define GGML_CPU_RUNNER_LOAD(v)     __atomic_load_n(&(v), __ATOMIC_ACQUIRE)
+#define GGML_CPU_RUNNER_STORE(v, x) __atomic_store_n(&(v), (x), __ATOMIC_RELEASE)
+#else
+#define GGML_CPU_RUNNER_LOAD(v)     (v)
+#define GGML_CPU_RUNNER_STORE(v, x) ((v) = (x))
+#endif
+
+void ggml_cpu_set_region_runner(ggml_cpu_region_runner_t runner, void * user);
+
+void ggml_cpu_set_region_runner(ggml_cpu_region_runner_t runner, void * user) {
+    // the user pointer first: a caller that sees the runner sees its user pointer
+    GGML_CPU_RUNNER_STORE(ggml_cpu_region_runner_user, user);
+    GGML_CPU_RUNNER_STORE(ggml_cpu_region_runner, runner);
+}
+
+#ifdef GGML_USE_OPENMP
+struct ggml_graph_compute_region {
+    struct ggml_threadpool * threadpool;
+    int                      n_threads;
+};
+
+static void ggml_graph_compute_omp_region(void * arg) {
+    struct ggml_graph_compute_region * r = (struct ggml_graph_compute_region *) arg;
+    struct ggml_threadpool * threadpool = r->threadpool;
+    int n_threads = r->n_threads;
+
+    #pragma omp parallel num_threads(n_threads)
+    {
+        #pragma omp single
+        {
+            // update the number of threads from the actual number of threads that we got from OpenMP
+            n_threads = omp_get_num_threads();
+            atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
+        }
+
+        // Apply thread CPU mask and priority
+        int ith = omp_get_thread_num();
+
+        ggml_thread_apply_priority(threadpool->prio);
+        if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+            ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
+        }
+        ggml_graph_compute_thread(&threadpool->workers[ith]);
+    }
+}
+#endif
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
@@ -4633,23 +4690,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
-        #pragma omp parallel num_threads(n_threads)
-        {
-            #pragma omp single
-            {
-                // update the number of threads from the actual number of threads that we got from OpenMP
-                n_threads = omp_get_num_threads();
-                atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
-            }
-
-            // Apply thread CPU mask and priority
-            int ith = omp_get_thread_num();
-
-            ggml_thread_apply_priority(threadpool->prio);
-            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
-                ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
-            }
-            ggml_graph_compute_thread(&threadpool->workers[ith]);
+        struct ggml_graph_compute_region region = { threadpool, n_threads };
+        const ggml_cpu_region_runner_t runner = GGML_CPU_RUNNER_LOAD(ggml_cpu_region_runner);
+        if (runner != NULL) {
+            runner(ggml_graph_compute_omp_region, &region, GGML_CPU_RUNNER_LOAD(ggml_cpu_region_runner_user));
+        } else {
+            ggml_graph_compute_omp_region(&region);
         }
     } else {
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
