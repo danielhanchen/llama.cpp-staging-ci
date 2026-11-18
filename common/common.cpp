@@ -2636,6 +2636,9 @@ struct common_fit_draft_hx {
     ggml_type type_v   = GGML_TYPE_F16;
 };
 
+// set while the launch is fitted again with K/V host chunks for its DFlash / DSpark drafter (the small-device refit below)
+static bool g_fit_dflash_kv_host = false;
+
 static bool common_fit_draft_on_cpu(
         const common_params & params, const llama_model_params & mparams, const llama_context_params & cparams,
         const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level,
@@ -2655,6 +2658,11 @@ static bool common_fit_draft_on_cpu(
     double min_frac = common_moe_hybrid_max_frac();
     if (const char * env = getenv("LLAMA_FIT_DRAFT_MIN_CACHE_FRAC")) {
         min_frac = std::max(0.0, atof(env));
+    } else if (g_fit_dflash_kv_host) {
+        // the refit of a DFlash / DSpark launch on the small-device placement (see the caller): a cache of 2% of the host experts
+        // beside the drafter. G4 10 GB / 131K, Qwen3.8-Flash-Next UD-IQ4_XS + DFlash2 Q8_0 (932 MiB): the cache 4072 -> 3140 MiB (5.5%),
+        // chat 82.7 -> 129.1 tok/s (no drafting before), 8k 78.7 -> 106.7, all layers on the device
+        min_frac = 0.02;
     }
 
     llama_model_params   mp = mparams;
@@ -2683,7 +2691,9 @@ static bool common_fit_draft_on_cpu(
     // its verify windows are multi-token hybrid batches, open on k19-nanfix (plans/k19_lookup8.md section 4)
     // k19-kvlong (LLAMA_FIT_PLACE8_DRAFT=1, opt-in, measurement): the draft model is weighed against that cache by the rules below
     // as on a mid-size device (what a small drafter buys against the cache it takes, G4 10 / 12 GB at long contexts)
-    static const bool place8_draft = getenv("LLAMA_FIT_PLACE8_DRAFT") != nullptr && atoi(getenv("LLAMA_FIT_PLACE8_DRAFT")) != 0;
+    static const bool place8_draft_env = getenv("LLAMA_FIT_PLACE8_DRAFT") != nullptr && atoi(getenv("LLAMA_FIT_PLACE8_DRAFT")) != 0;
+    // and always in the refit of a DFlash / DSpark launch with its K/V cells in host chunks (g_fit_dflash_kv_host, see the caller)
+    const bool place8_draft = place8_draft_env || g_fit_dflash_kv_host;
     // k19-mtpkeep (LLAMA_FIT_DRAFT_HOST_EXPS, default on; 0 = off): only where the draft would be left out otherwise, for an MTP draft
     // model whose experts are not already placed by the user (-cmoed / -otd)
     static const bool hx_env = getenv("LLAMA_FIT_DRAFT_HOST_EXPS") == nullptr || atoi(getenv("LLAMA_FIT_DRAFT_HOST_EXPS")) != 0;
@@ -3790,6 +3800,13 @@ uma_restart:
                     mparams_dft.kv_overrides = params_dft.kv_overrides.data();
                 }
             }
+        }
+        // a DFlash / DSpark draft borrows the target's token embeddings and lm head (device tensors) whatever path the fit took above
+        // (the small-device placement returns before the draft is priced): G4 10 GB Qwen3.8-Flash-Next + DFlash2 with
+        // LLAMA_FIT_DRAFT_CPU=1 aborted in the draft's first graph reservation (output.weight on CUDA0, the draft context on the CPU)
+        if (draft_cpu && std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; })) {
+            draft_needs_target = true;
         }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
         // k15-small4: a draft that runs on the target's context (a gemma-4 assistant reads the target's KV cache) cannot run on the CPU
@@ -4953,8 +4970,14 @@ uma_restart:
         // VM: 81.2 -> 106.3, 76.5 -> 90.6, 78.3 -> 79.1; a third, whose host computed an expert row 15% slower, 2k 78.1 -> 66.1); 12 GB /
         // 262K chat 84.9 -> 113.5, 8k 81.1 -> 101.0, 2k 83.0 -> 80.8. Where the refit keeps no drafter the launch runs as
         // LLAMA_KV_SEL_HOST=1
+        // The same refit for a DFlash / DSpark drafter (LLAMA_KV_SEL_DFLASH=0 off), which the small-device placement drops as well:
+        // in the refit it is weighed against the cache (as LLAMA_FIT_PLACE8_DRAFT=1) with a cache floor of 2% of the host experts.
+        // G4 10 GB / 131K, Qwen3.8-Flash-Next UD-IQ4_XS + DFlash2 Q8_0 n6, 3 launches: chat 82.7 -> 129.1 tok/s, 8k 78.7 -> 106.7
+        const bool spec_dflash_ks = !spec_mtp && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; }) &&
+            (getenv("LLAMA_KV_SEL_DFLASH") == nullptr || atoi(getenv("LLAMA_KV_SEL_DFLASH")) != 0);
         if (!kv_sel_mtp_restart && !uma_no_cache && !model_only && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && llama_kv_sel_mode() == 2 &&
-                spec_mtp && has_draft && common_fit_place8() && !kv_sel_draft_fit_off_in && params.speculative.draft.fit_off &&
+                (spec_mtp || spec_dflash_ks) && has_draft && common_fit_place8() && !kv_sel_draft_fit_off_in && params.speculative.draft.fit_off &&
                 (getenv("LLAMA_KV_SEL_MTP") == nullptr || atoi(getenv("LLAMA_KV_SEL_MTP")) != 0)) {
             const char * e_dc = getenv("LLAMA_KV_SEL_DEV_CELLS");
             const int64_t dev_cells = e_dc != nullptr ? std::max(0, atoi(e_dc)) : 32768;
@@ -4966,11 +4989,13 @@ uma_restart:
             const uint64_t avail = llama_available_memory();
             const bool disk_tier = exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && !common_fit_file_in_ram_fs(params.model.path);
             if (n_gpu == 1 && cparams.n_ctx > (uint32_t) dev_cells && !disk_tier) {
-                COM_INF("%s: --fit: k19-g4ten: the MTP drafter was dropped on the small-device placement: fitted again with the K/V cells past %" PRId64
-                    " in host chunks (LLAMA_KV_SEL_HOST=1; LLAMA_KV_SEL_MTP=0 keeps this fit)\n", __func__, dev_cells);
+                COM_INF("%s: --fit: k19-g4ten: the %s drafter was dropped on the small-device placement: fitted again with the K/V cells past %" PRId64
+                    " in host chunks (LLAMA_KV_SEL_HOST=1; %s keeps this fit)\n", __func__, spec_dflash_ks ? "DFlash" : "MTP", dev_cells,
+                    spec_dflash_ks ? "LLAMA_KV_SEL_DFLASH=0" : "LLAMA_KV_SEL_MTP=0");
                 common_set_env("LLAMA_KV_SEL_HOST", "1");
                 params = params_given;
                 kv_sel_mtp_restart = true;
+                g_fit_dflash_kv_host = spec_dflash_ks;
                 goto uma_restart;
             }
         }
