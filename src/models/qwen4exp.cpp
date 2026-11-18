@@ -598,10 +598,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // head. The written rows come from the same ops on the same rows, so the cache bytes, drafts and output are those of the full
     // block. Strata's MTP prompt pass (draft_kv) also stops at the K / V append
     static const bool kv_only_env = getenv("LLAMA_MTP_PROMPT_KV_ONLY") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY")) != 0;
-    // only on prompt-sized batches (LLAMA_MTP_PROMPT_KV_ONLY_MIN rows, default 64): there every product is its own MMQ / cuBLAS
-    // launch whose result depends on that product's shape alone, while the small catch-up batches use mat-vec kernels that fuse
-    // adjacent products of one input (k15-mm2)
-    static const int64_t kv_only_min = getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN") ? std::max(1, atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN"))) : 64;
+    // the catch-up after a verify too (LLAMA_MTP_CATCHUP_KV_ONLY=0: only from 64 rows, LLAMA_MTP_PROMPT_KV_ONLY_MIN=N: from N rows). Its
+    // rows' FFN output is never read: a single MTP block's next draft starts from the target's hidden row. With the drafter's experts
+    // in host memory (the fit's host-expert placement) that FFN read the experts of every verified row from RAM (10 of 512 Q8_0
+    // experts of ~5 MiB per row): G4 Qwen3.8-Flash-Next UD-IQ4_XS 10 GB / 131K + its Q8_0 MTP drafter, 4.0 ms of a 30.6 ms pass. On
+    // the device it is a few hundred microseconds per pass: 48 GB chat / 8k +1.7% / +2.5%, the same text and drafts (2 launches).
+    // The small catch-up batches run mat-vec kernels that fuse adjacent products of one input where the full block reads Q
+    // next to K and V; K and V are each still their own product of the same input rows, and the drafts matched the full block's on
+    // every measured cell
+    static const bool kv_only_catchup = getenv("LLAMA_MTP_CATCHUP_KV_ONLY") == nullptr || atoi(getenv("LLAMA_MTP_CATCHUP_KV_ONLY")) != 0;
+    static const int64_t kv_only_min = getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN") ? std::max(1, atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN"))) :
+        kv_only_catchup ? 1 : 64;
     // k19-mtpkeep (LLAMA_MTP_PROMPT_KV_ONLY_UB=0 off): a drafter context whose n_ubatch is below that (the fit's host-expert MTP placement
     // runs at 16 rows, so its graphs fit the in-place q8_0 flash attention and keep no f16 copy of the whole K / V) writes full prompt
     // ubatches the same way, else every prompt ubatch would build the whole block with its experts on the host
