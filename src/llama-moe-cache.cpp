@@ -24,6 +24,7 @@ extern "C" { GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_c
         int n_core, struct ggml_tensor * scores, struct ggml_tensor * dep); }
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -2869,6 +2870,8 @@ struct llama_moe_cache::impl {
         int64_t  h_pre_ns   = 0; // pickup -> start of the host compute, end of it -> completed (host steady clock)
         int64_t  h_post_ns  = 0;
         single_plan plans[GGML_MOE_MAILBOX_MAX_TOKENS + 1];
+        std::array<int32_t, GGML_MOE_MAILBOX_MAX_TOKENS*16> pf_list{}; // GGML_MOE_HOST_PF: the experts read ahead for the next batch
+        int pf_n = 0;
     };
     // LLAMA_MOE_SINGLE unset: on where it was tested (k11 round 16): CUDA (the backend has mapped mailboxes: not HIP / MUSA), one GPU
     // in the context, not Windows, and only the expert form the host plans compute (separate gate / up, SiLU: see build_moe_ffn);
@@ -2937,6 +2940,18 @@ struct llama_moe_cache::impl {
         size_t (*fused_wsize)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int, int, int) = nullptr;
         std::vector<uint8_t> fused_buf;
         uint64_t             fused_batches = 0;
+        // GGML_MOE_HOST_PF (see single_register): after a batch, the threads read ahead the row slices of the experts the next layer's
+        // mailbox computed in its last batch, while the device runs that layer's attention
+        bool (*prefetch)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const int32_t *, int, int) = nullptr;
+        // the same in the OpenMP region (batches not on the team): run by this thread after a batch's completion is stored
+        bool (*prefetch_sync)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const int32_t *, int, int,
+            bool (*)(void *), void *, int64_t) = nullptr;
+        int pf_threads = 0; // threads of the last batch
+        bool pf_all_sizes = false; // GGML_MOE_HOST_PF=1: after every batch; by default after batches of 6+ tokens only
+        uint64_t pf_posted = 0;    // read-aheads started
+        uint64_t pf_exps   = 0;    // experts read ahead
+        uint64_t pf_used   = 0;    // host experts of a batch that its mailbox's read-ahead covered
+        uint64_t pf_all    = 0;    // host experts of the batches after a read-ahead of their mailbox
         // k19-hostadapt: the small-host team's size follows the CPU time of other processes (see single_adapt_threads); read and
         // written by the host thread only
         bool     adapt       = false;
@@ -3324,6 +3339,27 @@ struct llama_moe_cache::impl {
                     h.fused = nullptr;
                     h.fused_wsize = nullptr;
                 }
+                // the host read-ahead (GGML_MOE_HOST_PF): after a batch, the threads read the row slices of the experts the next layer's
+                // mailbox computed in its last batch while the device runs that layer's attention, and each batch computes the same row
+                // slices of every expert on every thread, so they find those rows in their caches. Only the reads and which thread
+                // computes which row change: every output is the same kernel on the same bytes. On by default for batches of 6+ tokens
+                // (a block drafter's verify windows) where they run in an OpenMP region of at least 16 threads (no host team: G4 hosts,
+                // 23 threads); every batch size, the team form (small hosts) and smaller regions with =1; =0 off. Colab G4,
+                // Qwen3.8-Flash-Next UD-IQ4_XS + its DFlash2 drafter, 16 / 32 GB: chat +2..+7%, 8k +3% (same text); with the MTP drafter's
+                // 5-row windows -6..+2% by host (not by default)
+                const char * epf = getenv("GGML_MOE_HOST_PF");
+                const int pf_mode = epf != nullptr ? (atoi(epf) != 0 ? 1 : 0) : -1;
+                h.pf_all_sizes = pf_mode == 1;
+                if (h.fused != nullptr && (pf_mode == 1 || (pf_mode < 0 && !h.team && h.threads >= 16))) {
+                    if (h.team) {
+                        h.prefetch = (decltype(h.prefetch)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_prefetch");
+                    } else {
+                        h.prefetch_sync = (decltype(h.prefetch_sync)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_prefetch_sync");
+                    }
+                    LLAMA_LOG_INFO("llama_moe_cache%s: host read-ahead: the host batches compute row slices and read ahead the next layer's "
+                        "last host experts (%s, %s; GGML_MOE_HOST_PF=0 off)\n", tag, h.team ? "host team" : "OpenMP region",
+                        h.prefetch != nullptr || h.prefetch_sync != nullptr ? "on" : "not in this CPU backend");
+                }
             }
         }
         // k19-hostovl: on 8-11 CPUs the mailbox only pays with the host team (the hub's team is set by its first cache)
@@ -3523,6 +3559,61 @@ struct llama_moe_cache::impl {
         return true;
     }
 
+    // GGML_MOE_HOST_PF (OpenMP form): whether any mailbox of the caches this thread serves has a batch published and not computed (the
+    // read-ahead region then ends): a later layer of this cache (one whose window has no host row publishes nothing), or another
+    // cache's (a draft model whose experts run on the host publishes right after the target's last layer). Called with reg_mtx held
+    static bool single_any_request(void * data) {
+        GGML_UNUSED(data);
+        for (const impl * o : single_hub().owners) {
+            for (size_t k = 0; k < o->mbox_n; ++k) {
+                const mailbox * mb = o->mbox_live[k].load(std::memory_order_acquire);
+                if (mb != nullptr && llama_mb_load_acq(&((ggml_moe_mailbox_hdr *) mb->host)->request) != mb->done) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // GGML_MOE_HOST_PF: the next live mailbox after i (the next MoE layer with host rows) reads ahead the distinct experts of its last
+    // batch; its ids area still holds them until the device publishes its next batch (a torn read only reads other bytes ahead)
+    void single_read_ahead(single_hub_t & hub, size_t i, int n_thr) {
+        for (size_t k = i + 1; k < mbox_n; ++k) {
+            mailbox * nb = mbox_live[k].load(std::memory_order_acquire);
+            if (nb == nullptr) {
+                continue;
+            }
+            const auto * nh = (const ggml_moe_mailbox_hdr *) nb->host;
+            const int nt_raw = ((const volatile int32_t *) &nh->n_tokens)[0];
+            const int nt = std::min(std::max(nt_raw, 0), (int) GGML_MOE_MAILBOX_MAX_TOKENS);
+            const volatile int32_t * nid = (const volatile int32_t *) ((const char *) nb->host + ggml_moe_mailbox_off_ids());
+            int n = 0;
+            for (int q = 0; q < nb->n_used*nt && n < (int) nb->pf_list.size(); ++q) {
+                const int32_t e = nid[q];
+                if (e < 0) {
+                    continue;
+                }
+                bool dup = false;
+                for (int r = 0; r < n && !dup; ++r) {
+                    dup = nb->pf_list[r] == e;
+                }
+                if (!dup) {
+                    nb->pf_list[n++] = e;
+                }
+            }
+            // (sync: not when a batch is already published; the region ends when one is, or after 400 us)
+            const bool started = n > 0 && (hub.prefetch != nullptr ? hub.prefetch(nb->w_up, nb->w_gate, nb->w_down, nb->pf_list.data(), n, n_thr) :
+                !single_any_request(this) && hub.prefetch_sync(nb->w_up, nb->w_gate, nb->w_down, nb->pf_list.data(), n, n_thr,
+                    single_any_request, this, 400));
+            if (started) {
+                nb->pf_n = n;
+                hub.pf_posted++;
+                hub.pf_exps += n;
+            }
+            return;
+        }
+    }
+
     // one pass over the mailboxes of this cache, true if one had work
     bool single_poll(ggml_backend_t cpu) {
         // LLAMA_MOE_SINGLE_DEBUG_STALL=N (test of the timeout): the thread stops answering after N batches, as if it died
@@ -3569,6 +3660,23 @@ struct llama_moe_cache::impl {
                 single_hub_busy(true);
                 single_debug_delay(true);
                 single_hub_t & hub = single_hub();
+                // (the read-ahead's coverage, counted with GGML_MOE_MAILBOX_TIMING only: the loop is before the batch's compute)
+                if (tm_on && (hub.prefetch != nullptr || hub.prefetch_sync != nullptr) && mb.pf_n > 0) {
+                    const int32_t * cid = (const int32_t *) ((const char *) mb.host + ggml_moe_mailbox_off_ids());
+                    for (int q = 0; q < mb.n_used*n_tokens; ++q) {
+                        if (cid[q] < 0) {
+                            continue;
+                        }
+                        hub.pf_all++;
+                        for (int k = 0; k < mb.pf_n; ++k) {
+                            if (mb.pf_list[k] == cid[q]) {
+                                hub.pf_used++;
+                                break;
+                            }
+                        }
+                    }
+                    mb.pf_n = 0;
+                }
                 if (hub.fused != nullptr) {
                     const int n_thr = single_adapt_threads(hub); // k19-hostadapt
                     const size_t ws = hub.fused_wsize(mb.w_up, mb.w_gate, mb.w_down, mb.n_used, n_tokens, n_thr);
@@ -3580,6 +3688,10 @@ struct llama_moe_cache::impl {
                         (const int32_t *) (hb + ggml_moe_mailbox_off_ids()), (float *) (hb + ggml_moe_mailbox_off_out(mb.n_used, mb.n_embd)),
                         mb.n_used, n_tokens, n_thr, hub.fused_buf.data(), hub.fused_buf.size());
                     hub.fused_batches += ok;
+                    hub.pf_threads = n_thr;
+                    if (ok && hub.prefetch != nullptr) {
+                        single_read_ahead(hub, i, n_thr);
+                    }
                 }
                 if (!ok) {
                     ok = ggml_backend_graph_compute(cpu, p->gf) == GGML_STATUS_SUCCESS;
@@ -3619,6 +3731,9 @@ struct llama_moe_cache::impl {
                 ((volatile uint64_t *) hdr->tm)[7] = (uint64_t) single_rt_ns();
             }
             llama_mb_store_rel(&hdr->completed, req);
+            if (ok && single_hub().prefetch_sync != nullptr && single_hub().pf_threads > 1 && (single_hub().pf_all_sizes || n_tokens >= 6)) {
+                single_read_ahead(single_hub(), i, single_hub().pf_threads);
+            }
         }
         return work;
     }
@@ -3751,6 +3866,12 @@ struct llama_moe_cache::impl {
                     single_rows > 0 ? (double) single_us/single_rows : 0.0, single_slow, single_max_us/1e3);
                 LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses: %" PRIu64 " of the process's host batches in one region "
                     "(LLAMA_MOE_SINGLE_FUSED)\n", tag, single_hub().fused_batches);
+                if (single_hub().prefetch != nullptr || single_hub().prefetch_sync != nullptr) {
+                    const single_hub_t & hb = single_hub();
+                    LLAMA_LOG_INFO("llama_moe_cache%s: host read-ahead: %" PRIu64 " read-aheads of %.1f experts on average; %" PRIu64 " of %" PRIu64
+                        " host expert rows after one were read ahead (%.1f%%, counted with GGML_MOE_MAILBOX_TIMING=1)\n", tag, hb.pf_posted, hb.pf_posted > 0 ? (double) hb.pf_exps/hb.pf_posted : 0.0,
+                        hb.pf_used, hb.pf_all, hb.pf_all > 0 ? 100.0*hb.pf_used/hb.pf_all : 0.0);
+                }
                 {
                     const single_hub_t & hb = single_hub();
                     const uint64_t nw = hb.adapt_win[0] + hb.adapt_win[1] + hb.adapt_win[2];
