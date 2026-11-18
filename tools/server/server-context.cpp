@@ -2345,6 +2345,23 @@ private:
                     // (a model on a memory file system: its experts are in RAM whatever MemAvailable reads)
                     disk_ok = disk_ok || in_ram_fs;
                 }
+                // Where the cache is expected to hold most of the routed experts (at least LLAMA_SPEC_HOSTPATH_OFF_SHARE, default 0.60;
+                // 0: off) on compute capability 12.0 cards, the CPU-miss host path stays off (as LLAMA_MOE_CPU_MISS=0): the few misses of
+                // the deep verify windows are fetched instead of computed on the host. There the host path ran inside the decode call
+                // (6-7 ms of host time in an 18 ms pass) and its trial in the first chat request. Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS +
+                // its MTP drafter, Studio argv, 48 GB (67.7% expected), two VMs x 2 launches: chat 231.9 -> 249.9 tok/s (+7.8%, 17.5 -> 16.3
+                // ms per pass), chat TTFT 0.184 -> 0.150 s, 8k level (210.6 / 210.9), the same text. At 32 GB (39%) the host path is
+                // needed (-15% without it), at 16 GB (11%) more so (-43%). An explicit LLAMA_MOE_CPU_MISS keeps its value
+                const double hp_share = [] {
+                    const char * x = getenv("LLAMA_SPEC_HOSTPATH_OFF_SHARE");
+                    return x != nullptr ? atof(x) : 0.60;
+                }();
+                if (def_on && hp_share > 0.0 && share >= hp_share && cc_min == 1200 && cc_max == 1200 && getenv("LLAMA_MOE_CPU_MISS") == nullptr) {
+                    common_set_env("LLAMA_MOE_CPU_MISS", "0");
+                    SRV_INF("MoE cache expected to hold %.1f%% of the routed experts beside the MTP drafter (compute capability 12.0): the CPU-miss "
+                        "host path is off, misses are fetched (LLAMA_SPEC_HOSTPATH_OFF_SHARE=%.2f; =0: the host path rule as before)\n",
+                        100.0*share, hp_share);
+                }
                 if (g4t && getenv("LLAMA_MOE_PREFETCH") == nullptr && getenv("LLAMA_MOE_PREFETCH_AUTO") == nullptr) {
                     common_set_env("LLAMA_MOE_PREFETCH_AUTO", "2");
                 }
