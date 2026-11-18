@@ -11,8 +11,9 @@
 #include <string>
 #include <vector>
 
-// ggml-cpu.c: the runner of the graph computes' OpenMP regions (runner(fn, arg, user) runs fn(arg) and returns once it returned)
-extern "C" void ggml_cpu_set_region_runner(void (*runner)(void (*fn)(void *), void * arg, void * user), void * user);
+// ggml-cpu.c: the runner of the graph computes' OpenMP regions (runner(fn, arg, user) runs fn(arg, max_threads) and returns once it
+// returned)
+extern "C" void ggml_cpu_set_region_runner(void (*runner)(void (*fn)(void *, int), void * arg, void * user), void * user);
 
 #ifdef GGML_USE_CPU_HBM
 #    include "hbm.h"

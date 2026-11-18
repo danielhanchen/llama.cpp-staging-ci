@@ -2974,11 +2974,11 @@ struct llama_moe_cache::impl {
         std::atomic<bool>       run_on{false};        // this thread takes regions (cleared before it stops)
         std::atomic<uint64_t>   run_caller{0};        // the thread whose regions it takes: the one that kicks the decode graphs
         std::atomic<int>        run_state{0};         // 0 idle, 1 posted, 2 done
-        void                  (*run_fn)(void *) = nullptr;
+        void                  (*run_fn)(void *, int) = nullptr;
         void *                  run_arg = nullptr;
         uint64_t                run_n  = 0;           // regions taken
         int64_t                 run_us = 0;           // time in them
-        void (*set_runner)(void (*)(void (*)(void *), void *, void *), void *) = nullptr; // the CPU backend's ggml_cpu_set_region_runner
+        void (*set_runner)(void (*)(void (*)(void *, int), void *, void *), void *) = nullptr; // the CPU backend's ggml_cpu_set_region_runner
     };
     static single_hub_t & single_hub() {
         static single_hub_t h;
@@ -3809,15 +3809,15 @@ struct llama_moe_cache::impl {
     // the CPU backend's region runner (ggml_cpu_set_region_runner): a region started by the thread that kicks the decode graphs runs
     // on the host thread, which serves the mailboxes between the graphs (that thread is idle then: its regions start where the device
     // finished); other threads' regions, and every region while the host thread is not taking them, run on their caller as before
-    static void single_region_run(void (*fn)(void *), void * arg, void * user) {
+    static void single_region_run(void (*fn)(void *, int), void * arg, void * user) {
         single_hub_t & h = *(single_hub_t *) user;
         if (!h.run_on.load(std::memory_order_acquire) || h.run_caller.load(std::memory_order_relaxed) != single_thread_key()) {
-            fn(arg);
+            fn(arg, 0);
             return;
         }
         std::lock_guard<std::mutex> lock(h.run_mtx);
         if (!h.run_on.load(std::memory_order_acquire)) {
-            fn(arg);
+            fn(arg, 0);
             return;
         }
         h.run_fn  = fn;
@@ -3841,7 +3841,10 @@ struct llama_moe_cache::impl {
             bool work = false;
             if (h.run_state.load(std::memory_order_acquire) == 1) {
                 const int64_t t0 = single_now_us();
-                h.run_fn(h.run_arg);
+                // LLAMA_MOE_SINGLE_REGIONS_CAP (default 1; 0 = the region's own count): at most the team's threads, so a region
+                // planned for the decode threads (one more) does not add a thread that then waits beside the team's batches
+                static const bool cap = getenv("LLAMA_MOE_SINGLE_REGIONS_CAP") == nullptr || atoi(getenv("LLAMA_MOE_SINGLE_REGIONS_CAP")) != 0;
+                h.run_fn(h.run_arg, cap ? h.threads : 0);
                 h.run_us += single_now_us() - t0;
                 h.run_n++;
                 h.run_state.store(2, std::memory_order_release);
