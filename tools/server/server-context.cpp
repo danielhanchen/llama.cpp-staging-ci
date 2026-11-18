@@ -2231,7 +2231,21 @@ private:
             }();
             const bool share_low = !share_hi && share_exp > 0 && (lo_e == nullptr || atoi(lo_e) != 0) && share_est >= share_lo &&
                 share_lo < share_min && (share_ram == 0 || share_exp <= share_ram);
-            const bool share_ok = share_hi || share_low;
+            // LLAMA_SPEC_TPP_CACHED_SHARE_CHAT (default 0.15, 0 = off): from that share up to the band above, the 3rd draft in the chat
+            // bucket only (the longer buckets keep 2 drafts). Colab L4 capped at 8 GB (17%), Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, 3 interleaved
+            // launches: chat 80.8 -> 87.1 tok/s (2.69 -> 3.29 tokens per pass); the 8k bucket's 3rd draft did not pay there
+            const double share_chat_lo = [] {
+                const char * s = getenv("LLAMA_SPEC_TPP_CACHED_SHARE_CHAT");
+                return s != nullptr ? atof(s) : 0.15;
+            }();
+            const bool share_chat = !share_hi && !share_low && share_exp > 0 && (lo_e == nullptr || atoi(lo_e) != 0) && share_chat_lo > 0.0 &&
+                share_est >= share_chat_lo && share_chat_lo < share_lo && (share_ram == 0 || share_exp <= share_ram);
+            if (share_chat && getenv("LLAMA_SPEC_TPP_CTX_EXTRA") == nullptr) {
+                common_set_env("LLAMA_SPEC_TPP_CTX_EXTRA", "1,0,0,0,0");
+                SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (from %.2f): the 3rd draft in the chat bucket only "
+                    "(LLAMA_SPEC_TPP_CACHED_SHARE_CHAT=0: off)\n", 100.0*share_est, share_chat_lo);
+            }
+            const bool share_ok = share_hi || share_low || share_chat;
             // LLAMA_SPEC_TPP_CACHED_LOW_MID (default 1, =0 off): in that band the windows of the 6144..12288 bucket take the 3rd draft
             // too. Their 4-row windows carry the verify tag (3-row kernels); beside a cache holding most experts the extra row adds few
             // misses while a pass carries ~0.6 more tokens. L4 capped at 16 GB (61%), Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, 8k prompt, 3
