@@ -2233,10 +2233,10 @@ private:
                 share_lo < share_min && (share_ram == 0 || share_exp <= share_ram);
             const bool share_ok = share_hi || share_low;
             // LLAMA_SPEC_TPP_CACHED_LOW_MID (default 1, =0 off): in that band the windows of the 6144..12288 bucket take the 3rd draft
-            // too. Their 4-row windows carry the verify tag (3-row kernels), so the text is the one of 2-draft windows; beside a cache
-            // holding most experts the extra row adds few misses while a pass carries ~0.6 more tokens. Colab L4 capped at 16 GB (61%),
-            // Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, 8k prompt, 3 interleaved launches: decode 96.9 -> 110.0 tok/s (2.59 -> 3.24 tokens per
-            // pass), same text; chat, 16k and 30k use other buckets and do not change
+            // too. Their 4-row windows carry the verify tag (3-row kernels); beside a cache holding most experts the extra row adds few
+            // misses while a pass carries ~0.6 more tokens. L4 capped at 16 GB (61%), Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, 8k prompt, 3
+            // interleaved launches: decode 96.9 -> 110.0 tok/s (2.59 -> 3.24 tokens per pass), same text there; on other cards the cache
+            // residency can differ and change the text within the -fa off KLD band; chat, 16k and 30k use other buckets
             static const bool low_mid = getenv("LLAMA_SPEC_TPP_CACHED_LOW_MID") == nullptr || atoi(getenv("LLAMA_SPEC_TPP_CACHED_LOW_MID")) != 0;
             if (share_low && getenv("LLAMA_SPEC_TPP_CTX_EXTRA") == nullptr) {
                 common_set_env("LLAMA_SPEC_TPP_CTX_EXTRA", low_mid ? "1,0,1,0,0" : "1,0,0,0,0");
