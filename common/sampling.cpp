@@ -146,6 +146,10 @@ struct common_sampler {
     bool    dev_gram  = false;
     int32_t dev_kneed = 0;                                  //         k + m of common_sampler_device_topk
     common_sampler_dev_stats dev_stats = {};
+    // the chain is exactly top-k(topk_pre) + a final draw (common_sampler_topk_prefilter): a full row fills cur with the tokens whose
+    // logit reaches the row's topk_pre-th largest logit only, in id order, instead of all n_vocab tokens; the top-k sort then keeps
+    // the same logits (0: off)
+    int32_t topk_pre = 0;
 
     // k19-gramdev: the full raw row of idx (the candidates of a device top-k are in cur otherwise)
     void set_logits_full(struct llama_context * ctx, int idx) {
@@ -195,6 +199,40 @@ struct common_sampler {
             if (dev_topk) {
                 // k15-fn: in id order, as the full row, for the samplers that depend on the order (greedy, dist before any sort)
                 std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
+            }
+        } else if (topk_pre > 0) {
+            const auto * logits = llama_get_logits_ith(ctx, idx);
+            GGML_ASSERT(logits != nullptr);
+            // the topk_pre-th largest logit (counted with repeats): an ascending buffer of the largest seen, a value enters only above
+            // its smallest
+            float top[64];
+            const int32_t k = topk_pre;
+            for (int32_t j = 0; j < k; ++j) {
+                top[j] = -INFINITY;
+            }
+            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                const float v = logits[token_id];
+                if (v > top[0]) {
+                    int32_t j = 1;
+                    for (; j < k && top[j] < v; ++j) {
+                        top[j - 1] = top[j];
+                    }
+                    top[j - 1] = v;
+                }
+            }
+            const float thr = top[0];
+            cur.clear();
+            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                if (logits[token_id] >= thr) {
+                    cur.push_back(llama_token_data{token_id, logits[token_id], 0.0f});
+                }
+            }
+            if ((int32_t) cur.size() < k) {
+                // NaN logits never compare: the full row, as below
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
@@ -323,6 +361,37 @@ static bool common_sampler_greedy_fast(const common_params_sampling & params, co
         }
     }
     return true;
+}
+
+// a chain of top-k (k <= 64) and the final draw only (the draft sampler of the MTP / EAGLE drafters when their backend sampling is
+// off, e.g. under -sm tensor): the top-k keeps the k largest logits of the row, so a full row is reduced to the tokens at or above
+// its k-th largest logit before the chain sorts it (ties at that logit all stay); the chain then sees the same logits in the same
+// id order as the full row restricted to them. A 248k vocabulary: one scan instead of filling and partially sorting 248k
+// candidates per drafted token. LLAMA_SAMPLE_TOPK_PREFILTER=0: the full row
+static int32_t common_sampler_topk_prefilter(const common_params_sampling & params, llama_sampler * chain, const llama_sampler * grmr,
+        const llama_sampler * rbudget) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SAMPLE_TOPK_PREFILTER");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!on || grmr != nullptr || rbudget != nullptr || params.mirostat != 0 || params.n_probs != 0 || params.samplers.size() != 1 ||
+            params.samplers[0] != COMMON_SAMPLER_TYPE_TOP_K || params.top_k <= 0 || params.top_k > 64 || chain == nullptr ||
+            llama_sampler_chain_n(chain) != 2) {
+        return 0;
+    }
+    // a chain initialized for the backend prefixes its names with '+' / '-'
+    const auto bare = [](const char * n) { return n + (n[0] == '+' || n[0] == '-'); };
+    const char * n0 = bare(llama_sampler_name(llama_sampler_chain_get(chain, 0)));
+    const char * n1 = bare(llama_sampler_name(llama_sampler_chain_get(chain, 1)));
+    if (strcmp(n0, "top-k") != 0 || (strcmp(n1, "dist") != 0 && strcmp(n1, "greedy") != 0)) {
+        return 0;
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LOG_INF("%s: top-k %d prefilter of full rows on the host (LLAMA_SAMPLE_TOPK_PREFILTER=0 off)\n", __func__, params.top_k);
+    }
+    return params.top_k;
 }
 
 // k19-sharednoise (see sampling.h): the shared-noise final stage
@@ -770,6 +839,7 @@ struct common_sampler * common_sampler_init(
     }
 
     result->greedy_fast = common_sampler_greedy_fast(params, grmr, rbudget);
+    result->topk_pre    = common_sampler_topk_prefilter(params, chain, grmr, rbudget);
     // the fast path applies the penalties only when the chain has a penalties stage (common_sampler_penalty_fast): a chain without one
     // never penalizes, whatever the penalty parameters
     result->pen_fast    = result->greedy_fast && common_sampler_penalty_active(params) && common_sampler_penalty_fast(params);
