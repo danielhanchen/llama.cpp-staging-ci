@@ -1138,6 +1138,25 @@ static void common_params_fit_impl(
         const bool   hl_sep_draft = use_margins && extra != nullptr && !extra->shares_model && !hl_draft_ok;
         const bool   hl_dflash    = hl_sep_draft && common_fit_is_dflash_draft(extra->path_model);
         const double hl_wide_exp  = hl_dflash && wide_frac > 0.0 ? (double) common_moe_expert_bytes(path_model) : 0.0;
+        // LLAMA_FIT_MOE_HEADLESS_DF2BAND (default 1, 0 = only the wide-graph rule above): beside a DFlash draft model the step-down also
+        // stays off where the cache it would leave holds a share of the host experts at which the server prewarms the verify graphs
+        // (LLAMA_SPEC_PREWARM_CACHED_FRAC, 0.3) but common_init keeps no device memory back for the DFlash2 cached window's graphs (that
+        // band is LLAMA_DFLASH_CACHED_FRAC_MIN 0.2 .. LLAMA_DFLASH_CACHED_FRAC_MAX 0.5, LLAMA_DFLASH_CACHED_RESERVE_MIB 512, see
+        // common.cpp). Inside that band its 512 MiB give the prewarm back the memory the step-down takes (32 GB, 42% cached: no width left
+        // out), so the step-down and its larger cache stay. From 0.5 nothing does: Colab A100 40 GB full card, Qwen3.8-Flash-Next
+        // UD-IQ4_XS + DFlash2 n6, ctx 32768, the step-down took the cache 31893 -> 32409 MiB (55.4 -> 56.3%) and the prewarm's floor
+        // left 20 of 21 graphs (7 without it) to the first request, whose captures then ran in the measured decode: chat 94.7 -> 71.1 tok/s
+        // (3 interleaved launches, same text)
+        static const bool   hl_df2band   = getenv("LLAMA_FIT_MOE_HEADLESS_DF2BAND") == nullptr || atoi(getenv("LLAMA_FIT_MOE_HEADLESS_DF2BAND")) != 0;
+        static const double pw_frac      = getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC") != nullptr ? atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.3;
+        static const bool   pw_on        = (getenv("LLAMA_SPEC_PREWARM") == nullptr || atoi(getenv("LLAMA_SPEC_PREWARM")) > 0) &&
+            (getenv("LLAMA_SPEC_PREWARM_MIN_FREE_MIB") == nullptr || atof(getenv("LLAMA_SPEC_PREWARM_MIN_FREE_MIB")) > 0.0);
+        static const bool   df2_band_on  = (getenv("LLAMA_DFLASH_WINDOW") == nullptr || atoi(getenv("LLAMA_DFLASH_WINDOW")) != 0) &&
+            (getenv("LLAMA_DFLASH_CACHED_WINDOW") == nullptr || atoi(getenv("LLAMA_DFLASH_CACHED_WINDOW")) != 0) &&
+            (getenv("LLAMA_DFLASH_CACHED_RESERVE_MIB") == nullptr || atoll(getenv("LLAMA_DFLASH_CACHED_RESERVE_MIB")) > 0);
+        static const double df2_band_lo  = getenv("LLAMA_DFLASH_CACHED_FRAC_MIN") != nullptr ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MIN")) : 0.20;
+        static const double df2_band_hi  = getenv("LLAMA_DFLASH_CACHED_FRAC_MAX") != nullptr ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MAX")) : 0.5;
+        const double hl_band_exp  = hl_dflash && hl_df2band && pw_on && pw_frac > 0.0 ? (double) common_moe_expert_bytes(path_model) : 0.0;
         for (size_t id = 0; id < nd; id++) {
             if (use_margins && int64_t(dmds[id].mb.total()) > int64_t(dmds_nc[id].mb.total())) {
                 int hl = id < dev_headless.size() ? dev_headless[id] : -1;
@@ -1150,6 +1169,24 @@ static void common_params_fit_impl(
                 }
                 if (hl_min_share > 0.0 && hl_experts > 0.0 && avail < hl_min_share*hl_experts) {
                     hl = -2; // the step-down stays off (below the share)
+                }
+                if (hl != -2 && hl_band_exp > 0.0) {
+                    // the cache's share with the stepped-down margin (the margin the step-down would leave, without logging)
+                    const int64_t m_id  = int64_t(margins[id]);
+                    const int64_t r_dn  = common_fit_moe_margin_headless(m_id, common_fit_moe_margin_impl(m_id, int64_t(dmds[id].free),
+                        int64_t(dmds[id].mb.total()) - int64_t(dmds_nc[id].mb.total()), has_drafter), int64_t(dmds[id].free), hl);
+                    const double share  = (avail - (double) r_dn)/hl_band_exp;
+                    const bool reserved = df2_band_on && df2_band_hi > df2_band_lo && share >= df2_band_lo && share < df2_band_hi;
+                    if (share >= pw_frac && !reserved && r_dn < m_id) {
+                        hl = -2; // the step-down stays off (the prewarm's memory beside a DFlash draft model, no cached-window reserve)
+                        static bool logged = false;
+                        if (!logged) {
+                            logged = true;
+                            LOG_INF("%s: headless device beside a DFlash draft model: the margin beside the MoE cache stays %" PRId64 " MiB for "
+                                "the verify graph prewarm (%.1f%% of the host experts cached with %" PRId64 " MiB; LLAMA_FIT_MOE_HEADLESS_DF2BAND=0: "
+                                "the step-down)\n", __func__, m_id/MiB, 100.0*share, r_dn/MiB);
+                        }
+                    }
                 }
                 margin_gain += int64_t(margins[id]) - common_fit_moe_margin(int64_t(margins[id]), int64_t(dmds[id].free),
                     int64_t(dmds[id].mb.total()) - int64_t(dmds_nc[id].mb.total()), has_drafter, hl);
