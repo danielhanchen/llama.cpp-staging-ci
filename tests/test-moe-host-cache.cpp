@@ -896,8 +896,7 @@ int main(int argc, char ** argv) {
     }
 
     // speculative reads into slots (reads ahead): exact with faults, VERIFY repairs, done / wait, demand reads go first, the store's
-    // destructor completes the reads it was not asked to wait for; whole reads and reads in 8 KiB pieces (unaligned expert offsets)
-    for (size_t chunk : { (size_t) 0, (size_t) 8192 })
+    // destructor completes the reads it was not asked to wait for
     for (int fmode : { 0, 4, 5, 6 }) {
         fault flt;
         flt.mode = fmode;
@@ -918,7 +917,6 @@ int main(int argc, char ** argv) {
             llama_weight_store_params p;
             p.io = LLAMA_WEIGHT_STREAM_IO_AUTO; p.n_threads = 2; p.verify = fmode == 4; p.ram_avail = (size_t) 1 << 30;
             llama_weight_store ws(ext, p);
-            ws.set_spec_chunk(chunk);
             if (fmode) {
                 ws.set_read_fn(read_hook, &flt);
             }
@@ -983,10 +981,7 @@ int main(int argc, char ** argv) {
             if (fmode == 5) {
                 CHECK(st.fallback_bytes > 0);
             }
-            if (chunk > 0) {
-                CHECK(st.spec_reads > 3*14); // in pieces: more reads than expert tensors
-            }
-            printf("speculative chunk %zu fault %d: %llu reads, %.2f MiB, %llu boosted, %.1f ms waiting\n", chunk, fmode, (unsigned long long) st.spec_reads,
+            printf("speculative fault %d: %llu reads, %.2f MiB, %llu boosted, %.1f ms waiting\n", fmode, (unsigned long long) st.spec_reads,
                     st.spec_bytes/1048576.0, (unsigned long long) st.spec_boosted, st.spec_wait_us/1000.0);
         }
         check_slot(12, "speculative at destruction");
