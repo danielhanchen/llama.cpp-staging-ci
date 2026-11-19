@@ -2155,15 +2155,17 @@ static void * ggml_cuda_host_malloc(size_t size) {
 // huge pages: anonymous memory aligned to 2 MiB, MADV_HUGEPAGE, then registered (portable, mapped) instead of cudaMallocHost, whose
 // pages are 4 KiB. The CPU reads each expert as long streams of rows; with 4 KiB pages every 4 KiB is a TLB entry and a stop of the
 // hardware prefetcher. Only the backing pages differ: the bytes, the device address (unified addressing) and every result are the
-// same. GGML_CUDA_HOST_THP=0 off; GGML_CUDA_HOST_THP_MIN_MB (default 256): buffers from that size on. Linux only; any failure takes
-// cudaMallocHost as before
+// same. Opt-in (GGML_CUDA_HOST_THP=1; unset / 0 = cudaMallocHost): on a Colab G4 (48 vCPU EPYC 9B45, RTX PRO 6000) with Qwen3.8-Flash-Next
+// UD-IQ4_XS host batches were 3-7% shorter per expert row, but no tok/s cell moved beyond launch spread (48 / 32 / 16 GB, full card,
+// Qwen3.6-35B-A3B at 16 GB) and the device side beside a host batch grew. GGML_CUDA_HOST_THP_MIN_MB (default 256): buffers from that size
+// on. Linux only; any failure takes cudaMallocHost as before
 #if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #define GGML_CUDA_HOST_THP_ALIGN ((size_t) 2 << 20)
 
 static size_t ggml_cuda_host_thp_min() {
     static const size_t min_b = [] {
         const char * e = getenv("GGML_CUDA_HOST_THP");
-        if (e != nullptr && atoi(e) == 0) {
+        if (e == nullptr || atoi(e) == 0) {
             return SIZE_MAX;
         }
         const char * m = getenv("GGML_CUDA_HOST_THP_MIN_MB");
@@ -2203,7 +2205,7 @@ static void * ggml_cuda_host_malloc_thp(size_t size) {
     }
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true)) {
-        GGML_LOG_INFO("%s: pinned host buffers of %zu MiB and more in transparent huge pages (%s; GGML_CUDA_HOST_THP=0 off)\n", __func__,
+        GGML_LOG_INFO("%s: pinned host buffers of %zu MiB and more in transparent huge pages (%s; GGML_CUDA_HOST_THP=1)\n", __func__,
             ggml_cuda_host_thp_min() >> 20, huge ? "MADV_HUGEPAGE" : "madvise refused: 4 KiB pages");
     }
     return p;
