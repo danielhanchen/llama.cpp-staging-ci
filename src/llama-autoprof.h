@@ -73,6 +73,7 @@ inline std::string dir() {
 // LLAMA_MOE_AUTOPROF_SHIPPED when it names a directory, else beside the model file, then in <calibration directory>/shipped.
 // LLAMA_MOE_AUTOPROF_SHIPPED=0: never looked up. A recording launch writes its own file (dir()) with the shipped counts carried over
 // at the weight of an earlier launch; from then on the own file is the one read. Never written.
+// The readers use it only on CUDA devices of compute capability 8.0 or higher (on a T4 a profile made the chat TTFT slower).
 inline std::vector<std::string> shipped_dirs(const std::string & model_path) {
     std::vector<std::string> v;
     const char * e = getenv("LLAMA_MOE_AUTOPROF_SHIPPED");

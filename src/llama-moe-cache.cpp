@@ -5315,8 +5315,14 @@ struct llama_moe_cache::impl {
         ap_rec = llama_autoprof::records(ap_mode);
         std::vector<prof_entry> prof;
         bool have = llama_moe_profile_load(ap_file, ne, prof);
-        // no recorded profile yet: a shipped one (read only; a recording writes its counts into ap_file at an earlier launch's weight)
-        const bool shipped = !have && !ap_ship_file.empty() && llama_moe_profile_load(ap_ship_file, ne, prof);
+        // no recorded profile yet: a shipped one (read only; a recording writes its counts into ap_file at an earlier launch's weight),
+        // only where the RAM tier serves CUDA devices of compute capability 8.0 or higher (on a T4 a profile made the chat TTFT slower)
+        const bool ship_cc = host_cc >= 800;
+        if (!have && !ap_ship_file.empty() && !ship_cc) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: shipped routing profile %s not used: the RAM tier's devices are below compute "
+                "capability 8.0 (lowest %d) or not CUDA\n", tag, ap_ship_file.c_str(), host_cc);
+        }
+        const bool shipped = !have && !ap_ship_file.empty() && ship_cc && llama_moe_profile_load(ap_ship_file, ne, prof);
         have = have || shipped;
         if (have) {
             for (const prof_entry & p : prof) {

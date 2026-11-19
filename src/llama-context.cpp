@@ -69,6 +69,23 @@
 
 static bool moe_cache_released_counts(); // k19-autoprof2 (defined beside moe_cache_refill_from_ids)
 
+// the lowest compute capability (major*100 + minor*10) of the model's GPU devices, -1 if one is not a CUDA device or there is none
+static int model_gpu_min_cc(const llama_model & model) {
+    int cc_min = -1;
+    bool first = true;
+    for (const auto & d : model.devices) {
+        if (d.is_meta || d.dev == nullptr || ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev);
+        auto cc_fn = reg != nullptr ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+        const int cc = cc_fn != nullptr ? cc_fn(d.dev) : -1;
+        cc_min = first ? cc : (cc < 0 || cc_min < 0 ? -1 : std::min(cc_min, cc));
+        first  = false;
+    }
+    return cc_min;
+}
+
 //
 // llama_context
 //
@@ -1565,9 +1582,16 @@ llama_context::llama_context(
                             if (ap_have && llama_autoprof::uses(ap_mode)) {
                                 prof = ap_path;
                             } else if (!ap_have && llama_autoprof::uses(ap_mode)) {
-                                // no recorded profile yet: a shipped one (read only, see llama_autoprof::shipped_dirs)
+                                // no recorded profile yet: a shipped one (read only, see llama_autoprof::shipped_dirs), only where the
+                                // model's GPUs are CUDA devices of compute capability 8.0 or higher (as the shipped routing profile)
                                 ap_ship = llama_autoprof::find_shipped(model.path_model, "ple",
                                     llama_autoprof::model_hash(model.desc(), model.n_elements(), model.size()), "." + std::to_string(t->ne[1]));
+                                const int cc = model_gpu_min_cc(model);
+                                if (!ap_ship.empty() && cc < 800) {
+                                    LLAMA_LOG_INFO("%s: k19-autoprof: shipped PLE row profile %s not used: the model's GPUs are below compute "
+                                        "capability 8.0 (lowest %d) or not CUDA\n", __func__, ap_ship.c_str(), cc);
+                                    ap_ship.clear();
+                                }
                                 if (!ap_ship.empty()) {
                                     prof = ap_ship;
                                 }
