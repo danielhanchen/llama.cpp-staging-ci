@@ -2214,6 +2214,83 @@ private:
             // (experts placed on the host by hand, --cpu-moe / --n-cpu-moe / -ot, or a fixed --moe-cache-mib: a cache tier too)
             const bool host_experts = tpp_host_experts(params.tensor_buft_overrides, params.moe_cache_size, params.moe_cache_auto);
             const bool cache_expected = (fe != nullptr && atoi(fe) != 0) || (n_gpu > 0 && (host_experts || !(need > (1536ull << 20) && need <= dev_free)));
+            const bool exact_mtp = [] {
+                const char * x = getenv("LLAMA_MTP_EXACT");
+                return x != nullptr && atoi(x) != 0;
+            }();
+            // Only where the routed experts fit in host RAM: where they do not (Colab L4, 52 GB of RAM for the 57.6 GB of experts of fn4n)
+            // the cache's misses are read from the disk and each verify row costs ~27% of a pass (fm_l1: 4 drafts -5% chat), so the windows
+            // stay at 2 there. LLAMA_SPEC_DEPTH_CACHED_DISK=1: on there too; LLAMA_SPEC_DEPTH_CACHED_RAM_MIB=N: N MiB of RAM instead of
+            // MemAvailable (test hook)
+            const uint64_t ram_avail = [] {
+                const char * r = getenv("LLAMA_SPEC_DEPTH_CACHED_RAM_MIB");
+                return r != nullptr ? (uint64_t) (std::max(0.0, atof(r))*1048576.0) : llama_available_memory();
+            }();
+            bool disk_ok = [] {
+                const char * d = getenv("LLAMA_SPEC_DEPTH_CACHED_DISK");
+                return d != nullptr && atoi(d) != 0;
+            }();
+            const char * dc_env = getenv("LLAMA_SPEC_DEPTH_CACHED");
+            int depth_cached = dc_env != nullptr ? atoi(dc_env) : 0;
+            // k19-fnmtp2: the default where a verify row beside the cache is cheap (LLAMA_SPEC_DEPTH_CACHED unset; =0: 2 drafts, =N: N).
+            // An MTP drafter of its own (-md) at Studio's shape drafts LLAMA_SPEC_DEPTH_CACHED_N (4) per window below LLAMA_SPEC_DEPTH_POS
+            // when (a) the cache is expected to hold at least LLAMA_SPEC_DEPTH_CACHED_SHARE (0.30) of the routed experts, estimated before
+            // the fit as 1 - (device need without the host-only per-layer embedding table - free) / expert bytes, and (b) the whole target
+            // GGUF is held in host memory (on a memory file system, or its bytes within the available memory), so the rows' expert misses
+            // and per-layer embedding rows come from RAM, not the disk. G4 RTX PRO 6000 96 GB, Qwen3.8-Flash-Next UD-IQ4_XS from RAM + its
+            // MTP drafter, Studio argv, 3 launches (plans/k19_fnmtp.md round 2), this rule against its kill switch: 48 GB (cache 67%) chat
+            // +10.1% / 8k +18.0%, 32 GB (41%) +10.0% / +3.0%; at 16 GB (14%: rule off) 4 drafts measured chat +7.8% (12.8% launch spread) /
+            // 8k -6.7%. A verify row there costs 2.2-2.5 ms of a 12.6-13.0 ms pass at 48 / 32 GB, ~3.5 ms of 15.2 at 16 GB. Colab A100 80 GB
+            // at 48 GB chat +17.7% / 8k +1.6%. The A100 40 GB VM of round 1 (93.7 GB model, 83 GB of RAM: rows read from the disk) stays at 2
+            // (decided before the cache share bands below: where these deeper windows are the default, those bands leave the
+            // windows to this rule, see share_deep)
+            const bool deep_try = dc_env == nullptr && mtp_shape && cache_expected && sp.has_dft() && !exact_mtp && !host_experts &&
+                (e != nullptr ? atoi(e) != 0 : dev_ok) && !(ce != nullptr && atoi(ce) != 0);
+            const uint64_t exp_b    = deep_try ? common_moe_expert_bytes(params.model.path) : 0;
+            const uint64_t ple_b    = deep_try ? tpp_host_input_bytes(params.model.path) : 0;
+            const uint64_t need_dev = need - std::min(need, ple_b);
+            const uint64_t short_b  = need_dev > dev_free ? need_dev - dev_free : 0;
+            const double   deep_share    = exp_b > 0 ? 1.0 - (double) short_b/(double) exp_b : 0.0;
+            const double   deep_share_min = [] {
+                const char * x = getenv("LLAMA_SPEC_DEPTH_CACHED_SHARE");
+                return x != nullptr ? atof(x) : 0.30;
+            }();
+            const int n_def = [] {
+                const char * x = getenv("LLAMA_SPEC_DEPTH_CACHED_N");
+                return x != nullptr ? std::clamp(atoi(x), 3, 8) : 4;
+            }();
+            const bool in_ram_fs = deep_try && tpp_file_in_ram_fs(params.model.path);
+            const bool resident  = in_ram_fs || (tgt_bytes > 0 && ram_avail > 0 && tgt_bytes <= ram_avail);
+            // (short_b == 0: every routed expert is expected on the devices and the need only reads high from the drafter and margin,
+            // k19-bigverify's A100 80 GB full card, where 4 drafts measured 8k -18.6%: not this rule's tier)
+            const bool def_on    = deep_try && exp_b > 0 && short_b > 0 && deep_share >= deep_share_min && resident;
+            // k19-g4tail (LLAMA_MOE_G4TAIL=0: off, the int3 rule above alone): a cache expected to hold LLAMA_MOE_G4TAIL_LO .. _HI (0.07 ..
+            // 0.17, the estimate; G4 16 GB reads 10.8% here, 14.4% once placed) of the routed experts, on compute capability 12.0 cards
+            // only, with the target in RAM: the windows draft n_def (4) too, and the MoE cache's cross-layer prefetch is on in its band
+            // (LLAMA_MOE_PREFETCH_AUTO=2 for llama_moe_cache: top 10 predicted experts, at most 1 copied per layer, generation and verify
+            // windows only, where the placed cache holds 10-20%). With the route tail skip off (int3 c5d7c3bc40d) every rank 7-9 miss is a
+            // host expert or a copy; the two together, Colab G4 Flash-Next UD-IQ4_XS MTP n2 16 GB, 3 launches on two VMs: chat +8.3 / +9.0%
+            // (held-out text +9.5%), 8k +8.0 / +10.8% (held-out -1.3%); long48 KLD inside the -fa off band on all 8 statistics
+            // (plans/k19_g4tail.md). An explicit LLAMA_SPEC_DEPTH_CACHED / LLAMA_MOE_PREFETCH / LLAMA_MOE_PREFETCH_AUTO keeps its value
+            const bool g4tail_on = [] {
+                const char * x = getenv("LLAMA_MOE_G4TAIL");
+                return x == nullptr || atoi(x) != 0;
+            }();
+            const double g4t_lo = getenv("LLAMA_MOE_G4TAIL_LO") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_LO")) : 0.07;
+            const double g4t_hi = getenv("LLAMA_MOE_G4TAIL_HI") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_HI")) : 0.17;
+            // k19-g4tail2: not above LLAMA_FIT_LONGCTX_MIN_CTX (32768, where --fit's long-context ladder takes over; n_ctx 0 = the
+            // trained context counts as above): there the deeper windows changed the fit itself. G4 16 GB ctx 262144: priced at 4
+            // drafts the requantized drafter was left out, and the placement moved (49 layers, n_ubatch 2048, cache 6233 MiB against
+            // 50 layers, n_ubatch 512, 3915 MiB with the rule off): decode chat / 8k 87.4 / 82.3 tok/s against 133.0 / 125.2. Above the
+            // bound the rule sets nothing, as LLAMA_MOE_G4TAIL=0
+            const int64_t g4t_ctx_max = [] {
+                const char * x = getenv("LLAMA_FIT_LONGCTX_MIN_CTX");
+                return x != nullptr && x[0] != 0 ? (int64_t) atoll(x) : (int64_t) 32768;
+            }();
+            const bool g4t_ctx_ok = params.n_ctx > 0 && (int64_t) params.n_ctx <= g4t_ctx_max;
+            const bool g4t_band = deep_try && !def_on && g4tail_on && exp_b > 0 && short_b > 0 && resident && deep_share >= g4t_lo && deep_share < g4t_hi &&
+                n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
+            const bool g4t = g4t_band && g4t_ctx_ok;
             // k19-sharegate (LLAMA_SPEC_TPP_SHAREGATE=0: off, the blanket rule above): a cache expected to hold nearly every routed
             // expert (estimated share = 1 - (need - free) / expert bytes, at least LLAMA_SPEC_TPP_CACHED_SHARE, default 0.85) keeps the
             // priced 3-draft windows, as LLAMA_SPEC_TPP_CACHED=1. The rule above came from fn4 at a 9-14% share; at ~92% (q4x on a 24 GB
@@ -2244,7 +2321,13 @@ private:
                 const char * s = getenv("LLAMA_SPEC_TPP_CACHED_SHARE_LOW");
                 return s != nullptr ? atof(s) : 0.30;
             }();
-            const bool share_low = !share_hi && share_exp > 0 && (lo_e == nullptr || atoi(lo_e) != 0) && share_est >= share_lo &&
+            // Neither band below caps an MTP drafter of its own (-md) where the deeper windows above are its default (def_on / g4t): their
+            // estimate counts the host-only per-layer embedding table as device need and reads far below the cache's real share there.
+            // Colab G4 48 GB, Qwen3.8-Flash-Next UD-IQ4_XS + its MTP drafter: 20% read against 67.7% held, so the chat band set 3-draft
+            // windows in place of 6 / 4 (chat 262.2 -> 235.2 tok/s, 8k 220.8 -> 211.3). Built-in MTP heads (no -md) never take the deep
+            // windows and keep both bands
+            const bool share_deep = def_on || g4t;
+            const bool share_low = !share_hi && !share_deep && share_exp > 0 && (lo_e == nullptr || atoi(lo_e) != 0) && share_est >= share_lo &&
                 share_lo < share_min && (share_ram == 0 || share_exp <= share_ram);
             // LLAMA_SPEC_TPP_CACHED_SHARE_CHAT (default 0.15, 0 = off): from that share up to the band above, the 3rd draft in the chat
             // bucket only (the longer buckets keep 2 drafts). L4 capped at 8 GB (17%), Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, three VMs, 10
@@ -2253,8 +2336,13 @@ private:
                 const char * s = getenv("LLAMA_SPEC_TPP_CACHED_SHARE_CHAT");
                 return s != nullptr ? atof(s) : 0.15;
             }();
-            const bool share_chat = !share_hi && !share_low && share_exp > 0 && (lo_e == nullptr || atoi(lo_e) != 0) && share_chat_lo > 0.0 &&
-                share_est >= share_chat_lo && share_chat_lo < share_lo && (share_ram == 0 || share_exp <= share_ram);
+            const bool share_chat = !share_hi && !share_low && !share_deep && share_exp > 0 && (lo_e == nullptr || atoi(lo_e) != 0) &&
+                share_chat_lo > 0.0 && share_est >= share_chat_lo && share_chat_lo < share_lo && (share_ram == 0 || share_exp <= share_ram);
+            if (share_deep && !share_hi && share_exp > 0 && (lo_e == nullptr || atoi(lo_e) != 0) &&
+                    share_est >= std::min(share_lo, share_chat_lo > 0.0 ? share_chat_lo : share_lo)) {
+                SRV_INF("MoE cache expected to hold %.1f%% of the routed experts by the device need, %.1f%% without the host-only tables: "
+                    "the deeper MTP windows are the default here, the 3rd-draft share bands stay off\n", 100.0*share_est, 100.0*deep_share);
+            }
             if (share_chat && getenv("LLAMA_SPEC_TPP_CTX_EXTRA") == nullptr) {
                 common_set_env("LLAMA_SPEC_TPP_CTX_EXTRA", "1,0,0,0,0");
                 SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (from %.2f): the 3rd draft in the chat bucket only "
@@ -2299,81 +2387,7 @@ private:
             // Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk, 3 launches, with the PLE table read in part): 3 drafts full card chat +3.4% /
             // 8k -3.8%, 16 GB chat -6% / 8k +7.6%; 4 drafts full card +1.8% / +6.8%, 16 GB -16% / -14%. A verify row costs ~10 ms there
             // (PLE rows read from the disk and expert misses copied at ~10 GB/s), against 3.4 -> 4.0 tokens per pass
-            const bool exact_mtp = [] {
-                const char * x = getenv("LLAMA_MTP_EXACT");
-                return x != nullptr && atoi(x) != 0;
-            }();
-            // Only where the routed experts fit in host RAM: where they do not (Colab L4, 52 GB of RAM for the 57.6 GB of experts of fn4n)
-            // the cache's misses are read from the disk and each verify row costs ~27% of a pass (fm_l1: 4 drafts -5% chat), so the windows
-            // stay at 2 there. LLAMA_SPEC_DEPTH_CACHED_DISK=1: on there too; LLAMA_SPEC_DEPTH_CACHED_RAM_MIB=N: N MiB of RAM instead of
-            // MemAvailable (test hook)
-            const uint64_t ram_avail = [] {
-                const char * r = getenv("LLAMA_SPEC_DEPTH_CACHED_RAM_MIB");
-                return r != nullptr ? (uint64_t) (std::max(0.0, atof(r))*1048576.0) : llama_available_memory();
-            }();
-            bool disk_ok = [] {
-                const char * d = getenv("LLAMA_SPEC_DEPTH_CACHED_DISK");
-                return d != nullptr && atoi(d) != 0;
-            }();
-            const char * dc_env = getenv("LLAMA_SPEC_DEPTH_CACHED");
-            int depth_cached = dc_env != nullptr ? atoi(dc_env) : 0;
-            // k19-fnmtp2: the default where a verify row beside the cache is cheap (LLAMA_SPEC_DEPTH_CACHED unset; =0: 2 drafts, =N: N).
-            // An MTP drafter of its own (-md) at Studio's shape drafts LLAMA_SPEC_DEPTH_CACHED_N (4) per window below LLAMA_SPEC_DEPTH_POS
-            // when (a) the cache is expected to hold at least LLAMA_SPEC_DEPTH_CACHED_SHARE (0.30) of the routed experts, estimated before
-            // the fit as 1 - (device need without the host-only per-layer embedding table - free) / expert bytes, and (b) the whole target
-            // GGUF is held in host memory (on a memory file system, or its bytes within the available memory), so the rows' expert misses
-            // and per-layer embedding rows come from RAM, not the disk. G4 RTX PRO 6000 96 GB, Qwen3.8-Flash-Next UD-IQ4_XS from RAM + its
-            // MTP drafter, Studio argv, 3 launches (plans/k19_fnmtp.md round 2), this rule against its kill switch: 48 GB (cache 67%) chat
-            // +10.1% / 8k +18.0%, 32 GB (41%) +10.0% / +3.0%; at 16 GB (14%: rule off) 4 drafts measured chat +7.8% (12.8% launch spread) /
-            // 8k -6.7%. A verify row there costs 2.2-2.5 ms of a 12.6-13.0 ms pass at 48 / 32 GB, ~3.5 ms of 15.2 at 16 GB. Colab A100 80 GB
-            // at 48 GB chat +17.7% / 8k +1.6%. The A100 40 GB VM of round 1 (93.7 GB model, 83 GB of RAM: rows read from the disk) stays at 2
-            if (dc_env == nullptr && mtp_shape && !on && cache_expected && sp.has_dft() && !exact_mtp && !host_experts &&
-                    (e != nullptr ? atoi(e) != 0 : dev_ok)) {
-                const uint64_t exp_b    = common_moe_expert_bytes(params.model.path);
-                const uint64_t ple_b    = tpp_host_input_bytes(params.model.path);
-                const uint64_t need_dev = need - std::min(need, ple_b);
-                const uint64_t short_b  = need_dev > dev_free ? need_dev - dev_free : 0;
-                const double   share    = exp_b > 0 ? 1.0 - (double) short_b/(double) exp_b : 0.0;
-                const double   share_min = [] {
-                    const char * x = getenv("LLAMA_SPEC_DEPTH_CACHED_SHARE");
-                    return x != nullptr ? atof(x) : 0.30;
-                }();
-                const int n_def = [] {
-                    const char * x = getenv("LLAMA_SPEC_DEPTH_CACHED_N");
-                    return x != nullptr ? std::clamp(atoi(x), 3, 8) : 4;
-                }();
-                const bool in_ram_fs = tpp_file_in_ram_fs(params.model.path);
-                const bool resident  = in_ram_fs || (tgt_bytes > 0 && ram_avail > 0 && tgt_bytes <= ram_avail);
-                // (short_b == 0: every routed expert is expected on the devices and the need only reads high from the drafter and margin,
-                // k19-bigverify's A100 80 GB full card, where 4 drafts measured 8k -18.6%: not this rule's tier)
-                const bool def_on    = exp_b > 0 && short_b > 0 && share >= share_min && resident;
-                // k19-g4tail (LLAMA_MOE_G4TAIL=0: off, the int3 rule above alone): a cache expected to hold LLAMA_MOE_G4TAIL_LO .. _HI (0.07 ..
-                // 0.17, the estimate; G4 16 GB reads 10.8% here, 14.4% once placed) of the routed experts, on compute capability 12.0 cards
-                // only, with the target in RAM: the windows draft n_def (4) too, and the MoE cache's cross-layer prefetch is on in its band
-                // (LLAMA_MOE_PREFETCH_AUTO=2 for llama_moe_cache: top 10 predicted experts, at most 1 copied per layer, generation and verify
-                // windows only, where the placed cache holds 10-20%). With the route tail skip off (int3 c5d7c3bc40d) every rank 7-9 miss is a
-                // host expert or a copy; the two together, Colab G4 Flash-Next UD-IQ4_XS MTP n2 16 GB, 3 launches on two VMs: chat +8.3 / +9.0%
-                // (held-out text +9.5%), 8k +8.0 / +10.8% (held-out -1.3%); long48 KLD inside the -fa off band on all 8 statistics
-                // (plans/k19_g4tail.md). An explicit LLAMA_SPEC_DEPTH_CACHED / LLAMA_MOE_PREFETCH / LLAMA_MOE_PREFETCH_AUTO keeps its value
-                const bool g4tail_on = [] {
-                    const char * x = getenv("LLAMA_MOE_G4TAIL");
-                    return x == nullptr || atoi(x) != 0;
-                }();
-                const double g4t_lo = getenv("LLAMA_MOE_G4TAIL_LO") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_LO")) : 0.07;
-                const double g4t_hi = getenv("LLAMA_MOE_G4TAIL_HI") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_HI")) : 0.17;
-                // k19-g4tail2: not above LLAMA_FIT_LONGCTX_MIN_CTX (32768, where --fit's long-context ladder takes over; n_ctx 0 = the
-                // trained context counts as above): there the deeper windows changed the fit itself. G4 16 GB ctx 262144: priced at 4
-                // drafts the requantized drafter was left out, and the placement moved (49 layers, n_ubatch 2048, cache 6233 MiB against
-                // 50 layers, n_ubatch 512, 3915 MiB with the rule off): decode chat / 8k 87.4 / 82.3 tok/s against 133.0 / 125.2. Above the
-                // bound the rule sets nothing, as LLAMA_MOE_G4TAIL=0
-                const int64_t g4t_ctx_max = [] {
-                    const char * x = getenv("LLAMA_FIT_LONGCTX_MIN_CTX");
-                    return x != nullptr && x[0] != 0 ? (int64_t) atoll(x) : (int64_t) 32768;
-                }();
-                const bool g4t_ctx_ok = params.n_ctx > 0 && (int64_t) params.n_ctx <= g4t_ctx_max;
-                const bool g4t_band = !def_on && g4tail_on && exp_b > 0 && short_b > 0 && resident && share >= g4t_lo && share < g4t_hi &&
-                    n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
-                const bool g4t = g4t_band && g4t_ctx_ok;
+            if (deep_try && !on) {
                 if (g4t_band && !g4t_ctx_ok) {
                     SRV_INF("k19-g4tail2: n_ctx %d is above LLAMA_FIT_LONGCTX_MIN_CTX (%lld): the g4tail rule stays off (MTP windows and "
                         "the prefetch as with LLAMA_MOE_G4TAIL=0)\n", params.n_ctx, (long long) g4t_ctx_max);
@@ -2395,12 +2409,12 @@ private:
                     const char * x = getenv("LLAMA_SPEC_HOSTPATH_OFF_SHARE");
                     return x != nullptr ? atof(x) : 0.60;
                 }();
-                spec_chat_deep = def_on && share >= 0.60 && cc_min == 1200 && cc_max == 1200;
-                if (def_on && hp_share > 0.0 && share >= hp_share && cc_min == 1200 && cc_max == 1200 && getenv("LLAMA_MOE_CPU_MISS") == nullptr) {
+                spec_chat_deep = def_on && deep_share >= 0.60 && cc_min == 1200 && cc_max == 1200;
+                if (def_on && hp_share > 0.0 && deep_share >= hp_share && cc_min == 1200 && cc_max == 1200 && getenv("LLAMA_MOE_CPU_MISS") == nullptr) {
                     common_set_env("LLAMA_MOE_CPU_MISS", "0");
                     SRV_INF("MoE cache expected to hold %.1f%% of the routed experts beside the MTP drafter (compute capability 12.0): the CPU-miss "
                         "host path is off, misses are fetched (LLAMA_SPEC_HOSTPATH_OFF_SHARE=%.2f; =0: the host path rule as before)\n",
-                        100.0*share, hp_share);
+                        100.0*deep_share, hp_share);
                 }
                 // In the same band the MTP drafter's restricted head keeps 32768 rows instead of 65536: each draft step's lm head is
                 // the largest kernel of the step there, and the deep windows draft 4-6 steps per pass. Colab G4, Qwen3.8-Flash-Next
@@ -2411,24 +2425,24 @@ private:
                     const char * x = getenv("LLAMA_SPEC_MTP_VOCAB_WIDE");
                     return x == nullptr || atoi(x) != 0;
                 }();
-                if (def_on && mtp_vocab_wide && share >= 0.60 && cc_min == 1200 && cc_max == 1200 &&
+                if (def_on && mtp_vocab_wide && deep_share >= 0.60 && cc_min == 1200 && cc_max == 1200 &&
                         getenv("LLAMA_MTP_DRAFT_VOCAB") == nullptr) {
                     common_set_env("LLAMA_MTP_DRAFT_VOCAB", "32768");
                     SRV_INF("MoE cache expected to hold %.1f%% of the routed experts beside the MTP drafter (compute capability 12.0): "
-                        "the drafter's restricted head keeps 32768 rows (LLAMA_SPEC_MTP_VOCAB_WIDE=0: 65536)\n", 100.0*share);
+                        "the drafter's restricted head keeps 32768 rows (LLAMA_SPEC_MTP_VOCAB_WIDE=0: 65536)\n", 100.0*deep_share);
                 }
                 if (g4t && getenv("LLAMA_MOE_PREFETCH") == nullptr && getenv("LLAMA_MOE_PREFETCH_AUTO") == nullptr) {
                     common_set_env("LLAMA_MOE_PREFETCH_AUTO", "2");
                 }
                 if (g4t) {
                     SRV_INF("k19-g4tail: MoE cache expected to hold %.1f%% of the routed experts (band %.2f .. %.2f, compute capability 12.0, target "
-                        "in RAM): MTP windows of %d drafts and the cache's cross-layer prefetch in its band (LLAMA_MOE_G4TAIL=0: off)\n", 100.0*share,
+                        "in RAM): MTP windows of %d drafts and the cache's cross-layer prefetch in its band (LLAMA_MOE_G4TAIL=0: off)\n", 100.0*deep_share,
                         g4t_lo, g4t_hi, n_def);
                 }
                 SRV_INF("k19-fnmtp2: MoE cache expected to hold %.1f%% of the routed experts (%.0f MiB short of %.0f MiB); target GGUF %.0f MiB %s "
-                    "(%.0f MiB of RAM available): %s (LLAMA_SPEC_DEPTH_CACHED_SHARE=%.2f; LLAMA_SPEC_DEPTH_CACHED=0: 2 drafts)\n", 100.0*share,
+                    "(%.0f MiB of RAM available): %s (LLAMA_SPEC_DEPTH_CACHED_SHARE=%.2f; LLAMA_SPEC_DEPTH_CACHED=0: 2 drafts)\n", 100.0*deep_share,
                     short_b/1048576.0, exp_b/1048576.0, tgt_bytes/1048576.0, in_ram_fs ? "on a memory file system" : resident ? "fits in RAM" :
-                    "does not fit in RAM", ram_avail/1048576.0, def_on || g4t ? "deeper MTP windows by default" : "MTP windows of 2 drafts", share_min);
+                    "does not fit in RAM", ram_avail/1048576.0, def_on || g4t ? "deeper MTP windows by default" : "MTP windows of 2 drafts", deep_share_min);
             }
             // The windows of the chat bucket (KV positions below LLAMA_SPEC_DEPTH_CHAT_POS, 1536) draft LLAMA_SPEC_DEPTH_CHAT_N (6; 0: off)
             // where the deep windows are on and a verify row is cheap: the full card and a cache expected to hold at least 60% of the
