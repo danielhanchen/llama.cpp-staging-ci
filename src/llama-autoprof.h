@@ -7,7 +7,8 @@
 // one of today.
 //
 // LLAMA_MOE_AUTOPROF: unset or 1 = record and use, 0 = off (nothing read, written or hooked), 2 = record only, 3 = use only (never
-// written). LLAMA_MOE_AUTOPROF_DIR: the directory (default: the CPU-miss calibration directory, see cal_dir).
+// written). LLAMA_MOE_AUTOPROF_DIR: the directory (default: the CPU-miss calibration directory, see cal_dir). Without a recorded
+// profile a shipped one is read (see shipped_dirs).
 //
 // Header-only and free of ggml so tests/test-autoprof.cpp can test it on the CPU.
 
@@ -18,6 +19,7 @@
 #include <filesystem>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #if defined(_WIN32)
 #include <process.h>
@@ -64,6 +66,32 @@ inline bool uses(int m)    { return m == 1 || m == 3; }
 inline std::string dir() {
     const char * e = getenv("LLAMA_MOE_AUTOPROF_DIR");
     return e != nullptr && *e ? std::string(e) : cal_dir();
+}
+
+// a shipped profile (read only): the profile a model can ship, used by a launch that has no recorded one of its own yet (a first
+// launch, a new user). Same file names as the recorded ones (autoprof_<kind>_<model hash><suffix>), looked up in
+// LLAMA_MOE_AUTOPROF_SHIPPED when it names a directory, else beside the model file, then in <calibration directory>/shipped.
+// LLAMA_MOE_AUTOPROF_SHIPPED=0: never looked up. A recording launch writes its own file (dir()) with the shipped counts carried over
+// at the weight of an earlier launch; from then on the own file is the one read. Never written.
+// The readers use it only on CUDA devices of compute capability 8.0 or higher (on a T4 a profile made the chat TTFT slower).
+inline std::vector<std::string> shipped_dirs(const std::string & model_path) {
+    std::vector<std::string> v;
+    const char * e = getenv("LLAMA_MOE_AUTOPROF_SHIPPED");
+    if (e != nullptr && *e) {
+        if (std::string(e) != "0") {
+            v.emplace_back(e);
+        }
+        return v;
+    }
+    if (!model_path.empty()) {
+        const std::filesystem::path p(model_path);
+        v.push_back(p.has_parent_path() ? p.parent_path().string() : std::string("."));
+    }
+    const std::string c = cal_dir();
+    if (!c.empty()) {
+        v.push_back((std::filesystem::path(c) / "shipped").string());
+    }
+    return v;
 }
 
 // FNV-1a 64 of the model's identity (as the k19-ptres core profile: description | parameters | bytes)
@@ -127,6 +155,18 @@ inline bool write_atomic(const std::string & path, const std::string & body) {
         return false;
     }
     return true;
+}
+
+// the first existing shipped profile of this kind (see shipped_dirs), "" if none
+inline std::string find_shipped(const std::string & model_path, const char * kind, uint64_t hash, const std::string & suffix) {
+    for (const std::string & d : shipped_dirs(model_path)) {
+        const std::string p = path(d, kind, hash, suffix);
+        std::error_code ec;
+        if (!p.empty() && std::filesystem::is_regular_file(p, ec)) {
+            return p;
+        }
+    }
+    return "";
 }
 
 } // namespace llama_autoprof

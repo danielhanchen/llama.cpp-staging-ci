@@ -326,6 +326,41 @@ static void test_recorder(const fs::path & root) {
     ggml_backend_free(g.be);
 }
 
+// shipped profiles: read-only lookup beside the model file, then <cal dir>/shipped; LLAMA_MOE_AUTOPROF_SHIPPED names the one
+// directory or turns the lookup off
+static void test_shipped(const fs::path & root) {
+    const fs::path md = root / "models";
+    const fs::path cal = root / "shipcal";
+    fs::create_directories(md);
+    fs::create_directories(cal / "shipped");
+    unsetenv("LLAMA_MOE_AUTOPROF_SHIPPED");
+    setenv("LLAMA_MOE_CPU_MISS_CAL_DIR", cal.string().c_str(), 1);
+    const std::string model = (md / "m.gguf").string();
+    const uint64_t h = 0xabcdef;
+    CHECK(llama_autoprof::find_shipped(model, "moe", h, ".48.512").empty(), "nothing shipped");
+    const std::string in_cal = llama_autoprof::path((cal / "shipped").string(), "moe", h, ".48.512");
+    CHECK(llama_autoprof::write_atomic(in_cal, "moe-cache-profile 1 48\n"), "write the cal-dir file");
+    CHECK(llama_autoprof::find_shipped(model, "moe", h, ".48.512") == in_cal, "found in <cal dir>/shipped");
+    CHECK(llama_autoprof::find_shipped("", "moe", h, ".48.512") == in_cal, "no model path: <cal dir>/shipped");
+    const std::string beside = llama_autoprof::path(md.string(), "moe", h, ".48.512");
+    CHECK(llama_autoprof::write_atomic(beside, "moe-cache-profile 1 48\n"), "write the file beside the model");
+    CHECK(llama_autoprof::find_shipped(model, "moe", h, ".48.512") == beside, "beside the model wins");
+    CHECK(llama_autoprof::find_shipped(model, "moe", h, ".48.256").empty(), "another suffix (expert count) is not found");
+    CHECK(llama_autoprof::find_shipped(model, "moe", h + 1, ".48.512").empty(), "another model hash is not found");
+    CHECK(llama_autoprof::find_shipped(model, "ple", h, ".48.512").empty(), "another kind is not found");
+    setenv("LLAMA_MOE_AUTOPROF_SHIPPED", (cal / "shipped").string().c_str(), 1);
+    CHECK(llama_autoprof::find_shipped(model, "moe", h, ".48.512") == in_cal, "the named directory only");
+    setenv("LLAMA_MOE_AUTOPROF_SHIPPED", root.string().c_str(), 1);
+    CHECK(llama_autoprof::find_shipped(model, "moe", h, ".48.512").empty(), "a named directory without the file: none");
+    setenv("LLAMA_MOE_AUTOPROF_SHIPPED", "0", 1);
+    CHECK(llama_autoprof::find_shipped(model, "moe", h, ".48.512").empty(), "0: off");
+    CHECK(llama_autoprof::shipped_dirs(model).empty(), "0: no directory");
+    fs::create_directories(md / ("autoprof_moe_" + std::string("0000000000abcdef") + ".48.1"));
+    unsetenv("LLAMA_MOE_AUTOPROF_SHIPPED");
+    CHECK(llama_autoprof::find_shipped(model, "moe", h, ".48.1").empty(), "a directory of that name is not a profile");
+    unsetenv("LLAMA_MOE_CPU_MISS_CAL_DIR");
+}
+
 int main() {
     const fs::path root = fs::absolute("test-autoprof.tmp");
     std::error_code ec;
@@ -336,6 +371,7 @@ int main() {
     test_moe_body(root);
     test_pick();
     test_recorder(root);
+    test_shipped(root);
     fs::remove_all(root, ec);
     if (n_fail == 0) {
         printf("test-autoprof: ALL OK\n");

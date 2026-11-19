@@ -1438,8 +1438,11 @@ struct llama_moe_cache::impl {
             if (set != layer_set::nextn && !model.hparams.no_alloc && host_profile_file.empty()) {
                 ap_mode = llama_autoprof::mode();
                 if (ap_mode != 0) {
-                    ap_file = llama_autoprof::path(llama_autoprof::dir(), "moe",
-                        llama_autoprof::model_hash(model.desc(), model.n_elements(), model.size()), sfx);
+                    const uint64_t h = llama_autoprof::model_hash(model.desc(), model.n_elements(), model.size());
+                    ap_file = llama_autoprof::path(llama_autoprof::dir(), "moe", h, sfx);
+                    if (llama_autoprof::uses(ap_mode)) {
+                        ap_ship_file = llama_autoprof::find_shipped(model.path_model, "moe", h, sfx);
+                    }
                 }
             }
         }
@@ -4888,6 +4891,7 @@ struct llama_moe_cache::impl {
     // Placement only (which slot holds which expert's file bytes): exact. No file: nothing is used (the recording reads the ids only).
     int      ap_mode = 0;
     std::string ap_file;
+    std::string ap_ship_file; // a shipped profile, read when ap_file does not exist yet (see llama_autoprof::shipped_dirs)
     bool     ap_rec  = false;                    // recording (a RAM tier exists, LLAMA_MOE_AUTOPROF 1 / 2)
     bool     ap_use  = false;                    // a profile was read and the exclusive tier uses it
     std::vector<std::vector<float>>   ap_cnt;    // [n_layer][n_expert] heat: the file's (halved) + this launch's routing counts
@@ -5329,7 +5333,16 @@ struct llama_moe_cache::impl {
         ap_layer_epoch.assign(layers.size(), 0);
         ap_rec = llama_autoprof::records(ap_mode);
         std::vector<prof_entry> prof;
-        const bool have = llama_moe_profile_load(ap_file, ne, prof);
+        bool have = llama_moe_profile_load(ap_file, ne, prof);
+        // no recorded profile yet: a shipped one (read only; a recording writes its counts into ap_file at an earlier launch's weight),
+        // only where the RAM tier serves CUDA devices of compute capability 8.0 or higher (on a T4 a profile made the chat TTFT slower)
+        const bool ship_cc = host_cc >= 800;
+        if (!have && !ap_ship_file.empty() && !ship_cc) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: shipped routing profile %s not used: the RAM tier's devices are below compute "
+                "capability 8.0 (lowest %d) or not CUDA\n", tag, ap_ship_file.c_str(), host_cc);
+        }
+        const bool shipped = !have && !ap_ship_file.empty() && ship_cc && llama_moe_profile_load(ap_ship_file, ne, prof);
+        have = have || shipped;
         if (have) {
             for (const prof_entry & p : prof) {
                 if (p.heat > 0.0f && (size_t) p.e < ap_cnt[p.il].size()) {
@@ -5380,7 +5393,7 @@ struct llama_moe_cache::impl {
             }
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: routing profile %s %s (%zu experts)%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", tag,
-            ap_file.c_str(), have ? "read" : "not found", aps.loaded,
+            shipped ? ap_ship_file.c_str() : ap_file.c_str(), shipped ? "read (shipped; LLAMA_MOE_AUTOPROF_SHIPPED=0 off)" : have ? "read" : "not found", aps.loaded,
             ap_use ? (host->exclusive() ? ": the RAM tier is filled hottest first" : ": the inclusive RAM tier is filled hottest first (LLAMA_MOE_AUTOPROF_INCL=1)") :
             have ? ": not used (needs a RAM tier of the weight store, LLAMA_MOE_AUTOPROF 1 / 3, LLAMA_MOE_AUTOPROF_INCL for the inclusive tier)" :
             ap_rec ? ": recording" : "");

@@ -764,6 +764,10 @@ struct llama_model {
     // file extents of the host weights mapped from the model files (see llama_weight_store), nullptr if nothing is mapped
     std::shared_ptr<llama_weight_extents> weight_extents;
 
+    // the model file the weights were loaded from (the first split; empty when loaded from metadata or a FILE): the place a
+    // shipped routing / PLE row profile can sit beside (see llama_autoprof::shipped_dirs)
+    std::string path_model;
+
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * type_embd  = nullptr;
     struct ggml_tensor * pos_embd   = nullptr;
