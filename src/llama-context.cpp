@@ -1555,6 +1555,7 @@ llama_context::llama_context(
                         // has no slots (record only), so the recording launch reads exactly what it would without the cache
                         const int ap_mode = prof_env == nullptr ? llama_autoprof::mode() : 0;
                         std::string ap_path;
+                        std::string ap_ship;
                         bool ap_have = false;
                         if (ap_mode != 0) {
                             ap_path = llama_autoprof::path(llama_autoprof::dir(), "ple",
@@ -1563,6 +1564,13 @@ llama_context::llama_context(
                             ap_have = !ap_path.empty() && std::filesystem::exists(ap_path, ec);
                             if (ap_have && llama_autoprof::uses(ap_mode)) {
                                 prof = ap_path;
+                            } else if (!ap_have && llama_autoprof::uses(ap_mode)) {
+                                // no recorded profile yet: a shipped one (read only, see llama_autoprof::shipped_dirs)
+                                ap_ship = llama_autoprof::find_shipped(model.path_model, "ple",
+                                    llama_autoprof::model_hash(model.desc(), model.n_elements(), model.size()), "." + std::to_string(t->ne[1]));
+                                if (!ap_ship.empty()) {
+                                    prof = ap_ship;
+                                }
                             }
                         }
                         const bool ap_rec = !ap_path.empty() && llama_autoprof::records(ap_mode);
@@ -1618,14 +1626,16 @@ llama_context::llama_context(
                                 rc->enable_recorder((size_t) (std::max(0.0, em ? atof(em) : 256.0) * 1048576.0));
                             }
                             if (llama_row_cache_attach(rc.get())) {
-                                if (prof_save && !prof.empty()) {
+                                if (prof_save && !prof.empty() && prof != ap_ship) { // a shipped profile is never written
                                     model.ple_row_profile_save = prof;
                                 }
                                 if (ap_rec) {
                                     model.ple_row_profile_save = ap_path;
                                 }
-                                LLAMA_LOG_INFO("%s: k19-autoprof: PLE row profile %s %s%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", __func__,
-                                    ap_path.c_str(), ap_have ? "found" : "not found", ap_rec ? ", this launch's rows are recorded and written at exit" : "");
+                                LLAMA_LOG_INFO("%s: k19-autoprof: PLE row profile %s %s%s%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", __func__,
+                                    ap_path.c_str(), ap_have ? "found" : "not found",
+                                    ap_ship.empty() ? "" : (", shipped profile " + ap_ship + " read (LLAMA_MOE_AUTOPROF_SHIPPED=0 off)").c_str(),
+                                    ap_rec ? ", this launch's rows are recorded and written at exit" : "");
                                 if (part > 0 && part < table) {
                                     // the part gives up what the cache holds (rows from `skip` up are cached, not part rows)
                                     part = std::max<size_t>(part_min, (part - std::min(part, rc->bytes())) & ~((size_t) (8ull << 20) - 1));
