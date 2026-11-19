@@ -92,10 +92,10 @@ bool llama_kv_lazy_measure_on();
 // k19-kvsel: K/V cells of QSA attention caches in host chunks (LLAMA_KV_SEL_HOST): 0 = off (=0, the kill switch), 1 = on (=1, wherever
 // the cache is armed and the backend maps host memory), 2 = auto (unset or =auto: a measurement reports the bytes host chunks would take,
 // and a cache allocated for running uses them only where common set LLAMA_KV_SEL_GRANTED=1 for its fit, see common_fit_kv_sel_granted)
-int  llama_kv_sel_mode();
+LLAMA_API int  llama_kv_sel_mode();
 // auto mode: whether a measurement (no_alloc) on any thread places the K/V in host chunks (set by the fit around the measurements of a
 // placement that uses them; off: measurements as with LLAMA_KV_SEL_HOST=0)
-void llama_kv_sel_measure(bool on);
+LLAMA_API void llama_kv_sel_measure(bool on);
 
 struct llama_device_memory_data {
     int64_t total;

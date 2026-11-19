@@ -1948,6 +1948,18 @@ static atomic_int ggml_moe_team_init = 0; // 0: not yet, 1: ready
 // a later batch is expected to compute, run by the team's workers while the caller goes on (ggml_cpu_moe_host_team_prefetch). Worker i reads the slices it computes in the sliced form of a batch
 // on n_thr threads, so they are in its caches when the batch comes; the next batch (or read-ahead) stops it first. Only bytes are read:
 // what a batch computes does not depend on it
+// 64-bit atomics of the MoE host path: the MSVC shim above covers LONG only (no atomic_llong, no 64-bit overloads)
+#if defined(_MSC_VER) && !defined(__clang__)
+typedef volatile LONG64 atomic_llong;
+#define ggml_atomic_ll_load(p)           InterlockedCompareExchange64((p), 0, 0)
+#define ggml_atomic_ll_store(p, v)       ((void) InterlockedExchange64((p), (LONG64) (v)))
+#define ggml_atomic_ll_add_relaxed(p, v) InterlockedExchangeAdd64((p), (LONG64) (v))
+#else
+#define ggml_atomic_ll_load(p)           atomic_load(p)
+#define ggml_atomic_ll_store(p, v)       atomic_store((p), (v))
+#define ggml_atomic_ll_add_relaxed(p, v) atomic_fetch_add_explicit((p), (v), memory_order_relaxed)
+#endif
+
 struct ggml_moe_host_pf {
     const struct ggml_tensor * up;
     const struct ggml_tensor * gate;
@@ -2000,7 +2012,7 @@ static void ggml_moe_host_pf_thread(int ith) {
         const char * b = (const char *) f->down->data + e*f->down->nb[2];
         v += ggml_moe_host_pf_read(b + d0*f->down->nb[1], (size_t) ((d1 - d0)*f->down->nb[1]));
     }
-    atomic_fetch_add_explicit(&f->sink, (long long) v, memory_order_relaxed);
+    ggml_atomic_ll_add_relaxed(&f->sink, (long long) v);
 }
 
 static int ggml_moe_host_team_mode(void) {
@@ -2019,14 +2031,14 @@ static int64_t ggml_moe_host_team_spin_us(void) {
     static int64_t us = -1;
     if (us < 0) {
         const char * e = getenv("GGML_MOE_HOST_TEAM_SPIN_US");
-        us = e != NULL && atoll(e) >= 0 ? atoll(e) : (int64_t) atomic_load(&ggml_moe_host_team_spin_default);
+        us = e != NULL && atoll(e) >= 0 ? atoll(e) : (int64_t) ggml_atomic_ll_load(&ggml_moe_host_team_spin_default);
     }
     return us;
 }
 
 void ggml_cpu_moe_host_team_set_spin_us(int64_t us) {
     if (us >= 0) {
-        atomic_store(&ggml_moe_host_team_spin_default, (long long) us);
+        ggml_atomic_ll_store(&ggml_moe_host_team_spin_default, (long long) us);
     }
 }
 

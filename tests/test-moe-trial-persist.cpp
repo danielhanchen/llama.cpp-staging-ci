@@ -75,6 +75,11 @@ static bool same(const std::vector<tp::rec> & a, const std::vector<tp::rec> & b)
 
 int main() {
     const char * td = getenv("TMPDIR");
+#if defined(_WIN32)
+    if (td == nullptr || td[0] == '\0') {
+        td = getenv("TEMP"); // no /tmp on Windows
+    }
+#endif
     const std::string dir  = std::string(td != nullptr && td[0] != '\0' ? td : "/tmp");
     const std::string path = dir + "/test_moe_trial_persist_" + std::to_string((long long) std::rand()) + ".txt";
     const std::string key  = "moe-cpu-miss-cal v2|build=test|dev=Tesla T4|threads=4|ncpu=4|cache=main|n_expert=256|n_used=8|bytes=1966080|q4_K:2048x512";

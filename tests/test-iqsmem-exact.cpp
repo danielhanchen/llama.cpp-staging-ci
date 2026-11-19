@@ -23,6 +23,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#if defined(_WIN32)
+#define popen  _popen
+#define pclose _pclose
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <map>
