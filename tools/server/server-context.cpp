@@ -2293,16 +2293,18 @@ private:
             const bool g4t = g4t_band && g4t_ctx_ok;
             // Between the two rules (from LLAMA_MOE_G4TAIL_HI, 0.17, up to LLAMA_SPEC_DEPTH_CACHED_SHARE, 0.30) the windows stayed at 2
             // drafts on compute capability 12.0 cards. There the deep windows' rule applies too, under the same conditions as the band
-            // below it (target in RAM, n_ctx not above LLAMA_FIT_LONGCTX_MIN_CTX), drafting LLAMA_SPEC_DEPTH_MID_N (default n_def) per
-            // window; no prefetch and no host-path change (both stay as at the rule's floor). LLAMA_SPEC_DEPTH_MID=0, LLAMA_MOE_G4TAIL=0
-            // or an explicit LLAMA_SPEC_DEPTH_CACHED_SHARE: off
+            // below it (target in RAM, n_ctx not above LLAMA_FIT_LONGCTX_MIN_CTX), drafting LLAMA_SPEC_DEPTH_MID_N (default 3) per
+            // window; no prefetch and no host-path change (both stay as at the rule's floor). Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS +
+            // its MTP drafter, Studio argv, 24 GB (25.0% expected), 3 launches: 3 drafts chat 185.7 -> 194.8 tok/s, 8k 163.0 -> 174.8;
+            // 4 drafts chat 191.5, 8k 155.5 (each extra verify row misses more experts at this share). LLAMA_SPEC_DEPTH_MID=0,
+            // LLAMA_MOE_G4TAIL=0 or an explicit LLAMA_SPEC_DEPTH_CACHED_SHARE: off
             const bool mid_on = [] {
                 const char * x = getenv("LLAMA_SPEC_DEPTH_MID");
                 return x == nullptr || atoi(x) != 0;
             }();
-            const int n_mid = [&] {
+            const int n_mid = [] {
                 const char * x = getenv("LLAMA_SPEC_DEPTH_MID_N");
-                return x != nullptr ? std::clamp(atoi(x), 3, 8) : n_def;
+                return x != nullptr ? std::clamp(atoi(x), 3, 8) : 3;
             }();
             const bool def_mid = deep_try && !def_on && !g4t_band && mid_on && g4tail_on && getenv("LLAMA_SPEC_DEPTH_CACHED_SHARE") == nullptr &&
                 exp_b > 0 && short_b > 0 && resident && deep_share >= g4t_hi && deep_share < deep_share_min && g4t_ctx_ok &&
