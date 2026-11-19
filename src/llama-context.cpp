@@ -189,8 +189,8 @@ static bool llama_verify_wide_cached_env() {
 
 // k19-fnmtp: LLAMA_SPEC_VERIFY4_CACHED=1 (off by default; the server sets it with LLAMA_SPEC_DEPTH_CACHED): beside an MoE cache a
 // 4-token verify batch (a 3-draft MTP window, a 4-row DFlash window) is tagged too. Untagged, its F32 products leave mmvf for cuBLAS
-// (TF32 sgemm + split-K outside the CUDA graph: 3.7 ms of kernels and ~12 ms of host time per pass, Colab A100 48 GB fn4n,
-// plans/k19_a100chat.md R4; fm_m1 A100 40 GB full card: 4-row verify 54.8 ms untagged vs 52.5 tagged); tagged it runs the 3-row
+// (TF32 sgemm + split-K outside the CUDA graph: 3.7 ms of kernels and ~12 ms of host time per pass, Colab A100 48 GB fn4n;
+// fm_m1 A100 40 GB full card: 4-row verify 54.8 ms untagged vs 52.5 tagged); tagged it runs the 3-row
 // window's kernels. 2..3-token windows (Studio's 2-draft MTP default) are never affected
 static bool llama_verify4_cached_env() {
     static const bool value = [] {
@@ -679,8 +679,8 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     // k17-models: a model without experts takes no MoE cache (it used to throw "MoE cache requires a MoE model" from the cache): with
     // --fit on --moe-cache-mib auto (Studio's argv) that error aborted the fit's probe context, so a dense model was loaded with every layer
-    // on the device and failed to allocate wherever it does not fit (Kaggle T4: Llama-3.1-8B at 4 GB, Mistral-Small-3.2-24B at 8 / 16 GB,
-    // plans/k17_models.md). Same path and text as without the flag; MoE models are unchanged
+    // on the device and failed to allocate wherever it does not fit (Kaggle T4: Llama-3.1-8B at 4 GB, Mistral-Small-3.2-24B at 8 / 16 GB).
+    // Same path and text as without the flag; MoE models are unchanged
     cparams.moe_cache_size = model.hparams.n_expert > 0 ? params.moe_cache_size : 0;
     if (params.moe_cache_size > 0 && model.hparams.n_expert == 0) {
         LLAMA_LOG_INFO("%s: the model has no experts: no MoE cache (--moe-cache-mib ignored)\n", __func__);
@@ -1370,7 +1370,7 @@ llama_context::llama_context(
         // layer-major prompts: the host arena of the group inputs (mostly the KQ masks) and the graph results of the members. k9 made them
         // at load so that the first prompt does not pay for them: 2 x 256 MiB of pinned memory (main + MTP context) and ~290 MiB of zeroed
         // graph metadata (16 results per context) in every such process, also one that never reads a long prompt (k9 vs k8 host RSS +805 MiB
-        // at idle on a B200, +884 MiB on gfx1151; plans/k9_prompt_pass.md). Now both are made by the first group, the arena sized by what
+        // at idle on a B200, +884 MiB on gfx1151). Now both are made by the first group, the arena sized by what
         // it needs (decode_layer_major grows it); LLAMA_MOE_LAYER_MAJOR_EAGER=1 allocates them here as before
         static const bool lm_eager = getenv("LLAMA_MOE_LAYER_MAJOR_EAGER") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EAGER")) != 0;
         if (lm_enabled && moe_cache && lm_eager) {
@@ -1448,7 +1448,7 @@ llama_context::llama_context(
 
     // k15-fn (LLAMA_PLE_RESIDENT: unset = auto, 0 = off, 1 = always): the lazy per-layer embedding table (Qwen3.8-Flash-Next: 26.8 GiB,
     // read a few rows per token through the mapping) is read in whole and locked when the host has room for it beside every other host
-    // weight plus 8 GiB (Strata v0.2.7's PLE auto-RAM rule): the rows of a prompt then cost no page faults (a cold disk: G4 fn4 8k TTFT
+    // weight plus 8 GiB: the rows of a prompt then cost no page faults (a cold disk: G4 fn4 8k TTFT
     // 25.2 -> 2.0 s), and the page cache cannot evict them. The same bytes through the same mapping, so exact. Once per model, Linux only.
     // The read runs in a background thread after the load (the server is ready at once; a row a prompt touches first is read by its own
     // fault, the thread then finds it resident), with idle I/O priority and the readahead the lazy mapping's MADV_RANDOM switches off
@@ -2806,7 +2806,7 @@ void llama_context::ext_park(const char * why) {
 
 // k19-t4small: after a prompt, at the first decode step: this context's and its MTP drafters' device compute buffers are freed (their
 // next graphs allocate what a decode step needs, as tiny_rel_leave does), then the cache grows into the free device memory less
-// LLAMA_MOE_DECODE_EXT_KEEP_MIB (384, in steps of 64 MiB). PolyStrata's engine keeps ~235 MiB free beside its expert cache this way
+// LLAMA_MOE_DECODE_EXT_KEEP_MIB (384, in steps of 64 MiB)
 void llama_context::ext_unpark() {
     if (ext_grown || !moe_cache) {
         return;
@@ -6889,7 +6889,7 @@ bool llama_context::lm_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 // k13-small: the hybrid gate's fixed share (a cache of at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts) computes the misses of
 // small batches only, the prompt ubatches a layer-major group runs copy their experts as before. A cache below LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC
 // (0.05) of the host experts runs its prompts layer-major too: G4 at 4 GB, Qwen3.6 Q3_K_M + MTP (0.7% cached) copied every host expert once
-// per 512-token ubatch, 55 GB of copies for a 2k prompt (PolyStrata: 13.6 GB, one per prompt). LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0: k12
+// per 512-token ubatch, 55 GB of copies for a 2k prompt. LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0: k12
 // k16-parity: the line was 5%, inside the default gate's band (at most 10% cached, LLAMA_MOE_CACHE_HYBRID_MAX_FRAC): a cache between 5 and
 // 10% ran every prompt ubatch alone (G4 q3m 4 GB ctx 20480 with q8_0 K/V, 5.4% cached: 2k / 8k prompt 2000 / 2059 tok/s, where 4.0% cached
 // gave 5706 / 9436). Now 0.25, past the default band, so every share the default gate fixes runs its prompts layer-major.
@@ -7782,12 +7782,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // which synchronizes the device once per layer, so the next layer's expert copies are queued only after its router has run and the copy
     // engine idles through every layer's attention (G4, Qwen3.6-35B-A3B Q4 + MTP at 12 GB, 2k prompt: 42 gaps of ~2 ms in a 357 ms pass).
     // Off: G4 12 GB 2k +7.1%, 8 GB 2k +10.9% / 8k +5.7%; but L4 8 GB 8k -4.5% (the prompt after an unseeded one misses more experts on a
-    // copy-bound link), so it stays opt-in until the seed reads the routing without a device sync (plans/k13_pp.md section 9)
+    // copy-bound link), so it stays opt-in until the seed reads the routing without a device sync
     static const bool lm_seed_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED")) != 0;
     // beside the device seed (seed_sync off: the host seed of a ubatch's own ids does not fit) only the seed from an earlier member's
     // routing, which needs no larger graph
     const bool lm_seed_dev = moe_cache_devseed_on && lm_devseed_seed;
-    // k11 (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY=1, opt-in, default off: no model / tier has passed the KLD gate with it yet, plans/k11_prompt.md
+    // k11 (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY=1, opt-in, default off: no model / tier has passed the KLD gate with it yet
     // 3n; it acts wherever the checkpoint merge is on, which other branches may turn on by default): a group merged across a ubatch break
     // (llama_set_ubatch_breaks) whose last member is the only ubatch after it, a prefetched large one without outputs that would end its own
     // batch: run by themselves, the members before the break seed as the batch they were (host seed from the routing of an earlier member),
@@ -10443,7 +10443,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     // a ubatch below the prefetch threshold reads its ids for its copies anyway, it seeds from them
     // a prefetched ubatch: =2 (default) seeds from the routing of an earlier ubatch if any, else reads its own ids first (this serializes
     // its expert uploads with the compute of every layer); =1 does not seed it
-    // strata-gap: also when prompts do not seed (n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO) but the lent slots are refilled by routing
+    // also when prompts do not seed (n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO) but the lent slots are refilled by routing
     moe_cache_record    = large && prefetch_min_batch != INT64_MAX && (moe_cache_seed_sync || moe_cache->refills_routed());
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;

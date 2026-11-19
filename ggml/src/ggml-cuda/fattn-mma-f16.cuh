@@ -3060,7 +3060,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const bool async_kv_preload = nstages == 2 && !use_sparse;
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // k19-fattnq4: a two-source node (ggml_flash_attn_ext_set_src2: a q4_0 body and a q8_0 recent-window ring, plans/k19_kvwin.md). One
+    // k19-fattnq4: a two-source node (ggml_flash_attn_ext_set_src2: a q4_0 body and a q8_0 recent-window ring). One
     // kernel loops over the KV tiles of both sources with one online softmax, so it computes what the same kernel computes over the
     // concatenated cells (same tiles, stream-k split and fixup). In place where both sources are q4_0 / q8_0 pairs of a compiled
     // combination (body q4_0 / q4_0 or q8_0 / q8_0, ring q8_0 / q8_0) and the rows allow it (ggml_cuda_flash_attn_ext_src2_codes), else

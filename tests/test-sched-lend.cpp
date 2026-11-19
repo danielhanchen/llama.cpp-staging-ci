@@ -6,7 +6,7 @@
 // headroom) the lender places them too and the graph allocator does not grow; when it can, the old path is kept (the lender is not asked);
 // with GGML_SCHED_LEND_SYNC=0 (the old behaviour) the graph allocator has to hold every copy of B, which the device cannot hold;
 // GGML_SCHED_LEND_SYNC=2 always offers them (a lender that places none reverts to the old path)
-// (cudaMalloc failed on a 1725 MiB compute buffer after a 16k prompt at -ub 512 on G4, see plans/impl_moe_vram_lend.md)
+// (cudaMalloc failed on a 1725 MiB compute buffer after a 16k prompt at -ub 512 on G4)
 
 #include "ggml.h"
 #include "ggml-alloc.h"

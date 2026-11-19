@@ -5,8 +5,8 @@
 // The verify window of t tokens (the sampled token + t - 1 drafted ones) is priced by the measured wall time of the rounds of that
 // size (an EMA per size, kept across requests: it is a property of the model, the GPU and the placement, not of the text). A draft
 // of k tokens from a match class whose decayed per-token acceptance is q is expected to commit 1 + q + ... + q^k tokens; it is
-// taken when the best expected tokens per ms beats a plain round's 1 / cost(1) by a margin. This is PolyStrata's
-// DraftPolicy::choose (src/spec/draft_policy.cpp: measured round costs, a guessed cost shape for sizes not seen yet, a few probes
+// taken when the best expected tokens per ms beats a plain round's 1 / cost(1) by a margin
+// (measured round costs, a guessed cost shape for sizes not seen yet, a few probes
 // of a size before its guessed cost can veto it, a re-probe of a size not seen for a long time), with two changes for llama.cpp:
 //   - only two window sizes besides 1 (a short window for short repeats, the full window for long ones): every size is a target
 //     graph of its own, and a size change rebuilds it;
@@ -27,7 +27,7 @@
 struct common_spec_cost_policy {
     static constexpr int MAX_T = 8;
 
-    // relative round cost by window size before a size is measured: PolyStrata's RTX 5070 curve (kShape), pessimistic for a
+    // relative round cost by window size before a size is measured: an RTX 5070 curve (kShape), pessimistic for a
     // resident model, so a size is priced high until measured (the probes measure it)
     static constexpr double SHAPE[MAX_T + 1] = { 0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6 };
     static constexpr double ALPHA  = 0.1;     // EMA weight of a new round time
@@ -180,8 +180,7 @@ struct common_spec_cost_policy {
     // one. Bit t of `sizes` allows a verify window of t rows (t - 1 drafts); every allowed size is its own target graph, so the set stays
     // small. The size with the most expected tokens per measured ms is taken when it beats a plain round by the margin; a size not
     // measured PROBES times yet (or not for STALE rounds) is probed only where the class is right at least P_PROBE of the time, and
-    // the probe is the largest allowed size the drafts reach (the small ones get measured by the rounds that choose them). The idea is
-    // Strata's lookup window choice (clean-room: no code taken)
+    // the probe is the largest allowed size the drafts reach (the small ones get measured by the rounds that choose them).
     unsigned sizes = 0;
 
     static unsigned parse_sizes(const char * s) {
@@ -314,8 +313,8 @@ struct common_spec_round_timer {
     }
 };
 
-// k15-fn: LLAMA_SPEC_COST=1, the cost-aware MTP window (Strata's STRATA_SPEC_COST, src/spec/draft_policy.cpp keep_draft at
-// 7ddc17a3). While the MTP drafts, each draft's top-1 probability p is mapped to a measured acceptance a(p) (8 probability
+// k15-fn: LLAMA_SPEC_COST=1, the cost-aware MTP window.
+// While the MTP drafts, each draft's top-1 probability p is mapped to a measured acceptance a(p) (8 probability
 // buckets, decayed counts; before data a(p) = p), the chain's expected committed tokens E(rows) = 1 + a1 + a1 a2 + ... are
 // priced by the measured round time of a window of that many rows (an EMA per context bucket and size, kept across requests),
 // and the window keeps the rows with the best E / cost. Drafting stops when one or two more drafts as likely as the last could
@@ -565,7 +564,7 @@ struct common_spec_tpp_cost {
     bool   live            = false;
     double cost_ratio[CTX] = { 1.14, 1.14, 1.14, 1.18, 1.18 };
     // LLAMA_SPEC_TPP_SWITCH_SKIP=1 (opt-in): the first round after a window-size switch stays out of the size's median. Off by
-    // default: a size not run for a while re-captures its verify graph when the KV view has grown since (3-5 ms host, plans/fndec.md
+    // default: a size not run for a while re-captures its verify graph when the KV view has grown since (3-5 ms host
     // section 7), a real cost of switching to it, so skipping those rounds underprices the rarely used 4-row window. The switched
     // rounds' times also go to sw[], a median per kind printed in the cost table, so a run shows what a switch costs
     bool      switch_skip = false;
@@ -582,7 +581,7 @@ struct common_spec_tpp_cost {
     // k19-depth: below deep_pos (LLAMA_SPEC_DEPTH_POS, default 12288) every window drafts deep_extra more past floor + 1, so its width
     // is fixed at floor + 2 + deep_extra rows there; from deep_pos on the windows are the ones above (floor, floor + 1 where it pays).
     // The drafter sets deep_extra from its n_max (the server raises Studio's 2 drafts to 4 where it is on: LLAMA_SPEC_DEPTH). One width
-    // per context band, as each width a request mixes pays its own CUDA graph captures (plans/fndec.md section 7). Deterministic
+    // per context band, as each width a request mixes pays its own CUDA graph captures. Deterministic
     int     deep_extra = 0;
     int64_t deep_pos   = 12288;
     // k19-fnmtp: the deep band also for a window of floor + 1 drafts (deep_extra 0): set beside a MoE cache by the server's rule

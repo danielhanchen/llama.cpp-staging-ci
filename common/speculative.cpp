@@ -1146,7 +1146,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // cache: A100 fn4n full card (the 26.8 GiB PLE table is the only host part) has a flat cost curve, chat level (169.7 vs 170.1,
     // ac_a0), and srv_kld long48 put one position above the -fa off band's max there (0.090 vs 0.075).
     // Under the exact verify contract beside a MoE cache it stays off by default: there the cache's host path computes the misses of
-    // some batch sizes on the CPU (ac_a48 48 GB 8k: EV-auto on / off gave two exact texts; plans/k19_a100chat.md); =1 forces it
+    // some batch sizes on the CPU (ac_a48 48 GB 8k: EV-auto on / off gave two exact texts); =1 forces it
     static int eva_mode() {
         static const int m = [] {
             const char * e = getenv("LLAMA_DFLASH_EV_AUTO");
@@ -1698,7 +1698,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 static const int32_t df2_cached_tok_max = getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX") ? atoi(getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX")) : 12;
                 // k19-df2cost (LLAMA_DFLASH_CACHED_FRAC_MAX, default K19_DF2COST_FRAC_MAX 0.5; 0 = off; the cache leaves
                 // LLAMA_DFLASH_CACHED_RESERVE_MIB for the second width's graphs, see common.cpp: without it the srv_kld gate at 32 GB died
-                // of a CUDA out of memory, plans/k19_df2cost.md round 6): also
+                // of a CUDA out of memory): also
                 // where the cache holds LLAMA_DFLASH_CACHED_FRAC_MIN (0.20) .. LLAMA_DFLASH_CACHED_FRAC_MAX of the
                 // host experts (llama_moe_cache_frac; G4 fn4 24 GB 27.5%, 32 GB 42%), at every position, with that band's pass costs
                 // (LLAMA_DFLASH_CACHED_COST_MID="c_lo,slope", default 15 ms at 3 rows + 2.3 ms per further row: G4 fn4 fixed-width passes
@@ -1817,7 +1817,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // GPU is compute capability 8.0 (A100 / A30). There each further verify row costs 2.6-2.9 ms of a ~27 ms 7-row pass (no
                 // MoE cache) and the drafter's 5th / 6th steps are accepted too rarely to pay for theirs: Colab A100 80 GB, Qwen3.8-Flash-Next
                 // fn4n full card, --spec-draft-n-max 6: capped chat 182.9 vs 165.9 tok/s, 8k 109.8 vs 93.2, the same text (md5 equal), 5
-                // rows (n_max 4) at 21.2 ms vs 7 rows at 26.8 (plans/k19_a80verify.md). The window rules below (EV, P_CUM, p_min) still
+                // rows (n_max 4) at 21.2 ms vs 7 rows at 26.8. The window rules below (EV, P_CUM, p_min) still
                 // cut inside it. A user's --spec-draft-n-max below it is kept. Not beside a MoE cache (LLAMA_DFLASH_N_MAX_SM80_CACHED=1: there
                 // too): there the measured EV window (eva_t) already picks the width, and the route tail skip makes the text follow the
                 // window: A100 80 GB at a 48 GB cap, chat 119.5 vs 115.0 tok/s (same text), 8k 84.0 vs 93.9 (other text, 2.98 vs 3.41
@@ -2285,7 +2285,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<uint8_t> pending_dev;     // per seq: its pending row is sink row 0 (pending_h is stale)
     std::vector<uint8_t> verify_dev;      // per seq: the verify rows are sink rows 1 .. verify_h_rows (verify_h is unused)
 
-    // k15-fn: LLAMA_SPEC_COST=1 (opt-in): the cost-aware MTP window (common_spec_mtp_cost, Strata's STRATA_SPEC_COST): the drafts
+    // k15-fn: LLAMA_SPEC_COST=1 (opt-in): the cost-aware MTP window (common_spec_mtp_cost): the drafts
     // kept per round are the ones with the best expected tokens per ms, from the drafts' probabilities and measured round times
     const bool spec_cost = [] {
         const char * e = getenv("LLAMA_SPEC_COST");
@@ -2554,7 +2554,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // once for all the window's rows, so the deeper window's extra rows cost little at long context too: G4 Qwen3.8-27B
             // UD-Q4_K_XL + its MTP head, full card, 30k prompt: 4 drafts past position 12288 151.1 tok/s (3.12 tokens, 20.7 ms per pass)
             // against 134.5 with 2 (2.44, 18.1 ms); chat / 8k unchanged (deep band already). MoE targets keep 12288 (fn4 full card: 4
-            // drafts -13% at 30k, plans/k19_depth.md). LLAMA_SPEC_DEPTH_POS set: that position; LLAMA_SPEC_DEPTH_DENSE=0: 12288 as before.
+            // drafts -13% at 30k). LLAMA_SPEC_DEPTH_POS set: that position; LLAMA_SPEC_DEPTH_DENSE=0: 12288 as before.
             // Not on the HBM data-centre parts (compute capability 8.0 / 9.0: A100, A30, H100, H200), whose bandwidth per dp4a op makes the
             // extra verify rows dear: A100 80 GB, the same model and prompt, 30k 86.6 tok/s with every position deep against 90.1 at 12288
             // (-3.9%; chat / 8k equal). L4 (8.9) +10.6% and G4 (12.0) +12.5% at 30k. LLAMA_SPEC_DEPTH_DENSE=1 forces it on any GPU
@@ -2604,7 +2604,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // k15-pp: on by default beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): the target's next-n rows of a prompt
         // batch then go to the device sink and the host keeps none of them (llama_context::nextn_store_ensure), so the host rows no
         // longer grow with n_batch (q4x 16384-token groups: 128 MiB pinned). A -md draft model keeps the host path (G4 Flash-Next 8k
-        // prompt +8% with it, plans/impl_mtp.md). LLAMA_MTP_DEV_H=0 / =1 forces it off / on
+        // prompt +8% with it). LLAMA_MTP_DEV_H=0 / =1 forces it off / on
         const char * dev_h_env = getenv("LLAMA_MTP_DEV_H");
         // (G4 k15g4q1 measured it together with 16384 groups beside the heads, which cost decode and stay opt-in; at 8192 the device
         // path saves the 64 MiB of host rows for a 64 MiB sink)
@@ -3623,11 +3623,10 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 };
 
 // k9-draft: ngram-suffix. The draft is what followed the longest earlier repeat (at least n_min_match, at most 64 tokens) of the last
-// tokens of the prompt + output, found through a hash of trigrams that keeps the last 4 places of each (the suffix lookup of
-// PolyStrata: src/spec/suffix_drafter.cpp:47-87, --lookup 3 by default in src/poly/main.cpp:1127). Its length follows the decayed
-// acceptance of earlier suffix drafts of the same match-length class, q per token, with PolyStrata's priors (src/spec/draft_policy.cpp:
-// 13-19, 26-33): k tokens while q^k >= p_cut, at most n_max_short below a match of n_long_match tokens and n_max from there (its
-// window of 4 for short repeats and the full window for a copy of 8 or more, src/poly/main.cpp:68-73, 489). Beside a model drafter
+// tokens of the prompt + output, found through a hash of trigrams that keeps the last 4 places of each. Its length follows the decayed
+// acceptance of earlier suffix drafts of the same match-length class, q per token, with fixed priors:
+// k tokens while q^k >= p_cut, at most n_max_short below a match of n_long_match tokens and n_max from there (a
+// window of 4 for short repeats and the full window for a copy of 8 or more). Beside a model drafter
 // (later in the priority list: MTP, -md, eagle3, dflash) it drafts only a full window from a match class right at least p_take of the
 // time and otherwise leaves the round to the model (main.cpp:491-494); the model's rounds still see the verify rows (process()), so
 // both compose. The verifier accepts a suffix token only if the target samples it, so the output distribution is unchanged.
@@ -3960,7 +3959,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             const double q   = rate(si, b);
             const int    win = match >= si.n_long ? cap : std::min(cap, si.n_short);
             // the draft is the whole window (fewer tokens only where the repeat runs out): every verify length is a graph of its own
-            // (a change of length rebuilds the target graph, 10-15 ms on G4, plans/mtp_adapt.md), so the lengths stay few
+            // (a change of length rebuilds the target graph, 10-15 ms on G4), so the lengths stay few
             int k = 0;
             if (with_model) {
                 // a full window from a class that is right most of the time, else the model drafts this round

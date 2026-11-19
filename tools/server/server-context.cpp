@@ -2238,7 +2238,7 @@ private:
             // the fit as 1 - (device need without the host-only per-layer embedding table - free) / expert bytes, and (b) the whole target
             // GGUF is held in host memory (on a memory file system, or its bytes within the available memory), so the rows' expert misses
             // and per-layer embedding rows come from RAM, not the disk. G4 RTX PRO 6000 96 GB, Qwen3.8-Flash-Next UD-IQ4_XS from RAM + its
-            // MTP drafter, Studio argv, 3 launches (plans/k19_fnmtp.md round 2), this rule against its kill switch: 48 GB (cache 67%) chat
+            // MTP drafter, Studio argv, 3 launches, this rule against its kill switch: 48 GB (cache 67%) chat
             // +10.1% / 8k +18.0%, 32 GB (41%) +10.0% / +3.0%; at 16 GB (14%: rule off) 4 drafts measured chat +7.8% (12.8% launch spread) /
             // 8k -6.7%. A verify row there costs 2.2-2.5 ms of a 12.6-13.0 ms pass at 48 / 32 GB, ~3.5 ms of 15.2 at 16 GB. Colab A100 80 GB
             // at 48 GB chat +17.7% / 8k +1.6%. The A100 40 GB VM of round 1 (93.7 GB model, 83 GB of RAM: rows read from the disk) stays at 2
@@ -2270,8 +2270,8 @@ private:
             // (LLAMA_MOE_PREFETCH_AUTO=2 for llama_moe_cache: top 10 predicted experts, at most 1 copied per layer, generation and verify
             // windows only, where the placed cache holds 10-20%). With the route tail skip off (int3 c5d7c3bc40d) every rank 7-9 miss is a
             // host expert or a copy; the two together, Colab G4 Flash-Next UD-IQ4_XS MTP n2 16 GB, 3 launches on two VMs: chat +8.3 / +9.0%
-            // (held-out text +9.5%), 8k +8.0 / +10.8% (held-out -1.3%); long48 KLD inside the -fa off band on all 8 statistics
-            // (plans/k19_g4tail.md). An explicit LLAMA_SPEC_DEPTH_CACHED / LLAMA_MOE_PREFETCH / LLAMA_MOE_PREFETCH_AUTO keeps its value
+            // (held-out text +9.5%), 8k +8.0 / +10.8% (held-out -1.3%); long48 KLD inside the -fa off band on all 8 statistics.
+            // An explicit LLAMA_SPEC_DEPTH_CACHED / LLAMA_MOE_PREFETCH / LLAMA_MOE_PREFETCH_AUTO keeps its value
             const bool g4tail_on = [] {
                 const char * x = getenv("LLAMA_MOE_G4TAIL");
                 return x == nullptr || atoi(x) != 0;
@@ -2382,8 +2382,8 @@ private:
             // (-md) drafts N in every window below LLAMA_SPEC_DEPTH_POS (12288), the windows from there are k19-tpp's priced ones (2, a 3rd
             // where it pays at the cache's cost ratio). The 4-row windows then get the verify tag (LLAMA_SPEC_VERIFY4_CACHED=1 is set unless
             // given), so they run the 3-row kernels instead of cuBLAS. Not with LLAMA_MTP_EXACT=1 (beside a cache the exact text follows the
-            // window where the CPU-miss host path runs, plans/k19_a100chat.md section 5): there the windows stay at 2.
-            // Not on by itself because the deeper window does not pay on every measured cached tier (plans/k19_fnmtp.md, Colab A100 40 GB
+            // window where the CPU-miss host path runs): there the windows stay at 2.
+            // Not on by itself because the deeper window does not pay on every measured cached tier (Colab A100 40 GB
             // Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk, 3 launches, with the PLE table read in part): 3 drafts full card chat +3.4% /
             // 8k -3.8%, 16 GB chat -6% / 8k +7.6%; 4 drafts full card +1.8% / +6.8%, 16 GB -16% / -14%. A verify row costs ~10 ms there
             // (PLE rows read from the disk and expert misses copied at ~10 GB/s), against 3.4 -> 4.0 tokens per pass
@@ -2496,8 +2496,8 @@ private:
             } else if (mtp_shape && on) {
                 // k19-depth (LLAMA_SPEC_DEPTH=0: off, =1: also beside built-in MTP heads): with an MTP drafter of its own (-md), every window
                 // below position 12288 (LLAMA_SPEC_DEPTH_POS) drafts 4, the windows from there are the ones above (2, a 3rd where it pays).
-                // G4 Qwen3.8-Flash-Next fn4 full card (plans/k19_depth.md): 4 drafts +6.8% chat / +10.9% 8k, -13% 30k against 2 + tpp.
-                // Built-in heads (Qwen3.6) stay at the windows above: their extra verify row costs ~20% of a pass (plans/k19_fn_tpp.md)
+                // G4 Qwen3.8-Flash-Next fn4 full card: 4 drafts +6.8% chat / +10.9% 8k, -13% 30k against 2 + tpp.
+                // Built-in heads (Qwen3.6) stay at the windows above: their extra verify row costs ~20% of a pass
                 const char * de = getenv("LLAMA_SPEC_DEPTH");
                 // (k19-sharegate: beside the cache the deep windows stay opt-in, LLAMA_SPEC_DEPTH=1)
                 const bool deep = de != nullptr ? atoi(de) != 0 : sp.has_dft() && !share_ok;
@@ -2994,7 +2994,7 @@ private:
 
         // k15-lfm2: LFM2.5 with drafts verified exactly (output unchanged by the window): prompts of 4096+ tokens take a short window of
         // 2 drafts and the full window from a repeat of 6. Opt-in (LLAMA_SPEC_LFM_LONG_WIN=1): G4 32 GB +0.6% / +3.1% at 8k / 16k on the
-        // default build, but -3.7% / -1.6% with GGML_CUDA_MMVQ_MOE_ONE=1 (k15-fn's coming default), plans/k15_lfm2.md
+        // default build, but -3.7% / -1.6% with GGML_CUDA_MMVQ_MOE_ONE=1 (k15-fn's coming default)
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
                 llama_verify_exact_placement(ctx_tgt) && server_spec_auto_arch(params_base.model.path) == "lfm2moe") {
             const char * e = getenv("LLAMA_SPEC_LFM_LONG_WIN");
@@ -3076,8 +3076,8 @@ private:
         }
 
         // k19: with the reassociated verify (GGML_CUDA_VERIFY_REASSOC, default on: verify rows differ from single token decodes by f32
-        // summation order, plans/k11.md equivalence rule) and windows priced from measured round times, which tokens come from a verify
-        // row depends on timing, so greedy output can differ between launches at near ties (plans/k19_phi4_nondet.md)
+        // summation order equivalence rule) and windows priced from measured round times, which tokens come from a verify
+        // row depends on timing, so greedy output can differ between launches at near ties
         if (spec && auto_verify_exact) {
             const char * e = getenv("GGML_CUDA_VERIFY_REASSOC");
             if (e == nullptr || atoi(e) != 0) {
@@ -5411,8 +5411,8 @@ private:
     // Separate, the last ubatch before that checkpoint ran alone and streamed every host expert a second time: G4 Qwen3.6-35B-A3B
     // Q4 + MTP at 12 GB, 2k prompt [1532] [512] [4] = 27.7 GB of uploads, 16.0 merged, 3188 -> 5226 tok/s. Merged, the output is
     // md5-equal with the misses pinned on the device (LLAMA_MOE_CPU_MISS=0) and decode speed is unchanged; with the misses on the host
-    // the decode after the prompt may take another text (Qwen3.8-Flash-Next 32 GB 8k), as the cache is seeded once (plans/k15_pp.md
-    // section 6). LLAMA_LM_CKPT_MERGE=0: the separate calls
+    // the decode after the prompt may take another text (Qwen3.8-Flash-Next 32 GB 8k), as the cache is seeded once.
+    // LLAMA_LM_CKPT_MERGE=0: the separate calls
     bool lm_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev, bool lm_ckpt) const {
         static const bool on = getenv("LLAMA_LM_CKPT_MERGE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0;
         return on && !lm_ckpt && n_tokens_prev == 0 && !slot.task->tokens.has_mtmd && llama_layer_major_on(ctx_tgt) &&
@@ -5426,7 +5426,7 @@ private:
     bool near_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev) const {
         // opt-in (LLAMA_CKPT_NEAR_MERGE=1): exact and multi-turn reuse unchanged, but slower on G4 (Qwen3.6 MTP 32 GB chat 1413 -> 1269
         // prompt tok/s, TTFT 54 -> 61 ms; 2k -2.4%; 12 GB chat -2.6%): the merged decode is GPU-bound for longer after its last launch
-        // than the two separate calls (plans/k15_models.md round 11)
+        // than the two separate calls
         static const bool on = getenv("LLAMA_CKPT_NEAR_MERGE") != nullptr && atoi(getenv("LLAMA_CKPT_NEAR_MERGE")) != 0;
         static const bool cap_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
         if (!on || !cap_env || n_tokens_prev != 0 || slot.task->tokens.has_mtmd || !llama_state_capture_supported(ctx_tgt) ||
@@ -6457,11 +6457,11 @@ private:
                             // batch starts at the last user message (a checkpoint is made there). A single-pass prompt makes no checkpoint of
                             // its own (the memory is empty before its only pass), so without that bound a raw prompt that grows by a few
                             // tokens per turn found no usable checkpoint and ran again from the start. LLAMA_SERVER_CKPT_SINGLE_ANY=1: the
-                            // k11 rule (any prompt whose rest is at most N). Still opt-in: the KLD gate (plans/k11.md) failed on G4 for
+                            // k11 rule (any prompt whose rest is at most N). Still opt-in: the KLD gate  failed on G4 for
                             // Qwen3.6-35B-A3B Q4 (first-token p99 0.0058 vs 0.0024 for -fa off), LFM2.5 (first-token mean 0.24 vs 0.065) and
-                            // gemma-4 26B (decode top-1 98.9 vs 99.7%), plans/k13_pp.md section 7
-                            // k15-ttft: on by default (N = 128) where the single pass is reassociation-only (plans/k11.md "Equivalence
-                            // rule", llama_single_pass_equivalent: all weights on CUDA, no host-computed expert, no F16 matmul weight) and
+                            // gemma-4 26B (decode top-1 98.9 vs 99.7%)
+                            // k15-ttft: on by default (N = 128) where the single pass is reassociation-only
+                            // (equivalence rule, llama_single_pass_equivalent: all weights on CUDA, no host-computed expert, no F16 matmul weight) and
                             // the split pass would run at least 4 tokens before its last 4 (below that MMVF F32 / FlashAttention vec kernels
                             // take the first pass, other formats). An explicit LLAMA_SERVER_CKPT_SINGLE_MAX keeps the k11 meaning on every
                             // placement (0 = off, the kill switch)

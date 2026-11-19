@@ -1583,7 +1583,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
     cudaStream_t stream = ctx.stream();
 
     // route tail skip (ggml_moe_cache_set_tail_skip): op param 12 = rank | default << 8. The default is taken on NVIDIA and on RDNA4
-    // (gfx1200 / gfx1201), the devices Strata turns it on by default for; an explicit rank everywhere
+    // (gfx1200 / gfx1201); an explicit rank everywhere
     int tail_rank = ggml_get_op_params_i32(dst, 12) & 0xff;
     if (tail_rank > 0 && (ggml_get_op_params_i32(dst, 12) >> 8) & 1) {
 #if defined(GGML_USE_HIP)

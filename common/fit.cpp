@@ -246,8 +246,8 @@ static void common_fit_place8_env(uint32_t ub, bool mid = false, int64_t grow_mi
 // within the default margin, but beside a MoE cache of at most LLAMA_FIT_HOSTBOUND_MAX_FRAC (0.10, the share of the hybrid gate,
 // LLAMA_MOE_CACHE_HYBRID_MAX_FRAC) of the host experts: the host computes most misses of every decode step and a larger cache is what
 // shortens it. Colab L4 capped at 4 GB, LFM2.5-24B-A2B UD-Q4_K_XL ctx 16384 (3696 MiB free, 13371 MiB of host experts): a 1157 MiB
-// cache at the 1024 MiB margin, 663 MiB of it after the tiny-cache n_ubatch rule (117 slots, 4.8%), against PolyStrata's 322 experts
-// (1.73 GiB, 352 MiB left free). Such a device takes the small-device placement (the 256 MiB margin + the run-time reserve) and its
+// cache at the 1024 MiB margin, 663 MiB of it after the tiny-cache n_ubatch rule (117 slots, 4.8%).
+// Such a device takes the small-device placement (the 256 MiB margin + the run-time reserve) and its
 // k19-place8 decode-sized cache. LLAMA_FIT_HOSTBOUND=0 off
 static bool g_hostbound = false;
 
@@ -1944,8 +1944,8 @@ static void common_params_fit_impl(
                     int64_t(dmds_cpu_moe.back().mb.model) - int64_t(dmds_full.back().mb.model));
             // k13-small: a small device (G4 ballasted to 4 GB, Qwen3.6-35B-A3B Q3_K_M + MTP: the dense weights of every layer, the context and
             // a cache fit only inside the 1024 MiB margin). Without this the fit moves 13 of 41 whole layers (attention, KV, recurrent state)
-            // to the CPU and drops the cache, so every token pays a graph split per CPU layer and per MoE layer (k12: 91 tok/s against
-            // PolyStrata's 177, which keeps every dense layer on the device). Here the margin of the one device drops to
+            // to the CPU and drops the cache, so every token pays a graph split per CPU layer and per MoE layer (k12: 91 tok/s).
+            // Here the margin of the one device drops to
             // LLAMA_FIT_SMALL_MARGIN_MIB (256) instead: every layer stays on the device beside a small cache, whose host misses the
             // single-graph path computes (no graph split). The placement is the one of -fitt 256; one GPU only, default margin only (an
             // explicit smaller -fitt is the user's), LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps the k12 placement.
@@ -2258,14 +2258,14 @@ static void common_params_fit_impl(
                 // ubatches of up to 31 tokens exceed the few tokens the device lookups serve (4 there), so their expert products run on the
                 // CPU from the mapping, whose pages the disk serves at its read rate. With the compute buffers kept a prompt ubatch copies its
                 // routed experts from the RAM tier instead. Colab L4 12 GB, Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk (57.6 GB of
-                // experts, 51 GB of RAM) + MTP n2, 3 interleaved launches (plans/k19_l4gap.md): 42-token chat TTFT 28.1 -> 17.1 s, 8k TTFT
+                // experts, 51 GB of RAM) + MTP n2, 3 interleaved launches: 42-token chat TTFT 28.1 -> 17.1 s, 8k TTFT
                 // 90.7 -> 85.4 s, but chat decode 5.94 -> 5.59 tok/s (the cache keeps 2256 instead of 4173 MiB): answers longer than ~1000
                 // tokens get slower, so it stays opt-in. Unset: k19-placemid as before (no extra work, no log line)
                 // k19-l4gap2 (default; LLAMA_FIT_PLACEMID_DISK_UB=0 off): on the same disk tier k19-placemid keeps its cache but reserves the
                 // graphs at, and splits short prompts into, ubatches of LLAMA_FIT_PLACEMID_DISK_UB (4) tokens: the tokens the device lookups
                 // serve there, so a short prompt's experts come from the device slots and the RAM tier instead of the CPU products of the
-                // mapping, and the decode keeps the larger cache. Colab L4 12 GB, same model, held-out texts, 3 interleaved launches
-                // (plans/k19_l4gap.md section 15d): chat TTFT -25%, chat decode +15%, a second chat TTFT -60%, a 1536-token thinking answer
+                // mapping, and the decode keeps the larger cache. Colab L4 12 GB, same model, held-out texts, 3 interleaved launches:
+                // chat TTFT -25%, chat decode +15%, a second chat TTFT -60%, a 1536-token thinking answer
                 // decode +2%; the skip above lost 9% on that answer. Only where a speculative verify window has at most that many rows (MTP
                 // n2: 3), set by common_fit_set_verify_rows: a wider one would release and refill the banks in every pass
                 static const bool placemid_disk_skip = getenv("LLAMA_FIT_PLACEMID_DISK_SKIP") != nullptr && atoi(getenv("LLAMA_FIT_PLACEMID_DISK_SKIP")) != 0;
@@ -2357,7 +2357,7 @@ static void common_params_fit_impl(
                             100.0*placemid_min_frac);
                     }
                 }
-                // k17-small (lazy KV step 2, PolyStrata's rule): LLAMA_KV_LAZY=1 backs only the first LLAMA_KV_LAZY_INIT (4096) cells of
+                // k17-small (lazy KV step 2): LLAMA_KV_LAZY=1 backs only the first LLAMA_KV_LAZY_INIT (4096) cells of
                 // the KV cache at load (mb.kv_lazy: the rest, reported only where the MoE cache can shrink). The cache was fitted above
                 // beside the full-context KV, so that size is its floor; it gets the unbacked KV bytes on top (up to the size requested)
                 // and gives them back as the cells grow (llama_moe_cache::shrink), so every cell of the context still fits.

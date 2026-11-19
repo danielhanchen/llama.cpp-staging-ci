@@ -323,7 +323,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 // k19-ampere (GGML_CUDA_VERIFY_WIDE bit 8): the Turing / Ampere table sends some MUL_MAT_IDs of 7..8 tokens to MMQ (IQ3_S from 7: the
 // Flash-Next gate / up of a DFlash2 n_max 6 window). Inside a verify-tagged graph those columns keep the multi-token mmvq kernels a
 // 2..6-row window and every Ada / Blackwell window runs (mul_mat_vec_q_moe_vl for the fused IQ3_S gate / up). Not bit-identical to the
-// MMQ launch it replaces (another f32 summation order: reassociation, KLD-gated, plans/k19_ampere.md)
+// MMQ launch it replaces (another f32 summation order: reassociation, KLD-gated)
 // k19-ampmoe: also 8 where the int8 tensor-core MoE kernel (mmvq-moetc.cuh) takes the type inside a verify window
 int ggml_cuda_mmvq_mmid_max_batch(ggml_type type, int cc) {
     const int table = get_mmvq_mmid_max_batch(type, cc);
@@ -339,7 +339,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // of min..8 columns inside a verify-tagged graph runs MMQ (int8 tensor cores) instead of the batched mmvq, for the types of the mask
 // (1 Q6_K, 2 Q8_0, 4 the other K / legacy quants MMQ takes). The A100 mmvq pays every further column of these products in full (Colab
 // A100 80 GB, Qwen3.8-Flash-Next fn4n full card, node trace of a 7-row DFlash2 verify: the 8192-row Q6_K in-projections 87.5 us at 7
-// columns vs 47.4 at 3, the dense mat-vecs 1.36 ms of the 2.9 ms each verify row costs, plans/k19_a80verify.md). MUL_MAT_IDs keep their
+// columns vs 47.4 at 3, the dense mat-vecs 1.36 ms of the 2.9 ms each verify row costs). MUL_MAT_IDs keep their
 // rule (ggml_cuda_mmvq_mmid_max_batch); 1..min-1 columns, prompt chunks (untagged graphs) and the exact (batch invariant) verify keep
 // mmvq. Not bit-identical to the mmvq launch it replaces (another f32 order of the same int8 dot products: reassociation, KLD-gated).
 // Opt-in: full card 7-row DFlash2 chat +4.0% (165.8 -> 172.5 tok/s, md5 equal), but MMQ's pool scratch beside a MoE cache that fills
@@ -2000,7 +2000,7 @@ static __global__ void mul_mat_vec_q_moe_group(
 // vec_dot_q_cuda calls on the same bytes, so every output is bitwise mul_mat_vec_q_moe's (and mul_mat_vec_q_moe_group's). As in
 // mul_mat_vec_q_moe_group, a warp takes every entry (token, slot) that chose its expert, so an expert's rows are read from DRAM once.
 // Turing has no cp.async: 16 byte loads through registers. On Turing (T4) the multi-token kernels run at ~20% of the DRAM peak and
-// this one is 20-35% faster at 2..8 tokens; on Blackwell (G4) it is slower than the K-unrolled mul_mat_vec_q_moe (plans/k19_moebw.md)
+// this one is 20-35% faster at 2..8 tokens; on Blackwell (G4) it is slower than the K-unrolled mul_mat_vec_q_moe
 // Grid: (ceil(nrows_x / (rpw * nwarps)), slots, tokens); block (32, nwarps); warp y owns rows [row0, row0 + rpw).
 template <ggml_type type, bool has_fusion>
 __launch_bounds__(8*WARP_SIZE)
@@ -2563,7 +2563,7 @@ static constexpr bool mmvq_moe_unroll_type(const ggml_type type) {
 // (test-moe-bw-exact on A100: rpb8_g0 / bw1 / vl16_4 0 floats differ). A100 microbench (test-moe-bw-exact --bench, Flash-Next shapes,
 // 128 experts, P 0.55; us per layer vs the old rule): IQ4_NL down at 5..8 tokens 8 rows per warp block 0.86 / 0.84 / 0.88 / 0.83;
 // IQ3_S gate or up without a fused gate (MoE cache tiers) at 5..8 tokens the staged kernel 0.90 / 0.92 / 0.87 / 0.87, the fused gate / up
-// at 2 tokens 0.81; mul_mat_vec_q_moe_vl with 4 entries per decode at 3..5 tokens 0.91 / 0.88 / 0.86 (plans/k19_ampere.md)
+// at 2 tokens 0.81; mul_mat_vec_q_moe_vl with 4 entries per decode at 3..5 tokens 0.91 / 0.88 / 0.86
 static bool mmvq_moe_ampere(const int cc) {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_MOE_AMPERE");
@@ -2718,7 +2718,7 @@ static void mul_mat_vec_q_moe_launch(
 // k19-vrow: GGML_CUDA_MMVQ_MOE_GROUP (default 1; 0 = mul_mat_vec_q_moe everywhere): a bit mask of the multi-token IQ3_S / IQ4_NL
 // MUL_MAT_IDs that run mul_mat_vec_q_moe_group instead, bitwise the same values: 1 = with a fused gate (gate / up + GLU), 2 = the
 // others (down). Flash-Next shapes on G4, random weights, real-like routing (1.85x top-k distinct experts at 3 tokens), us per layer
-// of gate / up + down (scripts/k19vr, plans/k19_vrow.md): 3 tokens 49.6 -> 47.0, 5 tokens 69.9 -> 66.2, 6 tokens 82.9 -> 76.5 with
+// of gate / up + down 3 tokens 49.6 -> 47.0, 5 tokens 69.9 -> 66.2, 6 tokens 82.9 -> 76.5 with
 // bit 1 and the shape below; the grouped down is slower at every shape (its base kernel is 40 registers, all lanes busy on L2 hits),
 // and without shared experts across tokens the grouped gate / up is 2-4% slower.
 // GGML_CUDA_MMVQ_MOE_GROUP_CFG=rpw,nwarps,dec,group (microbench builds, GGML_CUDA_MMVQ_MOE_GROUP_BENCH) picks another shape
@@ -3157,8 +3157,8 @@ static int mul_mat_vec_q_nwarps_1(const int ncols_x, const bool has_ids, const i
 // k19-mmvqcols: more rows per block for a dense 2..8 column launch (speculative verify windows) of the types whose lanes each read one
 // q8_1 block per 32 weights (IQ3_S, IQ2_XXS, Q3_K): a warp's 32-bit activation load then spans 9 cache lines, the per-column cost of these
 // launches is L1 wavefronts, and the rows of a block share those loads. Rows alone keep every row's sum (the K split and the reduction are
-// per row): bitwise the launch they replace, also on the exact (batch invariant) verify path. Rows per arch from the benches
-// (plans/k19_mmvqcols.md): Turing 8 at 2..8 columns (Kaggle T4); Ampere cc 8.0 4 at 2..8 (Colab A100: 8 lost up to 35%, register
+// per row): bitwise the launch they replace, also on the exact (batch invariant) verify path. Rows per arch from the benches:
+// Turing 8 at 2..8 columns (Kaggle T4); Ampere cc 8.0 4 at 2..8 (Colab A100: 8 lost up to 35%, register
 // pressure); Ada cc 8.9 4 from IQ2_XXS 4, Q3_K 5, IQ3_S 7 columns (Colab L4: below that within +-5%); other archs unchanged until measured.
 // GGML_CUDA_MMVQ_COLS_CFG: unset / AUTO = that table, 0 = off, R4 / R8 = those rows for every listed type, width and NVIDIA table.
 // Returns the rows (0: not taken)
@@ -3175,7 +3175,7 @@ static constexpr bool mmvq_kq_type(const ggml_type type) {
 // AUTO: Ada (cc 8.9) 4 rows at 2..8 columns for all four types: Colab L4, Qwen3.8-27B UD-Q4_K_XL + MTP drafter (5-row verify windows),
 // 3 interleaved launches, chat 34.3 -> 39.5 tok/s, 8k 30.4 -> 35.1 (+15%), text unchanged (default and exact verify). Ampere cc 8.0
 // stays off: on a Colab A100 the 4-row launch of Q4_K / Q5_K / Q6_K at 5 columns ran 1-16% slower (test-mmvqcols-exact --bench, register
-// pressure; plans/k19_q38next.md). Other archs off until measured
+// pressure). Other archs off until measured
 static int mmvq_kq_rows_auto(const ggml_type type, const int ncols_dst, const int cc) {
     GGML_UNUSED(type); GGML_UNUSED(ncols_dst);
     return cc == GGML_CUDA_CC_ADA_LOVELACE ? 4 : 0;
@@ -3787,7 +3787,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // k15-fv, GGML_CUDA_VERIFY_REASSOC (default 1; 0 = the bit-exact per-token verify below): a batch invariant verify batch runs the
     // ordinary multi-column kernels (MUL_MAT_ID: mul_mat_vec_q_moe; dense without fusion: the batched mmvq). Every row then reads the same
     // q8_1 activations into the same int8 dot products with f32 accumulation as its single token launch, only the order of the f32
-    // sums differs (plans/k11.md equivalence rule); the dispatcher still never routes these nodes to MMQ / cuBLAS
+    // sums differs (equivalence rule); the dispatcher still never routes these nodes to MMQ / cuBLAS
     static const bool reassoc = [] {
         const char * e = getenv("GGML_CUDA_VERIFY_REASSOC");
         return e == nullptr || atoi(e) != 0;

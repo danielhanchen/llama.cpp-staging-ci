@@ -409,8 +409,8 @@ static std::vector<moe_case> make_cases() {
         { "q6k_ldn",  GGML_TYPE_Q6_K,   1536, 2048,  8,  4, false },
         { "iq4xs_dn", GGML_TYPE_IQ4_XS, 1536, 2048,  8,  4, false },
         { "iq3s_dn",  GGML_TYPE_IQ3_S,  1024,  256, 12,  6, false },
-        // odd: rows not a multiple of 8 (N 90 hits a base race: the single-token small-K launch writes rows past N into the next slot,
-        // see plans/k19_moebw.md), K of one block, top-k 20 (160 entries at 8 tokens)
+        // odd: rows not a multiple of 8 (N 90 hits a base race: the single-token small-K launch writes rows past N into the next slot),
+        // K of one block, top-k 20 (160 entries at 8 tokens)
         { "q4k_odd",  GGML_TYPE_Q4_K,    768,   92, 12,  4, true  },
         { "iq4nl_k1", GGML_TYPE_IQ4_NL,   32,  100, 12,  4, false },
         { "q8_0_k20", GGML_TYPE_Q8_0,    256,   64, 40, 20, false },

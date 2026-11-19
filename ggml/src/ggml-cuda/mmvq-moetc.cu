@@ -660,7 +660,7 @@ struct moetc_cfg {
     // bit per moetc_type_bit. Default Q4_K / Q5_K / Q6_K: srv_kld long48 q4x (A100) inside the -fa off band on every statistic. The
     // Flash-Next types (IQ4_XS / IQ4_NL / Q5_0 / Q8_0 / IQ3_XXS / IQ2_S) are opt-in (GGML_CUDA_MOE_TC_TYPES=all or a list): fn4n
     // full card long48 KLD mean / p99 / max inside the band, top-1 97.58% vs 97.70 / 98.14% for the two band samples (-fa off,
-    // GGML_CUDA_VERIFY_WIDE=0), 0.12 pp below (plans/k19_ampmoe.md)
+    // GGML_CUDA_VERIFY_WIDE=0), 0.12 pp below
     int  types = 0x7;
     int  kw    = 0;    // 0 = by K
     bool log   = false;
@@ -719,7 +719,7 @@ static const moetc_cfg & moetc_config() {
 }
 
 // the fewest tokens at which the kernel beats the mul_mat_vec_q MoE kernels it replaces, per type and device (test-moe-bw-exact --bench,
-// verify-tagged, plans/k19_ampmoe.md); 9 = never. GGML_CUDA_MOE_TC_MIN=N: N for every type (bench)
+// verify-tagged); 9 = never. GGML_CUDA_MOE_TC_MIN=N: N for every type (bench)
 static int moetc_min_tokens(const ggml_type type, const int cc, const int env_min) {
     if (env_min > 0) {
         return env_min;

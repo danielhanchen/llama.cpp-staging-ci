@@ -3043,8 +3043,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ne11 > 1) {
         // k15-lfm2, GGML_CUDA_VERIFY_MMQ: a quantized dense verify product of up to 16 columns runs MMQ (int8 tensor cores) instead
         // of the batched mmvq: the same q8_1 activations into the same int8 products with f32 accumulation, only the order of the f32
-        // scale products and sums differs (plans/k11.md equivalence rule). T4 at 8 rows the dp4a mmvq is compute-bound (2x one row,
-        // plans/k15_lfm2.md section 15). Default on Turing (cc 7.5) only, where it was timed and passed the KLD gate; =1 on any device with
+        // scale products and sums differs (equivalence rule). T4 at 8 rows the dp4a mmvq is compute-bound (2x one row).
+        // Default on Turing (cc 7.5) only, where it was timed and passed the KLD gate; =1 on any device with
         // the Turing MMA (Ampere and newer too), =0 off. Not here: the products of a multi-matrix mmvq launch (ggml_cuda_mmvq_multi_*),
         // which keep the batched mmvq. GGML_CUDA_VERIFY_MMQ_LOG=1 names each product once with the kernel it takes
         static const int verify_mmq_env = [] {
@@ -3132,7 +3132,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     // k13-pp: GGML_CUDA_DENSE_CUBLAS_MIN=N (opt-in, 0 = off): quantized dense products of at least N columns are dequantized to FP16 and
-    // multiplied by cuBLAS instead of MMQ (Strata's prompt path for dense layers). Other rounding (KLD-gated)
+    // multiplied by cuBLAS instead of MMQ. Other rounding (KLD-gated)
     // k19-tcgemm: the route dequantizes the weight into a pool scratch buffer (no second copy kept) and runs a tensor-core GEMM with FP32
     // accumulation and FP32 output; GGML_CUDA_DENSE_CUBLAS_ACC=f16 restores the k13 FP16-accumulate path, =bf16 uses BF16 inputs
     if (ggml_cuda_dense_tc_route(src0, src1, dst, cc)) {
