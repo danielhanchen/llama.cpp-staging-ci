@@ -2309,13 +2309,14 @@ private:
             const bool def_mid = deep_try && !def_on && !g4t_band && mid_on && g4tail_on && getenv("LLAMA_SPEC_DEPTH_CACHED_SHARE") == nullptr &&
                 exp_b > 0 && short_b > 0 && resident && deep_share >= g4t_hi && deep_share < deep_share_min && g4t_ctx_ok &&
                 n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
-            // The same 3-draft windows just above that floor, up to LLAMA_SPEC_DEPTH_MID_HI (0.345; 0: the deep windows' own depth from
+            // The same 3-draft windows just above that floor, up to LLAMA_SPEC_DEPTH_MID_HI (0.33; 0: the deep windows' own depth from
             // the floor): there a 4th verify row still misses enough experts that the narrower window pays. Colab G4, Qwen3.8-Flash-Next
-            // UD-IQ4_XS + its MTP drafter, Studio argv, 3 launches, 4 against 3 drafts: 28 GB (32.1% expected) chat 212.0 -> 217.0, 8k
-            // 179.3 -> 190.5 tok/s; 30 GB (35.7%) chat 236.7 -> 226.6 (4 drafts ahead from there)
+            // UD-IQ4_XS + its MTP drafter, Studio argv, 3 launches on three texts each, 3 against 4 drafts: 27 GB (30.4% expected) chat
+            // +2..+8%, 8k -3..+14%; 28 GB (32.1%) chat +1..+8%, 8k +2..+38%; from 29 GB (33.9%) on 4 drafts win chat on every text
+            // (29 / 30 / 32 / 36 GB)
             const double mid_hi = [] {
                 const char * x = getenv("LLAMA_SPEC_DEPTH_MID_HI");
-                return x != nullptr ? atof(x) : 0.345;
+                return x != nullptr ? atof(x) : 0.33;
             }();
             const bool def_mid_hi = def_on && mid_on && g4tail_on && getenv("LLAMA_SPEC_DEPTH_CACHED_SHARE") == nullptr &&
                 getenv("LLAMA_SPEC_DEPTH_CACHED_N") == nullptr && deep_share < mid_hi && g4t_ctx_ok && n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
@@ -2467,7 +2468,7 @@ private:
                         "RAM): MTP windows of %d drafts (LLAMA_SPEC_DEPTH_MID=0: 2 drafts)\n", 100.0*deep_share, g4t_hi, deep_share_min, n_mid);
                 }
                 if (def_mid_hi) {
-                    SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (from %.2f up to %.3f, compute capability 12.0): MTP "
+                    SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (from %.2f up to %.2f, compute capability 12.0): MTP "
                         "windows of %d drafts (LLAMA_SPEC_DEPTH_MID_HI=0: %d)\n", 100.0*deep_share, deep_share_min, mid_hi, n_mid, n_def);
                 }
                 if (g4t) {
