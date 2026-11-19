@@ -527,8 +527,15 @@ llama_context::llama_context(
             // default only for a target without a MoE cache: there the target's text is unchanged (G4 Flash-Next full card, md5 = full
             // head). Beside a cache the head's memory comes from the cache, which moves the target's placement and so its text
             // (srv_kld long48 at 32 GB above the -fa off band of the full card); an explicit LLAMA_DFLASH_DRAFT_VOCAB=n opts in there
+            // A cache that holds most of the experts (llama_moe_cache_wide_graphs: the band where the verify graphs are prewarmed as
+            // without a cache) also takes the restricted head by default, where the drafter's lm head is a quarter of its graph; the fit
+            // keeps the head's bytes free from the cache in that band beside a DFlash draft model, so the prewarm keeps its memory
+            // (LLAMA_DFLASH_DRAFT_VOCAB_WIDE=1, which the server sets on compute capability 12.0 cards only; 0 or unset: the full head and
+            // no reserve, as before)
+            static const bool vocab_wide = getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE") != nullptr && atoi(getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE")) != 0;
             if (model.arch == LLM_ARCH_DFLASH && model.output == nullptr) {
-                if (!params.ctx_other->moe_cache_active() || getenv("LLAMA_DFLASH_DRAFT_VOCAB") != nullptr) {
+                if (!params.ctx_other->moe_cache_active() || getenv("LLAMA_DFLASH_DRAFT_VOCAB") != nullptr ||
+                        (vocab_wide && llama_moe_cache_wide_graphs(params.ctx_other))) {
                     const_cast<llama_model &>(model).draft_head_from_target(*llama_get_model(params.ctx_other));
                 } else {
                     LLAMA_LOG_INFO("%s: the target has a MoE cache: the DFlash2 draft keeps the full head (LLAMA_DFLASH_DRAFT_VOCAB=n: "
