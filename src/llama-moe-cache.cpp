@@ -8737,8 +8737,8 @@ struct llama_moe_cache::impl {
     // zero-copy gather before the layer's admitted experts could run (~84 experts, ~194 MiB per DFlash2 verify pass at a 48 GB cap on an
     // RTX PRO 6000, pass wall = 11.5 + 1.09 x the fetch kernels' ms), and the host path without the admission (the rule's share, copied in
     // the stream) left the computed experts out of the cache: hit rate 96.75% -> 94.5%, twice the misses per window, slower. Colab G4
-    // (48 vCPU, AMD EPYC 9B45), Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6, 48 GB: chat 276.5 -> 291.8 tok/s, 16.31 -> 15.61 ms per pass,
-    // hit rate with the host's experts 95.5% (plans/k19_g4miss48.md). The host's products are not the device's bit for bit (int8
+    // (48 vCPU, AMD EPYC 9B45), Qwen3.8-Flash-Next UD-IQ4_XS, 48 GB, 3 launches: DFlash2 n6 chat 277.0 -> 288.4 tok/s, MTP chat 233.8 ->
+    // 252.8, 8k 207.5 -> 212.0; ~15.6 ms per DFlash2 pass, hit rate with the host's experts 95.4-95.9%. Not bit for bit the device's (int8
     // activations): KLD-gated
     bool dec_band() const {
         static const bool on = [] {
