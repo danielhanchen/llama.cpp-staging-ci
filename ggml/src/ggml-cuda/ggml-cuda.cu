@@ -109,6 +109,9 @@
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #endif
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -2148,7 +2151,80 @@ static void * ggml_cuda_host_malloc(size_t size) {
     return ptr;
 }
 
+// Large pinned host buffers (the host copies of MoE experts that the CPU computes from and the GPU reads over the link) in transparent
+// huge pages: anonymous memory aligned to 2 MiB, MADV_HUGEPAGE, then registered (portable, mapped) instead of cudaMallocHost, whose
+// pages are 4 KiB. The CPU reads each expert as long streams of rows; with 4 KiB pages every 4 KiB is a TLB entry and a stop of the
+// hardware prefetcher. Only the backing pages differ: the bytes, the device address (unified addressing) and every result are the
+// same. GGML_CUDA_HOST_THP=0 off; GGML_CUDA_HOST_THP_MIN_MB (default 256): buffers from that size on. Linux only; any failure takes
+// cudaMallocHost as before
+#if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#define GGML_CUDA_HOST_THP_ALIGN ((size_t) 2 << 20)
+
+static size_t ggml_cuda_host_thp_min() {
+    static const size_t min_b = [] {
+        const char * e = getenv("GGML_CUDA_HOST_THP");
+        if (e != nullptr && atoi(e) == 0) {
+            return SIZE_MAX;
+        }
+        const char * m = getenv("GGML_CUDA_HOST_THP_MIN_MB");
+        const long long mb = m != nullptr ? atoll(m) : 256;
+        return (size_t) std::max(1LL, mb) << 20;
+    }();
+    return min_b;
+}
+
+static size_t ggml_cuda_host_thp_len(size_t size) {
+    return (size + GGML_CUDA_HOST_THP_ALIGN - 1)/GGML_CUDA_HOST_THP_ALIGN*GGML_CUDA_HOST_THP_ALIGN;
+}
+
+static void * ggml_cuda_host_malloc_thp(size_t size) {
+    if (ggml_cuda_pinned_memory_disabled() || size < ggml_cuda_host_thp_min()) {
+        return nullptr;
+    }
+    const size_t len = ggml_cuda_host_thp_len(size);
+    char * raw = (char *) mmap(nullptr, len + GGML_CUDA_HOST_THP_ALIGN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) {
+        return nullptr;
+    }
+    // keep the 2 MiB aligned part only
+    char * p = (char *) (((uintptr_t) raw + GGML_CUDA_HOST_THP_ALIGN - 1) & ~(uintptr_t) (GGML_CUDA_HOST_THP_ALIGN - 1));
+    if (p > raw) {
+        munmap(raw, (size_t) (p - raw));
+    }
+    const size_t tail = (size_t) (raw + len + GGML_CUDA_HOST_THP_ALIGN - (p + len));
+    if (tail > 0) {
+        munmap(p + len, tail);
+    }
+    const bool huge = madvise(p, len, MADV_HUGEPAGE) == 0;
+    if (cudaHostRegister(p, len, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        munmap(p, len);
+        return nullptr;
+    }
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        GGML_LOG_INFO("%s: pinned host buffers of %zu MiB and more in transparent huge pages (%s; GGML_CUDA_HOST_THP=0 off)\n", __func__,
+            ggml_cuda_host_thp_min() >> 20, huge ? "MADV_HUGEPAGE" : "madvise refused: 4 KiB pages");
+    }
+    return p;
+}
+
+static void ggml_backend_cuda_host_buffer_free_buffer_thp(ggml_backend_buffer_t buffer) {
+    const size_t len = ggml_cuda_host_thp_len(ggml_backend_buffer_get_size(buffer));
+    CUDA_CHECK(cudaHostUnregister(buffer->context));
+    munmap(buffer->context, len);
+}
+#endif // defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+#if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (void * thp = ggml_cuda_host_malloc_thp(size); thp != nullptr) {
+        ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(thp, size);
+        buffer->buft = buft;
+        buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer_thp;
+        return buffer;
+    }
+#endif // defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     void * ptr = ggml_cuda_host_malloc(size);
 
     if (ptr == nullptr) {
