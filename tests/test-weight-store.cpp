@@ -170,11 +170,17 @@ int main(int argc, char ** argv) {
                 fsync(fd);
                 for (size_t o = 0; o < file_size; o += (size_t) 2 << 20) {
                     madvise((uint8_t *) map + o, (size_t) 1 << 20, MADV_DONTNEED); // mapped pages are not dropped from the page cache
+#ifdef POSIX_FADV_DONTNEED
                     posix_fadvise(fd, (off_t) o, (off_t) 1 << 20, POSIX_FADV_DONTNEED);
+#endif
                 }
                 const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
                 std::vector<unsigned char> res((file_size + pg - 1) / pg);
+#if defined(__APPLE__)
+                if (mincore(map, file_size, (char *) res.data()) == 0) { // macOS: char * vector
+#else
                 if (mincore(map, file_size, res.data()) == 0) {
+#endif
                     for (unsigned char r : res) {
                         n_dropped += (r & 1) == 0;
                     }
