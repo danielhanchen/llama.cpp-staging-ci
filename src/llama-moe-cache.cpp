@@ -1198,6 +1198,7 @@ struct llama_moe_cache::impl {
     int      cm_dec_on    = -1;    // -1 not read yet
     int64_t  cm_dec_max   = 0;
     float    cm_dec_share = 0.125f;
+    bool     cm_dec_band  = false; // the fixed share comes from the wide-cache band rule (dec_band), not LLAMA_MOE_CPU_MISS_DECODE
     bool     cm_small_ok   = true;  // the last trial kept the host path for small batches
     bool     cm_small_live = true;  // the graphs of small batches use it now
     int      cmt_done   = -1;       // small batches of the running trial, -1 if none
@@ -8715,10 +8716,42 @@ struct llama_moe_cache::impl {
         cm_dec_on    = e != nullptr && atoi(e) != 0 ? 1 : 0;
         cm_dec_max   = std::max<int64_t>(1, std::min<int64_t>(single_max(), em != nullptr && atoi(em) > 0 ? atoi(em) : single_max()));
         cm_dec_share = es != nullptr ? (float) std::min(1.0, std::max(0.0, atof(es))) : 0.125f;
+        if (e == nullptr && dec_band()) {
+            static const double sh = getenv("LLAMA_MOE_WIDE_HOST_SHARE") != nullptr ? atof(getenv("LLAMA_MOE_WIDE_HOST_SHARE")) : 0.5;
+            cm_dec_on   = 1;
+            cm_dec_band = true;
+            if (es == nullptr) {
+                cm_dec_share = (float) std::min(1.0, std::max(0.0, sh));
+            }
+            LLAMA_LOG_INFO("llama_moe_cache%s: wide-cache host misses: %.1f%% of the host experts cached on a %d-CPU host: generation windows of "
+                "1..%" PRId64 " tokens admit %.3f of their missing experts (the most used; copies beside the graph) and the host computes every "
+                "missing expert (LLAMA_MOE_WIDE_HOST=0 off, LLAMA_MOE_WIDE_HOST_SHARE)\n",
+                tag, 100.0*cache_frac, llama_moe_n_cpus(), cm_dec_max, cm_dec_share);
+        }
+    }
+    // Wide-cache band (default on; LLAMA_MOE_WIDE_HOST=0 off): on a many-core host (single_wide_host) whose cache holds
+    // LLAMA_MOE_WIDE_HOST_MIN_FRAC (0.60) .. LLAMA_MOE_WIDE_HOST_MAX_FRAC (0.85) of the host experts, generation windows (not a prompt's
+    // tail) take the fixed-share host path above with the deferred admission of fetch_defer: the host computes every missing expert of
+    // the window through the mailbox, the device computes the hits alone, and the most used LLAMA_MOE_WIDE_HOST_SHARE (0.5) of the misses
+    // are copied into their slots beside the rest of the graph for later windows. Before, every miss of a window was fetched by the
+    // zero-copy gather before the layer's admitted experts could run (~84 experts, ~194 MiB per DFlash2 verify pass at a 48 GB cap on an
+    // RTX PRO 6000, pass wall = 11.5 + 1.09 x the fetch kernels' ms), and the host path without the admission (the rule's share, copied in
+    // the stream) left the computed experts out of the cache: hit rate 96.75% -> 94.5%, twice the misses per window, slower. Colab G4
+    // (48 vCPU, AMD EPYC 9B45), Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6, 48 GB: chat 276.5 -> 291.8 tok/s, 16.31 -> 15.61 ms per pass,
+    // hit rate with the host's experts 95.5% (plans/k19_g4miss48.md). The host's products are not the device's bit for bit (int8
+    // activations): KLD-gated
+    bool dec_band() const {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_WIDE_HOST");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        static const double lo = getenv("LLAMA_MOE_WIDE_HOST_MIN_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_WIDE_HOST_MIN_FRAC")) : 0.60;
+        static const double hi = getenv("LLAMA_MOE_WIDE_HOST_MAX_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_WIDE_HOST_MAX_FRAC")) : 0.85;
+        return on && single_wide_host() && !single_max_env && cache_frac >= lo && cache_frac < hi;
     }
     // k19-flint: a decode batch of n_tokens on the fixed-share host path (LLAMA_MOE_CPU_MISS_DECODE)
     bool cm_decode(int64_t n_tokens) const {
-        return cm_dec_on > 0 && cm && cm_cal && !cm_force && !cm_frozen && n_tokens >= 1 && n_tokens <= cm_dec_max && n_tokens <= max_batch &&
+        return cm_dec_on > 0 && !(cm_dec_band && cm_prompt_now) && cm && cm_cal && !cm_force && !cm_frozen && n_tokens >= 1 && n_tokens <= cm_dec_max && n_tokens <= max_batch &&
             n_tokens <= cm_max && single_form_state >= 0 && single_usable(n_tokens);
     }
 
@@ -9601,7 +9634,19 @@ struct llama_moe_cache::impl {
         // windows; a single token needs the overlap, which keeps the hits apart from the admitted experts)
         static const int64_t max_tok = getenv("LLAMA_MOE_FETCH_DEFER_MAX_TOKENS") != nullptr ?
             std::max<int64_t>(1, atoll(getenv("LLAMA_MOE_FETCH_DEFER_MAX_TOKENS"))) : 1;
-        if (mode == 0 || n_ubatch < 1 || n_ubatch > max_tok || (n_ubatch == 1 && !overlap_batch(n_ubatch)) || !single_req || single_off) {
+        if (mode == 0 || n_ubatch < 1 || (n_ubatch == 1 && !overlap_batch(n_ubatch)) || !single_req || single_off) {
+            return false;
+        }
+        // the wide-cache band (dec_band): every generation window on its fixed-share host path
+        if (cm_dec_band && getenv("LLAMA_MOE_FETCH_DEFER_MAX_TOKENS") == nullptr) {
+            const bool band_on = cm_decode(n_ubatch);
+            static std::atomic<bool> logged_band{false};
+            if (band_on && !logged_band.exchange(true)) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: wide-cache host misses: generation windows defer their admitted experts' copies (LLAMA_MOE_FETCH_DEFER=0 off)\n", tag);
+            }
+            return band_on;
+        }
+        if (n_ubatch > max_tok) {
             return false;
         }
         // only where the cache holds more than LLAMA_MOE_FETCH_DEFER_MIN_FRAC (0.25) and at most LLAMA_MOE_FETCH_DEFER_MAX_FRAC (0.5) of the
