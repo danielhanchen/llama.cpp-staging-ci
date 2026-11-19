@@ -2158,6 +2158,21 @@ private:
                 cc_max = std::max(cc_max, cc);
             }
             const bool dev_ok = n_gpu > 0 && cc_min >= 800;
+            // The restricted DFlash2 draft head beside a MoE cache that holds most of the experts (LLAMA_DFLASH_DRAFT_VOCAB_WIDE, see
+            // llama_context and the fit) is on where every GPU the fit uses has compute capability 12.0, the only cards it is measured on:
+            // Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS + DFlash2 n6, 48 GB, 3 launches: chat 281.2 -> 285.8 tok/s (+1.6%), the same text.
+            // An explicit LLAMA_DFLASH_DRAFT_VOCAB_WIDE keeps its value
+            if (getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE") == nullptr && sp.has_dft() && !gpus.empty()) {
+                bool all_120 = true;
+                for (ggml_backend_dev_t dev : gpus) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+                    all_120 = all_120 && cc_fn != nullptr && cc_fn(dev) == 1200;
+                }
+                if (all_120) {
+                    common_set_env("LLAMA_DFLASH_DRAFT_VOCAB_WIDE", "1");
+                }
+            }
             // no wider window where the experts will not all fit on the devices: there the fit runs an MoE cache, whose residency a
             // wider window moves, and sizing the outputs for 4 rows instead of 3 already takes from the cache (G4 fn4 16 GB, ktp_g4e: MoE
             // cache 5528 vs 5538 MiB, text != base, 0.94-0.96 of base at 16k / 30k). Decided before the fit, from the GGUF bytes (target

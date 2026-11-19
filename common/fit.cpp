@@ -1219,7 +1219,7 @@ static void common_params_fit_impl(
                     // on the target's head buffer: its bytes come from the cache here, so the prewarm keeps the memory it measured
                     // without the head (unpriced, the 140 MiB head left 8 of 21 verify graphs to the first request at 48 GB). With
                     // LLAMA_DFLASH_DRAFT_VOCAB set the draft estimate prices it instead
-                    static const bool dh_wide = (getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE") == nullptr || atoi(getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE")) != 0) &&
+                    static const bool dh_wide = (getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE") != nullptr && atoi(getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE")) != 0) &&
                         getenv("LLAMA_DFLASH_DRAFT_VOCAB") == nullptr;
                     if (dh_wide) {
                         dh_reserve = common_fit_dflash_head_bytes(path_model);

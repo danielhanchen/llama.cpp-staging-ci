@@ -530,8 +530,9 @@ llama_context::llama_context(
             // A cache that holds most of the experts (llama_moe_cache_wide_graphs: the band where the verify graphs are prewarmed as
             // without a cache) also takes the restricted head by default, where the drafter's lm head is a quarter of its graph; the fit
             // keeps the head's bytes free from the cache in that band beside a DFlash draft model, so the prewarm keeps its memory
-            // (LLAMA_DFLASH_DRAFT_VOCAB_WIDE=0: the full head and no reserve, as before)
-            static const bool vocab_wide = getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE") == nullptr || atoi(getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE")) != 0;
+            // (LLAMA_DFLASH_DRAFT_VOCAB_WIDE=1, which the server sets on compute capability 12.0 cards only; 0 or unset: the full head and
+            // no reserve, as before)
+            static const bool vocab_wide = getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE") != nullptr && atoi(getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE")) != 0;
             if (model.arch == LLM_ARCH_DFLASH && model.output == nullptr) {
                 if (!params.ctx_other->moe_cache_active() || getenv("LLAMA_DFLASH_DRAFT_VOCAB") != nullptr ||
                         (vocab_wide && llama_moe_cache_wide_graphs(params.ctx_other))) {
