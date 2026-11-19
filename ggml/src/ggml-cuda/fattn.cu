@@ -380,8 +380,8 @@ void ggml_cuda_flash_attn_ext_set_q8_inplace_rows(const int device, const int ro
 // tensor cores, rows of whole blocks starting 4 byte aligned: the MMA kernel reads them in place. The same answer for the launch and for the
 // graph allocation (ggml_cuda_flash_attn_ext_get_alloc_size: no f16 copy behind the output). GGML_CUDA_FATTN_Q8_INPLACE=0: off
 // k19-fattnq4: likewise q4_0 K and / or V (q4_0 / q4_0, q4_0 / q8_0, q8_0 / q4_0), GGML_CUDA_FATTN_Q4_INPLACE=0: off (staged f16 copy
-// as before). Up to GGML_CUDA_FATTN_Q4_INPLACE_MAX_ROWS query rows (default 16: verify windows; prompt ubatches stay staged, see
-// plans/k19_fattnq4.md). The allocation answer (for_alloc) of a pair with q4_0 is in place only up to 16 rows, the configs that have a
+// as before). Up to GGML_CUDA_FATTN_Q4_INPLACE_MAX_ROWS query rows (default 16: verify windows; prompt ubatches stay staged).
+// The allocation answer (for_alloc) of a pair with q4_0 is in place only up to 16 rows, the configs that have a
 // q4_0 kernel (ggml_cuda_flash_attn_ext_mma_kvq_compiled); a launch of more rows in place leaves the reserved copy unused.
 // Returns 0 (staged) or the in-place code of fattn-mma-f16.cuh: 1 | 4 (K q4_0) | 8 (V q4_0)
 int ggml_cuda_flash_attn_ext_mma_kvq_inplace(const int device, const ggml_tensor * dst, const bool for_alloc) {
@@ -1889,7 +1889,7 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
         const best_fattn_kernel k1 = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), &d1);
         // k15-lfm2, GGML_CUDA_FA_VERIFY_MMA=1 (opt-in): where the one query node runs the MMA kernel (Turing / Ampere: f16 KQ tiles,
         // f16 P, half2 VKQ), the verify node runs that kernel once for all its queries instead of once per query. Same kernel family
-        // and number formats, only the tiling of the KV loop / softmax rescales and the KV split differ (plans/k11.md equivalence
+        // and number formats, only the tiling of the KV loop / softmax rescales and the KV split differ (equivalence
         // rule: reassociation); taken only when the batched node would pick the MMA kernel too
         static const bool verify_mma = [] {
             const char * e = getenv("GGML_CUDA_FA_VERIFY_MMA");

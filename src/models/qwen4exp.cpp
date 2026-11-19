@@ -596,7 +596,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // every row output=false) is only read later through the caches it writes: the block's K / V and, for a QSA block, the indexer
     // keys and pooled keys. So the graph ends after those writes: no query, attention, output projection, FFN (512 Q8_0 experts) or
     // head. The written rows come from the same ops on the same rows, so the cache bytes, drafts and output are those of the full
-    // block. Strata's MTP prompt pass (draft_kv) also stops at the K / V append
+    // block
     static const bool kv_only_env = getenv("LLAMA_MTP_PROMPT_KV_ONLY") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY")) != 0;
     // the catch-up after a verify too (LLAMA_MTP_CATCHUP_KV_ONLY=0: only from 64 rows, LLAMA_MTP_PROMPT_KV_ONLY_MIN=N: from N rows). Its
     // rows' FFN output is never read: a single MTP block's next draft starts from the target's hidden row. With the drafter's experts

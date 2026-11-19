@@ -1822,7 +1822,7 @@ static constexpr bool mmq_pipe_instantiated() {
          type == GGML_TYPE_Q5_K  || type == GGML_TYPE_Q6_K);
 }
 
-// The bits measured fastest on an RTX PRO 6000 (G4, tests/test-mmq-pipe, plans/k19_mmq_pipe.md) per type, tile width and grid form.
+// The bits measured fastest on an RTX PRO 6000 (G4, tests/test-mmq-pipe) per type, tile width and grid form.
 // one_tile_per_block: the grid has a block per output tile; otherwise it is the stream-k split over one block per SM, which has no
 // second block to put on an SM
 static int mmq_pipe_policy(const ggml_type type, const int J, const bool one_tile_per_block) {
@@ -1920,7 +1920,7 @@ static mmq_kernel_t mmq_pipe_kernel(const mmq_args & args, const int cc, const i
     const bool sm80 = sm80_on && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE &&
         ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_AMPERE;
     // k19-p5mmq: the same kernels on Turing (cc 7.5, sm_75 code; 64 KiB of shared memory per SM: one J <= 64 tile, so OCC2 drops
-    // itself where 2 blocks do not fit). GGML_CUDA_MMQ_PIPE_SM75=1 turns it on (default: off, see plans/k19_p5mmq.md)
+    // itself where 2 blocks do not fit). GGML_CUDA_MMQ_PIPE_SM75=1 turns it on (default: off)
     static const bool sm75_on = [] {
         const char * e = getenv("GGML_CUDA_MMQ_PIPE_SM75");
         return e != nullptr && atoi(e) != 0;

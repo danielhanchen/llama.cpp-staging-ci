@@ -4,7 +4,7 @@
 // (ggml_flash_attn_ext_set_kv_len, the n_kv bucket of LLAMA_KV_BUCKET_DEV) and without it, against a double precision reference of
 // the visible cells. Every output must be finite and within the tolerance of the reference: row t of T sees the cells [0, L - T + 1 + t)
 // of a padded node of P cells (the causal mask of a window that ends at cell L - 1), the cells past L hold zeros (a cleared cache), the
-// device length is L rounded up to 256 cells. The 8 GB G4 token-0 bug (plans/k19_nanfix.md): T = 2, P = 2048, q8_0, L = 2 (the seq_rm
+// device length is L rounded up to 256 cells. The 8 GB G4 token-0 bug: T = 2, P = 2048, q8_0, L = 2 (the seq_rm
 // probe) or 643 (a verify window after a 640 token prompt) take the vector kernel at the live length, which read row j of the mask at
 // j*ne11 (the live cells) instead of its row stride (the padded cells): row 1 read row 0's masked tail, saw no cell and wrote NaN.
 // usage: test-fa-kvlen-rows [-v]. No GPU: the CPU backend (checks the reference only).

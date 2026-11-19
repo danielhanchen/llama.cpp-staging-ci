@@ -938,7 +938,7 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
     }
 }
 
-// k19-kqtc AUTO table (min columns, 0 = off), from Qwen3.8-27B UD-Q4_K_XL + MTP verify passes (plans/k19_kqtc.md):
+// k19-kqtc AUTO table (min columns, 0 = off), from Qwen3.8-27B UD-Q4_K_XL + MTP verify passes:
 // - cc 8.0 (A100 / A30): K-quants from 2 columns (micro-bench 5 columns: Q4_K 53%, Q5_K 57% of the batched mmvq; q38d MTP +41% chat,
 //   +39% 8k on an A100 40 GB), Q6_K / IQ4_XS from 3, Q8_0 from 5 (from 2 it moved q4x's Q8_0 verify text: -5% chat by acceptance);
 // - cc 8.9 (Ada, L4): the upstream table (L4 q38d +8.5% chat, +5.4% 8k);

@@ -3692,7 +3692,7 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 // ---- k19-hostrow: an AVX-512 IQ3_S dot product (single and multi-column), bit-identical to the AVX2 kernel -------------------------
 // The host experts of a spilled MoE (Flash-Next UD-IQ4_XS at 8 GB: gate / up IQ3_S, down IQ4_NL, ~0.2% of the experts on the device)
 // are bound by the IQ3_S decode, not by DRAM: with 24 threads the AVX2 kernel reads 73 GB/s of weights from the LLC and 60-72 GB/s from
-// DRAM against a 141-195 GB/s read roofline (Xeon 8559C, scripts/k19hostrow/bench_host.cpp; IQ4_NL runs 210-230 GB/s from the LLC),
+// DRAM against a 141-195 GB/s read roofline (Xeon 8559C; IQ4_NL runs 210-230 GB/s from the LLC),
 // so every verified row of a draft window costs about one more token of host time. Here the 16 grid entries of 64 weights come from
 // one 512-bit gather (the AVX2 kernel inserts them one by one through the shuffle port), the signs are a 64-bit mask (a masked negate
 // of the activations), and one 512-bit maddubs / madd covers two sub-blocks of 32. The int32 lanes of the two sub-blocks are added

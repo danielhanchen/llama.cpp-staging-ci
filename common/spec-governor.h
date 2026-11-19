@@ -12,7 +12,7 @@
 // Qwen3.6 + MTP: re-measuring a plain block at every request cost 2-5% of the decode where drafting wins). The first sample of each side after a change is
 // dropped (it pays the graph rebuild), and so is the worst drafted sample of a round.
 //
-// From plans/mtp_adapt.md (an EMA of step costs carried the warm-up and costs of another context into later decisions): every
+// (an EMA of step costs carried the warm-up and costs of another context into later decisions): every
 // verdict compares blocks of the same round, measured back to back at the same context length. A re-probe after a park is judged
 // against the last parked steps (plain decodes measured just before it), never against an older plain cost, and a round's samples
 // are dropped when a request ends.
@@ -20,7 +20,7 @@
 // Steps where drafting was allowed but produced no draft (an n-gram drafter without a match) are not samples of either side.
 // OPT-IN, LLAMA_SPEC_GOVERNOR=1 (unset / 0: off, drafting always allowed, the code path of the k9 tip): on G4 (RTX PRO 6000) it cost
 // 0-5% decode beside a winning MTP head (Qwen3.6-35B-A3B, gemma-4-26B-A4B + its assistant, n_max 2) and did not recover the n-gram
-// losses on LFM2.5 (plans/k9_draft.md). LLAMA_SPEC_GOVERNOR_MARGIN (1.03): drafting stays
+// losses on LFM2.5. LLAMA_SPEC_GOVERNOR_MARGIN (1.03): drafting stays
 // on while its ms per token is at most margin x the plain one; LLAMA_SPEC_GOVERNOR_LOG=1 logs every verdict.
 
 #include <algorithm>

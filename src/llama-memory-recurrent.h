@@ -90,7 +90,7 @@ public:
     // k15-rsr: copies the per-token snapshot `group` of cell `cell` onto its live row (group 0) on the device; false when off or failed
     bool rollback_copy(uint32_t cell, uint32_t group);
 
-    // k16-draft (LLAMA_RS_REPLAY, the commit-by-replay of Strata's verify window, include/strata/core/verify.hpp:13-18): the delta-net
+    // k16-draft (LLAMA_RS_REPLAY, commit-by-replay of the verify window): the delta-net
     // states (s_l) keep one row per cell instead of 1 + n_rs_seq. A window of at most 1 + n_rs_seq tokens per sequence reads the row and
     // leaves it as it was, and stores its delta-net inputs (k, v, gate, beta; rk_l ...) per layer and cell; its conv histories (r_l, p_l)
     // keep their snapshot rows. The commit (llama_context::rs_replay_commit, run before the memory is read again: the next ubatch, a

@@ -2500,7 +2500,7 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
 
 // k19-draftcost: the restricted draft head of a DFlash2 draft. The noise block projects onto the target's lm head (ctx_other), all 248320
 // rows for each of its 8 tokens, and the selector keeps only the top-k (16) of each row (G4 Flash-Next: the head is 0.36 of the 1.47 ms
-// drafter graph; Strata drafts over 106299 tokens at 0.17 ms). The rows of the restricted vocabulary (llama_draft_vocab_ids, plus the
+// drafter graph). The rows of the restricted vocabulary (llama_draft_vocab_ids, plus the
 // LLAMA_MTP_DRAFT_VOCAB_CTX request rows of llama_model_draft_head_add) are copied from the target's head, in its type and on its
 // buffer type, into a head of the draft; the selector takes its top-k over them and maps it to token ids through d2t_i32 (dflash.cpp).
 // Only the drafts change: the target verifies every token. LLAMA_DFLASH_DRAFT_VOCAB=n (default 65536), 0: the full head

@@ -8534,7 +8534,7 @@ struct test_moe_amax_rescale : public test_case {
 
 // k15-fn: a gated op (swiglu GLU, or SIGMOID / SILU -> MUL as the CUDA backend fuses it) read by a quantized mat-vec product
 // (MUL_MAT, or MUL_MAT_ID over n_used rows as the MoE down projection): the CUDA gated kernel writes the q8_1 copy of its output
-// for the product (unary_gated_q8_1_kernel), as Strata fuses swiglu + quantize
+// for the product (unary_gated_q8_1_kernel): swiglu + quantize fused
 struct test_gated_mmvq : public test_case {
     const ggml_type type;
     const std::string gate; // "swiglu", "sigmoid", "silu"

@@ -277,8 +277,8 @@ LLAMA_API double llama_moe_cache_frac(const struct llama_context * ctx);
 // (32768; 0 = any size). False without a cache or before its slots are sized
 LLAMA_API bool llama_moe_cache_wide_graphs(const struct llama_context * ctx);
 
-// k15-ttft: a prompt run as one ubatch instead of [n-4] [4] differs from the split run only by IEEE reassociation (plans/k11.md
-// "Equivalence rule"): every layer weight is computed on a CUDA device with no host-computed expert (llama_verify_exact_placement and
+// k15-ttft: a prompt run as one ubatch instead of [n-4] [4] differs from the split run only by IEEE reassociation
+// (equivalence rule): every layer weight is computed on a CUDA device with no host-computed expert (llama_verify_exact_placement and
 // llama_moe_host_mode == 0), and no F16 matmul weight (cuBLAS accumulates F16 products in F16 above 16 rows, MMF in F32 below).
 // On such a placement both shapes use the same formats: q8_1 activations into int8 MMVQ / MMQ with F32 accumulation, TF32 for F32
 // weights (MMF and cuBLAS SGEMM under CUBLAS_TF32_TENSOR_OP_MATH), BF16 in / F32 out, FlashAttention MMA F16 (at least 4 rows)

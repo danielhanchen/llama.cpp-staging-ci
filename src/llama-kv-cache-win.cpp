@@ -4,7 +4,7 @@
 // among the last W positions of its sequence or among its first S positions, in a ring slot of a wider type (typically q8_0) written
 // from the same rotated K / V. Query row r (position p) reads a visible cell from the ring iff the cell holds a live slot and
 // (pos > p - W or pos < S); otherwise from the body. The ring holds n_seq_per_stream*(W + S) + n_ubatch slots per stream, so every
-// cell in a row's window has one in normal operation (appends, rollback of rejected drafts). See plans/k19_kvwin.md.
+// cell in a row's window has one in normal operation (appends, rollback of rejected drafts).
 
 #include "llama-kv-cache.h"
 

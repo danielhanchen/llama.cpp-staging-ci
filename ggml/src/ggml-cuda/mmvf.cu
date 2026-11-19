@@ -1098,9 +1098,9 @@ bool ggml_cuda_verify_graph_active() {
 // mmvq's per-column sums do not depend on the column count once the kernel family and the warps are fixed (block size from K only, rows
 // per block and K unrolling do not change a row's sum), so with all three bits a row of a 5..8-row window gets, for these products, the
 // bytes of the same row in a 1..4-row window, and a deeper window costs the extra columns only. Not bit-identical to a 5..8-row window
-// without it (another f32 summation order than MMF / cuBLAS / 2-warp mmvq: KLD-gated, plans/k19_vrow3.md); windows of 1..4 rows and
+// without it (another f32 summation order than MMF / cuBLAS / 2-warp mmvq: KLD-gated); windows of 1..4 rows and
 // untagged graphs (prompt chunks) are not touched. NVIDIA Ampere and newer only, CUDA builds only: HIP / MUSA and older GPUs keep their
-// kernels. As any reassociation, it can flip a borderline MoE top-k route that then drifts (kvr2_tfc1 / k19-v5bug, plans/k19_v5bug.md).
+// kernels. As any reassociation, it can flip a borderline MoE top-k route that then drifts (kvr2_tfc1 / k19-v5bug).
 // 8 (k19-ampere, opt-in: GGML_CUDA_VERIFY_WIDE=15): MUL_MAT_IDs of 5..8 tokens stay on the multi-token mmvq kernels where the Turing /
 // Ampere table sends them to MMQ (ggml_cuda_mmvq_mmid_max_batch; Ada / Blackwell already keep them, so nothing changes there)
 int ggml_cuda_verify_wide_cols(const int cc, const int bit) {

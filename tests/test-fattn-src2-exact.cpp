@@ -1,6 +1,6 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// k19-fattnq4: two-source flash attention (ggml_flash_attn_ext_set_src2: a body K / V with its mask plus a ring K / V with its own mask,
-// plans/k19_kvwin.md) on the CUDA MMA kernel, byte for byte:
+// k19-fattnq4: two-source flash attention (ggml_flash_attn_ext_set_src2: a body K / V with its mask plus a ring K / V with its own mask)
+// on the CUDA MMA kernel, byte for byte:
 //   (a) the two-source node in place (body q4_0 / q4_0 or q8_0 / q8_0 read in place, ring q8_0 / q8_0 in place; default load mode and
 //       GGML_CUDA_FATTN_Q8_MODE=1 synchronous loads) == the same node staged (GGML_CUDA_FATTN_Q4_INPLACE=0, GGML_CUDA_FATTN_Q8_INPLACE=0:
 //       both sources converted to f16);

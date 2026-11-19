@@ -21,8 +21,8 @@
 #include <algorithm>
 #include <string>
 
-// k13: default spill drafting modes per model and host path (see server_spec_spill_mode), gated by the KLD gate of plans/k11.md and the
-// G4 timing of plans/k13_lfm.md section 10 (both must pass):
+// k13: default spill drafting modes per model and host path (see server_spec_spill_mode), gated by the KLD gate and the
+// G4 timing (both must pass):
 //   - LFM2.5 with the hybrid gate (small caches, G4 4 GB): mode 1 from repeats of at least 16 tokens (chat = kill switch, 2k +35%,
 //     8k +5%; decode KLD inside the -fa off band, first token unchanged);
 //   - LFM2.5 with the CPU-miss rule (G4 8 GB): mode 3 (k15: its prompts stay off the pinned host path, LLAMA_MOE_PIN_PROMPT_DEV, so
@@ -54,7 +54,7 @@ static int server_spec_spill_min_match(int32_t host_mode) {
 // k15-spec: the shortest repeat the default spill drafts take on a long prompt (LLAMA_SPEC_SPILL_LONG_PROMPT tokens, default 4096). A long
 // prompt (a document, code to edit) is copied in long runs, where a repeat of a few tokens already predicts the next ones; the cost
 // policy still prices each window. host_mode 1 (the hybrid gate, G4 LFM2.5 4 GB) only: the CPU-miss rule's mode 3 (8 GB) already takes
-// every match; chat prompts keep server_spec_spill_min_match (16). Changes text, KLD-gated (plans/k15_models.md, G4 k15spec kld4:
+// every match; chat prompts keep server_spec_spill_min_match (16). Changes text, KLD-gated (G4 k15spec kld4:
 // short192 + long48 inside the calibrated band, = the 16+ default) and timed (G4 4 GB 8k 122-124 -> 164-166 tok/s, chat unchanged).
 // LLAMA_SPEC_SPILL_MIN_MATCH_LONG=16: off.
 #ifndef SPEC_SPILL_MIN_MATCH_LONG_GATE
@@ -68,7 +68,7 @@ static int server_spec_spill_long_prompt() {
 // k15-spec: with the CPU-miss rule (mode 3, G4 LFM2.5 8 GB) a long prompt takes no drafts: their verify windows read host-spilled experts
 // (4 rows 13.4 ms, 8 rows 33 ms against a 4.5 ms plain round), and the pinned host path alone is what wins (G4 8 GB 8k: pinned without
 // drafts 221.3 tok/s, with drafts 196.1, mode 0 206.0; chat 170.7 / 170.0). A repeat no longer than the longest match (64) never drafts.
-// The text is that of the pinned path without drafts (KLD-gated, plans/k15_models.md). LLAMA_SPEC_SPILL_LONG_CM=3: drafts from 3+ (as before)
+// The text is that of the pinned path without drafts (KLD-gated). LLAMA_SPEC_SPILL_LONG_CM=3: drafts from 3+ (as before)
 // k17-models: repeats of 8+ (LLAMA_SPEC_SPILL_LONG_CM=65: the k15-spec value above, no long-prompt drafts). LFM2.5 Q4_K_XL 12 GB on this
 // head (k17m_l4lf / k17m_g4lf, f976a60d684, 2 launches): L4 8k 75.8-76.2 -> 91.4-91.6 tok/s, 16k 71.9-72.1 -> 79.1-79.5, long48 76.6 ->
 // 78.5; G4 8k 258.7 -> 312.6-313.8, 16k 278.1-279.1 -> 290.6-292.8, long48 248.4 -> 251.0; chat / 2k unchanged (short prompts). 3 lost G4
@@ -100,7 +100,7 @@ static int server_spec_spill_min_match_long(int32_t host_mode, int min_match, co
     return c != nullptr ? std::max(3, atoi(c)) : SPEC_SPILL_MIN_MATCH_LONG_CM;
 }
 
-// k15-lfm2: see server_context::spill_pinned. Opt-in (LLAMA_SPEC_SPILL_UNPIN_LONG=1): G4 LFM2.5, 3 launches (plans/k15_lfm2.md section 10):
+// k15-lfm2: see server_context::spill_pinned. Opt-in (LLAMA_SPEC_SPILL_UNPIN_LONG=1): G4 LFM2.5, 3 launches :
 // 12 GB 16k +10% (247.0 vs 223.8 tok/s), but 12 GB 8k -2.1%, 8 GB 8k -5.2%, 8 GB 16k -3.6%
 // =2: lifted before the prompt of such a request (its prompt runs as without drafts too), restored before the next one
 static int server_spec_spill_unpin_long() {
@@ -160,14 +160,14 @@ static bool server_spec_auto_exact() {
 }
 
 // k13: the default drafts freeze the small batches of a MoE cache with CPU misses so that they verify exactly (llama_moe_freeze_small);
-// opt-in (LLAMA_SPEC_EXACT_FROZEN=1): exact, but the frozen cache stops following the decode, a loss at long prompts (plans/k13_lfm.md)
+// opt-in (LLAMA_SPEC_EXACT_FROZEN=1): exact, but the frozen cache stops following the decode, a loss at long prompts
 static bool server_spec_exact_frozen() {
     const char * e = getenv("LLAMA_SPEC_EXACT_FROZEN");
     return e != nullptr && atoi(e) != 0;
 }
 
 // k13: default n-gram drafts where a MoE cache's host computes experts (text changes, so a model gets it only after the KLD gate of
-// plans/k11.md passed for it, plans/k13_lfm.md). host_mode: llama_moe_host_mode. Returns 0 = no drafts (the k12 behaviour), 1 = drafts
+// passed for it). host_mode: llama_moe_host_mode. Returns 0 = no drafts (the k12 behaviour), 1 = drafts
 // verified as ordinary batches with the host path, 2 = frozen small batches with drafts verified exactly against them, 3 = as 1 with the
 // small-batch host path of the CPU-miss rule pinned on (llama_moe_pin_small; 1 where the cache has no CPU-miss rule).
 // LLAMA_SPEC_SPILL=0 off, 1 / 2 / 3 force that mode for any model.
@@ -181,8 +181,7 @@ static int server_spec_spill_cm_min_threads() {
     return e != nullptr ? std::max(0, atoi(e)) : 4;
 }
 
-// k17-models: Flint (arch flint) drafted nothing at any spilled tier (4-16 GB): mode 0 for every arch but LFM2.5 / gemma-4, while
-// PolyStrata drafts 60-140 of 256 tokens there and per forward pass we were as fast or faster (plans/k17_models.md section 1). Spill
+// k17-models: Flint (arch flint) drafted nothing at any spilled tier (4-16 GB): mode 0 for every arch but LFM2.5 / gemma-4. Spill
 // mode SPEC_SPILL_FLINT_GATE with the hybrid gate, SPEC_SPILL_FLINT_CM with the CPU-miss rule. Changes text where it drafts (verify
 // windows run as ordinary batches with the host path), KLD-gated. LLAMA_SPEC_SPILL_FLINT=0: off (mode 0, the previous default).
 // The LLAMA_SPEC_SPILL_CM_MIN_THREADS guard is for mode 3 only (its pinned small-batch host path is what loses on 2 threads); mode 1 pins
@@ -215,7 +214,7 @@ static int server_spec_spill_mode(const std::string & arch, int32_t host_mode, i
         const int m = host_mode == 1 ? SPEC_SPILL_FLINT_GATE : SPEC_SPILL_FLINT_CM;
         return m == 3 && n_threads > 0 && n_threads < server_spec_spill_cm_min_threads() ? 0 : m;
     }
-    // per (model, host path) after the KLD gate and the G4 timing (plans/k13_lfm.md section 10)
+    // per (model, host path) after the KLD gate and the G4 timing
     if (arch == "lfm2moe") {
         if (host_mode != 1 && n_threads > 0 && n_threads < server_spec_spill_cm_min_threads()) {
             return 0;
@@ -228,7 +227,7 @@ static int server_spec_spill_mode(const std::string & arch, int32_t host_mode, i
     // k19-agn: every other arch took mode 0, so a MoE cache with the CPU-miss rule (or the hybrid gate) dropped the default drafts that
     // the same cache without it keeps (verified with the reassociated verify): G4 gpt-oss-20b Q2_K 8 GB 8k 250 tok/s by default vs 412 with
     // LLAMA_MOE_CPU_MISS=0. Mode 1 (drafts verified as ordinary batches with the host path, nothing pinned) is Flint's, the arch-neutral
-    // one; changes text where it drafts, KLD-gated (plans/k19_agn.md). LLAMA_SPEC_SPILL_GENERIC=0: mode 0 (the previous default), N: mode N
+    // one; changes text where it drafts, KLD-gated. LLAMA_SPEC_SPILL_GENERIC=0: mode 0 (the previous default), N: mode N
     if (const char * e = getenv("LLAMA_SPEC_SPILL_GENERIC")) {
         return std::max(0, std::min(3, atoi(e)));
     }

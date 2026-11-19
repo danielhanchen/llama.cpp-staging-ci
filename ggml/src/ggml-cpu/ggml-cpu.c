@@ -1914,8 +1914,8 @@ static void ggml_moe_host_ffn_thread_impl(struct ggml_moe_host_job * j, int ith,
 }
 
 // ---- k19-l4b: the host team of ggml_cpu_moe_host_ffn_team (GGML_MOE_HOST_TEAM, default on; 0 = the OpenMP region of k18) -------------
-// Colab L4 (12 vCPUs, 6 cores) LFM2.5 4 GB: the host experts take most of a decode step (5 threads, 661 us per batch), PolyStrata runs them
-// on 12 threads. A larger OpenMP team does not get there: libgomp counts every OpenMP thread of the process (the decode team as well) and,
+// Colab L4 (12 vCPUs, 6 cores) LFM2.5 4 GB: the host experts take most of a decode step (5 threads, 661 us per batch).
+// A larger OpenMP team does not get there: libgomp counts every OpenMP thread of the process (the decode team as well) and,
 // with more of them than CPUs, stops spinning between regions, so each batch waits for its threads to wake up (k16_l4g: an 11-thread team
 // lost 9-34%, 2.7-4.9 cores busy). These threads are the batch's own: the caller is thread 0, the others spin on a counter between
 // batches and sleep after GGML_MOE_HOST_TEAM_SPIN_US (2000) without one. Up to GGML_MOE_TEAM_MAX threads; one batch at a time.
