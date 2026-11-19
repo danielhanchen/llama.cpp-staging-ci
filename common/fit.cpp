@@ -697,6 +697,54 @@ static bool common_fit_is_dflash_draft(const char * path) {
     return ok;
 }
 
+// bytes of the restricted DFlash2 draft head a target's lm head gives (llama_model::draft_head_from_target): 65536 tokens + the 4096
+// request rows + up to 1024 control tokens, in the type of the target's output.weight; 0 if the head would not be restricted
+static int64_t common_fit_dflash_head_bytes(const char * path) {
+    static std::string last_path;
+    static int64_t     last_b = 0;
+    if (path == nullptr) {
+        return 0;
+    }
+    if (last_path == path) {
+        return last_b;
+    }
+    int64_t b = 0;
+    const int64_t n_rows = 65536 + 4096 + 1024;
+    std::string fname = path;
+    int n_split = 1;
+    for (int i = 0; i < n_split && b == 0; ++i) {
+        ggml_context * meta = nullptr;
+        gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+        gguf_context_ptr gctx(gguf_init_from_file(fname.c_str(), gp));
+        if (!gctx) {
+            break;
+        }
+        ggml_context_ptr meta_ptr(meta);
+        if (i == 0) {
+            const int64_t kid = gguf_find_key(gctx.get(), "split.count");
+            n_split = kid >= 0 ? (int) gguf_get_val_u16(gctx.get(), kid) : 1;
+        }
+        if (const ggml_tensor * out = ggml_get_tensor(meta, "output.weight")) {
+            if (n_rows*10 <= out->ne[1]*9) {
+                b = n_rows*(int64_t) ggml_row_size(out->type, out->ne[0]);
+            }
+            break;
+        }
+        if (i + 1 < n_split) {
+            char prefix[4096];
+            char next[4096];
+            if (llama_split_prefix(prefix, sizeof(prefix), path, 0, n_split) <= 0) {
+                break;
+            }
+            llama_split_path(next, sizeof(next), prefix, i + 1, n_split);
+            fname = next;
+        }
+    }
+    last_path = path;
+    last_b    = b;
+    return b;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -1070,8 +1118,9 @@ static void common_params_fit_impl(
     auto fit_moe_cache_size = [&](dmds_t & dmds, const llama_model_params * mp, const bool use_margins) -> int64_t {
         g_moe_margin_gain = 0; // the last sizing of the cache decides
         int64_t pw_reserve = 0; // k19-int3fix2: prewarmed verify graphs beside a wide-graphs cache (common_fit_set_prewarm_graphs)
+        int64_t dh_reserve = 0; // the restricted DFlash2 draft head beside a wide-graphs cache (see below)
         auto margin_of = [&](size_t id) -> int64_t {
-            return use_margins ? int64_t(margins[id]) + pw_reserve : 0;
+            return use_margins ? int64_t(margins[id]) + pw_reserve + dh_reserve : 0;
         };
         auto surplus_of = [&](const dmds_t & d) {
             int64_t s = 0;
@@ -1166,6 +1215,15 @@ static void common_params_fit_impl(
                 const double avail = (double) (int64_t(dmds[id].free) - int64_t(dmds_nc[id].mb.total()));
                 if (hl_wide_exp > 0.0 && hl_wide_exp >= wide_min && avail >= wide_frac*hl_wide_exp) {
                     hl = -2; // the step-down stays off (the prewarm's memory beside a DFlash draft model)
+                    // the draft context then makes the restricted head of the DFlash2 draft (llama_context, LLAMA_DFLASH_DRAFT_VOCAB_WIDE)
+                    // on the target's head buffer: its bytes come from the cache here, so the prewarm keeps the memory it measured
+                    // without the head (unpriced, the 140 MiB head left 8 of 21 verify graphs to the first request at 48 GB). With
+                    // LLAMA_DFLASH_DRAFT_VOCAB set the draft estimate prices it instead
+                    static const bool dh_wide = (getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE") == nullptr || atoi(getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE")) != 0) &&
+                        getenv("LLAMA_DFLASH_DRAFT_VOCAB") == nullptr;
+                    if (dh_wide) {
+                        dh_reserve = common_fit_dflash_head_bytes(path_model);
+                    }
                 }
                 if (hl_min_share > 0.0 && hl_experts > 0.0 && avail < hl_min_share*hl_experts) {
                     hl = -2; // the step-down stays off (below the share)
