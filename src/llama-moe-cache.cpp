@@ -3063,6 +3063,13 @@ struct llama_moe_cache::impl {
         const char * e = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS");
         return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : (single_wide_host() ? GGML_MOE_MAILBOX_MAX_TOKENS : 4)));
     }();
+    static bool single_wide_low_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_SINGLE_WIDE_LOW");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
+    }
     // the largest batch on the mailbox now: the wide default only where the cache holds at least LLAMA_MOE_SINGLE_WIDE_MIN_FRAC of the
     // host experts (cache_frac is known after the slots are sized; before that the wide default counts)
     int single_max() const {
@@ -3074,9 +3081,21 @@ struct llama_moe_cache::impl {
         // wins at 16 GB too: Colab G4 Flash-Next UD-IQ4_XS DFlash2 n6, 16 GB (15.5% cached), same text, w7 27.1 -> 24.9 ms, chat 161.9 ->
         // 179.1 tok/s, 8k 120.9 -> 126.9 (gp_p1, 2 launches). nsys (node trace, ms per w7 pass): eager split 33.5 wall = 25.0 busy + 7.7 idle
         // inside the verify (111 launches, the device waiting on each layer's host split) vs the mailbox 29.8 = 27.3 + 1.6 (29 launches,
-        // host-expert wait + merge 3.6). 12 GB (about 9% cached, DFlash2 not admitted by default) keeps the split
+        // host-expert wait + merge 3.6). 12 GB (about 9% cached, DFlash2 not admitted by default then) kept the split.
+        // LLAMA_MOE_SINGLE_WIDE_LOW=0 keeps 0.12; default 0.05 (the floor of the fixed-cost DFlash2 window band, below
+        // which the whole draft is rarely verified). Now that the DFlash2 drafter is kept at 12 GB its 7-row windows run on the mailbox there
+        // too: Colab G4 Flash-Next UD-IQ4_XS DFlash2 n6, 12 GB / 131K (8.3% cached), same text: chat 136.1 -> 142.9 tok/s, 8k 113.4 ->
+        // 114.8 (3 interleaved launches)
         static const double min_frac = getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC")) :
-            (g4pass_on() ? 0.12 : 0.20);
+            !g4pass_on() ? 0.20 : single_wide_low_on() ? 0.05 : 0.12;
+        if (!single_max_env && single_max_tok > 4 && cache_frac >= min_frac && cache_frac < 0.12 && single_wide_low_on()) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LLAMA_LOG_INFO("llama_moe_cache: wide mailbox: windows of up to %d rows on the mailbox at %.1f%% of the host experts cached "
+                    "(LLAMA_MOE_SINGLE_WIDE_LOW=0: 4 below 12%%)\n", single_max_tok, 100.0*cache_frac);
+            }
+        }
         return !single_max_env && single_max_tok > 4 && cache_frac >= 0.0 && cache_frac < min_frac ? 4 : single_max_tok;
     }
 
