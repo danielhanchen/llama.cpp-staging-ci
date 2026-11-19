@@ -405,6 +405,7 @@ public:
     // the RAM tier is on and the mapped host weights exceed the available RAM (its misses are read from the disk)
     bool host_disk_tier() const;
     bool host_exclusive() const; // the RAM tier is on with the exclusive policy
+    int  host_min_cc() const;    // lowest compute capability (major*100 + minor*10) of the CUDA devices the RAM tier serves, -1 otherwise
     // k19-mgpu2: resident mode swaps the experts a prompt's last large ubatch routed into each card's slots at the prompt end
     // (LLAMA_MOE_RESIDENT_FILL=0 off); the context records the routing of every large ubatch with set_resident_counts
     bool resident_fill_wanted() const;

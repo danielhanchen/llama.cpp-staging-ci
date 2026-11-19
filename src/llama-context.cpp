@@ -10713,7 +10713,9 @@ static bool moe_cache_released_counts() {
 // of a capped card runs with released banks, and without these counts the profile stayed empty. Placement only: exact.
 // Colab L4 12 GB, Flash-Next UD-IQ4_XS from the disk, a profile recorded on texts disjoint from the measured ones, 3 interleaved
 // launches on one VM: chat TTFT 17.38 -> 14.94 s, chat decode 4.87 -> 5.47 tok/s, 8k level, same text.
-// LLAMA_MOE_AUTOPROF_DISK_COUNTS=0 off (LLAMA_MOE_RELEASE_COUNTS=2 still counts them on every tier, =0 never)
+// Only on CUDA devices of compute capability 8.0 or higher: on a Colab T4 (7.5, Flash-Next IQ1_S from the disk under a 30 GiB RAM
+// cap, a profile recorded the same way, read only) the chat TTFT got worse (20.5 / 19.6 s against 15.7 / 17.3 s without the counts),
+// so older cards keep the refill counts only. LLAMA_MOE_AUTOPROF_DISK_COUNTS=0 off (LLAMA_MOE_RELEASE_COUNTS=2 still counts them on every tier, =0 never)
 static bool moe_cache_disk_counts() {
     static const bool on = [] { const char * e = getenv("LLAMA_MOE_AUTOPROF_DISK_COUNTS"); return e == nullptr || atoi(e) != 0; }();
     return on;
@@ -10723,7 +10725,7 @@ void llama_context::moe_cache_refill_from_ids(bool count) {
     ggml_backend_sched_synchronize(sched.get());
     const bool fill = count && moe_cache->fill_wants_counts();
     const bool ap_disk = count && moe_cache_release_counts_mode() == 1 && moe_cache_disk_counts() && moe_cache->host_disk_tier() &&
-        moe_cache->host_exclusive();
+        moe_cache->host_exclusive() && moe_cache->host_min_cc() >= 800;
     const bool ap   = count && (moe_cache_release_counts_mode() >= 2 || ap_disk) && !moe_ap_counted && moe_cache->autoprof_wants_counts();
     if (ap && ap_disk) {
         static int n_log = 0;

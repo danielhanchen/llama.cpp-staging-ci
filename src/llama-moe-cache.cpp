@@ -684,6 +684,7 @@ struct llama_moe_cache::impl {
     // the RAM tier is on where the mapped host weights exceed the available RAM (the page cache cannot hold the streamed experts the
     // tier leaves out: its misses are read from the disk)
     bool host_disk = false;
+    int  host_cc   = -1; // the lowest compute capability of the CUDA devices the RAM tier serves (major*100 + minor*10), -1: another device
     // k19-copyback: a device eviction whose expert RAM still holds (a duplicate kept at promotion) needs no copy back: the weights are
     // read-only, so the RAM bytes equal the device bytes. LLAMA_MOE_COPYBACK_SKIP=0 copies them back over that RAM copy anyway (same
     // bytes, same slot, the slot waits for the copy as a real copy back does): the A/B arm for the skip, cache decisions unchanged
@@ -4389,6 +4390,16 @@ struct llama_moe_cache::impl {
         const size_t budget = plan.budget;
         const int    policy = plan.policy;
         host_disk  = mapped > avail;
+        host_cc    = -1;
+        bool cc_first = true;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            if (!host_group[ig]) {
+                continue;
+            }
+            const int cc = pf_backend_cc(devices[groups[ig].id].backend);
+            host_cc  = cc_first ? cc : (cc < 0 || host_cc < 0 ? -1 : std::min(host_cc, cc));
+            cc_first = false;
+        }
         host_spare = policy == LLAMA_MOE_HOST_EXCLUSIVE && plan.spare;
         if (const char * e = getenv("LLAMA_MOE_HOST_CACHE_SPARE"); e != nullptr) {
             host_spare = policy == LLAMA_MOE_HOST_EXCLUSIVE && atoi(e) != 0;
@@ -15312,6 +15323,10 @@ bool llama_moe_cache::has_resident_counts() const {
 
 bool llama_moe_cache::host_disk_tier() const {
     return pimpl->host && pimpl->host_disk;
+}
+
+int llama_moe_cache::host_min_cc() const {
+    return pimpl->host ? pimpl->host_cc : -1;
 }
 
 bool llama_moe_cache::host_exclusive() const {
