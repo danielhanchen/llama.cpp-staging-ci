@@ -3066,7 +3066,7 @@ struct llama_moe_cache::impl {
     // batches reuse one activation quantization per window and the copy overlap runs beside the hits, a 7-row DFlash2 verify on the
     // eager split of every MoE layer costs more than the same rows on the mailbox on these hosts as well: Colab A100 40 GB (12 vCPU,
     // 10 host threads), Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6 at 32 GB (42.1% cached), same text: chat 54.9 -> 64.1 tok/s, 8k 55.4 ->
-    // 61.5. The cached-share floor of single_max still applies
+    // 61.5. The cached-share floor of single_max still applies, and the rule stops at the share of the small-batch timing trials (see single_max)
     static bool single_wide_mid_host() {
         static const bool v = [] {
             const char * e  = getenv("LLAMA_MOE_SINGLE_WIDE_MID");
@@ -3115,7 +3115,12 @@ struct llama_moe_cache::impl {
                     "(LLAMA_MOE_SINGLE_WIDE_LOW=0: 4 below 12%%)\n", single_max_tok, 100.0*cache_frac);
             }
         }
-        const int n = !single_max_env && single_max_tok > 4 && cache_frac >= 0.0 && cache_frac < min_frac ? 4 : single_max_tok;
+        // on a 12..31-CPU host only below the share where the small-batch timing trials start (trial_frac_single, 50%): there the
+        // host computes the missing experts of a 5..8-row window on the eager split as well, so the mailbox runs the same rows (same
+        // text); from that share the trials may send small batches' misses to the device, and the wider mailbox would compute them on
+        // the host instead (Colab A100 40 GB full card, 55.4% cached: other DFlash2 drafts and another MTP 8k text)
+        const bool mid_off = !single_max_env && !single_wide_host() && single_wide_mid_host() && cache_frac >= llama_moe_cache::trial_frac_single();
+        const int n = !single_max_env && single_max_tok > 4 && cache_frac >= 0.0 && (cache_frac < min_frac || mid_off) ? 4 : single_max_tok;
         if (n > 4 && !single_max_env && single_wide_mid_host() && cache_frac >= 0.0) {
             static bool logged_mid = false;
             if (!logged_mid) {
