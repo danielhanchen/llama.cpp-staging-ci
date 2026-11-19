@@ -3061,10 +3061,26 @@ struct llama_moe_cache::impl {
         }();
         return v;
     }
+    // On a host with LLAMA_MOE_SINGLE_WIDE_MID_CPUS (default 12) to 31 logical CPUs (LLAMA_MOE_SINGLE_WIDE_MID=0 off) the mailbox takes
+    // 5..8-row windows too; only the mailbox width changes (the wide-cache band of dec_band keeps the many-core rule). Since the host
+    // batches reuse one activation quantization per window and the copy overlap runs beside the hits, a 7-row DFlash2 verify on the
+    // eager split of every MoE layer costs more than the same rows on the mailbox on these hosts as well: Colab A100 40 GB (12 vCPU,
+    // 10 host threads), Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6 at 32 GB (42.1% cached), same text: chat 54.9 -> 64.1 tok/s, 8k 55.4 ->
+    // 61.5. The cached-share floor of single_max still applies
+    static bool single_wide_mid_host() {
+        static const bool v = [] {
+            const char * e  = getenv("LLAMA_MOE_SINGLE_WIDE_MID");
+            const char * em = getenv("LLAMA_MOE_SINGLE_WIDE_MID_CPUS");
+            const int min_cpus = em != nullptr ? atoi(em) : 12;
+            return !(e != nullptr && atoi(e) == 0) && !single_wide_host() && llama_moe_n_cpus() >= min_cpus;
+        }();
+        return v;
+    }
     const bool single_max_env = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS") != nullptr;
     const int single_max_tok = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS");
-        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : (single_wide_host() ? GGML_MOE_MAILBOX_MAX_TOKENS : 4)));
+        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) :
+            (single_wide_host() || single_wide_mid_host() ? GGML_MOE_MAILBOX_MAX_TOKENS : 4)));
     }();
     static bool single_wide_low_on() {
         static const bool on = [] {
@@ -3099,7 +3115,16 @@ struct llama_moe_cache::impl {
                     "(LLAMA_MOE_SINGLE_WIDE_LOW=0: 4 below 12%%)\n", single_max_tok, 100.0*cache_frac);
             }
         }
-        return !single_max_env && single_max_tok > 4 && cache_frac >= 0.0 && cache_frac < min_frac ? 4 : single_max_tok;
+        const int n = !single_max_env && single_max_tok > 4 && cache_frac >= 0.0 && cache_frac < min_frac ? 4 : single_max_tok;
+        if (n > 4 && !single_max_env && single_wide_mid_host() && cache_frac >= 0.0) {
+            static bool logged_mid = false;
+            if (!logged_mid) {
+                logged_mid = true;
+                LLAMA_LOG_INFO("llama_moe_cache: wide mailbox on a %d-CPU host: windows of up to %d rows on the mailbox at %.1f%% of the host "
+                    "experts cached (LLAMA_MOE_SINGLE_WIDE_MID=0: 4)\n", llama_moe_n_cpus(), n, 100.0*cache_frac);
+            }
+        }
+        return n;
     }
 
     // k19-l4poly: the CPU backend's host team serves (or, before the first mailbox, would serve) this cache's host batches: a small
