@@ -10703,7 +10703,8 @@ void llama_context::moe_cache_resident_record(const llm_graph_result * res) {
 // refill (k19-l4fill) and the self-learned profile (k19-autoprof) never got a count there ("0 prompts counted ... 0 read"). The routed
 // refill of the banks reads that routing after the ubatch / group anyway (one sync, one read of the ids per prompt): the counts come
 // from that same read, no extra sync or device read, nothing on the decode path. Counting only orders RAM-tier placement: exact.
-// =1 (default): the refill's counts only; =2: also the self-learned profile (opt-in: with a fair base, i.e. base with its PLE profile,
+// =1 (default): the refill's counts, plus the self-learned profile on a disk tier (moe_cache_disk_counts); =2: also the self-learned
+// profile on every tier (opt-in: with a fair base, i.e. base with its PLE profile,
 // using the MoE profile there gave decode +3..+19% but TTFT +7..+15% on a Colab T4 (Flash-Next IQ1_S, 30 GiB) and +11% on the L4 @12
 // GB MTP 8k, level on L4 @12 no drafter); =0: as before
 static int moe_cache_release_counts_mode() {
@@ -10714,10 +10715,31 @@ static bool moe_cache_released_counts() {
     return moe_cache_release_counts_mode() != 0;
 }
 
+// On a disk tier (the RAM tier is on, exclusive, and the mapped host weights exceed the available RAM) the released-bank prompts are
+// also counted into the self-learned routing profile by default, so a later launch fills the RAM tier hottest first: there every prompt
+// of a capped card runs with released banks, and without these counts the profile stayed empty. Placement only: exact.
+// Colab L4 12 GB, Flash-Next UD-IQ4_XS from the disk, a profile recorded on texts disjoint from the measured ones, 3 interleaved
+// launches on one VM: chat TTFT 17.38 -> 14.94 s, chat decode 4.87 -> 5.47 tok/s, 8k level, same text.
+// Only on CUDA devices of compute capability 8.0 or higher: on a Colab T4 (7.5, Flash-Next IQ1_S from the disk under a 30 GiB RAM
+// cap, a profile recorded the same way, read only) the chat TTFT got worse (20.5 / 19.6 s against 15.7 / 17.3 s without the counts),
+// so older cards keep the refill counts only. LLAMA_MOE_AUTOPROF_DISK_COUNTS=0 off (LLAMA_MOE_RELEASE_COUNTS=2 still counts them on every tier, =0 never)
+static bool moe_cache_disk_counts() {
+    static const bool on = [] { const char * e = getenv("LLAMA_MOE_AUTOPROF_DISK_COUNTS"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
 void llama_context::moe_cache_refill_from_ids(bool count) {
     ggml_backend_sched_synchronize(sched.get());
     const bool fill = count && moe_cache->fill_wants_counts();
-    const bool ap   = count && moe_cache_release_counts_mode() >= 2 && !moe_ap_counted && moe_cache->autoprof_wants_counts();
+    const bool ap_disk = count && moe_cache_release_counts_mode() == 1 && moe_cache_disk_counts() && moe_cache->host_disk_tier() &&
+        moe_cache->host_exclusive() && moe_cache->host_min_cc() >= 800;
+    const bool ap   = count && (moe_cache_release_counts_mode() >= 2 || ap_disk) && !moe_ap_counted && moe_cache->autoprof_wants_counts();
+    if (ap && ap_disk) {
+        static int n_log = 0;
+        if (n_log++ < 3) {
+            LLAMA_LOG_INFO("%s: released-bank prompt counted into the routing profile on the disk tier (LLAMA_MOE_AUTOPROF_DISK_COUNTS=0 off)\n", __func__);
+        }
+    }
     if (fill) {
         moe_cache->fill_counts_begin();
     }
