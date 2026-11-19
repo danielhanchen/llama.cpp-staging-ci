@@ -209,16 +209,19 @@ inline bool marginal_on(bool on, double t_on, double t_off, double min_gain) {
 // is firm "off". So only a trial that timed "on" inside the band can change in a later launch, and only to a clear "on".
 // old = the open record this launch timed again (nullptr: a new trial). Returns the verdict this launch takes; out gets on / firm / tries
 // (the caller fills the rest)
-inline bool settle(const rec * old, bool on, bool is_marginal, int max_tries, rec & out) {
+// trust (the caller's scope, see trial_trust_marginal): a marginal "on" is taken in the launch that timed it and recorded as an open
+// "on"; a later timing that is not "on" makes it firm "off" as before, and max_tries marginal "on" timings in a row make it firm "on"
+// (repeated timings that agree are a small real gain, not noise)
+inline bool settle(const rec * old, bool on, bool is_marginal, int max_tries, rec & out, bool trust = false) {
     out.tries = (old != nullptr ? old->tries : 0) + 1;
     if (!is_marginal || !on) {
         out.on   = on ? 1 : 0;
         out.firm = 1;
         return on;
     }
-    out.on   = 0;
     out.firm = out.tries >= std::max(1, max_tries) ? 1 : 0;
-    return false;
+    out.on   = trust ? 1 : 0;
+    return trust;
 }
 
 } // namespace llama_moe_tp
