@@ -2309,6 +2309,16 @@ private:
             const bool def_mid = deep_try && !def_on && !g4t_band && mid_on && g4tail_on && getenv("LLAMA_SPEC_DEPTH_CACHED_SHARE") == nullptr &&
                 exp_b > 0 && short_b > 0 && resident && deep_share >= g4t_hi && deep_share < deep_share_min && g4t_ctx_ok &&
                 n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
+            // The same 3-draft windows just above that floor, up to LLAMA_SPEC_DEPTH_MID_HI (0.345; 0: the deep windows' own depth from
+            // the floor): there a 4th verify row still misses enough experts that the narrower window pays. Colab G4, Qwen3.8-Flash-Next
+            // UD-IQ4_XS + its MTP drafter, Studio argv, 3 launches, 4 against 3 drafts: 28 GB (32.1% expected) chat 212.0 -> 217.0, 8k
+            // 179.3 -> 190.5 tok/s; 30 GB (35.7%) chat 236.7 -> 226.6 (4 drafts ahead from there)
+            const double mid_hi = [] {
+                const char * x = getenv("LLAMA_SPEC_DEPTH_MID_HI");
+                return x != nullptr ? atof(x) : 0.345;
+            }();
+            const bool def_mid_hi = def_on && mid_on && g4tail_on && getenv("LLAMA_SPEC_DEPTH_CACHED_SHARE") == nullptr &&
+                getenv("LLAMA_SPEC_DEPTH_CACHED_N") == nullptr && deep_share < mid_hi && g4t_ctx_ok && n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
             // k19-sharegate (LLAMA_SPEC_TPP_SHAREGATE=0: off, the blanket rule above): a cache expected to hold nearly every routed
             // expert (estimated share = 1 - (need - free) / expert bytes, at least LLAMA_SPEC_TPP_CACHED_SHARE, default 0.85) keeps the
             // priced 3-draft windows, as LLAMA_SPEC_TPP_CACHED=1. The rule above came from fn4 at a 9-14% share; at ~92% (q4x on a 24 GB
@@ -2412,7 +2422,7 @@ private:
                 }
                 spec_g4t_raised = g4t;
                 if (def_on || g4t || def_mid) {
-                    depth_cached = def_mid ? n_mid : n_def;
+                    depth_cached = def_mid || def_mid_hi ? n_mid : n_def;
                     // (a model on a memory file system: its experts are in RAM whatever MemAvailable reads)
                     disk_ok = disk_ok || in_ram_fs;
                 }
@@ -2455,6 +2465,10 @@ private:
                 if (def_mid) {
                     SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (from %.2f up to %.2f, compute capability 12.0, target in "
                         "RAM): MTP windows of %d drafts (LLAMA_SPEC_DEPTH_MID=0: 2 drafts)\n", 100.0*deep_share, g4t_hi, deep_share_min, n_mid);
+                }
+                if (def_mid_hi) {
+                    SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (from %.2f up to %.3f, compute capability 12.0): MTP "
+                        "windows of %d drafts (LLAMA_SPEC_DEPTH_MID_HI=0: %d)\n", 100.0*deep_share, deep_share_min, mid_hi, n_mid, n_def);
                 }
                 if (g4t) {
                     SRV_INF("k19-g4tail: MoE cache expected to hold %.1f%% of the routed experts (band %.2f .. %.2f, compute capability 12.0, target "
