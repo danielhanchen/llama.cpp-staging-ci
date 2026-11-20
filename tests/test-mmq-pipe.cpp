@@ -225,6 +225,14 @@ int main(int argc, char ** argv) {
     cs.push_back({ "fn_down_iq4nl_inplace",  GGML_TYPE_IQ4_NL,  640, 2560, 512, 10, false, 2048, 384, 0.0f,  0.5f, 4 }); // stream-k
     cs.push_back({ "fn_gate_iq3s_1638",      GGML_TYPE_IQ3_S,  2560,  640, 512, 10, true,  1638, 0,   0.0f,  0.0f, 5 }); // J 32
     cs.push_back({ "fn_gate_iq3s_1229",      GGML_TYPE_IQ3_S,  2560,  640, 512, 10, true,  1229, 0,   0.0f,  0.0f, 6 }); // J 24: base
+    // the UD-IQ4_XS Flash-Next expert types on the pipe (GGML_CUDA_MMQ_PIPE_EXT)
+    cs.push_back({ "fn_gate_iq3xxs_2048",    GGML_TYPE_IQ3_XXS, 2560, 640, 512, 10, true,  2048, 0,   0.0f,  0.0f, 1 });
+    cs.push_back({ "fn_gate_iq2s_2048",      GGML_TYPE_IQ2_S,  2560,  640, 512, 10, true,  2048, 0,   0.0f,  0.0f, 1 });
+    cs.push_back({ "fn_down_q5_0_2048",      GGML_TYPE_Q5_0,    640, 2560, 512, 10, false, 2048, 0,   0.0f,  0.0f, 1 });
+    cs.push_back({ "fn_down_q5_0_2044",      GGML_TYPE_Q5_0,    640, 2560, 512, 10, false, 2044, 0,   0.0f,  0.0f, 2 }); // last ubatch
+    cs.push_back({ "fn_gate_iq3xxs_skew",    GGML_TYPE_IQ3_XXS, 2560, 640, 512, 10, true,  2048, 0,   0.05f, 1.0f, 3 });
+    cs.push_back({ "fn_gate_iq3xxs_inplace", GGML_TYPE_IQ3_XXS, 2560, 640, 512, 10, true,  2048, 384, 0.0f,  0.5f, 4 }); // stream-k
+    cs.push_back({ "fn_gate_iq3xxs_1229",    GGML_TYPE_IQ3_XXS, 2560, 640, 512, 10, true,  1229, 0,   0.0f,  0.0f, 6 }); // J 24
     // Qwen3.6 MoE (35B-A3B class): 256 experts, 8 used, n_embd 2048, n_ff_exp 512; -ub 2048 (64 columns per expert, J 64)
     cs.push_back({ "q36_gate_q4k_2048",      GGML_TYPE_Q4_K,   2048,  512, 256,  8, true,  2048, 0,   0.0f,  0.0f, 1 });
     cs.push_back({ "q36_down_q6k_2048",      GGML_TYPE_Q6_K,    512, 2048, 256,  8, false, 2048, 0,   0.0f,  0.0f, 1 });
