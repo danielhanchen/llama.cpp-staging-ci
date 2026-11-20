@@ -8660,7 +8660,7 @@ struct llama_moe_cache::impl {
         }();
         const bool skip_share = cm_trial && !cm_force && ((cache_frac >= 0.0 && cache_frac < trial_frac) || per_req_no_trials);
         // A launch on a 12..31-CPU mailbox host whose calibration file holds a first trial made firm "on" by agreeing marginal timings
-        // (cmt_trust_marginal: cmt_ps_tries() timings, each on by less than the persist margin) runs no warm phase and no trials: those
+        // (cmt_trust_marginal: cmt_trust_tries() timings, each on by less than the persist margin) runs no warm phase and no trials: those
         // timings already decided the host path for this machine, model and cache size, and re-running the trial's blocks with the host
         // path off costs most of a short request (LLAMA_MOE_CPU_MISS_FIRM_SKIP=0: the recorded trials replay as before). A clear "on" or
         // any "off" replays as recorded. Colab L4 (12 vCPU), Qwen3.6-35B-A3B UD-Q4_K_XL with its MTP head capped at 16 GB (58% cached)
@@ -8669,7 +8669,7 @@ struct llama_moe_cache::impl {
             skip_firm = llama_moe_tp::firm_skip(cmt_firm_skip_on(), cmt_trust_marginal(), [&]() -> const llama_moe_tp::rec * {
                 cmt_ps_setup();
                 return cmt_ps_state == 1 && cmt_rec_file > 0 ? &cmt_rec[0] : nullptr;
-            }, cmt_ps_tries(), cmt_ps_min_gain());
+            }, cmt_trust_tries(), cmt_ps_min_gain());
         }
         const bool skip = skip_share || skip_firm;
         if (late) {
@@ -10835,7 +10835,7 @@ struct llama_moe_cache::impl {
     }
     // A marginal "on" (a gain smaller than cmt_ps_min_gain) is taken in the launch that timed it on a 12..31-CPU host whose host misses go
     // through the single-graph mailbox (LLAMA_MOE_CPU_MISS_MARGIN_TRUST=0: kept off as on other hosts); the record stays open, the next
-    // launches time it again, an "off" timing makes it firm "off" and cmt_ps_tries() marginal "on" timings in a row make it firm "on"
+    // launches time it again, an "off" timing makes it firm "off" and cmt_trust_tries() marginal "on" timings in a row make it firm "on"
     // (llama_moe_tp::settle). Only the trial's own measured direction decides: a trial that times the host path slower keeps it off.
     // On these hosts the 4-row mailbox serves the short verify windows of an MTP head beside a cache of 50-90% of the host experts, and
     // a small measured gain repeats from launch to launch: Colab L4 (12 vCPU, Intel Xeon 2.20 GHz), Qwen3.6-35B-A3B UD-Q4_K_XL with its
@@ -10846,6 +10846,11 @@ struct llama_moe_cache::impl {
             return e == nullptr || atoi(e) != 0;
         }();
         return on && single_wide_mid_host() && single_weigh() && single_usable(1);
+    }
+    // trusted marginal "on" timings in a row that make the record firm "on" (llama_moe_tp::trust_tries, LLAMA_MOE_CPU_MISS_TRUST_TRIES)
+    static int cmt_trust_tries() {
+        static const int n = llama_moe_tp::trust_tries(getenv("LLAMA_MOE_CPU_MISS_TRUST_TRIES"));
+        return n;
     }
     // k19-calvmargin: launches that time a marginal "on" before it is firm "off" (default 3)
     static int cmt_ps_tries() {
@@ -11065,7 +11070,7 @@ struct llama_moe_cache::impl {
                     const bool   measured = on;
                     const bool   trust = marg && cmt_trust_marginal();
                     llama_moe_tp::rec r;
-                    on = llama_moe_tp::settle(retime ? &cmt_rec[cmt_n] : nullptr, on, marg, cmt_ps_tries(), r, trust);
+                    on = llama_moe_tp::settle(retime ? &cmt_rec[cmt_n] : nullptr, on, marg, trust ? cmt_trust_tries() : cmt_ps_tries(), r, trust);
                     if (on != measured) {
                         gap_next = std::min(t_on < 1.05*t_off ? 2*cmt_gap : std::max(4*cmt_gap, 512), cmt_gap_max);
                     }
@@ -11089,10 +11094,10 @@ struct llama_moe_cache::impl {
                     cmt_rec_dirty = true;
                     if (marg || retime) {
                         LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: t_on / t_off %.3f%s (switch point %.3f, persisted on needs <= %.3f): %s, "
-                            "try %d of %d%s (LLAMA_MOE_CPU_MISS_PERSIST_MIN, LLAMA_MOE_CPU_MISS_PERSIST_TRIES)\n", tag, cmt_n + 1, r.ratio,
+                            "try %d of %d%s (LLAMA_MOE_CPU_MISS_PERSIST_MIN, LLAMA_MOE_CPU_MISS_PERSIST_TRIES, LLAMA_MOE_CPU_MISS_TRUST_TRIES)\n", tag, cmt_n + 1, r.ratio,
                             retime ? " (an open record, timed again)" : "", thr, 1.0 - cmt_ps_min_gain(),
                             trust ? "on by less than the margin, taken on this 12..31-CPU mailbox host (LLAMA_MOE_CPU_MISS_MARGIN_TRUST=0: kept off)" :
-                            marg ? "on by less than the margin, host path kept off" : (measured ? "on" : "off"), r.tries, cmt_ps_tries(),
+                            marg ? "on by less than the margin, host path kept off" : (measured ? "on" : "off"), r.tries, trust ? cmt_trust_tries() : cmt_ps_tries(),
                             r.firm ? ", recorded as firm" : ", the next launch times it again");
                     }
                 }

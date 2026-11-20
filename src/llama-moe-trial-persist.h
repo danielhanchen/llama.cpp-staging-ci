@@ -242,6 +242,14 @@ inline bool wide_mid_host(int n_cpus, bool wide, const char * e, const char * em
     return !(e != nullptr && atoi(e) == 0) && !wide && n_cpus >= min_cpus;
 }
 
+// how many marginal "on" timings in a row make a trusted record firm "on" (value of LLAMA_MOE_CPU_MISS_TRUST_TRIES, default 2, at least 1;
+// 3 = as many as the untrusted firm "off" needs). An "off" timing makes the record firm "off" at any try, so this only decides how soon
+// a launch stops re-timing a host path that timed faster each time. Colab L4 (12 vCPU), Qwen3.6-35B-A3B UD-Q4_K_XL with its MTP head:
+// the first trial timed 0.919-0.952 in every one of 40 launches at 16 GB on 8 VMs; at 20 GB 0.955-0.972 with two "off" timings among 16
+inline int trust_tries(const char * e) {
+    return e != nullptr ? std::max(1, atoi(e)) : 2;
+}
+
 // a first trial record made firm "on" by agreeing marginal timings: firm, on, timed by at least max_tries launches, and each "on" by less
 // than min_gain (1 - min_gain < t_on / t_off < 1)
 inline bool firm_marginal_on(const rec & r, int max_tries, double min_gain) {
