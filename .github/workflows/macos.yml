@@ -10,12 +10,28 @@ on:
         description: 'Also run macos-15-intel'
         type: boolean
         default: false
+      legs:
+        description: 'all, or mac-cpu (only the macOS CPU-only leg)'
+        type: string
+        default: 'all'
+      tests:
+        description: 'ctest -R regex (empty = every test)'
+        type: string
+        default: ''
+      ctest_j:
+        description: 'ctest parallel jobs'
+        type: string
+        default: '3'
+      ctest_timeout:
+        description: 'per-test timeout in seconds'
+        type: string
+        default: '600'
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.legs }}-${{ inputs.tests }}
   cancel-in-progress: true
 
 jobs:
@@ -23,9 +39,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.intel) && '[{"os":"macos-15","leg":"macos-15-arm64","gpu":"metal","cmake_extra":""},{"os":"macos-15","leg":"macos-15-arm64-cpu","gpu":"none","cmake_extra":"-DGGML_METAL=OFF"},{"os":"macos-15-intel","leg":"macos-15-x64","gpu":"none","cmake_extra":""},{"os":"ubuntu-latest","leg":"ubuntu-cpu","gpu":"none","cmake_extra":""}]' || '[{"os":"macos-15","leg":"macos-15-arm64","gpu":"metal","cmake_extra":""},{"os":"macos-15","leg":"macos-15-arm64-cpu","gpu":"none","cmake_extra":"-DGGML_METAL=OFF"},{"os":"ubuntu-latest","leg":"ubuntu-cpu","gpu":"none","cmake_extra":""}]') }}
+        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.legs == 'mac-cpu') && '[{"os":"macos-15","leg":"macos-15-arm64-cpu","gpu":"none","cmake_extra":"-DGGML_METAL=OFF"}]' || ((github.event_name == 'workflow_dispatch' && inputs.intel) && '[{"os":"macos-15","leg":"macos-15-arm64","gpu":"metal","cmake_extra":""},{"os":"macos-15","leg":"macos-15-arm64-cpu","gpu":"none","cmake_extra":"-DGGML_METAL=OFF"},{"os":"macos-15-intel","leg":"macos-15-x64","gpu":"none","cmake_extra":""},{"os":"ubuntu-latest","leg":"ubuntu-cpu","gpu":"none","cmake_extra":""}]' || '[{"os":"macos-15","leg":"macos-15-arm64","gpu":"metal","cmake_extra":""},{"os":"macos-15","leg":"macos-15-arm64-cpu","gpu":"none","cmake_extra":"-DGGML_METAL=OFF"},{"os":"ubuntu-latest","leg":"ubuntu-cpu","gpu":"none","cmake_extra":""}]')) }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 300
+    timeout-minutes: 330
     steps:
       - name: Leg
         id: gate
@@ -86,15 +102,22 @@ jobs:
         run: |
           cd build
           rc=0
-          ctest -j 3 --timeout 1800 --output-on-failure > ../ci-logs/ctest.log 2>&1 || rc=$?
+          CJ="${{ inputs.ctest_j }}"; CT="${{ inputs.ctest_timeout }}"; CR="${{ inputs.tests }}"
+          CJ=${CJ:-3}; CT=${CT:-600}
+          RX=(); [ -n "$CR" ] && RX=(-R "$CR")
+          echo "ctest -j $CJ --timeout $CT ${RX[*]}" | tee -a ../ci-logs/summary.txt
+          ctest -j "$CJ" --timeout "$CT" "${RX[@]}" --output-on-failure > ../ci-logs/ctest.log 2>&1 || rc=$?
           tail -40 ../ci-logs/ctest.log
           cp Testing/Temporary/LastTestsFailed.log ../ci-logs/ctest_failed_first.txt 2>/dev/null || true
           if [ "$rc" != 0 ]; then
             # one rerun of the failures before calling them failures
-            ctest --rerun-failed --timeout 1800 --output-on-failure > ../ci-logs/ctest_rerun.log 2>&1 || true
+            ctest --rerun-failed -j 1 --timeout 2400 --output-on-failure > ../ci-logs/ctest_rerun.log 2>&1 || true
             cp Testing/Temporary/LastTestsFailed.log ../ci-logs/ctest_failed_rerun.txt 2>/dev/null || true
             tail -20 ../ci-logs/ctest_rerun.log
           fi
+          grep -E "\*\*\*Timeout" ../ci-logs/ctest.log | sed 's/^/timeout_first: /' | tee -a ../ci-logs/summary.txt || true
+          grep -E "\*\*\*Timeout" ../ci-logs/ctest_rerun.log 2>/dev/null | sed 's/^/timeout_rerun: /' | tee -a ../ci-logs/summary.txt || true
+          grep -E "tests passed|tests failed" ../ci-logs/ctest_rerun.log 2>/dev/null | sed 's/^/ctest_rerun: /' | tee -a ../ci-logs/summary.txt || true
           grep -E "tests passed|tests failed" ../ci-logs/ctest.log | sed 's/^/ctest_first: /' | tee -a ../ci-logs/summary.txt
           echo "ctest_rc=$rc" | tee -a ../ci-logs/summary.txt
           for t in test-weight-store test-llama-archs test-llama-context; do
