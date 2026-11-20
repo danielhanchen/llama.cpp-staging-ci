@@ -1676,6 +1676,9 @@ struct ggml_moe_host_job {
     int    n_thr;
     char * qact;
     atomic_int done_act;
+    // GGML_MOE_HOST_DEP (default on; 0 = the one barrier): per group, the up and gate rows written so far; a down range waits
+    // only for the groups it reads instead of for every up and gate row of the batch
+    atomic_int * gdone;
     // 1: a read-ahead job (ggml_moe_host_pf_thread), not a batch
     int    kind;
 };
@@ -1817,10 +1820,20 @@ static void ggml_moe_host_ffn_thread_impl(struct ggml_moe_host_job * j, int ith,
                  k = atomic_fetch_add_explicit(&j->next_gu, 1, memory_order_relaxed)) {
             const int64_t i0 = ggml_moe_host_item_at(gstart, n_grp, 2*n_ff, w_all*k/j->n_task);
             const int64_t i1 = ggml_moe_host_item_at(gstart, n_grp, 2*n_ff, w_all*(k + 1)/j->n_task);
+            int dep_g = -1;
+            int dep_n = 0;
             for (int64_t it = i0; it < i1; ++it) {
                 const int     g = (int) (it/(2*n_ff));
                 const int     m = (int) ((it/n_ff) % 2);
                 const int64_t r = it % n_ff;
+                if (j->gdone != NULL && g != dep_g) {
+                    if (dep_g >= 0) {
+                        atomic_fetch_add_explicit(&j->gdone[dep_g], dep_n, memory_order_release);
+                    }
+                    dep_g = g;
+                    dep_n = 0;
+                }
+                dep_n++;
                 const struct ggml_tensor * wt = m == 0 ? j->up : j->gate;
                 const char * row = (const char *) wt->data + (int64_t) pe[glist[gstart[g]]]*wt->nb[2] + r*wt->nb[1];
                 float      * dst = m == 0 ? j->ub : j->gb;
@@ -1849,12 +1862,15 @@ static void ggml_moe_host_ffn_thread_impl(struct ggml_moe_host_job * j, int ith,
                     }
                 }
             }
+            if (dep_g >= 0) {
+                atomic_fetch_add_explicit(&j->gdone[dep_g], dep_n, memory_order_release);
+            }
             atomic_fetch_add_explicit(&j->done_gu, 1, memory_order_acq_rel);
         }
     }
 
-    // the one barrier: every up and gate row is written
-    while (atomic_load_explicit(&j->done_gu, memory_order_acquire) < j->n_task) {
+    // the one barrier: every up and gate row is written (with gdone: each down range waits for its own groups below)
+    while (j->gdone == NULL && atomic_load_explicit(&j->done_gu, memory_order_acquire) < j->n_task) {
         ggml_thread_cpu_relax();
     }
 
@@ -1869,6 +1885,15 @@ static void ggml_moe_host_ffn_thread_impl(struct ggml_moe_host_job * j, int ith,
                  k = atomic_fetch_add_explicit(&j->next_dn, 1, memory_order_relaxed)) {
             const int64_t i0 = ggml_moe_host_item_at(gstart, n_grp, n_embd, w_all*k/j->n_task);
             const int64_t i1 = ggml_moe_host_item_at(gstart, n_grp, n_embd, w_all*(k + 1)/j->n_task);
+            if (j->gdone != NULL && i1 > i0) {
+                // every gate / up task was claimed before this one (a thread takes down ranges only when none is left), so the
+                // groups waited for are being computed
+                for (int g = (int) (i0/n_embd); g <= (int) ((i1 - 1)/n_embd); ++g) {
+                    while (atomic_load_explicit(&j->gdone[g], memory_order_acquire) < 2*n_ff) {
+                        ggml_thread_cpu_relax();
+                    }
+                }
+            }
             int64_t it = i0;
             while (it < i1) {
                 const int     g    = (int) (it/n_embd);
@@ -2452,6 +2477,22 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
     atomic_store_explicit(&job.next_gu, 0, memory_order_relaxed);
     atomic_store_explicit(&job.next_dn, 0, memory_order_relaxed);
     atomic_store_explicit(&job.done_gu, 0, memory_order_relaxed);
+    // GGML_MOE_HOST_DEP: the per-group counters (the barrier form: NULL). Only the range form uses them (the sliced form
+    // keeps its barriers). Colab A100 VM (6 cores / 12 threads, 10 host threads), Flash-Next 7-row host batches: the barrier was 8% of
+    // each thread's batch time
+    static int dep_mode = -1;
+    if (dep_mode < 0) {
+        const char * e = getenv("GGML_MOE_HOST_DEP");
+        dep_mode = e == NULL || atoi(e) != 0;
+    }
+    atomic_int gdone[GGML_MOE_HOST_MAX_PAIRS];
+    job.gdone = NULL;
+    if (dep_mode && !job.sliced) {
+        for (int g = 0; g < n_grp; ++g) {
+            atomic_store_explicit(&gdone[g], 0, memory_order_relaxed);
+        }
+        job.gdone = gdone;
+    }
 
     if (team) {
         job.n_task = n_threads == 1 ? 1 : n_threads*ggml_moe_host_team_tasks();
@@ -2469,6 +2510,11 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
         atomic_store_explicit(&job.next_dn, 0, memory_order_relaxed);
         atomic_store_explicit(&job.done_gu, 0, memory_order_relaxed);
         atomic_store_explicit(&job.done_act, 0, memory_order_relaxed);
+        if (job.gdone != NULL) {
+            for (int g = 0; g < n_grp; ++g) {
+                atomic_store_explicit(&job.gdone[g], 0, memory_order_relaxed);
+            }
+        }
     }
 #if defined(GGML_USE_OPENMP)
     // k18 ranges: one per thread

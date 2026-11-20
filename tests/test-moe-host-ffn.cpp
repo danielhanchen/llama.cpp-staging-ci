@@ -182,6 +182,9 @@ int main(int argc, char ** argv) {
         { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, 256, 512, 16, 8, 4, false },
         // k19-hostrow: Flash-Next's expert types (the AVX-512 IQ3_S kernel where the build has it), experts shared by 2-4 rows
         { GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, 512, 640, 6,  4, 6, false },
+        // the IQ3_XXS gate / up and Q5_0 down experts of Flash-Next's UD-IQ4_XS layers (the Q5_0 multi-column kernel for shared experts)
+        { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, 512, 512, 6,  4, 6, false },
+        { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, 256, 512, 16, 8, 3, true  },
     };
     int fails = 0, runs = 0, unhandled = 0;
     printf("host team: %s\n", ggml_cpu_moe_host_team_on() ? "on" : "off (GGML_MOE_HOST_TEAM=0: OpenMP region)");

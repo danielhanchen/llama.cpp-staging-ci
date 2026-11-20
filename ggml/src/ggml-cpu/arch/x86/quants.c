@@ -503,8 +503,78 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 }
 
 // placeholder implementation for Apple targets
-void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q8_K_ref(x, y, k);
+// The Q8_K activations of every K-quant / IQ vec_dot (the host experts' up / gate rows: each host thread quantizes its
+// batch's tokens, 100 us of a 2.3 ms batch on a Colab A100 VM's Xeon with the reference) in AVX2, the reference's bytes: the first
+// element of the largest magnitude sets the scale, each value is the float product iscale*x rounded to the nearest integer, ties to
+// even (the reference's 1.5*2^23 trick does the same for these magnitudes), at most 127, and the 16-value sums. A block with a NaN or
+// an infinity, and an all-zero block (the reference leaves its sums as they were), take the reference. GGML_CPU_Q8K_SIMD=0: the reference
+#if defined(__AVX2__)
+static int ggml_q8k_simd_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GGML_CPU_Q8K_SIMD");
+        on = e == NULL || atoi(e) != 0;
+    }
+    return on;
+}
+#endif
+
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+#if defined(__AVX2__)
+    if (ggml_q8k_simd_on()) {
+        assert(k % QK_K == 0);
+        block_q8_K * GGML_RESTRICT y = vy;
+        const int64_t nb = k / QK_K;
+        const __m256 sign = _mm256_set1_ps(-0.0f);
+        const __m256i top = _mm256_set1_epi32(127);
+        const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for (int64_t i = 0; i < nb; ++i, x += QK_K) {
+            __m256 vmax = _mm256_setzero_ps();
+            __m256 bad  = _mm256_setzero_ps();
+            for (int j = 0; j < QK_K; j += 8) {
+                const __m256 v = _mm256_loadu_ps(x + j);
+                vmax = _mm256_max_ps(vmax, _mm256_andnot_ps(sign, v));
+                bad  = _mm256_or_ps(bad, _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
+            }
+            __m128 m4 = _mm_max_ps(_mm256_extractf128_ps(vmax, 1), _mm256_castps256_ps128(vmax));
+            m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+            m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+            const float amax = _mm_cvtss_f32(m4);
+            if (_mm256_movemask_ps(bad) != 0 || !isfinite(amax) || amax == 0.0f) {
+                quantize_row_q8_K_ref(x, y + i, QK_K);
+                continue;
+            }
+            const __m256 va = _mm256_set1_ps(amax);
+            int jm = 0;
+            for (int j = 0; j < QK_K; j += 8) {
+                const int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_andnot_ps(sign, _mm256_loadu_ps(x + j)), va, _CMP_EQ_OQ));
+                if (m != 0) {
+                    int b = 0;
+                    while (!((m >> b) & 1)) {
+                        ++b;
+                    }
+                    jm = j + b;
+                    break;
+                }
+            }
+            const float iscale = -127.f/x[jm];
+            const __m256 vs = _mm256_set1_ps(iscale);
+            for (int j = 0; j < QK_K; j += 32) {
+                __m256i q[4];
+                for (int u = 0; u < 4; ++u) {
+                    q[u] = _mm256_min_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(vs, _mm256_loadu_ps(x + j + 8*u))), top);
+                }
+                y[i].bsums[j/16]     = (int16_t) hsum_i32_8(_mm256_add_epi32(q[0], q[1]));
+                y[i].bsums[j/16 + 1] = (int16_t) hsum_i32_8(_mm256_add_epi32(q[2], q[3]));
+                const __m256i b8 = _mm256_packs_epi16(_mm256_packs_epi32(q[0], q[1]), _mm256_packs_epi32(q[2], q[3]));
+                _mm256_storeu_si256((__m256i *) (y[i].qs + j), _mm256_permutevar8x32_epi32(b8, perm));
+            }
+            y[i].d = 1/iscale;
+        }
+        return;
+    }
+#endif
+    quantize_row_q8_K_ref(x, vy, k);
 }
 
 //===================================== Dot products =================================
@@ -4687,6 +4757,35 @@ GGML_VDM_INLINE void ggml_vec_dot_iq3_s_q8_K_multi_n(int n, float * GGML_RESTRIC
     }
 }
 
+// Q5_0 (q8_0 activations) for an expert routed to 2-8 rows: each block's weights decoded once (nibbles, 5th bits), then
+// for every column the single-column kernel's own sequence (the signed byte products summed per 4 bytes, the block's scale, one fma
+// per block in block order), so each result is ggml_vec_dot_q5_0_q8_0's bit for bit. Qwen3.8-Flash-Next UD-IQ4_XS keeps its down
+// experts in Q5_0 in most layers: 24% of the host batches' kernel time on a Colab A100 VM, 1.2-1.6x per column at 2-4 columns there
+GGML_VDM_INLINE void ggml_vec_dot_q5_0_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+    const block_q5_0 * GGML_RESTRICT x = vx;
+    const int nb = n / QK5_0;
+    __m256 acc[GGML_VDM_MAX];
+    for (int c = 0; c < nc; ++c) {
+        acc[c] = _mm256_setzero_ps();
+    }
+    for (int ib = 0; ib < nb; ++ib) {
+        const float xd = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
+        __m256i bxhi = bytes_from_bits_32(x[ib].qh);
+        bxhi = _mm256_andnot_si256(bxhi, _mm256_set1_epi8((char)0xF0));
+        qx = _mm256_or_si256(qx, bxhi);
+        for (int c = 0; c < nc; ++c) {
+            const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *) vy[c] + ib;
+            const __m256 d = _mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(y->d));
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) y->qs);
+            acc[c] = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc[c]);
+        }
+    }
+    for (int c = 0; c < nc; ++c) {
+        s[c] = hsum_float_8(acc[c]);
+    }
+}
+
 GGML_VDM_INLINE void ggml_vec_dot_iq4_nl_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_iq4_nl * GGML_RESTRICT x = vx;
     const int nb = n / QK4_NL;
@@ -5322,6 +5421,7 @@ GGML_VDM_DISPATCH(ggml_vec_dot_q5_K_q8_K_multi)
 GGML_VDM_DISPATCH(ggml_vec_dot_q6_K_q8_K_multi)
 GGML_VDM_DISPATCH(ggml_vec_dot_iq3_xxs_q8_K_multi)
 GGML_VDM_DISPATCH(ggml_vec_dot_mxfp4_q8_0_multi)
+GGML_VDM_DISPATCH(ggml_vec_dot_q5_0_q8_0_multi)
 #undef GGML_VDM_DISPATCH
 
 ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type) {
@@ -5337,6 +5437,11 @@ ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type) {
     if (on_k < 0) {
         const char * e = getenv("GGML_CPU_MMID_MULTI_K");
         on_k = e == NULL || atoi(e) != 0;
+    }
+    static int on_q50 = -1;
+    if (on_q50 < 0) {
+        const char * e = getenv("GGML_CPU_Q50_MULTI");
+        on_q50 = e == NULL || atoi(e) != 0;
     }
     switch (type) {
 #if defined(GGML_IQ_AVX512)
@@ -5355,6 +5460,8 @@ ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type) {
         case GGML_TYPE_Q6_K:    return on_k ? ggml_vec_dot_q6_K_q8_K_multi    : NULL;
         case GGML_TYPE_IQ3_XXS: return on_k ? ggml_vec_dot_iq3_xxs_q8_K_multi : NULL;
         case GGML_TYPE_MXFP4:   return on_k ? ggml_vec_dot_mxfp4_q8_0_multi   : NULL;
+        // GGML_CPU_Q50_MULTI=0: one column at a time again
+        case GGML_TYPE_Q5_0:    return on_q50 ? ggml_vec_dot_q5_0_q8_0_multi  : NULL;
         default:               return NULL;
     }
 }
