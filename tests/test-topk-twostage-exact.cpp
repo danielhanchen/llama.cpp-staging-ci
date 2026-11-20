@@ -25,7 +25,7 @@
 static bool g_two_stage_logged = false;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-dtopk top-k of") != nullptr) {
+    if (strstr(text, "device top-k: top-k of") != nullptr) {
         g_two_stage_logged = true;
     }
     if (level >= GGML_LOG_LEVEL_WARN) {

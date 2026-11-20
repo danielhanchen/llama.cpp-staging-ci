@@ -376,7 +376,7 @@ static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_
         static bool logged = false;
         if (!logged) {
             logged = true;
-            LOG_INF("%s: k19-q4cap: headless device: the margin beside the MoE cache steps down to %" PRId64 " MiB (LLAMA_FIT_MOE_HEADLESS=0: %" PRId64 " MiB)\n",
+            LOG_INF("%s: headless device: the margin beside the MoE cache steps down to %" PRId64 " MiB (LLAMA_FIT_MOE_HEADLESS=0: %" PRId64 " MiB)\n",
                 __func__, r/(1024*1024), r0/(1024*1024));
         }
     }
@@ -2129,7 +2129,7 @@ static void common_params_fit_impl(
                                     break;
                                 }
                                 const int64_t s8 = int64_t(d8[0].free) - int64_t(d8[0].mb.total()) - ctx_ub - margins[0];
-                                LOG_TRC("%s: k19-place8: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
+                                LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
                                     " MiB over the margin\n", __func__, ub_rel, req/MiB, (size_t) (d8[0].mb.compute/MiB), s8/MiB);
                                 if (s8 >= 0) {
                                     d8[0].mb.context += size_t(ctx_ub);
@@ -2144,7 +2144,7 @@ static void common_params_fit_impl(
                         p8_got = got;
                         if (got) {
                             LOG_INF("%s: small device: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> "
-                                "%zu MiB; ubatches of more than %u tokens run with the cache banks released (k19-place8; LLAMA_FIT_PLACE8=0 off)\n",
+                                "%zu MiB; ubatches of more than %u tokens run with the cache banks released (LLAMA_FIT_PLACE8=0 off)\n",
                                 __func__, grow/MiB, (size_t) (size_ok/MiB), (size_t) (cparams->moe_cache_size/MiB), ub_rel);
                             // k19-pgroups: prompts keep their layer-major groups beside the decode-sized cache, as k19-placemid does on a
                             // mid-size device: a group releases the banks for its merged graph (one pass over each layer's experts for up to
@@ -2160,25 +2160,25 @@ static void common_params_fit_impl(
                                 common_fit_place8_env(ub_rel, true, grow/MiB, true, devs[0]);
                                 g_place8_mid = false; // the small device's draft rule (common_fit_draft_on_cpu) stays
                                 LOG_INF("%s: small device: prompts keep their layer-major groups beside the decode-sized cache, each group releases "
-                                    "the banks for its merged graph (k19-pgroups; LLAMA_FIT_PLACE8_GROUPS=0 off)\n", __func__);
+                                    "the banks for its merged graph (LLAMA_FIT_PLACE8_GROUPS=0 off)\n", __func__);
                             }
                         } else {
                             common_fit_place8_env(0);
                             cparams->moe_cache_size = size_ok;
                             dmds_cpu_moe            = dmds_ok;
-                            LOG_INF("%s: small device: the MoE cache keeps its size (k19-place8: %" PRId64 " MiB of prompt compute buffers, no "
+                            LOG_INF("%s: small device: the MoE cache keeps its size (%" PRId64 " MiB of prompt compute buffers, no "
                                 "larger cache within the margin)\n", __func__, grow/MiB);
                         }
                     }
                     if (p8_zero && !p8_got) {
                         ok = false; // the zero-cache start only stands with the k19-place8 cache: the placement of before (below)
                     } else if (p8_zero) {
-                        LOG_INF("%s: small device beside the KV window ring: every layer fits at the full n_ubatch without a cache, the k19-place8 "
+                        LOG_INF("%s: small device beside the KV window ring: every layer fits at the full n_ubatch without a cache, the small-device "
                             "cache takes the prompt compute memory (LLAMA_FIT_PLACE8_WIN=0 off)\n", __func__);
                     }
                     if (ok && hostbound) {
                         LOG_INF("%s: small device, host-bound: every layer fits within the margin of %" PRId64 " MiB beside a MoE cache of %zu MiB "
-                            "(at most %.0f%% of the host experts); the margin drops to %" PRId64 " MiB and the cache grows to %zu MiB (k19-l4poly; "
+                            "(at most %.0f%% of the host experts); the margin drops to %" PRId64 " MiB and the cache grows to %zu MiB ("
                             "LLAMA_FIT_HOSTBOUND=0 off)\n", __func__, margin_saved/MiB, (size_t) (size_fit_hb/MiB), 100.0*common_fit_hostbound_max_frac(),
                             margins[0]/MiB, (size_t) (cparams->moe_cache_size/MiB));
                         g_small_device = true;
@@ -2282,17 +2282,17 @@ static void common_params_fit_impl(
                             !common_fit_file_in_ram_fs(path_model)) {
                         if (placemid_disk_skip) {
                             placemid_ram = false;
-                            LOG_INF("%s: k19-l4gap: no k19-placemid (LLAMA_FIT_PLACEMID_DISK_SKIP=1): %.0f MiB of host experts do not fit in %.0f MiB of "
+                            LOG_INF("%s: no mid-size placement (LLAMA_FIT_PLACEMID_DISK_SKIP=1): %.0f MiB of host experts do not fit in %.0f MiB of "
                                 "available RAM and the cache of %zu MiB holds the experts of %.1f tokens (below %.1f): short prompts keep one ubatch that "
                                 "copies its experts from the RAM tier\n", __func__, exp_b/1048576.0, avail/1048576.0, (size_t) (cparams->moe_cache_size/MiB), tokens,
                                 placemid_disk_tokens);
                         } else if (g_verify_rows > placemid_disk_ub) {
                             // a verify window wider than the ubatch would run with the banks released every pass (DFlash2 n6: 7 rows)
-                            LOG_INF("%s: k19-l4gap2: k19-placemid stays at %u-token ubatches: verify windows of %d rows exceed %d tokens\n", __func__,
+                            LOG_INF("%s: stays at %u-token ubatches: verify windows of %d rows exceed %d tokens\n", __func__,
                                 common_fit_place8_ub(), g_verify_rows, placemid_disk_ub);
                         } else {
                             ub_disk = (uint32_t) placemid_disk_ub;
-                            LOG_INF("%s: k19-l4gap2: k19-placemid at ubatches of %u tokens: %.0f MiB of host experts do not fit in %.0f MiB of available "
+                            LOG_INF("%s: at ubatches of %u tokens: %.0f MiB of host experts do not fit in %.0f MiB of available "
                                 "RAM and the cache of %zu MiB holds the experts of %.1f tokens (below %.1f), so short prompts run in ubatches the device "
                                 "lookups serve (LLAMA_FIT_PLACEMID_DISK_UB=0: %u)\n", __func__, ub_disk, exp_b/1048576.0, avail/1048576.0,
                                 (size_t) (cparams->moe_cache_size/MiB), tokens, placemid_disk_tokens, common_fit_place8_ub());
@@ -2332,7 +2332,7 @@ static void common_params_fit_impl(
                                 break;
                             }
                             const int64_t sm = int64_t(dm[0].free) - int64_t(dm[0].mb.total()) - margins[0];
-                            LOG_TRC("%s: k19-placemid: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
+                            LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
                                 " MiB over the margin\n", __func__, ub_rel, req/MiB, (size_t) (dm[0].mb.compute/MiB), sm/MiB);
                             if (sm >= 0) {
                                 dmds_cpu_moe = dm;
@@ -2346,13 +2346,13 @@ static void common_params_fit_impl(
                     if (got) {
                         common_fit_place8_env(ub_rel, true, grow/MiB, false, devs[0]);
                         LOG_INF("%s: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> %zu MiB; "
-                            "ubatches of more than %u tokens run with the cache banks released, layer-major groups as before (k19-placemid; "
+                            "ubatches of more than %u tokens run with the cache banks released, layer-major groups as before ("
                             "LLAMA_FIT_PLACEMID=0 off)\n", __func__, grow/MiB, (size_t) (size_ok/MiB), (size_t) (cparams->moe_cache_size/MiB), ub_rel);
                     } else {
                         common_fit_place8_env(0);
                         cparams->moe_cache_size = size_ok;
                         dmds_cpu_moe            = dmds_ok;
-                        LOG_INF("%s: the MoE cache keeps its size (k19-placemid: %" PRId64 " MiB of prompt compute buffers beside a cache of %zu "
+                        LOG_INF("%s: the MoE cache keeps its size (%" PRId64 " MiB of prompt compute buffers beside a cache of %zu "
                             "MiB, at least %.0f%% of it and 256 MiB wanted, LLAMA_FIT_PLACEMID_MIN_FRAC)\n", __func__, grow/MiB, (size_t) (size_ok/MiB),
                             100.0*placemid_min_frac);
                     }

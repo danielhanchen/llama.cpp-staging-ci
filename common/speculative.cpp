@@ -1205,7 +1205,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 s += b;
             }
         }
-        LOG_INF("k19-a100chat: DFlash2 EV-auto %s: %" PRId64 " passes measured, draft %.2f ms, %" PRId64 " drafts cut by %" PRId64 " rows, %" PRId64 " probes; verify ms (decayed n, picks):%s\n",
+        LOG_INF("DFlash2 EV-auto %s: %" PRId64 " passes measured, draft %.2f ms, %" PRId64 " drafts cut by %" PRId64 " rows, %" PRId64 " probes; verify ms (decayed n, picks):%s\n",
                 when, eva.n_meas, eva.d_n > 0.0 ? eva.d_ms / eva.d_n : 0.0, eva.n_cut, eva.n_rows_cut, eva.n_probe, s.c_str());
     }
 
@@ -1453,7 +1453,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         feat_hash_v[seq_id] = (feat_hash_v[seq_id] ^ b[x]) * 1099511628211ULL;
                     }
                     feat_hash_n[seq_id] += n_chunk;
-                    LOG_INF("k19-df2pp: dflash features seq %d: %" PRId64 " rows up to pos %d, hash %016" PRIx64 "\n", (int) seq_id,
+                    LOG_INF("dflash features seq %d: %" PRId64 " rows up to pos %d, hash %016" PRIx64 "\n", (int) seq_id,
                             feat_hash_n[seq_id], (int) batch_in.tokens[i_batch_beg[seq_id] + offset + n_chunk - 1].pos[0], feat_hash_v[seq_id]);
                 }
 
@@ -1782,13 +1782,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             const int w_lo_log = df2_low ? std::max(3, std::min(4, (int) llama_moe_cache_tokens(params.ctx_tgt))) : 3;
                             LOG_INF("%s: DFlash2 window beside the MoE cache (its slots hold %d tokens, %.1f%% of the host experts): the %d-row or "
                                     "the whole draft by expected tokens per ms, %.2f ms at %d rows + %.2f per row (LLAMA_DFLASH_CACHED_WINDOW=0 off%s)\n",
-                                    df2_low ? "k19-g4verify" : df2_mid ? "k19-df2cost" : "k19-df2pp", (int) llama_moe_cache_tokens(params.ctx_tgt),
+                                    df2_low ? "low cache fraction" : df2_mid ? "mid cache fraction" : "cached", (int) llama_moe_cache_tokens(params.ctx_tgt),
                                     100.0*df2_frac, w_lo_log,
                                     df2_low ? df2_low_cost.first : df2_mid ? df2_mid_cost.first : df2_cached_cost.first, w_lo_log,
                                     df2_low ? df2_low_cost.second : df2_mid ? df2_mid_cost.second : df2_cached_cost.second,
                                     df2_low ? ", LLAMA_DFLASH_CACHED_LOW_FRAC=0 the 3-row costs" : "");
                         } else {
-                            LOG_INF("k19-handoff: DFlash2 window: the short or the whole draft by expected tokens per ms (%s; LLAMA_DFLASH_WINDOW=0 off)\n",
+                            LOG_INF("DFlash2 window: the short or the whole draft by expected tokens per ms (%s; LLAMA_DFLASH_WINDOW=0 off)\n",
                                     getenv("LLAMA_DFLASH_WINDOW") != nullptr ? "LLAMA_DFLASH_WINDOW=1" : "exact verify");
                         }
                     }
@@ -1804,7 +1804,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         logged = true;
                         LOG_INF("%s: DFlash2 window by expected tokens per ms from this run's measured pass costs and acceptance "
                                 "(MoE cache %s, %.1f%% of the host experts, slots of %d tokens%s; LLAMA_DFLASH_EV_AUTO=0 off)\n",
-                                df2_meas ? "k19-g4verify" : "k19-a100chat", df2_cache_on ? "on" : "off", df2_cache_on ? 100.0*df2_frac : 0.0,
+                                df2_meas ? "measured on this device" : "automatic", df2_cache_on ? "on" : "off", df2_cache_on ? 100.0*df2_frac : 0.0,
                                 df2_cache_on ? (int) llama_moe_cache_tokens(params.ctx_tgt) : -1,
                                 df2_meas ? ", the slots' rows or the whole draft; LLAMA_DFLASH_CACHED_MEASURED=0: fixed costs" : "");
                     }
@@ -1854,7 +1854,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     static bool logged = false;
                     if (!logged) {
                         logged = true;
-                        LOG_INF("k19-a80verify: DFlash2 drafts of at most %d steps (%d asked) on a compute capability 8.0 GPU without a MoE cache "
+                        LOG_INF("DFlash2 drafts of at most %d steps (%d asked) on a compute capability 8.0 GPU without a MoE cache "
                                 "(LLAMA_DFLASH_N_MAX_SM80=0 off, LLAMA_DFLASH_N_MAX_SM80_CACHED=1 beside a cache too)\n", df2_n_max, params.n_max);
                     }
                 }
@@ -2155,7 +2155,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (lowg.n == 8 && lowg.latched < 0) {
                     static const double thr = getenv("LLAMA_DFLASH_CACHED_LOW_LNG_RATIO") ? atof(getenv("LLAMA_DFLASH_CACHED_LOW_LNG_RATIO")) : 2.0;
                     lowg.latched = lowg.r_sum > thr * lowg.r_n ? 1 : 0;
-                    LOG_INF("%s: k19-g4verify: DFlash2 band passes at %.2f x their priced ms (8 passes, LLAMA_DFLASH_CACHED_LOW_LNG_RATIO"
+                    LOG_INF("%s: DFlash2 band passes at %.2f x their priced ms (8 passes, LLAMA_DFLASH_CACHED_LOW_LNG_RATIO"
                             "=%.2f): from position 4096 the %s costs, fixed for this context\n", __func__, lowg.r_sum / lowg.r_n, thr,
                             lowg.latched ? "cached" : "band");
                 }
@@ -2484,18 +2484,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     adraft_prev = atoi(e) != 0;
                 }
                 if (adraft_mode == 3) {
-                    LOG_INF("%s: k19-adraft: sampled requests: %d drafts while the running hold share is >= %.2f, %d below %.2f, at most one "
+                    LOG_INF("%s: sampled requests: %d drafts while the running hold share is >= %.2f, %d below %.2f, at most one "
                         "switch per %d rounds; greedy requests: %d drafts (LLAMA_SPEC_ADRAFT=0: off)\n", __func__, this->params.n_max, adraft_on,
                         adraft_keep, adraft_off, adraft_dwell, adraft_keep);
                 } else if (adraft_mode == 4) {
-                    LOG_INF("%s: k19-adraft: sampled requests: %d drafts below position %lld, %d from there; greedy requests: %d drafts "
+                    LOG_INF("%s: sampled requests: %d drafts below position %lld, %d from there; greedy requests: %d drafts "
                         "(LLAMA_SPEC_ADRAFT=0: off)\n", __func__, this->params.n_max, (long long) adraft_pos, adraft_keep, adraft_keep);
                 } else if (adraft_mode == 1) {
-                    LOG_INF("%s: k19-adraft: sampled requests: MTP windows of 1..%d drafts, the 2nd kept at p >= %.2f, later ones at p >= %.2f, "
+                    LOG_INF("%s: sampled requests: MTP windows of 1..%d drafts, the 2nd kept at p >= %.2f, later ones at p >= %.2f, "
                         "bar on %s; greedy requests: %d drafts (LLAMA_SPEC_ADRAFT=0: off)\n", __func__, this->params.n_max, adraft_p2, adraft_p,
                         adraft_prev ? "the draft before (LLAMA_SPEC_ADRAFT_PREV)" : "the draft itself", adraft_keep);
                 } else {
-                    LOG_INF("%s: k19-adraft: sampled requests: MTP windows by expected tokens per ms, %d..%d drafts; greedy requests: %d drafts "
+                    LOG_INF("%s: sampled requests: MTP windows by expected tokens per ms, %d..%d drafts; greedy requests: %d drafts "
                         "(LLAMA_SPEC_ADRAFT=2; =0: off)\n", __func__, adraft_floor, this->params.n_max, adraft_keep);
                 }
             } else {
@@ -2536,7 +2536,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 this->params.n_max = this->params.n_floor;
                 this->n_max = this->params.n_max;
                 cost_on = spec_cost;
-                LOG_INF("%s: k19-tpp: off: 3-draft windows are off because the MoE cache is on; MTP windows of %d drafts, as LLAMA_SPEC_TPP=0 "
+                LOG_INF("%s: off: 3-draft windows are off because the MoE cache is on; MTP windows of %d drafts, as LLAMA_SPEC_TPP=0 "
                     "(LLAMA_SPEC_TPP_CACHED=1: on)\n", __func__, this->params.n_max);
             }
         }
@@ -2546,7 +2546,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (this->params.deep_cached) {
                 // k19-fnmtp: every window below deep_pos drafts n_max, also where that is floor + 1 (3 drafts)
                 tpp_cost.deep_all = true;
-                LOG_INF("%s: k19-fnmtp: MoE cache %s: MTP windows of %d drafts below position %lld, from there %d and a priced %d "
+                LOG_INF("%s: MoE cache %s: MTP windows of %d drafts below position %lld, from there %d and a priced %d "
                     "(LLAMA_SPEC_DEPTH_CACHED=0: off)\n", __func__, cached ? "on" : "off (expected by the server)", this->params.n_max,
                     (long long) tpp_cost.deep_pos, tpp_floor, tpp_floor + 1);
             }
@@ -2583,21 +2583,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     (llama_model_meta_val_str(mt, (std::string(arch) + ".expert_count").c_str(), nexp, sizeof(nexp)) < 0 || atoi(nexp) == 0);
                 if (dense) {
                     tpp_cost.deep_pos = INT64_MAX;
-                    LOG_INF("%s: k19-q38d: dense target: the deep MTP windows at every position (LLAMA_SPEC_DEPTH_DENSE=0: below 12288)\n", __func__);
+                    LOG_INF("%s: dense target: the deep MTP windows at every position (LLAMA_SPEC_DEPTH_DENSE=0: below 12288)\n", __func__);
                 }
             } else if (tpp_cost.deep_extra > 0 && hbm_dc && e_dd == nullptr && getenv("LLAMA_SPEC_DEPTH_POS") == nullptr) {
-                LOG_INF("%s: k19-q38d: an A100 / H100-class GPU (compute capability 8.0 / 9.0): the deep MTP windows stay below 12288 (LLAMA_SPEC_DEPTH_DENSE=1: every position for a dense target)\n", __func__);
+                LOG_INF("%s: an A100 / H100-class GPU (compute capability 8.0 / 9.0): the deep MTP windows stay below 12288 (LLAMA_SPEC_DEPTH_DENSE=1: every position for a dense target)\n", __func__);
             }
             if (tpp_cost.ctx_on) {
-                LOG_INF("%s: k19-tppctx: windows fixed per context bucket: drafts past %d per bucket <1536 / <6144 / <12288 / <24576 / longer "
+                LOG_INF("%s: windows fixed per context bucket: drafts past %d per bucket <1536 / <6144 / <12288 / <24576 / longer "
                     "%d / %d / %d / %d / %d (-1 priced; LLAMA_SPEC_TPP_CTX=0: off)\n", __func__, tpp_floor, tpp_cost.ctx_extra[0],
                     tpp_cost.ctx_extra[1], tpp_cost.ctx_extra[2], tpp_cost.ctx_extra[3], tpp_cost.ctx_extra[4]);
             }
             if (tpp_cost.deep_extra > 0) {
-                LOG_INF("%s: k19-depth: MTP windows of %d drafts below position %lld (LLAMA_SPEC_DEPTH_POS), the windows below from there "
+                LOG_INF("%s: MTP windows of %d drafts below position %lld (LLAMA_SPEC_DEPTH_POS), the windows below from there "
                     "(LLAMA_SPEC_DEPTH=0: off)\n", __func__, this->params.n_max, (long long) tpp_cost.deep_pos);
             }
-            LOG_INF("%s: k19-tpp: MTP windows of %d drafts, %d where the expected tokens per ms pay for the wider window (LLAMA_SPEC_TPP=0: "
+            LOG_INF("%s: MTP windows of %d drafts, %d where the expected tokens per ms pay for the wider window (LLAMA_SPEC_TPP=0: "
                 "off); round times %s (cost ratio %.2f at 16k, MoE cache %s; LLAMA_SPEC_TPP_LIVE=1: live medians)\n", __func__, tpp_floor,
                 tpp_floor + 1, tpp_cost.live ? "live" : "from the fixed table", tpp_cost.cost_ratio[3], cached ? "on" : "off");
         }
@@ -2655,7 +2655,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 h += string_format(" %zu:%lld", k, (long long) adraft_hist[k]);
             }
             if (n > 0) {
-                LOG_INF("%s: k19-adraft: sampled windows by drafts kept (so far):%s, width switches %lld\n", __func__, h.c_str(),
+                LOG_INF("%s: sampled windows by drafts kept (so far):%s, width switches %lld\n", __func__, h.c_str(),
                     (long long) adraft_switches);
             }
         }
@@ -2663,10 +2663,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (cost_st[seq_id].t_us > 0) {
                 if (tpp_floor > 0) {
                     const int n_deep = tpp_floor + 1 + tpp_cost.deep_extra;
-                    LOG_INF("%s: MTP window cost table (k19-tpp): %s | windows: %d drafts %.0f, %d drafts %.0f%s\n", __func__, tpp_cost.text().c_str(),
+                    LOG_INF("%s: MTP window cost table: %s | windows: %d drafts %.0f, %d drafts %.0f%s\n", __func__, tpp_cost.text().c_str(),
                         tpp_floor, cost_pol.n_rounds[tpp_floor + 1], tpp_floor + 1, cost_pol.n_rounds[tpp_floor + 2],
                         tpp_cost.deep_extra > 0 && n_deep + 1 <= common_spec_mtp_cost::MAX_T ?
-                            string_format(", %d drafts %.0f (k19-depth)", n_deep, cost_pol.n_rounds[n_deep + 1]).c_str() : "");
+                            string_format(", %d drafts %.0f", n_deep, cost_pol.n_rounds[n_deep + 1]).c_str() : "");
                 } else {
                     LOG_INF("%s: MTP window cost table: %s\n", __func__, cost_pol.text().c_str());
                 }
@@ -3733,7 +3733,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                     ls += (ls.empty() ? "" : ",") + std::to_string(t);
                 }
             }
-            SPC_INF("ngram-suffix: k19-lookup8 window sizes %s (rows), each priced by its measured round time (LLAMA_SPEC_SUFFIX_SIZES)\n", ls.c_str());
+            SPC_INF("ngram-suffix: window sizes %s (rows), each priced by its measured round time (LLAMA_SPEC_SUFFIX_SIZES)\n", ls.c_str());
         }
         if (policy_on) {
             SPC_INF("ngram-suffix: cost-priced windows of %d / %d drafts (margin %.2f)%s; LLAMA_SPEC_SUFFIX_POLICY=0 for the fixed gate\n",
@@ -3904,7 +3904,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                     PRId64 " probes\n", seq_id, ts, tl, policy.cost_ms(1), policy.cost_n[1], policy.cost_ms(ts), policy.cost_n[ts], policy.cost_ms(tl),
                     policy.cost_n[tl], policy.gain[ts], policy.gain_n[ts], policy.gain[tl], policy.gain_n[tl], si.n_probe);
             if (policy.sizes != 0) {
-                SPC_INF("ngram-suffix seq %d: k19-lookup8 round ms by window:%s; drafts by window:%s\n", seq_id, policy.text().c_str(), si.win_text().c_str());
+                SPC_INF("ngram-suffix seq %d: round ms by window:%s; drafts by window:%s\n", seq_id, policy.text().c_str(), si.win_text().c_str());
             }
         }
         si.n_lookups = si.n_matches = si.n_drafts = si.n_drafted = si.n_accepted = si.n_yield = 0;

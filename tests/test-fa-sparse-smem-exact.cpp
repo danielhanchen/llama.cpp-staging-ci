@@ -27,7 +27,7 @@
 static bool g_fix_logged = false;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-p2qsa: sparse flash attention with one-stage shared memory") != nullptr) {
+    if (strstr(text, "QSA: sparse flash attention with one-stage shared memory") != nullptr) {
         g_fix_logged = true;
         fputs(text, stdout);
     }

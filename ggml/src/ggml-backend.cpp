@@ -5017,7 +5017,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         st_mark(-1);
         st_tot += ggml_time_us() - st_t0;
         if (++st_n % st_every == 0) {
-            GGML_LOG_INFO("%s: k19-vcost host timing over %lld graphs: %.1f us per graph, host splits %.1f us (%.1f per graph), device splits %.1f us (%.1f per graph), %d nodes\n",
+            GGML_LOG_INFO("%s: host timing over %lld graphs: %.1f us per graph, host splits %.1f us (%.1f per graph), device splits %.1f us (%.1f per graph), %d nodes\n",
                 __func__, (long long) st_n, (double) st_tot / st_n, (double) st_host / st_n, (double) st_nh / st_n, (double) st_dev / st_n,
                 (double) st_nd / st_n, sched->graph.n_nodes);
             st_n = st_host = st_dev = st_tot = st_nh = st_nd = 0;

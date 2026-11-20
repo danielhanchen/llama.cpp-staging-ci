@@ -42,7 +42,7 @@
 static int n_logs = 0, n_logs_multi = 0;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-kqtc:") != nullptr) {
+    if (strstr(text, "few-row MMQ:") != nullptr) {
         if (strstr(text, " columns ") != nullptr) { // per launch line (GGML_CUDA_MMQ_FEW_LOG=1)
             n_logs++;
             if (strstr(text, " 2 matrices") != nullptr) {

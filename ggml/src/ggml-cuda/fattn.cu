@@ -812,7 +812,7 @@ static bool ggml_cuda_flash_attn_ext_dec_mma(const int device, const ggml_tensor
     // logged at the first launch (data set), not at a graph reservation (the parameter fit reserves with its log muted)
     static std::atomic<int> n_logged { 0 };
     if (ggml_cuda_fattn_probe_cur == nullptr && dst->data != nullptr && K->data != nullptr && n_logged++ == 0) {
-        GGML_LOG_INFO("%s: k19-decmma: one-row decode over the %s K / %s V cache runs the in-place MMA kernel (D %lld, GQA %lld, %lld "
+        GGML_LOG_INFO("%s: one-row decode over the %s K / %s V cache runs the in-place MMA kernel (D %lld, GQA %lld, %lld "
             "cells; GGML_CUDA_FATTN_DEC_MMA=0: the vector kernel)\n", __func__, ggml_type_name(K->type), ggml_type_name(V->type),
             (long long) D, (long long) (Q->ne[2] / K->ne[2]), (long long) K->ne[1]);
     }
@@ -1638,7 +1638,7 @@ static ggml_cuda_fattn_kvl_plan ggml_cuda_fattn_kvl_get_plan(ggml_backend_cuda_c
         plan.mode = GGML_CUDA_FATTN_KVL_DEV;
         static std::atomic<int> n_dev_logged { 0 };
         if (n_dev_logged++ == 0) {
-            GGML_LOG_INFO("%s: k19-graph: flash attention reads the KV length on the device ('%s', %s), first at %lld of %lld cells "
+            GGML_LOG_INFO("%s: flash attention reads the KV length on the device ('%s', %s), first at %lld of %lld cells "
                 "(GGML_CUDA_FA_KV_LEN=0: off)\n", __func__, dst->src[5]->name, dst->src[5]->buffer ? ggml_backend_buffer_name(dst->src[5]->buffer) : "none",
                 (long long) n_kv, (long long) K->ne[1]);
         }

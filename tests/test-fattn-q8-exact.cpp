@@ -28,7 +28,7 @@
 static bool g_inplace_logged = false;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-fattnq8: tensor-core flash attention reads") != nullptr) {
+    if (strstr(text, "q8_0-KV flash attention: tensor-core flash attention reads") != nullptr) {
         g_inplace_logged = true;
         fputs(text, stdout);
     }

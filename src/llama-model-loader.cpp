@@ -2353,7 +2353,7 @@ void llama_model_loader::drop_device_cache() {
             n_dropped += r.size;
         }
     }
-    LLAMA_LOG_INFO("%s: k19-fnttft: dropped the page cache of %zu tensors copied to a device (%.2f MiB%s): a lazy PLE table is short of "
+    LLAMA_LOG_INFO("%s: dropped the page cache of %zu tensors copied to a device (%.2f MiB%s): a lazy PLE table is short of "
         "RAM (LLAMA_MODEL_DROP_DEVICE_CACHE=0 keeps it)\n", __func__, device_ranges.size(), n_dropped/1048576.0,
         n_skipped > 0 ? ", tmpfs files left alone" : "");
 #endif

@@ -191,7 +191,7 @@ static void kv_win_set(const llm_graph_kv_win & w, const llama_kv_cache_context 
     if (!w.used) {
         static std::atomic<bool> logged { false };
         if (!logged.exchange(true)) {
-            LLAMA_LOG_WARN("%s: k19-kvwin: no attention of this graph reads the KV window ring: the cache is read as without it\n", __func__);
+            LLAMA_LOG_WARN("%s: no attention of this graph reads the KV window ring: the cache is read as without it\n", __func__);
         }
     }
     mctx->set_input_win(w.idxs, w.used ? w.mask : nullptr, mask_ok ? kq_mask : nullptr, ubatch, w.cells);
@@ -3926,7 +3926,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                     if (!kv_win_src2_supported(cur)) {
                         static std::atomic<bool> logged { false };
                         if (!logged.exchange(true)) {
-                            LLAMA_LOG_WARN("%s: k19-kvwin: the device does not take this two-source attention node: concat stopgap\n", __func__);
+                            LLAMA_LOG_WARN("%s: the device does not take this two-source attention node: concat stopgap\n", __func__);
                         }
                         cur = nullptr;
                     }
@@ -5309,7 +5309,7 @@ void llm_graph_context::build_sampling() const {
     if (dtopk) {
         static std::atomic<bool> logged { false };
         if (!logged.exchange(true)) {
-            LLAMA_LOG_INFO("k19-dtopk: MTP draft top-k over the %lld restricted head rows (not the %lld-token scatter; "
+            LLAMA_LOG_INFO("device top-k: MTP draft top-k over the %lld restricted head rows (not the %lld-token scatter; "
                     "LLAMA_MTP_DRAFT_TOPK_FULL=1: full vocabulary)\n", (long long) res->t_dh_logits->ne[0], (long long) res->t_logits->ne[0]);
         }
     }
@@ -5400,7 +5400,7 @@ void llm_graph_context::build_sampling() const {
 
                 static std::atomic<bool> logged { false };
                 if (n_act >= 2 && !logged.exchange(true)) {
-                    LLAMA_LOG_INFO("k19-p3topk: the verify rows' backend top-k of %d in one launch per window (%u rows of %lld, up to %u "
+                    LLAMA_LOG_INFO("batched top-k: the verify rows' backend top-k of %d in one launch per window (%u rows of %lld, up to %u "
                             "per launch; LLAMA_DEV_TOPK_BATCH=0: one per row)\n", k_first, n_act, (long long) logits_t->ne[0], bt_chunk);
                 }
             }

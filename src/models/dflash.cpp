@@ -517,7 +517,7 @@ static ggml_tensor * build_dflash2_conv(
         static bool logged = false;
         if (!logged) {
             logged = true;
-            LLAMA_LOG_INFO("k19-handoff: DFlash2 conv fused (ggml_dflash2_conv, LLAMA_DFLASH2_CONV_FUSED=0 off)\n");
+            LLAMA_LOG_INFO("DFlash2 conv fused (ggml_dflash2_conv, LLAMA_DFLASH2_CONV_FUSED=0 off)\n");
         }
         ggml_tensor * base_1d = ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]);
         return ggml_dflash2_conv(ctx0, hidden, dynamic, base_1d, (int) kernel_size, (int) group_size, (int) n_blocks, side);

@@ -389,7 +389,7 @@ static int child(const char * model, int vi) {
     setenv("LLAMA_MTP_DRAFT_VOCAB_CTX", v.vocab_ctx, 1);
     llama_backend_init();
     llama_log_set([](ggml_log_level level, const char * text, void *) {
-        if (strstr(text, "k19-dtopk: MTP draft top-k over the") != nullptr) {
+        if (strstr(text, "device top-k: MTP draft top-k over the") != nullptr) {
             g_engaged = true;
         }
         if (level >= GGML_LOG_LEVEL_ERROR || getenv("TEST_MTP_DTOPK_LOG")) {

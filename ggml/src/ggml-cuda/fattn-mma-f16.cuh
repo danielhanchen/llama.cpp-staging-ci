@@ -3012,7 +3012,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                         int occ_old = 0, occ_new = 0;
                         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_old, fattn_kernel, nthreads, nbytes_shared_total));
                         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_new, fattn_kernel, nthreads, nbytes_shared_sparse));
-                        GGML_LOG_INFO("%s: k19-p2qsa: sparse flash attention with one-stage shared memory, first D %d ncols %d x %d: %zu -> %zu bytes, "
+                        GGML_LOG_INFO("%s: QSA: sparse flash attention with one-stage shared memory, first D %d ncols %d x %d: %zu -> %zu bytes, "
                             "%d -> %d blocks/SM, occupancy %s (GGML_CUDA_FA_SPARSE_SMEM_FIX=0: off)\n", __func__, DKQ, ncols1, ncols2,
                             nbytes_shared_total, nbytes_shared_sparse, occ_old, occ_new, smem_fix == 2 ? "free" : "pinned");
                     }
@@ -3112,7 +3112,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
         static std::atomic<int> n_logged { 0 };
         if (ggml_cuda_fattn_probe_cur == nullptr && n_logged++ == 0) {
-            GGML_LOG_INFO("%s: k19-fattnq4: two-source flash attention (body %s / %s %lld cells, ring %s / %s %lld cells), first D %d ncols %d x %d, %s "
+            GGML_LOG_INFO("%s: quantized-KV flash attention: two-source flash attention (body %s / %s %lld cells, ring %s / %s %lld cells), first D %d ncols %d x %d, %s "
                 "(GGML_CUDA_FATTN_SRC2=0: unsupported, the graph's generic form)\n", __func__, ggml_type_name(K->type), ggml_type_name(V->type),
                 (long long) K->ne[1], ggml_type_name(dst->src[6]->type), ggml_type_name(dst->src[7]->type), (long long) dst->src[6]->ne[1],
                 DKQ, ncols1, ncols2, codes == 0 ? "staged f16" : (mode == 2 ? "in place, raw rows pipelined" : "in place, synchronous loads"));
@@ -3194,14 +3194,14 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             if (kvq == 0) {
                 static std::atomic<int> n_logged { 0 };
                 if (ggml_cuda_fattn_probe_cur == nullptr && n_logged++ == 0) {
-                    GGML_LOG_INFO("%s: k19-fattnq8: tensor-core flash attention reads the q8_0 K / V cache in place, first D %d ncols %d x %d, "
+                    GGML_LOG_INFO("%s: q8_0-KV flash attention: tensor-core flash attention reads the q8_0 K / V cache in place, first D %d ncols %d x %d, "
                         "%s, %lld cells (GGML_CUDA_FATTN_Q8_INPLACE=0: staged f16 copy)\n", __func__, DKQ, ncols1, ncols2,
                         q8_mode == 2 ? "raw rows pipelined" : "synchronous loads", (long long) K->ne[1]);
                 }
             } else {
                 static std::atomic<int> n_logged { 0 };
                 if (ggml_cuda_fattn_probe_cur == nullptr && n_logged++ == 0) {
-                    GGML_LOG_INFO("%s: k19-fattnq4: tensor-core flash attention reads the %s K / %s V cache in place, first D %d ncols %d x %d, "
+                    GGML_LOG_INFO("%s: quantized-KV flash attention: tensor-core flash attention reads the %s K / %s V cache in place, first D %d ncols %d x %d, "
                         "%s, %lld cells (GGML_CUDA_FATTN_Q4_INPLACE=0: staged f16 copy)\n", __func__, ggml_type_name(K->type),
                         ggml_type_name(V->type), DKQ, ncols1, ncols2, q8_mode == 2 ? "raw rows pipelined" : "synchronous loads",
                         (long long) K->ne[1]);

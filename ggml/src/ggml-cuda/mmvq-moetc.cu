@@ -876,11 +876,11 @@ bool ggml_cuda_moe_tc_launch(const ggml_type type, const void * vx, const void *
 
     static std::once_flag once;
     std::call_once(once, [&] {
-        GGML_LOG_INFO("k19-ampmoe: multi-token MUL_MAT_IDs on int8 tensor cores (first: %s%s, %d tokens, K %lld, %d K warps; "
+        GGML_LOG_INFO("int8 tensor-core MoE: multi-token MUL_MAT_IDs on int8 tensor cores (first: %s%s, %d tokens, K %lld, %d K warps; "
             "GGML_CUDA_MOE_TC=0 off)\n", ggml_type_name(type), fused ? " fused gate" : "", (int) ntok, (long long) ncols_x, kw);
     });
     if (cfg.log) {
-        GGML_LOG_INFO("k19-ampmoe: %s%s %d tokens %d slots rows %lld K %lld kw %d\n", ggml_type_name(type), fused ? " fused" : "",
+        GGML_LOG_INFO("int8 tensor-core MoE: %s%s %d tokens %d slots rows %lld K %lld kw %d\n", ggml_type_name(type), fused ? " fused" : "",
             (int) ntok, (int) nslots, (long long) nrows_x, (long long) ncols_x, kw);
     }
 

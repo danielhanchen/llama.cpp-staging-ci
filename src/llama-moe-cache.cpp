@@ -2100,7 +2100,7 @@ struct llama_moe_cache::impl {
                     fit += (size_t) g.n_slots_fit*g.expert_bytes;
                     cap += (size_t) g.n_slots_cap*g.expert_bytes;
                 }
-                LLAMA_LOG_INFO("%s: MoE cache: k19-t4small decode extension: room for %.2f MiB of slots past the %.2f MiB fitted (unbacked "
+                LLAMA_LOG_INFO("%s: MoE cache: decode extension: room for %.2f MiB of slots past the %.2f MiB fitted (unbacked "
                     "until the decode grows into free device memory; LLAMA_MOE_DECODE_EXT=0 off)\n", __func__, (cap - fit)/1048576.0, fit/1048576.0);
             }
             buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), buft_host));
@@ -2360,7 +2360,7 @@ struct llama_moe_cache::impl {
         if (n_fill > 0) {
             prefilled_dev = true;
             LLAMA_LOG_INFO("%s: MoE cache prefilled with %zu experts, %.2f MiB (LLAMA_MOE_CACHE_PREFILL=0 to disable)%s\n", __func__, n_fill, n_bytes/1024.0/1024.0,
-                n_prefill_dup > 0 ? (std::string("; k19-l4held: ") + std::to_string(n_prefill_dup) + " RAM copies of them marked as duplicates").c_str() : "");
+                n_prefill_dup > 0 ? (std::string("; ") + std::to_string(n_prefill_dup) + " RAM copies of them marked as duplicates").c_str() : "");
         }
     }
 
@@ -2403,7 +2403,7 @@ struct llama_moe_cache::impl {
         static const int w = getenv("LLAMA_MOE_CORE_WARM") ? atoi(getenv("LLAMA_MOE_CORE_WARM")) : -1;
         const bool ok = w > 0 || (w < 0 && core_on);
         if (!ok) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-core2: no warm start from the core's profile %s: %s (LLAMA_MOE_CORE_WARM=1 warm-starts anyway)\n",
+            LLAMA_LOG_INFO("llama_moe_cache%s: no warm start from the core's profile %s: %s (LLAMA_MOE_CORE_WARM=1 warm-starts anyway)\n",
                 tag, profile_file.c_str(), w == 0 ? "LLAMA_MOE_CORE_WARM=0" : "no core was placed");
         }
         return ok;
@@ -2446,7 +2446,7 @@ struct llama_moe_cache::impl {
             why = "nothing to make room for (no lazy PLE table short of RAM; LLAMA_MOE_CORE_MIB sets a size)";
         }
         if (why != nullptr) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-ptres core: off: %s\n", tag, why);
+            LLAMA_LOG_INFO("llama_moe_cache%s: core: off: %s\n", tag, why);
             return false;
         }
         static const double max_frac = getenv("LLAMA_MOE_CORE_MAX_FRAC") ? std::min(0.9, std::max(0.0, atof(getenv("LLAMA_MOE_CORE_MAX_FRAC")))) : 0.4;
@@ -2495,7 +2495,7 @@ struct llama_moe_cache::impl {
                 }
             }
             if (!ok || !g.lru.set_core(n_take)) {
-                LLAMA_LOG_WARN("llama_moe_cache%s: k19-ptres core: group %zu could not be placed in its first %d slots: no core there\n", tag, ig, n_take);
+                LLAMA_LOG_WARN("llama_moe_cache%s: core: group %zu could not be placed in its first %d slots: no core there\n", tag, ig, n_take);
                 continue;
             }
             core_bytes += (size_t) n_take*g.expert_bytes;
@@ -2532,7 +2532,7 @@ struct llama_moe_cache::impl {
             core_holes_b += h.second - h.first;
         }
         core_on = n_core_all > 0;
-        LLAMA_LOG_INFO("llama_moe_cache%s: k19-ptres core: %zu experts (%.1f MiB of %.1f MiB asked, at most %.0f%% of each group's slots) placed for good from %s, "
+        LLAMA_LOG_INFO("llama_moe_cache%s: core: %zu experts (%.1f MiB of %.1f MiB asked, at most %.0f%% of each group's slots) placed for good from %s, "
             "%.1f MiB of their host pages to leave out of the registration (LLAMA_MOE_CORE=0 off)\n", tag, n_core_all, core_bytes/1048576.0,
             core_want/1048576.0, 100.0*max_frac, profile_file.c_str(), core_holes_b/1048576.0);
         return core_on;
@@ -2655,7 +2655,7 @@ struct llama_moe_cache::impl {
             }
         }
         core_dropped = core_holes_b - std::min(core_holes_b, resident);
-        LLAMA_LOG_INFO("llama_moe_cache%s: k19-ptres core: host copies of the core dropped: %.1f of %.1f MiB no longer resident (%zu ranges, %zu fadvise calls "
+        LLAMA_LOG_INFO("llama_moe_cache%s: core: host copies of the core dropped: %.1f of %.1f MiB no longer resident (%zu ranges, %zu fadvise calls "
             "over %zu files, %.1f ms)\n", tag, core_dropped/1048576.0, core_holes_b/1048576.0, core_holes.size(), n_fadv, fds.size(), (ggml_time_us() - t0)/1000.0);
 #endif
     }
@@ -2842,7 +2842,7 @@ struct llama_moe_cache::impl {
                 core_checks += g.lru.n_core;
             }
             if (core_bad > 0) {
-                GGML_ABORT("k19-ptres core: %llu core slots lost their expert (a host copy the device may read is no longer registered)", (unsigned long long) core_bad);
+                GGML_ABORT("MoE cache core: %llu core slots lost their expert (a host copy the device may read is no longer registered)", (unsigned long long) core_bad);
             }
         }
         profile_save(true);
@@ -4044,14 +4044,14 @@ struct llama_moe_cache::impl {
         profile_save();
         ap_save(true);
         if (ap_rec || ap_use) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: %s; %zu ubatches / %llu routings counted, %zu profile experts read, target set %zu "
+            LLAMA_LOG_INFO("llama_moe_cache%s: %s; %zu ubatches / %llu routings counted, %zu profile experts read, target set %zu "
                 "(rebuilt %zu times), %zu cold experts marked, offers: %llu target, %llu cold taken, %llu cold refused; page-cache fill %llu target / "
                 "%llu cold\n", tag, ap_use ? "used" : "recorded only", aps.ubatches, (unsigned long long) aps.routings, aps.loaded, aps.targets,
                 aps.rebuilds, aps.marked, (unsigned long long) aps.hot_taken, (unsigned long long) aps.cold_taken,
                 (unsigned long long) aps.cold_refused, (unsigned long long) aps.pf_hot, (unsigned long long) aps.pf_cold);
         }
         if (resident_mode) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-mgpu2: resident prompt fill: %llu prompts, %llu layers, %llu experts wanted, %llu swapped in "
+            LLAMA_LOG_INFO("llama_moe_cache%s: resident prompt fill: %llu prompts, %llu layers, %llu experts wanted, %llu swapped in "
                 "(%.2f MiB), %llu copies back chained into the promoted experts' RAM slots, %llu into fresh slots, %llu kept (RAM held them), "
                 "%llu dropped, %llu read from the files, %.1f ms (LLAMA_MOE_RESIDENT_FILL=%d, MIN %d, MAX %lld, DEFER %d: %llu layer swaps in decode lookups, PASS %lld)\n", tag, (unsigned long long) rpfs.prompts,
                 (unsigned long long) rpfs.layers, (unsigned long long) rpfs.wanted, (unsigned long long) rpfs.swapped, rpfs.bytes/1048576.0,
@@ -4060,24 +4060,24 @@ struct llama_moe_cache::impl {
                 (unsigned long long) rpf_deferred_layers, (long long) rpf_pass);
         }
         if (rps.used || rp_rec) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-mgpu2: resident device prefill %s (%zu profile entries read, %zu taken, %zu by id); decode routing "
+            LLAMA_LOG_INFO("llama_moe_cache%s: resident device prefill %s (%zu profile entries read, %zu taken, %zu by id); decode routing "
                 "%s: %llu routed experts in %llu host lookups\n", tag, rps.used ? "from the profile" : "by id", rps.read, rps.taken, rps.padded,
                 rp_rec ? "recorded" : "not recorded", (unsigned long long) rps.counted, (unsigned long long) rps.lookups);
         }
         ua_shutdown();
         log_stats();
         if (core_mode != 0) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-ptres core: %s, %.1f MiB of experts, %.1f MiB of host pages dropped, %llu core slot checks, %llu lost, "
+            LLAMA_LOG_INFO("llama_moe_cache%s: core: %s, %.1f MiB of experts, %.1f MiB of host pages dropped, %llu core slot checks, %llu lost, "
                 "%llu bank releases refused\n", tag, core_on ? "on" : "off", core_bytes/1048576.0, core_dropped/1048576.0,
                 (unsigned long long) core_checks, (unsigned long long) core_bad, (unsigned long long) core_refused);
         }
         ua_free();
         if (n_pad_zero > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: %llu padding pieces after uploaded runs written as zeros instead of read from the files "
+            LLAMA_LOG_INFO("llama_moe_cache%s: %llu padding pieces after uploaded runs written as zeros instead of read from the files "
                 "(LLAMA_MOE_PROMPT_PAD_ZERO=0 off)\n", tag, (unsigned long long) n_pad_zero);
         }
         if (plr.layers > 0 || plr.over > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: prompt layer reads: %llu layers, %llu experts, %.1f MiB in %.1f ms, %llu past the scratch "
+            LLAMA_LOG_INFO("llama_moe_cache%s: prompt layer reads: %llu layers, %llu experts, %.1f MiB in %.1f ms, %llu past the scratch "
                 "(LLAMA_MOE_PROMPT_LAYER_READ=1 opt-in)\n", tag, (unsigned long long) plr.layers, (unsigned long long) plr.experts, plr.bytes/1048576.0,
                 plr.read_us/1000.0, (unsigned long long) plr.over);
         }
@@ -4495,7 +4495,7 @@ struct llama_moe_cache::impl {
             const int    mq = eq != nullptr ? atoi(eq) : 0;
             host_quota_mode = mq;
             host->set_layer_quota(mq >= 2 || (mq == 1 && host->exclusive()));
-            LLAMA_LOG_INFO("%s: k19-l4held: RAM tier layer quota %s (LLAMA_MOE_HOST_LAYER_QUOTA=%d; 0 off, 1 exclusive tier, 2 both)\n", __func__,
+            LLAMA_LOG_INFO("%s: RAM tier layer quota %s (LLAMA_MOE_HOST_LAYER_QUOTA=%d; 0 off, 1 exclusive tier, 2 both)\n", __func__,
                 host->layer_quota_on() ? "on" : "off", mq);
         }
         // resident mode: when the RAM tier and the device slots can hold every streamed
@@ -4971,7 +4971,7 @@ struct llama_moe_cache::impl {
         }
         std::vector<prof_entry> prof;
         if (!llama_moe_profile_load(ap_file, profile_n_expert(), prof)) {
-            LLAMA_LOG_INFO("%s: k19-mgpu2: no routing profile at %s yet: resident device slots by expert id, this launch records the decode "
+            LLAMA_LOG_INFO("%s: no routing profile at %s yet: resident device slots by expert id, this launch records the decode "
                 "routing (LLAMA_MOE_RESIDENT_PROF=1)\n", __func__, ap_file.c_str());
             return false;
         }
@@ -5017,7 +5017,7 @@ struct llama_moe_cache::impl {
         }
         prefilled_dev = true;
         rps.used = true;
-        LLAMA_LOG_INFO("%s: k19-mgpu2: resident device slots from the routing profile %s: %zu experts (%.2f MiB), %zu hottest of %zu profile "
+        LLAMA_LOG_INFO("%s: resident device slots from the routing profile %s: %zu experts (%.2f MiB), %zu hottest of %zu profile "
             "entries + %zu by id (LLAMA_MOE_RESIDENT_PROF=1; 2 = record only)\n", __func__, ap_file.c_str(), n_fill, n_bytes/1048576.0, rps.taken, rps.read, rps.padded);
         return true;
     }
@@ -5363,7 +5363,7 @@ struct llama_moe_cache::impl {
         // only where the RAM tier serves CUDA devices of compute capability 8.0 or higher (on a T4 a profile made the chat TTFT slower)
         const bool ship_cc = host_cc >= 800;
         if (!have && !ap_ship_file.empty() && !ship_cc) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: shipped routing profile %s not used: the RAM tier's devices are below compute "
+            LLAMA_LOG_INFO("llama_moe_cache%s: shipped routing profile %s not used: the RAM tier's devices are below compute "
                 "capability 8.0 (lowest %d) or not CUDA\n", tag, ap_ship_file.c_str(), host_cc);
         }
         const bool shipped = !have && !ap_ship_file.empty() && ship_cc && llama_moe_profile_load(ap_ship_file, ne, prof);
@@ -5417,7 +5417,7 @@ struct llama_moe_cache::impl {
                 fill_order_dirty = true;
             }
         }
-        LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: routing profile %s %s (%zu experts)%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", tag,
+        LLAMA_LOG_INFO("llama_moe_cache%s: routing profile %s %s (%zu experts)%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", tag,
             shipped ? ap_ship_file.c_str() : ap_file.c_str(), shipped ? "read (shipped; LLAMA_MOE_AUTOPROF_SHIPPED=0 off)" : have ? "read" : "not found", aps.loaded,
             ap_use ? (host->exclusive() ? ": the RAM tier is filled hottest first" : ": the inclusive RAM tier is filled hottest first (LLAMA_MOE_AUTOPROF_INCL=1)") :
             have ? ": not used (needs a RAM tier of the weight store, LLAMA_MOE_AUTOPROF 1 / 3, LLAMA_MOE_AUTOPROF_INCL for the inclusive tier)" :
@@ -5608,7 +5608,7 @@ struct llama_moe_cache::impl {
             ap_new = 0;
         }
         if (at_exit || aps.saves + aps.save_fail <= 2) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: routing profile %s %s (%zu experts, %zu ubatches counted in this launch)\n", tag,
+            LLAMA_LOG_INFO("llama_moe_cache%s: routing profile %s %s (%zu experts, %zu ubatches counted in this launch)\n", tag,
                 ok ? "written to" : "NOT written to", ap_file.c_str(), v.size(), aps.ubatches);
         }
     }
@@ -5835,7 +5835,7 @@ struct llama_moe_cache::impl {
         const int32_t n_slots = host->n_slots();
         const int32_t n_free  = host->n_free();
         const int32_t n_fill  = host->n_filling();
-        LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4fill RAM tier at %s: %d held (%d duplicates of device experts, %zu unused guesses), %d free, %d being "
+        LLAMA_LOG_INFO("llama_moe_cache%s: RAM tier at %s: %d held (%d duplicates of device experts, %zu unused guesses), %d free, %d being "
             "filled, of %d slots; since load: promoted %llu with device evictions / %llu without / %llu by seeds, uploads into empty device slots %llu, "
             "demoted %llu into free slots or duplicates / %llu evicting / %llu kept (RAM held them) / %llu without a slot, admitted from prompts %llu, "
             "page-cache fill %llu; fill %s: %llu read, %llu done (%llu duplicates), %llu cancelled, %llu waited for (%.1f ms), %.1f MiB\n",
@@ -6062,14 +6062,14 @@ struct llama_moe_cache::impl {
                 aps.pf_cold += hot ? 0 : 1;
             }
             ap_mark_cold();
-            LLAMA_LOG_INFO("%s: k19-autoprof: the page-cache fill copied %llu target + %llu other experts of %zu resident, hottest first (%llu no longer "
+            LLAMA_LOG_INFO("%s: the page-cache fill copied %llu target + %llu other experts of %zu resident, hottest first (%llu no longer "
                 "resident when their turn came, not copied)\n", __func__, (unsigned long long) aps.pf_hot, (unsigned long long) aps.pf_cold, ap_cand.size(),
                 (unsigned long long) aps.pf_stale);
         }
         hst.prefilled = n_fill + n_prof;
         LLAMA_LOG_INFO("%s: MoE host cache: %zu experts (%.1f MiB) copied from the page cache into RAM slots in %.1f ms, %zu of them read from the files"
                 " (LLAMA_MOE_HOST_CACHE_PREFILL=0 off, 2 also reads the experts that are not in the page cache)%s\n",
-                __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0, n_file, mark ? "; k19-l4ttft: marked as guesses" : "");
+                __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0, n_file, mark ? "; marked as guesses" : "");
 #endif
     }
 
@@ -7522,7 +7522,7 @@ struct llama_moe_cache::impl {
             plr.base = (uint8_t *) (((uintptr_t) plr.pageable.data() + 4095) & ~(uintptr_t) 4095);
             plr.size = want;
         }
-        LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: prompt layer reads: %s (%.0f MiB scratch, %.0f MiB reclaimable, floor %.0f MiB; "
+        LLAMA_LOG_INFO("llama_moe_cache%s: prompt layer reads: %s (%.0f MiB scratch, %.0f MiB reclaimable, floor %.0f MiB; "
             "LLAMA_MOE_PROMPT_LAYER_READ=1 opt-in)\n", tag, plr.base == nullptr ? "off, no room" : plr.buf != nullptr ? "on, pinned" : "on, pageable",
             want/1048576.0, recl/1048576.0, floor/1048576.0);
         return plr.base != nullptr;
@@ -7653,7 +7653,7 @@ struct llama_moe_cache::impl {
                         n_dup  += r && in_device((int32_t) jl, e);
                     }
                 }
-                LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4held prompt start: RAM tier %llu held (%llu also on the device) of %d slots, %d free\n", tag,
+                LLAMA_LOG_INFO("llama_moe_cache%s: prompt start: RAM tier %llu held (%llu also on the device) of %d slots, %d free\n", tag,
                     (unsigned long long) n_held, (unsigned long long) n_dup, host->n_slots(), host->n_free());
             }
         }
@@ -7779,19 +7779,19 @@ struct llama_moe_cache::impl {
                     ml += (ml.empty() ? "" : " ") + std::to_string(plr.p_miss_layer[il]);
                 }
             }
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft prompt %llu: %llu layers, routed %llu = device %llu + RAM %llu + missing %llu; read in layer "
+            LLAMA_LOG_INFO("llama_moe_cache%s: prompt %llu: %llu layers, routed %llu = device %llu + RAM %llu + missing %llu; read in layer "
                 "batches %llu experts (%.1f MiB) in %.1f ms, %llu past the scratch; %.1f ms since the first layer; missing per layer: %s\n", tag,
                 (unsigned long long) plr.prompts, (unsigned long long) plr.p_layers, (unsigned long long) plr.p_used, (unsigned long long) plr.p_dev,
                 (unsigned long long) plr.p_ram, (unsigned long long) plr.p_miss, (unsigned long long) plr.p_read, plr.p_bytes/1048576.0, plr.p_us/1000.0,
                 (unsigned long long) plr.p_over, (ggml_time_us() - plr.p_t0)/1000.0, ml.c_str());
             const llama_weight_store::stats w = wstore != nullptr ? wstore->get_stats() : plr.p_ws;
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft prompt %llu: %llu copies: routing reads waited %.1f ms, copies issued in %.1f ms; store: "
+            LLAMA_LOG_INFO("llama_moe_cache%s: prompt %llu: %llu copies: routing reads waited %.1f ms, copies issued in %.1f ms; store: "
                 "%.1f MiB uploaded from the RAM tier, %.1f MiB demand reads (%llu regions), %.1f MiB host reads, %.1f MiB ring reads, waited %.1f ms\n", tag,
                 (unsigned long long) plr.prompts, (unsigned long long) plr.p_ncopy, plr.p_sync_us/1000.0, plr.p_up_us/1000.0,
                 (w.tier_uploaded - plr.p_ws.tier_uploaded)/1048576.0, (w.demand_bytes - plr.p_ws.demand_bytes)/1048576.0,
                 (unsigned long long) (w.demand_regions - plr.p_ws.demand_regions), (w.host_read_bytes - plr.p_ws.host_read_bytes)/1048576.0,
                 (w.plan_bytes - plr.p_ws.plan_bytes)/1048576.0, (w.wait_us - plr.p_ws.wait_us)/1000.0);
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4held prompt %llu: copy callbacks %.1f ms in all, seeds %.1f ms, upload-ahead %.1f ms\n", tag,
+            LLAMA_LOG_INFO("llama_moe_cache%s: prompt %llu: copy callbacks %.1f ms in all, seeds %.1f ms, upload-ahead %.1f ms\n", tag,
                 (unsigned long long) plr.prompts, plr.p_x_us[0]/1000.0, plr.p_x_us[1]/1000.0, plr.p_x_us[2]/1000.0);
             // where the experts are after the prompt: device / RAM / both / neither, per layer (neither) and the layer quota's counters
             if (host) {
@@ -7813,7 +7813,7 @@ struct llama_moe_cache::impl {
                     nl += (nl.empty() ? "" : " ") + std::to_string(none);
                     rl += (rl.empty() ? "" : " ") + std::to_string(ram);
                 }
-                LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4held prompt %llu: held after it: device only %llu, RAM only %llu, both %llu, neither %llu; "
+                LLAMA_LOG_INFO("llama_moe_cache%s: prompt %llu: held after it: device only %llu, RAM only %llu, both %llu, neither %llu; "
                     "quota %s (refused %llu, same-layer %llu (%llu ranked), slack %llu); rank mode: %llu layers, %llu routed misses, %llu extra staged, %llu not staged; "
                     "neither per layer: %s; RAM per layer: %s\n", tag, (unsigned long long) plr.prompts,
                     (unsigned long long) n_d, (unsigned long long) n_r, (unsigned long long) n_b, (unsigned long long) n_n,
@@ -9015,7 +9015,7 @@ struct llama_moe_cache::impl {
             }
             static std::atomic<bool> logged{false};
             if (!logged.exchange(true)) {
-                LLAMA_LOG_INFO("llama_moe_cache: k19-hostrow wide hybrid windows: a small batch of %" PRId64 " tokens takes the hybrid assign beyond "
+                LLAMA_LOG_INFO("llama_moe_cache: wide hybrid windows: a small batch of %" PRId64 " tokens takes the hybrid assign beyond "
                     "the %d slots of its group (the misses they cannot take run on the host; LLAMA_MOE_HYBRID_WIDE=0: the CPU path)\n",
                     n_ubatch, (int) g.n_slots);
             }
@@ -9030,7 +9030,7 @@ struct llama_moe_cache::impl {
                 n_ov_plain_wide++;
             }
             if (n_ov_plain++ == 0) {
-                LLAMA_LOG_INFO("llama_moe_cache%s: k19-q4xcache: verify windows of %" PRId64 " tokens with the host path off copy their missing "
+                LLAMA_LOG_INFO("llama_moe_cache%s: verify windows of %" PRId64 " tokens with the host path off copy their missing "
                     "experts beside the cached ones (LLAMA_MOE_OVERLAP_SMALL_PLAIN=0 off)\n", tag, n_ubatch);
             }
         }
@@ -9069,7 +9069,7 @@ struct llama_moe_cache::impl {
             const char * e8m = getenv("LLAMA_MOE_PLACE8_MID"); // k19-placemid: the 8 GB guard only (k19-nanfix is merged)
             place8_single = e8 != nullptr && atoi(e8) > 0 && (e8s == nullptr || atoi(e8s) != 0) && (e8m == nullptr || atoi(e8m) == 0);
             if (hybrid_wide && !model.hparams.no_alloc) {
-                LLAMA_LOG_INFO("%s: k19-hostrow: hybrid small batches of up to %" PRId64 " tokens may outnumber the slots (LLAMA_MOE_HYBRID_WIDE)\n",
+                LLAMA_LOG_INFO("%s: hybrid small batches of up to %" PRId64 " tokens may outnumber the slots (LLAMA_MOE_HYBRID_WIDE)\n",
                     __func__, wide_max);
             }
         }
@@ -9411,7 +9411,7 @@ struct llama_moe_cache::impl {
                     setenv("LLAMA_MOE_G4TAIL_PLACED", "1", 1);
 #endif
                 }
-                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4tail: cross-layer prefetch beside the MTP drafter %s: %.1f%% of the host experts "
+                LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch beside the MTP drafter %s: %.1f%% of the host experts "
                     "cached (band %.2f .. %.2f), %s (top %d predicted experts, at most %d per layer, generation and verify windows only; "
                     "LLAMA_MOE_G4TAIL=0 off)\n", tag, on ? "on" : "off", 100.0*cache_frac, flo, fhi, !anyg ? "no device lookups" :
                     !(cmin == 1200 && cmax == 1200) ? "not a compute capability 12.0 device" : on ? "in the band" : "outside the band", c.n, c.max_fill);
@@ -9422,7 +9422,7 @@ struct llama_moe_cache::impl {
         }
         if (const char * ea = getenv("LLAMA_MOE_PREFETCH_AUTO"); ea == nullptr || atoi(ea) == 0) {
             if (!pf_quiet) {
-                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch off by default: LLAMA_MOE_PREFETCH_AUTO=0 (set beside an "
+                LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch off by default: LLAMA_MOE_PREFETCH_AUTO=0 (set beside an "
                     "MTP drafter; LLAMA_MOE_PREFETCH=N on)\n", tag);
             }
             pf_cfg = c;
@@ -9466,11 +9466,11 @@ struct llama_moe_cache::impl {
         }
         if (!pf_quiet && any) {
             if (c.n > 0) {
-                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch on by default: compute capability 12.0, %.1f%% of the host "
+                LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch on by default: compute capability 12.0, %.1f%% of the host "
                     "experts cached: top %d predicted experts per token, at most %d per layer (LLAMA_MOE_PREFETCH=0 off)\n", tag,
                     100.0*cache_frac, c.n, c.max_fill);
             } else {
-                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch off by default: %s (compute capability %d, %.1f%% of the "
+                LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch off by default: %s (compute capability %d, %.1f%% of the "
                     "host experts cached; LLAMA_MOE_PREFETCH=N on)\n", tag, why, cc_max, 100.0*cache_frac);
             }
         }
@@ -9537,7 +9537,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * op = ggml_moe_cache_prefetch(ctx, logits, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il, n_top,
             max_fill, g.lru.n_core, g.scores, dep);
         if (n_prefetch_ops++ == 0) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch of the top %d predicted experts per token (max %d per layer, "
+            LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch of the top %d predicted experts per token (max %d per layer, "
                 "0 = no cap; LLAMA_MOE_PREFETCH=0 off)\n", tag, n_top, max_fill);
         }
         return op;
@@ -9747,7 +9747,7 @@ struct llama_moe_cache::impl {
         const bool on = (mode == 2 || single_team_host()) && fetch_defer_frac();
         static std::atomic<bool> logged{false};
         if (on && !logged.exchange(true)) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4c deferred admission: single token ubatches compute the admitted experts on the host, their "
+            LLAMA_LOG_INFO("llama_moe_cache%s: deferred admission: single token ubatches compute the admitted experts on the host, their "
                 "copies to the slots finish beside the graph (LLAMA_MOE_FETCH_DEFER=0 off)\n", tag);
         }
         return on;
@@ -10805,7 +10805,7 @@ struct llama_moe_cache::impl {
             cm_t1, g.expert_bytes/cm_t1/1e3, cm_dt, cm_tup, g.expert_bytes/cm_tup/1e3, cm_split, cm_share[1], cm_share[std::min<int64_t>(4, cm_max)],
             (int) std::min<int64_t>(4, cm_max), cm_share[cm_max], cm_max, n_max_share, cm_skip + cm_win1, (ggml_time_us() - t_start)/1e3);
         if (cm_dec_on > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: k19-flint decode host path (LLAMA_MOE_CPU_MISS_DECODE=1): batches of 1..%" PRId64 " tokens "
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: decode host path (LLAMA_MOE_CPU_MISS_DECODE=1): batches of 1..%" PRId64 " tokens "
                 "fetch %.3f of their missing experts (the most used) and the host computes the rest through the mailbox, no rule or trial "
                 "(%s; changes the output, KLD-gated)\n", tag, cm_dec_max, cm_dec_share,
                 cm_decode(1) ? "mailbox usable" : "not used here: no single-graph mailbox, frozen small batches or LLAMA_MOE_CPU_MISS=2");
@@ -12444,7 +12444,7 @@ struct llama_moe_cache::impl {
         ext_max_bytes = std::max(ext_max_bytes, ext_bytes(id));
         ext_us += ggml_time_us() - t0;
         if (n_ext_grows <= 3 && n_added > 0) {
-            LLAMA_LOG_INFO("%s: %s: MoE cache k19-t4small decode extension: +%d slots (%.2f MiB) for %.2f MiB of free device memory%s, "
+            LLAMA_LOG_INFO("%s: %s: MoE cache decode extension: +%d slots (%.2f MiB) for %.2f MiB of free device memory%s, "
                 "%.1f ms (LLAMA_MOE_DECODE_EXT=0 off)\n", __func__, ggml_backend_name(backend), n_added, grown/1048576.0, bytes/1048576.0,
                 failed ? " (stopped: the device had no memory for more)" : "", (ggml_time_us() - t0)/1000.0);
         }
@@ -12571,7 +12571,7 @@ struct llama_moe_cache::impl {
         // k19-ptres: released banks would empty the core, whose host copies are gone: the banks stay
         if (core_on) {
             if (core_refused++ == 0) {
-                LLAMA_LOG_WARN("%s: MoE cache: k19-ptres core: the banks are not released (the core has no host copies to refill from)\n", __func__);
+                LLAMA_LOG_WARN("%s: MoE cache: the banks are not released (the core has no host copies to refill from)\n", __func__);
             }
             return false;
         }
@@ -14447,7 +14447,7 @@ struct llama_moe_cache::impl {
             return true;
         }
         if (const char * why = pw_refused()) {
-            LLAMA_LOG_WARN("llama_moe_cache%s: k19-prewexact: no snapshot before the verify-graph prewarm (%s): the prewarm moves the cache\n", tag, why);
+            LLAMA_LOG_WARN("llama_moe_cache%s: no snapshot before the verify-graph prewarm (%s): the prewarm moves the cache\n", tag, why);
             return false;
         }
         ua_drain();
@@ -14516,7 +14516,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (why != nullptr) {
-            LLAMA_LOG_WARN("llama_moe_cache%s: k19-prewexact: the cache is not taken back after the verify-graph prewarm (%s)\n", tag, why);
+            LLAMA_LOG_WARN("llama_moe_cache%s: the cache is not taken back after the verify-graph prewarm (%s)\n", tag, why);
             cm_paused = pw_cm_paused;
             cm_have0  = false;
             cm_nb     = 0;
@@ -14598,7 +14598,7 @@ struct llama_moe_cache::impl {
         seed_own = pw_flags[0]; prefill_deferred = pw_flags[1]; prefilled_dev = pw_flags[2];
         cm_paused          = pw_cm_paused; // the window goes on where it was (its counters are back too)
         pw_groups.clear();
-        LLAMA_LOG_INFO("llama_moe_cache%s: k19-prewexact: the cache is back as before the verify-graph prewarm: %zu slots got their expert "
+        LLAMA_LOG_INFO("llama_moe_cache%s: the cache is back as before the verify-graph prewarm: %zu slots got their expert "
             "back (%.1f MiB), slot state, counters and rule state restored (LLAMA_SPEC_PREWARM_EXACT=0: off)\n", tag, n_copied, bytes/1048576.0);
         return true;
     }
@@ -14653,7 +14653,7 @@ struct llama_moe_cache::impl {
         for (const auto & v : seed_counts)   { mixb(ha, v.data(), v.size()*sizeof(int32_t)); mixv(ha, v.size()); }
         for (const auto & v : refill)        { mixb(ha, v.data(), v.size()*sizeof(int32_t)); mixv(ha, v.size()); }
         for (const auto & v : refill_counts) { mixb(ha, v.data(), v.size()*sizeof(int32_t)); mixv(ha, v.size()); }
-        LLAMA_LOG_INFO("llama_moe_cache%s: k19-prewexact fp %s: device %016llx lru %016llx rules %016llx aux %016llx\n", tag, when,
+        LLAMA_LOG_INFO("llama_moe_cache%s: fp %s: device %016llx lru %016llx rules %016llx aux %016llx\n", tag, when,
             (unsigned long long) hd, (unsigned long long) hl, (unsigned long long) hr, (unsigned long long) ha);
     }
 
@@ -14690,16 +14690,16 @@ struct llama_moe_cache::impl {
                 st.bytes  += cnt[1]*g.expert_bytes;
             }
             log("device lookups (ubatch <= 32)", st);
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-q4xcache: %llu layer graphs of 2-%d token windows with the host path off overlapped their "
-                "copies, %llu of them 5+ tokens (k19-bigverify, LLAMA_MOE_OVERLAP_PLAIN_MAX) (LLAMA_MOE_OVERLAP_SMALL_PLAIN=%d)\n", tag,
+            LLAMA_LOG_INFO("llama_moe_cache%s: %llu layer graphs of 2-%d token windows with the host path off overlapped their "
+                "copies, %llu of them 5+ tokens (LLAMA_MOE_OVERLAP_PLAIN_MAX) (LLAMA_MOE_OVERLAP_SMALL_PLAIN=%d)\n", tag,
                 (unsigned long long) n_ov_plain, (int) GGML_MOE_MAILBOX_MAX_TOKENS, (unsigned long long) n_ov_plain_wide, overlap_plain_on() ? 1 : 0);
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pass: %llu overlap queries of 5-%d token windows on the single-graph mailbox took the copy "
+            LLAMA_LOG_INFO("llama_moe_cache%s: %llu overlap queries of 5-%d token windows on the single-graph mailbox took the copy "
                 "overlap (LLAMA_MOE_G4PASS=%d)\n", tag, (unsigned long long) n_ov_wide_host, (int) GGML_MOE_MAILBOX_MAX_TOKENS, g4pass_on() ? 1 : 0);
-            LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4mid: %llu overlap queries of 5-%d token mailbox windows took the copy overlap in the "
+            LLAMA_LOG_INFO("llama_moe_cache%s: %llu overlap queries of 5-%d token mailbox windows took the copy overlap in the "
                 "%.1f%% cached band (LLAMA_MOE_G4MID=%d)\n", tag, (unsigned long long) n_ov_wide_mid, (int) GGML_MOE_MAILBOX_MAX_TOKENS,
                 100.0*cache_frac, g4mid_on() ? 1 : 0);
             if (ext_on) {
-                LLAMA_LOG_INFO("llama_moe_cache%s: k19-t4small decode extension: %lld grows, %lld parks, at most %.2f MiB above the fitted slots, "
+                LLAMA_LOG_INFO("llama_moe_cache%s: decode extension: %lld grows, %lld parks, at most %.2f MiB above the fitted slots, "
                     "%.1f ms in all%s (LLAMA_MOE_DECODE_EXT=0 off)\n", tag, (long long) n_ext_grows, (long long) n_ext_parks,
                     ext_max_bytes/1048576.0, ext_us/1000.0, ext_fail > 0 ? ", some grows stopped short (no device memory)" : "");
             }
@@ -14815,13 +14815,13 @@ struct llama_moe_cache::impl {
                     "%llu forced over the RAM copy (%.2f MiB) (LLAMA_MOE_COPYBACK_SKIP=%d)\n",
                     (unsigned long long) hst.demoted, hst.demote_bytes/1048576.0, (unsigned long long) hst.demote_kept, hst.demote_kept_bytes/1048576.0,
                     (unsigned long long) hst.demote_forced, hst.demote_forced_bytes/1048576.0, copyback_skip ? 1 : 0);
-            LLAMA_LOG_INFO("llama_moe_cache: k19-l4held: %llu seed evictions copied back asynchronously (LLAMA_MOE_SHADOW_ASYNC=%d); RAM tier layer quota %s: "
+            LLAMA_LOG_INFO("llama_moe_cache: %llu seed evictions copied back asynchronously (LLAMA_MOE_SHADOW_ASYNC=%d); RAM tier layer quota %s: "
                     "%llu refused, %llu same-layer, %llu ranked, %llu slack; %zu device-prefill RAM copies marked as duplicates\n",
                     (unsigned long long) n_shadow_async, shadow_async() ? 1 : 0, host->layer_quota_on() ? "on" : "off",
                     (unsigned long long) host->quota_refused, (unsigned long long) host->quota_same, (unsigned long long) host->quota_ranked,
                     (unsigned long long) host->quota_slack, n_prefill_dup);
             if (host->exclusive()) {
-                LLAMA_LOG_INFO("llama_moe_cache: k19-l4fill: refill of freed RAM slots %s (LLAMA_MOE_HOST_FILL=%d, %d speculative reads at once): %llu prompts "
+                LLAMA_LOG_INFO("llama_moe_cache: refill of freed RAM slots %s (LLAMA_MOE_HOST_FILL=%d, %d speculative reads at once): %llu prompts "
                         "counted, %llu rounds (%llu at the server's idle point), %llu read (%.1f MiB), %llu done (%llu duplicates), %llu cancelled, %llu failed, %llu waited for (%.1f ms), "
                         "%llu unmarked RAM copies of device experts marked as duplicates\n",
                         fill_mode != 0 ? "on" : "off", fill_mode, fill_parallel, (unsigned long long) fls.prompts, (unsigned long long) fls.rounds,
@@ -14842,7 +14842,7 @@ struct llama_moe_cache::impl {
                     hs.alloc_us/1000.0, (unsigned long long) hs.alloc_fail, host->pageable_bytes()/1048576.0, (unsigned long long) hs.pin_fallbacks);
             if (!hprof_ticket.empty()) {
                 hprof_request_log("at exit");
-                LLAMA_LOG_INFO("llama_moe_cache: host profile (k19-ramprof2): %llu dropped for requests' reads, %llu copied at the first batch (%.1f MiB), %llu background reads issued (%.1f MiB) in %llu rounds, "
+                LLAMA_LOG_INFO("llama_moe_cache: host profile: %llu dropped for requests' reads, %llu copied at the first batch (%.1f MiB), %llu background reads issued (%.1f MiB) in %llu rounds, "
                         "%llu done, %llu waited for by a lookup (%.1f ms), %llu cancelled by a large batch, %llu without a free slot, %llu failed, %llu duplicates of "
                         "device experts; guesses: %llu marked, %llu used, %llu replaced unused, %zu still unused\n",
                         (unsigned long long) hps.dropped, (unsigned long long) hps.load_copied, hps.load_copied_bytes/1048576.0, (unsigned long long) hps.issued, hps.issued_bytes/1048576.0,

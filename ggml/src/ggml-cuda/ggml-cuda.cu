@@ -168,7 +168,7 @@ void ggml_cuda_p1_stat(ggml_cuda_p1_stat_kind kind) {
     static std::once_flag once;
     std::call_once(once, [] {
         atexit([] {
-            fprintf(stderr, "k19-p1fuse stats: gdn_fused_new=%lld gdn_fused=%lld gated_norm_silu=%lld gated_norm_sigmoid=%lld mmvf_onebar=%lld mmvf_twobar=%lld\n",
+            fprintf(stderr, "fusion stats: gdn_fused_new=%lld gdn_fused=%lld gated_norm_silu=%lld gated_norm_sigmoid=%lld mmvf_onebar=%lld mmvf_twobar=%lld\n",
                 (long long) counts[GGML_CUDA_P1_GDN_FUSED_NEW], (long long) counts[GGML_CUDA_P1_GDN_FUSED],
                 (long long) counts[GGML_CUDA_P1_GATED_NORM_SILU], (long long) counts[GGML_CUDA_P1_GATED_NORM_SIG],
                 (long long) counts[GGML_CUDA_P1_MMVF_ONEBAR], (long long) counts[GGML_CUDA_P1_MMVF_TWOBAR]);
@@ -179,7 +179,7 @@ void ggml_cuda_p1_stat(ggml_cuda_p1_stat_kind kind) {
                                                       "mmvf_twobar" };
     const long long n = ++counts[kind];
     if ((n & (n - 1)) == 0) {
-        GGML_LOG_INFO("k19-p1fuse stat: %s = %lld\n", names[kind], n);
+        GGML_LOG_INFO("fusion stat: %s = %lld\n", names[kind], n);
     }
 }
 
@@ -4999,7 +4999,7 @@ static void ggml_cuda_fusion_leaf_alias_log(const ggml_tensor * dst, const ggml_
     if ((!log_all && !seen.empty()) || !seen.insert(key).second) {
         return;
     }
-    GGML_LOG_INFO("%s: k19-fusealias: %s (%s) overlaps the input %s (%s, %s) its fused group reads: computed by the separate nodes "
+    GGML_LOG_INFO("%s: %s (%s) overlaps the input %s (%s, %s) its fused group reads: computed by the separate nodes "
         "(GGML_CUDA_FUSE_ALIAS_STRICT=0: fused anyway)\n", __func__, dst->name, ggml_op_desc(dst), src->name, ggml_op_desc(src),
         ggml_type_name(src->type));
 }
@@ -5284,7 +5284,7 @@ static int ggml_cuda_try_fuse_moe_red_add2(ggml_backend_cuda_context * cuda_ctx,
             static bool logged_alias = false;
             if (!logged_alias) {
                 logged_alias = true;
-                GGML_LOG_INFO("%s: k19-t4det: %s overlaps an input of its fused weighted reduction: computed by the separate nodes "
+                GGML_LOG_INFO("%s: %s overlaps an input of its fused weighted reduction: computed by the separate nodes "
                     "(GGML_CUDA_MOE_RED_FUSE_ALIAS=1: fused anyway)\n", __func__, dst->name);
             }
             return 0;
@@ -5294,7 +5294,7 @@ static int ggml_cuda_try_fuse_moe_red_add2(ggml_backend_cuda_context * cuda_ctx,
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: k19-g4fuse: the MoE cache's hit + fetched expert ADD%s in the weighted reduction launch (%s, %d nodes; "
+        GGML_LOG_INFO("%s: the MoE cache's hit + fetched expert ADD%s in the weighted reduction launch (%s, %d nodes; "
             "GGML_CUDA_MOE_RED_FUSE=0: off)\n", __func__, extra != nullptr ? " and the following ADD" : "", dst->name, n);
     }
     return n - 1;
@@ -6069,7 +6069,7 @@ static int ggml_cuda_try_fuse_hc_post_norm_conv(ggml_backend_cuda_context * cuda
             GGML_LOG_INFO("hc post conv: %s + %s in one launch (%lld tokens, mode %d)\n", hc_post->name, mul->name,
                 (long long) hc_post->ne[2], memo.producer_mode);
         } else if (!logged) {
-            GGML_LOG_INFO("%s: k19-fu2 F1: hc combine + next mix norm (+ q8_1 MMQ copy) in one kernel (GGML_CUDA_DISABLE_FUSE_HC_POST_CONV=1: off)\n", __func__);
+            GGML_LOG_INFO("%s: F1: hc combine + next mix norm (+ q8_1 MMQ copy) in one kernel (GGML_CUDA_DISABLE_FUSE_HC_POST_CONV=1: off)\n", __func__);
         }
         logged = true;
         return irn + 1 - i;
@@ -6472,7 +6472,7 @@ static bool ggml_cuda_turing_multi_mmq(const ggml_tensor * node, const int cc) {
     }
     static std::once_flag once;
     std::call_once(once, [&] {
-        GGML_LOG_INFO("k19-kqtc: Turing multi-matrix verify products of %d+ columns run single on MMQ (first: %s, %lld columns; "
+        GGML_LOG_INFO("few-row MMQ: Turing multi-matrix verify products of %d+ columns run single on MMQ (first: %s, %lld columns; "
             "GGML_CUDA_TURING_MULTI_MMQ=0 off)\n", min_cols, ggml_type_name(src0->type), (long long) ne11);
     });
     return true;
@@ -8703,7 +8703,7 @@ static bool ggml_cuda_try_gated_norm_mmq(ggml_backend_cuda_context * cuda_ctx, c
             GGML_LOG_INFO("gated norm mmq: %s with its q8_1 MMQ copy in one launch (%lld x %lld)\n", mul_g->name,
                 (long long) memo.K_out, (long long) memo.N_out);
         } else if (!logged) {
-            GGML_LOG_INFO("%s: k19-fu2 F2: gated delta net norm writes its out projection's q8_1 MMQ copy (GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ=1: off)\n", __func__);
+            GGML_LOG_INFO("%s: F2: gated delta net norm writes its out projection's q8_1 MMQ copy (GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ=1: off)\n", __func__);
         }
         logged = true;
         return true;
@@ -8762,7 +8762,7 @@ static int ggml_cuda_try_fuse_swiglu_mmid(ggml_backend_cuda_context * cuda_ctx, 
         GGML_LOG_INFO("swiglu mmid: %s computed in the quantize of %s (%lld tokens x %lld slots)\n", glu->name, mm->name,
             (long long) glu->ne[2], (long long) glu->ne[1]);
     } else if (!logged) {
-        GGML_LOG_INFO("%s: k19-fu2 F3: routed SWIGLU computed in the down product's gathered quantize (GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID=1: off)\n", __func__);
+        GGML_LOG_INFO("%s: F3: routed SWIGLU computed in the down product's gathered quantize (GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID=1: off)\n", __func__);
     }
     logged = true;
     return j - i;
@@ -10214,7 +10214,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (!side_chain_at.empty()) {
                 static int n_logged = 0;
                 if (n_logged++ < side_chain_log) {
-                    GGML_LOG_INFO("k19-vcost: side-stream branches in a captured graph: %zu (%d nodes)\n", side_chain_at.size(), cgraph->n_nodes);
+                    GGML_LOG_INFO("side-stream branches in a captured graph: %zu (%d nodes)\n", side_chain_at.size(), cgraph->n_nodes);
                 }
             }
             uint64_t side_chain_claims0 = 0;    // q8_1 cache claims when the open branch was forked
@@ -10629,7 +10629,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 static int n_chunk_logged = 0;
                 if (n_chunk_logged < chunk_log) {
                     n_chunk_logged++;
-                    GGML_LOG_INFO("k19-am17an: CUDA graph of %d ggml nodes captured in %zu chunks (GGML_CUDA_GRAPH_CHUNK_SIZE=%d; =0 off)\n",
+                    GGML_LOG_INFO("CUDA graph of %d ggml nodes captured in %zu chunks (GGML_CUDA_GRAPH_CHUNK_SIZE=%d; =0 off)\n",
                         cgraph->n_nodes, graph->chunk_graphs.size() + 1, chunk_size);
                 }
             }

@@ -2488,7 +2488,7 @@ static bool kq_mask_row_inc(const args_set_input_kq_mask & args, uint32_t strm, 
         for (int64_t j = 0; j < n_kv; ++j) {
             const T v = kq_mask_cell<T, causal, swa, is_2d>(args, cells, (uint32_t) j, seq_id, p1, p1_x, p1_y, spm);
             if (memcmp(&v, &dst[j], sizeof(T)) != 0) {
-                GGML_ABORT("k19-vwidth: incremental KQ mask row differs at cell %lld (seq %d, p1 %d, n_kv %lld)", (long long) j, seq_id, p1, (long long) n_kv);
+                GGML_ABORT("incremental KQ mask row differs at cell %lld (seq %d, p1 %d, n_kv %lld)", (long long) j, seq_id, p1, (long long) n_kv);
             }
             if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) + (int32_t) (args.n_swa + 32) >= spm) {
                 ref_idxs.push_back((uint32_t) j);
@@ -2497,11 +2497,11 @@ static bool kq_mask_row_inc(const args_set_input_kq_mask & args, uint32_t strm, 
         std::vector<uint32_t> got = idxs;
         std::sort(got.begin(), got.end());
         if (got != ref_idxs) {
-            GGML_ABORT("k19-vwidth: incremental KQ mask recorded cells differ (%zu vs %zu)", got.size(), ref_idxs.size());
+            GGML_ABORT("incremental KQ mask recorded cells differ (%zu vs %zu)", got.size(), ref_idxs.size());
         }
         static std::atomic<int64_t> n_checked { 0 };
         if (++n_checked % 1000 == 1) {
-            LLAMA_LOG_INFO("%s: k19-vwidth: incremental KQ mask check: %lld rows equal so far\n", __func__, (long long) n_checked);
+            LLAMA_LOG_INFO("%s: incremental KQ mask check: %lld rows equal so far\n", __func__, (long long) n_checked);
         }
     }
     return true;
@@ -2798,7 +2798,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         if (inc && !alibi && args.rows != nullptr && n_tps <= 64) {
             static std::atomic<bool> logged { false };
             if (!logged.exchange(true)) {
-                LLAMA_LOG_INFO("%s: k19-vwidth: decode KQ masks start from the kept first rows (LLAMA_KQ_MASK_INC=0: off)\n", __func__);
+                LLAMA_LOG_INFO("%s: decode KQ masks start from the kept first rows (LLAMA_KQ_MASK_INC=0: off)\n", __func__);
             }
             set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(args, seq_pos_min, data, 0, n_tps, sorted);
             return;

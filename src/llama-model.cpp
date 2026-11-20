@@ -1431,7 +1431,7 @@ void llama_model::drop_device_cache() const {
             close(fd);
         }
     }
-    LLAMA_LOG_INFO("%s: k19-fnttft: dropped the page cache of %zu tensors copied to a device (%.2f MiB): the model's PLE table is short "
+    LLAMA_LOG_INFO("%s: dropped the page cache of %zu tensors copied to a device (%.2f MiB): the model's PLE table is short "
         "of RAM (LLAMA_MODEL_DROP_DEVICE_CACHE=0 keeps it)\n", __func__, device_cache.size(), n_dropped/1048576.0);
 #endif
     device_cache.clear();
@@ -1793,7 +1793,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }();
     const int n_layer_slots = n_layer_all - n_nextn_skip; // loaded blocks; slot n_layer_slots = the output
     if (n_nextn_skip > 0) {
-        LLAMA_LOG_INFO("%s: k19-q38r2: -ngl counts the %d loaded blocks + output (the %d NextN block(s) are not loaded and take no slot; "
+        LLAMA_LOG_INFO("%s: -ngl counts the %d loaded blocks + output (the %d NextN block(s) are not loaded and take no slot; "
             "LLAMA_NGL_NEXTN_SLOT=1: as before)\n", __func__, n_layer_slots, n_nextn_skip);
     }
     const int i_gpu_start = std::max(n_layer_slots + 1 - n_gpu_layers, 0);

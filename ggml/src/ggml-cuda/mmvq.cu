@@ -367,7 +367,7 @@ static bool ggml_cuda_verify_dense_mmq_sm80(const ggml_type type, const int cc, 
     }
     static std::once_flag once;
     std::call_once(once, [&] {
-        GGML_LOG_INFO("k19-a80verify: dense verify products of %d..%d columns on MMQ on cc 8.0 (types mask %d: 1 Q6_K, 2 Q8_0, 4 others; "
+        GGML_LOG_INFO("dense verify products of %d..%d columns on MMQ on cc 8.0 (types mask %d: 1 Q6_K, 2 Q8_0, 4 others; "
             "first: %s, %lld columns; GGML_CUDA_VERIFY_DENSE_MMQ_SM80=0 off)\n", std::max(2, cfg.min_cols), MMVQ_MAX_BATCH_SIZE, cfg.mask,
             ggml_type_name(type), (long long) ne11);
     });
@@ -2575,7 +2575,7 @@ static bool mmvq_moe_ampere(const int cc) {
 static void mmvq_moe_ampere_log(const char * what, const ggml_type type, const int ntok) {
     static std::once_flag once;
     std::call_once(once, [&] {
-        GGML_LOG_INFO("k19-ampere: sm_80 MoE mat-vec shapes engaged (first: %s, %s, %d tokens; GGML_CUDA_MOE_AMPERE=0 off)\n", what,
+        GGML_LOG_INFO("sm_80 MoE mat-vec shapes engaged (first: %s, %s, %d tokens; GGML_CUDA_MOE_AMPERE=0 off)\n", what,
             ggml_type_name(type), ntok);
     });
 }
@@ -2611,12 +2611,12 @@ static int mmvq_moe_unroll(const int ncols_x, const int warp_size) {
 static void mmvq_moe_unroll_log(const char * kernel, const ggml_type type, const bool fused, const int unroll, const int ncols_dst) {
     static const bool every = [] { const char * e = getenv("GGML_CUDA_MOE_UNROLL_LOG"); return e != nullptr && atoi(e) != 0; }();
     if (every) {
-        GGML_LOG_INFO("k19-moebw: %s %s%s unroll %d, %d tokens\n", kernel, ggml_type_name(type), fused ? " fused" : "", unroll, ncols_dst);
+        GGML_LOG_INFO("MoE mat-vec: %s %s%s unroll %d, %d tokens\n", kernel, ggml_type_name(type), fused ? " fused" : "", unroll, ncols_dst);
         return;
     }
     static std::once_flag once;
     std::call_once(once, [&] {
-        GGML_LOG_INFO("k19-moebw: multi-token MoE mat-vec with K unroll engaged (first: %s %s%s, unroll %d, %d tokens)\n", kernel,
+        GGML_LOG_INFO("MoE mat-vec: multi-token MoE mat-vec with K unroll engaged (first: %s %s%s, unroll %d, %d tokens)\n", kernel,
             ggml_type_name(type), fused ? " with fused gate" : "", unroll, ncols_dst);
     });
 }
@@ -2896,13 +2896,13 @@ static constexpr bool mmvq_moe_bw_type(const ggml_type type) {
 static void mmvq_moe_bw_log(const ggml_type type, const bool fused, const int ntok, const int nslots, const int rpw, const int nwarps) {
     static const bool every = [] { const char * e = getenv("GGML_CUDA_MOE_UNROLL_LOG"); return e != nullptr && atoi(e) != 0; }();
     if (every) {
-        GGML_LOG_INFO("k19-moebw: mul_mat_vec_q_moe_bw %s%s %d x %d rpw %d nwarps %d\n", ggml_type_name(type), fused ? " fused" : "",
+        GGML_LOG_INFO("MoE mat-vec: mul_mat_vec_q_moe_bw %s%s %d x %d rpw %d nwarps %d\n", ggml_type_name(type), fused ? " fused" : "",
             ntok, nslots, rpw, nwarps);
         return;
     }
     static std::once_flag once;
     std::call_once(once, [&] {
-        GGML_LOG_INFO("k19-moebw: multi-token MoE mat-vec with staged weight rows engaged (first: %s%s, %d tokens x %d slots, "
+        GGML_LOG_INFO("MoE mat-vec: multi-token MoE mat-vec with staged weight rows engaged (first: %s%s, %d tokens x %d slots, "
             "%d rows per warp, %d warps)\n", ggml_type_name(type), fused ? " with fused gate" : "", ntok, nslots, rpw, nwarps);
     });
 }
@@ -3029,13 +3029,13 @@ static mmvq_moe_vl_cfg mmvq_moe_vl_config(const ggml_type type, const bool fused
 static void mmvq_moe_vl_log(const ggml_type type, const bool fused, const int ntok, const int nslots, const int tpr, const int g) {
     static const bool every = [] { const char * e = getenv("GGML_CUDA_MOE_UNROLL_LOG"); return e != nullptr && atoi(e) != 0; }();
     if (every) {
-        GGML_LOG_INFO("k19-moebw: mul_mat_vec_q_moe_vl %s%s %d x %d vl%d,%d\n", ggml_type_name(type), fused ? " fused" : "", ntok, nslots,
+        GGML_LOG_INFO("MoE mat-vec: mul_mat_vec_q_moe_vl %s%s %d x %d vl%d,%d\n", ggml_type_name(type), fused ? " fused" : "", ntok, nslots,
             tpr, g);
         return;
     }
     static std::once_flag once;
     std::call_once(once, [&] {
-        GGML_LOG_INFO("k19-moegrp: multi-token MoE mat-vec with %d threads per row, %d entries per decode engaged (first: %s%s, "
+        GGML_LOG_INFO("multi-token MoE mat-vec with %d threads per row, %d entries per decode engaged (first: %s%s, "
             "%d tokens x %d slots)\n", tpr, g, ggml_type_name(type), fused ? " with fused gate" : "", ntok, nslots);
     });
 }
@@ -3237,7 +3237,7 @@ static int mmvq_cols_rows(const ggml_type type, const int ncols_dst, const mmvq_
 static void mmvq_cols_log(const ggml_type type, const int ncols_dst, const int rpb, const int nwarps, const char * where) {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_MMVQ_COLS_LOG"); return e != nullptr && atoi(e) != 0; }();
     if (on) {
-        GGML_LOG_INFO("k19-mmvqcols: %s ncols %d rpb %d nwarps %d %s\n", ggml_type_name(type), ncols_dst, rpb, nwarps, where);
+        GGML_LOG_INFO("mmvq columns: %s ncols %d rpb %d nwarps %d %s\n", ggml_type_name(type), ncols_dst, rpb, nwarps, where);
     }
 }
 
@@ -3625,7 +3625,7 @@ static bool mul_mat_vec_q_tab_launch(
             static bool engaged = false;
             if (!engaged) {
                 engaged = true;
-                GGML_LOG_INFO("k19-iqsmem: %s %s engaged (%d rows per block, %d warps, ids %d)\n", ggml_type_name(type),
+                GGML_LOG_INFO("IQ shared-memory mat-vec: %s %s engaged (%d rows per block, %d warps, ids %d)\n", ggml_type_name(type),
                     grid_type ? "MUL_MAT_ID grid launch" : "codebook in shared memory", rpb, nwarps_l, ids != nullptr);
             }
         }
@@ -3720,7 +3720,7 @@ static bool mul_mat_vec_q_wpr_launch(
             static bool engaged2 = false;
             if (!engaged2) {
                 engaged2 = true;
-                GGML_LOG_INFO("k19-q4xt: %s %s 2-warp launch engaged (K %d, %d rows per block, was %d warps)\n", ggml_type_name(type),
+                GGML_LOG_INFO("MoE mat-vec launch: %s %s 2-warp launch engaged (K %d, %d rows per block, was %d warps)\n", ggml_type_name(type),
                     ids != nullptr ? "MUL_MAT_ID" : "dense", ncols_x, env_rows, nwarps_old);
             }
             return true;
@@ -3752,7 +3752,7 @@ static bool mul_mat_vec_q_wpr_launch(
         static bool engaged = false;
         if (!engaged) {
             engaged = true;
-            GGML_LOG_INFO("k19-q4xt: %s %s warp per row launch engaged (K %d, %d warps x %d rows per block, was %d warps)\n",
+            GGML_LOG_INFO("MoE mat-vec launch: %s %s warp per row launch engaged (K %d, %d warps x %d rows per block, was %d warps)\n",
                 ggml_type_name(type), ids != nullptr ? "MUL_MAT_ID" : "dense", ncols_x, env_w, env_rows, nwarps_old);
         }
         return true;
@@ -4621,7 +4621,7 @@ void ggml_cuda_mul_mat_vec_q(
             dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         static std::once_flag once;
         std::call_once(once, [&] {
-            GGML_LOG_INFO("k19-ampere: a verify MUL_MAT_ID of %d tokens (%s%s) on the multi-token mmvq kernels instead of MMQ "
+            GGML_LOG_INFO("a verify MUL_MAT_ID of %d tokens (%s%s) on the multi-token mmvq kernels instead of MMQ "
                 "(GGML_CUDA_VERIFY_WIDE bit 8)\n", (int) dst->ne[2], ggml_type_name(src0->type), fusion && fusion->gate ? ", fused gate" : "");
         });
     }

@@ -934,13 +934,13 @@ llama_context::llama_context(
             llama_kv_win_params wp = llama_kv_win_params_from(params);
             wp.n_ubatch = cparams.n_ubatch;
             if (wp.n_win >= 0 && !cparams.flash_attn) {
-                LLAMA_LOG_WARN("%s: k19-kvwin: the KV window ring needs flash attention: off\n", __func__);
+                LLAMA_LOG_WARN("%s: the KV window ring needs flash attention: off\n", __func__);
                 wp.n_win = -1;
             }
             // drafters (MTP heads, DFlash): their caches are written by their own paths (KV injection, K / V-only passes), and their
             // accuracy only moves the acceptance; the ring is for the target
             if (wp.n_win >= 0 && (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || model.arch == LLM_ARCH_DFLASH)) {
-                LLAMA_LOG_INFO("%s: k19-kvwin: no KV window ring for a drafter context\n", __func__);
+                LLAMA_LOG_INFO("%s: no KV window ring for a drafter context\n", __func__);
                 wp.n_win = -1;
             }
             if (wp.n_win >= 0) {
@@ -955,7 +955,7 @@ llama_context::llama_context(
                     kv = mhi->get_mem_attn()->get_base();
                 }
                 if (kv == nullptr) {
-                    LLAMA_LOG_WARN("%s: k19-kvwin: this model's memory has no plain attention cache for the KV window ring: off\n", __func__);
+                    LLAMA_LOG_WARN("%s: this model's memory has no plain attention cache for the KV window ring: off\n", __func__);
                 } else {
                     kv->win_init(wp);
                 }
@@ -1340,14 +1340,14 @@ llama_context::llama_context(
                 // 159.0 / 137.9 / 129.2 (16 GB); base 120.0 / 100.1 / 91.0 and 141.0 / 100.0 / 109.8 (k19pm_g3a / g3b)
                 tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr ? atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0 : !place8_lean;
                 if (place8_lean) {
-                    LLAMA_LOG_INFO("%s: MoE cache: k19-pgroups2: short prompts run in one ubatch with the banks released, the banks come back "
-                        "with the experts they held before%s (LLAMA_MOE_PLACE8_GROUPS_LEAN=0: as k19-placemid)\n", __func__,
+                    LLAMA_LOG_INFO("%s: MoE cache: short prompts run in one ubatch with the banks released, the banks come back "
+                        "with the experts they held before%s (LLAMA_MOE_PLACE8_GROUPS_LEAN=0: as the mid-size placement)\n", __func__,
                         place8_lean_group ? ", also after a layer-major group" : "");
                 }
-                LLAMA_LOG_INFO("%s: MoE cache: k19-placemid: graphs reserved at %lld tokens, layer-major prompt groups %s\n", __func__,
+                LLAMA_LOG_INFO("%s: MoE cache: graphs reserved at %lld tokens, layer-major prompt groups %s\n", __func__,
                     (long long) tiny_rel_ub, lm_enabled ? "kept (they release the banks for the merged graph)" : "off");
             }
-            LLAMA_LOG_INFO("%s: MoE cache: k19-place8: ubatches of more than %lld tokens (up to n_ubatch %u) run with the cache banks released, "
+            LLAMA_LOG_INFO("%s: MoE cache: ubatches of more than %lld tokens (up to n_ubatch %u) run with the cache banks released, "
                 "the next smaller ubatch frees the compute buffers and refills the banks (%s; LLAMA_FIT_PLACE8=0 off)\n", __func__,
                 (long long) tiny_rel_ub, cparams.n_ubatch, tiny_rel_routed ? "with the experts the last large ubatch routed most" :
                 "with the experts they held before");
@@ -1490,7 +1490,7 @@ llama_context::llama_context(
                 // k19-ptres (LLAMA_MOE_CORE=1): the host copies of the MoE cache's core are not in RAM (see llama_moe_cache::core_dropped_bytes)
                 if (moe_cache && moe_cache->core_dropped_bytes() > 0) {
                     const size_t dropped = std::min(host, moe_cache->core_dropped_bytes());
-                    LLAMA_LOG_INFO("%s: PLE table: %.1f GiB of host weights are a MoE cache core without host copies (k19-ptres)\n", __func__,
+                    LLAMA_LOG_INFO("%s: PLE table: %.1f GiB of host weights are a MoE cache core without host copies\n", __func__,
                         dropped/1073741824.0);
                     host -= dropped;
                 }
@@ -1588,7 +1588,7 @@ llama_context::llama_context(
                                     llama_autoprof::model_hash(model.desc(), model.n_elements(), model.size()), "." + std::to_string(t->ne[1]));
                                 const int cc = model_gpu_min_cc(model);
                                 if (!ap_ship.empty() && cc < 800) {
-                                    LLAMA_LOG_INFO("%s: k19-autoprof: shipped PLE row profile %s not used: the model's GPUs are below compute "
+                                    LLAMA_LOG_INFO("%s: shipped PLE row profile %s not used: the model's GPUs are below compute "
                                         "capability 8.0 (lowest %d) or not CUDA\n", __func__, ap_ship.c_str(), cc);
                                     ap_ship.clear();
                                 }
@@ -1656,7 +1656,7 @@ llama_context::llama_context(
                                 if (ap_rec) {
                                     model.ple_row_profile_save = ap_path;
                                 }
-                                LLAMA_LOG_INFO("%s: k19-autoprof: PLE row profile %s %s%s%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", __func__,
+                                LLAMA_LOG_INFO("%s: PLE row profile %s %s%s%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", __func__,
                                     ap_path.c_str(), ap_have ? "found" : "not found",
                                     ap_ship.empty() ? "" : (", shipped profile " + ap_ship + " read (LLAMA_MOE_AUTOPROF_SHIPPED=0 off)").c_str(),
                                     ap_rec ? ", this launch's rows are recorded and written at exit" : "");
@@ -2612,7 +2612,7 @@ void llama_context::place8_lend_now() {
     static int64_t n_lend = 0;
     if (freed_w > 0 && n_lend++ < 4) {
         LLAMA_LOG_INFO("%s: MTP drafter weights lent to a released prompt ubatch: %.2f MiB + %.2f MiB of its compute buffers, %.2f ms "
-            "(k19-mtpkeep; LLAMA_FIT_DRAFT_HOST_EXPS_LEND=0 off)\n", __func__, freed_w/1048576.0, freed_c/1048576.0, (ggml_time_us() - t0)/1000.0);
+            "(LLAMA_FIT_DRAFT_HOST_EXPS_LEND=0 off)\n", __func__, freed_w/1048576.0, freed_c/1048576.0, (ggml_time_us() - t0)/1000.0);
     }
 }
 
@@ -2638,7 +2638,7 @@ size_t llama_context::place8_free_compute() {
     static int64_t n_log = 0;
     if (n_log++ < 4) {
         LLAMA_LOG_INFO("%s: compute buffers of the released prompt ubatch freed for the MTP drafter's weights: %.2f MiB, %.2f MiB of "
-            "CUDA pools given back (k19-mtpkeep)\n", __func__, freed/1048576.0, trimmed/1048576.0);
+            "CUDA pools given back\n", __func__, freed/1048576.0, trimmed/1048576.0);
     }
     return freed + trimmed;
 }
@@ -2852,14 +2852,14 @@ void llama_context::ext_park(const char * why) {
     if (ext_grown) {
         static int n_warn = 0;
         if (n_warn++ < 2) {
-            LLAMA_LOG_WARN("%s: MoE cache k19-t4small decode extension: not parked (%s): the banks are released\n", __func__, why);
+            LLAMA_LOG_WARN("%s: MoE cache decode extension: not parked (%s): the banks are released\n", __func__, why);
         }
         return;
     }
     ext_n_park++;
     ext_ms += (ggml_time_us() - t0)/1e3;
     if (ext_n_park <= 2) {
-        LLAMA_LOG_INFO("%s: MoE cache k19-t4small decode extension parked (%s): %.2f MiB given back, %.1f ms\n", __func__, why,
+        LLAMA_LOG_INFO("%s: MoE cache decode extension parked (%s): %.2f MiB given back, %.1f ms\n", __func__, why,
             freed/1048576.0, (ggml_time_us() - t0)/1e3);
     }
 }
@@ -2913,7 +2913,7 @@ void llama_context::ext_unpark() {
     ext_max = std::max(ext_max, grown);
     ext_ms += (ggml_time_us() - t0)/1e3;
     if (ext_n_grow <= 3) {
-        LLAMA_LOG_INFO("%s: MoE cache k19-t4small decode extension: compute buffers freed %.2f MiB (MTP drafters %.2f MiB), %.1f MiB free, "
+        LLAMA_LOG_INFO("%s: MoE cache decode extension: compute buffers freed %.2f MiB (MTP drafters %.2f MiB), %.1f MiB free, "
             "%.2f MiB of slots added (keep %.0f MiB), %.1f ms\n", __func__, freed/1048576.0, freed_dft/1048576.0, fr/1048576.0,
             grown/1048576.0, keep/1048576.0, (ggml_time_us() - t0)/1e3);
     }
@@ -2966,7 +2966,7 @@ llama_context::~llama_context() {
                 "after another key's graph, LLAMA_RS_REPLAY_SCHED_REBUILD), %.2f ms total, %.3f ms each (host)\n", __func__,
                 rs_replay_mem->n_replay_commit, rs_reused, rs_sched_rebuilt, rs_replay_us/1e3, rs_replay_us/1e3/rs_replay_mem->n_replay_commit);
         LLAMA_LOG_INFO("%s: recurrent replay windows moved with their cells: %" PRIu64 "\n", __func__, rs_replay_mem->n_replay_move);
-        LLAMA_LOG_INFO("%s: k19-g4tier: %" PRIu64 " conv-only replay commits as one batched copy (LLAMA_RS_CONV_BATCH=0: commit graphs)\n",
+        LLAMA_LOG_INFO("%s: %" PRIu64 " conv-only replay commits as one batched copy (LLAMA_RS_CONV_BATCH=0: commit graphs)\n",
                 __func__, rs_conv_batched);
         LLAMA_LOG_INFO("%s: replay commit graph allocations: %.2f MiB at most, %" PRIu64 " commits in the reserved fallback buffer\n", __func__,
                 rs_ga_bytes_max/1024.0/1024.0, rs_fb_used);
@@ -2987,7 +2987,7 @@ llama_context::~llama_context() {
         rs_move_mem->sync_cb = nullptr;
     }
     if (n_small_check_assigned > 0 || getenv("LLAMA_GRAPH_SMALL_CHECK") != nullptr) {
-        LLAMA_LOG_INFO("%s: k19-mgpu3 small graph backends: %" PRIu64 " builder assignments at kept graph allocations, %" PRIu64 " lost\n", __func__,
+        LLAMA_LOG_INFO("%s: multi-GPU small graph backends: %" PRIu64 " builder assignments at kept graph allocations, %" PRIu64 " lost\n", __func__,
             n_small_check_assigned, n_small_check_lost);
     }
     if (n_plan_saves > 0) {
@@ -3400,7 +3400,7 @@ size_t llama_context::ple_topup() {
     const uint64_t target = std::min<uint64_t>(span, recl > reserve ? recl - reserve : 0);
     const uint64_t have   = (uint64_t) res * pg;
     if (target <= have + std::min<uint64_t>(64ull << 20, span / 64)) {   // less than 64 MiB (1/64 of a small table) to gain: no read
-        LLAMA_LOG_INFO("%s: k19-fnttft: PLE table top-up: %.0f of %.0f MiB in the page cache, nothing to read back (reclaimable %.1f GiB - "
+        LLAMA_LOG_INFO("%s: PLE table top-up: %.0f of %.0f MiB in the page cache, nothing to read back (reclaimable %.1f GiB - "
             "%.1f GiB reserve; LLAMA_PLE_TOPUP=0 off)\n", __func__, have/1048576.0, span/1048576.0, recl/1073741824.0,
             reserve/1073741824.0);
         return 0;
@@ -3499,7 +3499,7 @@ size_t llama_context::ple_topup() {
             break;
         }
     }
-    LLAMA_LOG_INFO("%s: k19-fnttft: PLE table top-up: %.0f of %.0f MiB were in the page cache, %.0f MiB read back in %zu runs in %.1f s, "
+    LLAMA_LOG_INFO("%s: PLE table top-up: %.0f of %.0f MiB were in the page cache, %.0f MiB read back in %zu runs in %.1f s, "
         "%.0f MiB now (reclaimable %.1f GiB - %.1f GiB reserve%s; LLAMA_PLE_TOPUP=0 off)\n", __func__, have/1048576.0, span/1048576.0,
         done.load()/1048576.0, runs.size(), (ggml_time_us() - t0)/1e6, (double) res2*pg/1048576.0, recl/1073741824.0,
         reserve/1073741824.0, churn ? "; stopped: the reads evicted the table's own pages" : "");
@@ -6027,7 +6027,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         int64_t t0 = 0; size_t n = 0;
         ~decode_timer() {
             if (t0) {
-                LLAMA_LOG_INFO("decode: k19-vcost %zu tokens: host %.3f ms\n", n, (ggml_time_us() - t0) / 1000.0);
+                LLAMA_LOG_INFO("decode: %zu tokens: host cost %.3f ms\n", n, (ggml_time_us() - t0) / 1000.0);
             }
         }
     } decode_timer_guard;
@@ -8052,7 +8052,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 lm_layer_inp_rows += ubatch.n_tokens;
                 if (!lm_layer_inp_logged) {
                     lm_layer_inp_logged = true;
-                    LLAMA_LOG_INFO("%s: k19-df2pp: the drafter's layer inputs (%d layers) are read from each layer-major member "
+                    LLAMA_LOG_INFO("%s: the drafter's layer inputs (%d layers) are read from each layer-major member "
                         "(LLAMA_MOE_LAYER_MAJOR_LAYER_INP=0 off)\n", __func__,
                         (int) std::count(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true));
                 }
@@ -8614,7 +8614,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         static int n_log = 0;
         if (n_log++ < 3) {
-            LLAMA_LOG_INFO("%s: k19-mgpu2: resident prompt fill: routing of %d weights recorded from a layer-major group\n", __func__, n_rec);
+            LLAMA_LOG_INFO("%s: resident prompt fill: routing of %d weights recorded from a layer-major group\n", __func__, n_rec);
         }
         if (group.back().n_outputs > 0 && moe_cache->has_resident_counts()) {
             moe_cache->resident_fill();
@@ -9536,7 +9536,7 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             static int n_log = 0;
             if (n_log++ == 0) {
-                LLAMA_LOG_INFO("%s: k19-fullcost: the pp graph re-reserve replaced no buffer: the kept decode / verify graphs stay valid "
+                LLAMA_LOG_INFO("%s: the pp graph re-reserve replaced no buffer: the kept decode / verify graphs stay valid "
                     "(LLAMA_PP_RERESERVE_KEEP_SMALL=0: off)\n", __func__);
             }
         }
@@ -10751,7 +10751,7 @@ void llama_context::moe_cache_resident_record(const llm_graph_result * res) {
     }
     static int n_log = 0;
     if (n_log++ < 3) {
-        LLAMA_LOG_INFO("%s: k19-mgpu2: resident prompt fill: routing of %d layers recorded from a large ubatch (LLAMA_MOE_RESIDENT_FILL=1)\n", __func__, n_rec);
+        LLAMA_LOG_INFO("%s: resident prompt fill: routing of %d layers recorded from a large ubatch (LLAMA_MOE_RESIDENT_FILL=1)\n", __func__, n_rec);
     }
 }
 
@@ -13708,13 +13708,13 @@ bool llama_moe_cache_wide_graphs(const llama_context * ctx) {
     const bool on = f > 0.0 && c >= f && h >= m;
     static std::atomic<bool> logged{false};
     if (on && !logged.exchange(true)) {
-        LLAMA_LOG_INFO("%s: k19-bigverify: the MoE cache holds %.1f%% of the host experts: verify graphs prewarmed and kept as without a cache "
+        LLAMA_LOG_INFO("%s: the MoE cache holds %.1f%% of the host experts: verify graphs prewarmed and kept as without a cache "
             "(device KV buckets of 16384 cells; LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC=0: off)\n", __func__, 100.0*c);
     }
     // k19-widefix: say once why a cache over the share stays on the 2048-cell step
     static std::atomic<bool> logged_small{false};
     if (f > 0.0 && c >= f && h < m && !logged_small.exchange(true)) {
-        LLAMA_LOG_INFO("%s: k19-widefix: the MoE cache holds %.1f%% of %.0f MiB of host experts, under LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB "
+        LLAMA_LOG_INFO("%s: the MoE cache holds %.1f%% of %.0f MiB of host experts, under LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB "
             "(%.0f): verify graphs stay as beside a cache\n", __func__, 100.0*c, h/1048576.0, m/1048576.0);
     }
     return on;
@@ -13983,7 +13983,7 @@ void llama_context::nextn_hold_free_log(double ms) {
     static std::atomic<int64_t> n{0};
     const int64_t k = ++n;
     if (k <= 3) {
-        LLAMA_LOG_INFO("%s: k19-q4x262: the drafter's pass on a worker ended before its compute buffers were freed (%lld, waited %.2f ms; "
+        LLAMA_LOG_INFO("%s: the drafter's pass on a worker ended before its compute buffers were freed (%lld, waited %.2f ms; "
             "LLAMA_MTP_PROMPT_BG_FREE_HOLD=0 off)\n", __func__, (long long) k, ms);
     }
 }

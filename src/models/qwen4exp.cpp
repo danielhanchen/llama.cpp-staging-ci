@@ -834,13 +834,13 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
         inp->allfit_idx3 = ggml_reshape_3d(ctx0, inp->allfit_idx, inp->n_sel, n_tokens, 1);
         static std::atomic<bool> logged { false };
         if (!logged.exchange(true)) {
-            LLAMA_LOG_INFO("%s: k19-p2qsa: QSA selection without indexer scoring while every pool fits the top_k (LLAMA_QSA_ALLFIT=0: off)\n", __func__);
+            LLAMA_LOG_INFO("%s: QSA: QSA selection without indexer scoring while every pool fits the top_k (LLAMA_QSA_ALLFIT=0: off)\n", __func__);
         }
     }
     {
         static const bool log_graphs = getenv("LLAMA_QSA_ALLFIT_LOG") != nullptr && atoi(getenv("LLAMA_QSA_ALLFIT_LOG")) != 0;
         if (log_graphs && !kv_only) {
-            LLAMA_LOG_INFO("k19-p2qsa graph: %s (n_tokens %d, n_pool %u)\n", inp->allfit ? "allfit" : "scored", (int) n_tokens, n_pool);
+            LLAMA_LOG_INFO("QSA graph: %s (n_tokens %d, n_pool %u)\n", inp->allfit ? "allfit" : "scored", (int) n_tokens, n_pool);
         }
     }
 

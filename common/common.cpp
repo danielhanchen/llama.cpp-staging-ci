@@ -2705,7 +2705,7 @@ static bool common_fit_draft_on_cpu(
     bool hx_only = false;
     if (common_fit_place8() && !common_fit_place8_mid() && !place8_draft) {
         if (!hx_ok) {
-            LOG_INF("%s: small device with the decode-sized MoE cache (k19-place8): the draft model is placed on the CPU\n", __func__);
+            LOG_INF("%s: small device with the decode-sized MoE cache: the draft model is placed on the CPU\n", __func__);
             return true;
         }
         hx_only = true;   // the small device keeps no draft at its file's placement: only the host-expert placement is weighed
@@ -2752,7 +2752,7 @@ static bool common_fit_draft_on_cpu(
             }
             d = d_model + d_ctx + d_comp;
         } catch (const std::exception & e) {
-            LOG_INF("%s: k19-mtpkeep: the draft with its experts in host memory could not be measured (%s)\n", __func__, e.what());
+            LOG_INF("%s: the draft with its experts in host memory could not be measured (%s)\n", __func__, e.what());
             return false;
         }
         const double take_hx = std::max(0.0, d - (double) free_);
@@ -2766,7 +2766,7 @@ static bool common_fit_draft_on_cpu(
         }
         const double keep_tok = common_fit_draft_hx_keep_tokens(params);
         const bool ok = d > 0.0 && take_hx <= hx_frac*(double) cache && (tok < 0.0 || (tok >= hx_tok && tok >= keep_tok));
-        LOG_INF("%s: k19-mtpkeep: the MTP draft with its experts in host memory (n_ubatch %u, K / V %s / %s, op offload %s) needs %.0f MiB of "
+        LOG_INF("%s: the MTP draft with its experts in host memory (n_ubatch %u, K / V %s / %s, op offload %s) needs %.0f MiB of "
             "device memory (weights %.0f, context %.0f, compute %.0f): the cache %.0f -> %.0f MiB, the experts of %.1f tokens per layer -> %s "
             "(at most %.0f%% of the cache, at least %.2f tokens and a verify window of %.2f, LLAMA_FIT_DRAFT_HOST_EXPS_KEEP_TOKENS; "
             "LLAMA_FIT_DRAFT_HOST_EXPS=0 off)\n", __func__, cp_hx.n_ubatch,
@@ -4092,10 +4092,10 @@ uma_restart:
                         if (tbo_one) {
                             mp.tensor_buft_overrides = tbo.data();
                         }
-                        COM_WRN("%s: --fit: k19-q38r2: the MTP drafter stays with one block on the host (-ngl %d): every layer did not fit beside "
+                        COM_WRN("%s: --fit: the MTP drafter stays with one block on the host (-ngl %d): every layer did not fit beside "
                             "a %zu MiB margin either (LLAMA_FIT_DRAFT_SQUEEZE_MARGIN2_MIB)\n", __func__, mp.n_gpu_layers, sq_margin2/(1024*1024));
                     } else if (fits_all) {
-                        COM_WRN("%s: --fit: k19-q38t: the MTP drafter stays with every layer on the device (-ngl %d with tensors on the host before): "
+                        COM_WRN("%s: --fit: the MTP drafter stays with every layer on the device (-ngl %d with tensors on the host before): "
                             "its context reads the prompt in ubatches of %u tokens%s (LLAMA_FIT_DRAFT_SQUEEZE=0 off)\n", __func__, ngl_spilled,
                             cp_dft_sq.n_ubatch, step == 1 ? ", beside a smaller device margin" : step == 2 ? ", beside a margin of LLAMA_FIT_DRAFT_SQUEEZE_MARGIN2_MIB" : "");
                     }
@@ -4231,7 +4231,7 @@ uma_restart:
                                 mp.tensor_buft_overrides = tbo.data();
                             }
                             how = "all without it beside a smaller device margin";
-                            COM_INF("%s: --fit: k19-spilldrop: without the drafter every block fits beside a %zu MiB margin\n", __func__,
+                            COM_INF("%s: --fit: without the drafter every block fits beside a %zu MiB margin\n", __func__,
                                 m_step/(1024*1024));
                             found = true;
                             break;
@@ -4251,7 +4251,7 @@ uma_restart:
                         }
                     }
                     if (found) {
-                        COM_INF("%s: --fit: k19-spilldrop: %d layers on the device without the drafter, %d with it (LLAMA_FIT_DRAFT_SPILL_LONG=0: "
+                        COM_INF("%s: --fit: %d layers on the device without the drafter, %d with it (LLAMA_FIT_DRAFT_SPILL_LONG=0: "
                             "keep the drafter unless every layer fits without it)\n", __func__,
                             mp.n_gpu_layers == llama_model_default_params().n_gpu_layers ? -1 : mp.n_gpu_layers, mparams.n_gpu_layers);
                     }
@@ -4396,10 +4396,10 @@ uma_restart:
                             const bool   hx_tok_ok = hx_need <= 0.0 || hx_tokl < 0.0 || hx_tokl >= hx_need;
                             const bool hx_keep = st_q == COMMON_PARAMS_FIT_STATUS_SUCCESS && lay(mq) >= l_plain && cq.n_ubatch == cp.n_ubatch &&
                                 (!hx_lend || hx_p8) && hx_tok_ok;
-                            COM_INF("%s: --fit: k19-mtpkeep: with the drafter the MoE cache is %.0f MiB, the experts of %.2f tokens per layer (a verify "
+                            COM_INF("%s: --fit: with the drafter the MoE cache is %.0f MiB, the experts of %.2f tokens per layer (a verify "
                                 "window needs %.2f, LLAMA_FIT_DRAFT_HOST_EXPS_KEEP_TOKENS; 0 keeps without this check) -> %s\n", __func__,
                                 (double) cq.moe_cache_size/(1024.0*1024.0), hx_tokl, hx_need, hx_tok_ok ? "enough" : "too few: not kept");
-                            COM_INF("%s: --fit: k19-mtpkeep: the MTP draft with its experts in host memory (n_ubatch %u, K / V %s / %s%s): %" PRId64
+                            COM_INF("%s: --fit: the MTP draft with its experts in host memory (n_ubatch %u, K / V %s / %s%s): %" PRId64
                                 " of %" PRId64 " layers on the device with it, %" PRId64 " without it, target n_ubatch %u%s -> %s (LLAMA_FIT_DRAFT_HOST_EXPS_LF=0 off)\n",
                                 __func__, cp_dft_hx.n_ubatch, ggml_type_name(cp_dft_hx.type_k), ggml_type_name(cp_dft_hx.type_v),
                                 hx_lend ? ", weights and compute buffers lent to the released prompt ubatches" : "",
@@ -4461,7 +4461,7 @@ uma_restart:
                         const common_params_fit_status st_q = common_fit_params(params.model.path.c_str(), &mq, &cq, tq.data(),
                             bq.empty() ? nullptr : bq.data(), gq.data(), params.fit_params_min_ctx, &extra_lf, fit_log_level, params.fit_kv_resident);
                         if (st_q == COMMON_PARAMS_FIT_STATUS_SUCCESS && lay(mq) >= l_plain) {
-                            COM_WRN("%s: --fit: k19-kvlong: the draft model would move layers to the CPU (%" PRId64 " of %" PRId64 " layers on the "
+                            COM_WRN("%s: --fit: the draft model would move layers to the CPU (%" PRId64 " of %" PRId64 " layers on the "
                                 "device with it, %" PRId64 " without it): it stays with its context reading the prompt in ubatches of %u tokens "
                                 "(LLAMA_FIT_DRAFT_LAYERS_FIRST_UB; LLAMA_FIT_DRAFT_LAYERS_FIRST=0 off)\n", __func__, l_with, n_layer + 1,
                                 l_plain, lub);
@@ -4502,7 +4502,7 @@ uma_restart:
                             const common_params_fit_status st_q = common_fit_params(params.model.path.c_str(), &mq, &cq, tq.data(),
                                 bq.empty() ? nullptr : bq.data(), gq.data(), params.fit_params_min_ctx, &extra, fit_log_level, params.fit_kv_resident);
                             if (st_q == COMMON_PARAMS_FIT_STATUS_SUCCESS && lay(mq) >= l_plain) {
-                                COM_WRN("%s: --fit: k19-kvlong: the draft model would move layers to the CPU (%" PRId64 " of %" PRId64 " layers on the "
+                                COM_WRN("%s: --fit: the draft model would move layers to the CPU (%" PRId64 " of %" PRId64 " layers on the "
                                     "device with it, %" PRId64 " without it): it stays with the target's n_ubatch %u -> %u "
                                     "(LLAMA_FIT_DRAFT_LAYERS_FIRST_TUB)\n", __func__, l_with, n_layer + 1, l_plain, cparams_in.n_ubatch, ub_t);
                                 std::copy(tq.begin(), tq.end(), params.tensor_split);
@@ -4541,12 +4541,12 @@ uma_restart:
                         const common_params_fit_status st_p2 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(),
                             tbo.empty() ? nullptr : tbo.data(), mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
                         if (st_p2 != st_p || (st_p2 == COMMON_PARAMS_FIT_STATUS_SUCCESS && lay(mp) != l_plain)) {
-                            COM_WRN("%s: --fit: k19-mtpkeep: the plain fit again gave %" PRId64 " layers (%" PRId64 " before)\n", __func__,
+                            COM_WRN("%s: --fit: the plain fit again gave %" PRId64 " layers (%" PRId64 " before)\n", __func__,
                                 st_p2 == COMMON_PARAMS_FIT_STATUS_SUCCESS ? lay(mp) : (int64_t) -1, l_plain);
                         }
                     }
                     if (!kept) {
-                        COM_WRN("%s: --fit: k19-kvlong: the draft model would move layers to the CPU (%" PRId64 " of %" PRId64 " layers on the "
+                        COM_WRN("%s: --fit: the draft model would move layers to the CPU (%" PRId64 " of %" PRId64 " layers on the "
                             "device with it, %" PRId64 " without it): speculative decoding is off (LLAMA_FIT_DRAFT_LAYERS_FIRST=0 keeps it)\n",
                             __func__, l_with, n_layer + 1, l_plain);
                         std::copy(ts.begin(), ts.end(), params.tensor_split);
@@ -4720,7 +4720,7 @@ uma_restart:
                     sig += h == 1 ? "headless" : h == 0 ? "display" : "unknown";
                 }
                 if (!common_fit_plain_spill_gate(headless, e_hl)) {
-                    COM_INF("%s: --fit: k19-fitplain: %d layers on the device beside the default margin; device display signal [%s]: "
+                    COM_INF("%s: --fit: %d layers on the device beside the default margin; device display signal [%s]: "
                         "the margin stays (LLAMA_FIT_PLAIN_HEADLESS=1 steps it down)\n", __func__, mparams.n_gpu_layers, sig.c_str());
                 } else {
                     const char * e_m = getenv("LLAMA_FIT_PLAIN_SPILL_MARGINS_MIB");
@@ -4743,7 +4743,7 @@ uma_restart:
                         if (sts != COMMON_PARAMS_FIT_STATUS_SUCCESS || !all_on_device(mps)) {
                             continue;
                         }
-                        COM_WRN("%s: --fit: k19-fitplain: %d layers on the device beside the default margin (-1: every layer, tensors moved), every layer beside a %zu MiB "
+                        COM_WRN("%s: --fit: %d layers on the device beside the default margin (-1: every layer, tensors moved), every layer beside a %zu MiB "
                             "margin on a device with no display [%s]: the smaller margin is used (LLAMA_FIT_PLAIN_SPILL=0 keeps the default)\n",
                             __func__, mparams.n_gpu_layers, mgt[0]/(1024*1024), sig.c_str());
                         params.tensor_buft_overrides = tbos;
@@ -4760,7 +4760,7 @@ uma_restart:
                         break;
                     }
                     if (!all_on_device(mparams)) {
-                        COM_INF("%s: --fit: k19-fitplain: no margin of the step list keeps every layer on the device, the default "
+                        COM_INF("%s: --fit: no margin of the step list keeps every layer on the device, the default "
                             "placement stays\n", __func__);
                     }
                 }
@@ -4989,7 +4989,7 @@ uma_restart:
             const uint64_t avail = llama_available_memory();
             const bool disk_tier = exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && !common_fit_file_in_ram_fs(params.model.path);
             if (n_gpu == 1 && cparams.n_ctx > (uint32_t) dev_cells && !disk_tier) {
-                COM_INF("%s: --fit: k19-g4ten: the %s drafter was dropped on the small-device placement: fitted again with the K/V cells past %" PRId64
+                COM_INF("%s: --fit: the %s drafter was dropped on the small-device placement: fitted again with the K/V cells past %" PRId64
                     " in host chunks (LLAMA_KV_SEL_HOST=1; %s keeps this fit)\n", __func__, spec_dflash_ks ? "DFlash" : "MTP", dev_cells,
                     spec_dflash_ks ? "LLAMA_KV_SEL_DFLASH=0" : "LLAMA_KV_SEL_MTP=0");
                 common_set_env("LLAMA_KV_SEL_HOST", "1");
@@ -6189,7 +6189,7 @@ static struct llama_model_params common_model_params_to_llama_impl(common_params
             static bool logged = false;
             if (!logged) {
                 logged = true;
-                COM_INF("k19-q38t: the target's own NextN layers are not loaded: the MTP drafter is '%s' (LLAMA_MTP_MD_TARGET_NEXTN=1 "
+                COM_INF("the target's own NextN layers are not loaded: the MTP drafter is '%s' (LLAMA_MTP_MD_TARGET_NEXTN=1 "
                     "loads them)\n", params.speculative.draft.mparams.path.c_str());
             }
         }

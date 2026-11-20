@@ -1122,7 +1122,7 @@ int ggml_cuda_verify_wide_cols(const int cc, const int bit) {
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: k19-vrow3: verify windows of 5..%d rows keep the kernels of a 1..4-row one (GGML_CUDA_VERIFY_WIDE=%d: 1 F32 mmvf, "
+        GGML_LOG_INFO("%s: verify windows of 5..%d rows keep the kernels of a 1..4-row one (GGML_CUDA_VERIFY_WIDE=%d: 1 F32 mmvf, "
             "2 mmvq warps, 4 multi-matrix mmvq warps, 8 MoE mmvq on Ampere; 0 off)\n", __func__, max_cols, mask);
     }
     return max_cols;
@@ -1154,7 +1154,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                         static bool logged = false;
                         if (!logged) {
                             logged = true;
-                            GGML_LOG_INFO("%s: k19-tpp: a 4-row verify window keeps its F32 products on mmvf, as a 3-row one "
+                            GGML_LOG_INFO("%s: a 4-row verify window keeps its F32 products on mmvf, as a 3-row one "
                                 "(LLAMA_SPEC_TPP_VERIFY=0: off)\n", __func__);
                         }
                         return true;

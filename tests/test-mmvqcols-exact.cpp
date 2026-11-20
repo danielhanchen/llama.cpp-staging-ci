@@ -35,7 +35,7 @@
 static int n_logs = 0;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-mmvqcols:") != nullptr) {
+    if (strstr(text, "mmvq columns:") != nullptr) {
         n_logs++;
         return;
     }
