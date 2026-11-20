@@ -1153,11 +1153,31 @@ struct llama_moe_cache::impl {
     // (raw 0.53, a cold first launch, then persisted for the bin) fetched 1/2 and lost their trials (chat 54.7 vs 57.5 tok/s, same head);
     // a fixed 1/4 decoded +13% (k19-flint), 1/8 +10%, every miss on the host -12% at 2k. Unchanged where LLAMA_MOE_CPU_MISS_SMALL_HALF
     // is set, without cm_stable, and on hosts without the team (G4, 4-vCPU T4)
+    //
+    // LLAMA_MOE_CPU_MISS_TEAM_MID (default 1; 0 = the 0.6 level at every cache share): on such a host, a cache that holds less than the
+    // trial share (cm_team_mid: no timing trials, the cost model alone decides) takes 1/2 above the geometric midpoint 0.354 of the two
+    // levels, the boundary of every other batch size. There the host experts are the critical path of a small batch and the link is
+    // not: Colab A100 40 GB VM (12 vCPU, 6 cores), Qwen3.8-Flash-Next UD-IQ4_XS at 16 GB (14% cached), the VM's own calibration 125-141
+    // us per expert against an upload of 205-215 us (raw 0.37-0.41): at 1/4 the device waited on the host for 45% of a verify pass
+    // (host batch 2.3 ms per layer beside 0.8 ms of device work), at 1/2 the host batch is 1.4 ms per layer. Cells whose raw share
+    // stays below the midpoint keep 1/4 (Colab L4 / A100 Qwen3.6-35B-A3B UD-Q4_K_XL 0.23-0.33, LFM2.5 0.20-0.32), and the 0.6 level
+    // stays where the trials run (Flint 16 GB, 56% cached)
+    bool cm_team_mid() const {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TEAM_MID");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on && getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM") == nullptr && cache_frac >= 0.0 &&
+            cache_frac < llama_moe_cache::trial_frac_single();
+    }
     double cm_small_half_eff() const {
         static const double team_half = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM") != nullptr ?
             std::min(0.80, std::max(0.177, atof(getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM")))) : 0.6;
         static const bool user_half = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF") != nullptr;
-        return cm_stable && !user_half && single_team_host() ? std::max(cm_small_half, team_half) : cm_small_half;
+        if (!cm_stable || user_half || !single_team_host()) {
+            return cm_small_half;
+        }
+        return cm_team_mid() ? 0.354 : std::max(cm_small_half, team_half);
     }
     bool     cm_recal_pending = false; // (timed only between requests: 2 x ~40 ms inside a reply cost chat decode 2% on G4)
     int      cm_nb    = 0;     // batches in the window
@@ -10745,6 +10765,11 @@ struct llama_moe_cache::impl {
             if (fetch_scale != 1.0 && raw <= 0.088) {
                 cm_share[n] = 0.0625f;
             }
+        }
+        if (!recal && cm_stable && single_team_host() && getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF") == nullptr && cm_team_mid()) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: host team, %.1f%% of the host experts cached (below the %.0f%% trial share): small "
+                "batches take 1/2 above a raw share of 0.354, not 0.6 (LLAMA_MOE_CPU_MISS_TEAM_MID=0 off)\n", tag, 100.0*cache_frac,
+                100.0*llama_moe_cache::trial_frac_single());
         }
         if (recal) {
             cm_gen++;
