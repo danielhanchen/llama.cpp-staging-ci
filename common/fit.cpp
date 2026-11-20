@@ -1294,7 +1294,7 @@ static void common_params_fit_impl(
             const double  cache_e = need_pl == INT64_MAX ? 0.0 : (double) (std::min(size_requested, cache_bytes) - need_pl);
             if (graph_mib > 0.0 && wide_frac > 0.0 && experts > 0.0 && experts >= wide_min && cache_e >= wide_frac*experts) {
                 pw_reserve = int64_t(graph_mib*(double) g_prewarm_graphs)*MiB;
-                LOG_INF("%s: k19-int3fix2: %" PRId64 " MiB kept free from the MoE cache for %d prewarmed verify graphs (cache %.0f MiB = %.1f%% of "
+                LOG_INF("%s: verify graph reserve: %" PRId64 " MiB kept free from the MoE cache for %d prewarmed verify graphs (cache %.0f MiB = %.1f%% of "
                     "%.0f MiB of host experts; LLAMA_FIT_PREWARM_GRAPH_MIB=0: off)\n", __func__, pw_reserve/MiB, g_prewarm_graphs,
                     cache_e/MiB, 100.0*cache_e/experts, experts/MiB);
             }
