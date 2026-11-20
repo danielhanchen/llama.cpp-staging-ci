@@ -101,6 +101,53 @@ jobs:
             grep -E "Test +#[0-9]+: $t " ../ci-logs/ctest.log | sed "s/^/ctest_line: /" | tee -a ../ci-logs/summary.txt || true
           done
 
+      - name: dflash2 conv NaN diagnostic
+        if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0' && hashFiles('tests/test-dflash2-conv-exact.cpp') != ''
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          src = open('tests/test-dflash2-conv-exact.cpp').read()
+          old = "const int r = memcmp(a.data(), b.data(), a.size() * 4) != 0 ? 1 : 0;"
+          assert old in src
+          new = ("int n_real = 0, n_nan = 0;\n"
+                 "    for (size_t i = 0; i < a.size(); ++i) {\n"
+                 "        uint32_t ua, ub; memcpy(&ua, &a[i], 4); memcpy(&ub, &b[i], 4);\n"
+                 "        if (ua == ub) continue;\n"
+                 "        if (std::isnan(a[i]) && std::isnan(b[i])) { n_nan++; } else { n_real++;\n"
+                 "            if (n_real <= 3) printf(\"    real diff i %zu ref %08x fused %08x\\n\", i, ua, ub); }\n"
+                 "    }\n"
+                 "    if (n_real || n_nan) printf(\"    elems: %d non-NaN diffs, %d NaN-payload-only diffs\\n\", n_real, n_nan);\n"
+                 "    const int r = n_real != 0 ? 1 : 0;")
+          open('dflash2_diag.cpp', 'w').write(src.replace(old, new))
+          PY
+          c++ -O2 -std=c++17 -Iggml/include dflash2_diag.cpp -Lbuild/bin -lggml -lggml-base -Wl,-rpath,"$PWD/build/bin" -o dflash2_diag > ci-logs/dflash2_diag_build.log 2>&1 || { cat ci-logs/dflash2_diag_build.log; exit 0; }
+          ./dflash2_diag > ci-logs/dflash2_diag.txt 2>&1 || true
+          cat ci-logs/dflash2_diag.txt
+          grep -E "^test-dflash2|^(OK|FAIL)$" ci-logs/dflash2_diag.txt | sed 's/^/dflash2_diag: /' >> ci-logs/summary.txt || true
+
+      - name: test-llama-context without the BLAS backend (macOS CPU leg)
+        if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0' && matrix.leg == 'macos-15-arm64-cpu'
+        shell: bash
+        run: |
+          rc=0
+          cmake -B build-noblas -DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=ON -DGGML_METAL=OFF -DGGML_BLAS=OFF > ci-logs/noblas_configure.log 2>&1 || rc=$?
+          [ "$rc" = 0 ] && { cmake --build build-noblas --config Release -j "$(sysctl -n hw.logicalcpu)" --target test-llama-context test-llama-archs > ci-logs/noblas_build.log 2>&1 || rc=$?; }
+          if [ "$rc" = 0 ]; then
+            (cd build-noblas && ctest -R "test-generate-models|test-llama-context" --timeout 1800 --output-on-failure > ../ci-logs/noblas_llctx.log 2>&1) || rc=$?
+          fi
+          grep -E "tests passed|tests failed" ci-logs/noblas_llctx.log | sed 's/^/noblas_llctx: /' | tee -a ci-logs/summary.txt || true
+          echo "noblas_llctx_rc=$rc" | tee -a ci-logs/summary.txt
+          # the main build (BLAS backend in) once more without the reallocation abort: does anything else fail?
+          rc2=0
+          if [ -x build/bin/test-llama-context ] && [ -d build/tests/test-models ]; then
+            build/bin/test-llama-context --models build/tests/test-models/ > ci-logs/llctx_norealloc.log 2>&1 || rc2=$?
+          else
+            rc2=97
+          fi
+          tail -5 ci-logs/llctx_norealloc.log
+          echo "llctx_blas_no_realloc_abort_rc=$rc2" | tee -a ci-logs/summary.txt
+
       - name: Tiny model smoke
         if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0'
         shell: bash
