@@ -224,4 +224,40 @@ inline bool settle(const rec * old, bool on, bool is_marginal, int max_tries, re
     return trust;
 }
 
+// an on-by-default switch read from the environment: unset or a nonzero number is on, "0" is off
+inline bool env_on(const char * v) {
+    return v == nullptr || atoi(v) != 0;
+}
+
+// a host with at least LLAMA_MOE_SINGLE_WIDE_MIN_CPUS (default 32) logical CPUs (LLAMA_MOE_SINGLE_WIDE=0 off); e / em are the two values
+inline bool wide_host(int n_cpus, const char * e, const char * em) {
+    const int min_cpus = em != nullptr ? atoi(em) : 32;
+    return !(e != nullptr && atoi(e) == 0) && n_cpus >= min_cpus;
+}
+
+// a host with LLAMA_MOE_SINGLE_WIDE_MID_CPUS (default 12) logical CPUs or more that is not a wide host (LLAMA_MOE_SINGLE_WIDE_MID=0 off),
+// so by default 12..31 CPUs; e / em are the two values, wide = wide_host for this host
+inline bool wide_mid_host(int n_cpus, bool wide, const char * e, const char * em) {
+    const int min_cpus = em != nullptr ? atoi(em) : 12;
+    return !(e != nullptr && atoi(e) == 0) && !wide && n_cpus >= min_cpus;
+}
+
+// a first trial record made firm "on" by agreeing marginal timings: firm, on, timed by at least max_tries launches, and each "on" by less
+// than min_gain (1 - min_gain < t_on / t_off < 1)
+inline bool firm_marginal_on(const rec & r, int max_tries, double min_gain) {
+    return r.firm != 0 && r.on != 0 && r.tries >= max_tries && r.ratio > 1.0 - min_gain && r.ratio < 1.0;
+}
+
+// whether a launch skips the warm phase and the timing trials on such a record: skip_on = LLAMA_MOE_CPU_MISS_FIRM_SKIP (env_on),
+// trust_scope = the marginal "on" is trusted on this host (a 12..31-CPU mailbox host, LLAMA_MOE_CPU_MISS_MARGIN_TRUST); first_rec is
+// called only when both hold and returns the first trial of the calibration file (nullptr: no file or no recorded trial)
+template <typename F>
+inline bool firm_skip(bool skip_on, bool trust_scope, F && first_rec, int max_tries, double min_gain) {
+    if (!skip_on || !trust_scope) {
+        return false;
+    }
+    const rec * r0 = first_rec();
+    return r0 != nullptr && firm_marginal_on(*r0, max_tries, min_gain);
+}
+
 } // namespace llama_moe_tp

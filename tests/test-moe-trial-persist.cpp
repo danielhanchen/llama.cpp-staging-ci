@@ -257,6 +257,52 @@ int main() {
         tp::rec te;
         CHECK( tp::settle(&ta, true, false, 3, te, true) && te.on == 1 && te.firm == 1 && te.tries == 2, "a trusted open on timed clear: firm on");
 
+        // the firm "on" skip: a first trial made firm "on" by agreeing marginal timings skips the warm phase and the trials in later
+        // launches, only on such a record, only on 12..31-CPU hosts and only while LLAMA_MOE_CPU_MISS_FIRM_SKIP is not 0
+        const double mg = 0.10;                                             // the default LLAMA_MOE_CPU_MISS_PERSIST_MIN
+        int calls = 0;
+        tp::rec fo = tc; fo.ratio = 0.935;                                  // three agreeing marginal "on" timings, recorded firm
+        auto first = [&](const tp::rec * r) { return [&calls, r]() { calls++; return r; }; };
+        CHECK( tp::firm_marginal_on(fo, 3, mg), "firm marginal on record");
+        CHECK( tp::firm_skip(true, true, first(&fo), 3, mg) && calls == 1, "(a) a firm marginal on record skips the trials");
+        tp::rec fo4 = fo; fo4.tries = 4;
+        CHECK( tp::firm_skip(true, true, first(&fo4), 3, mg), "(a) more tries than needed still skip");
+        tp::rec nf = tb; nf.ratio = 0.935;                                  // open: two trusted marginal timings
+        CHECK(!tp::firm_skip(true, true, first(&nf), 3, mg), "(b) an open record does not skip");
+        tp::rec nf3 = fo; nf3.firm = 0;                                     // open with enough tries (an earlier, larger PERSIST_TRIES)
+        CHECK(!tp::firm_skip(true, true, first(&nf3), 3, mg), "(b) an open on record with three tries does not skip");
+        tp::rec fx = c; fx.ratio = 0.935;                                   // firm off after three untrusted marginal timings
+        CHECK(!tp::firm_skip(true, true, first(&fx), 3, mg), "(b) a firm off record does not skip");
+        tp::rec fx2 = td; fx2.ratio = 1.02;                                 // firm off by an off re-timing
+        CHECK(!tp::firm_skip(true, true, first(&fx2), 3, mg), "(b) a firm off re-timing does not skip");
+        tp::rec cl = e; cl.ratio = 0.85;                                    // a clear first "on": firm, but not marginal
+        CHECK(!tp::firm_skip(true, true, first(&cl), 3, mg), "(b) a clear firm on replays as recorded");
+        tp::rec few = fo; few.tries = 2;
+        CHECK(!tp::firm_skip(true, true, first(&few), 3, mg), "(b) firm on with fewer tries than needed does not skip");
+        tp::rec r1 = fo; r1.ratio = 1.0;
+        CHECK(!tp::firm_skip(true, true, first(&r1), 3, mg), "(b) ratio 1 is not on");
+        tp::rec r95 = fo; r95.ratio = 1.0 - mg;
+        CHECK(!tp::firm_skip(true, true, first(&r95), 3, mg), "(b) ratio at the margin is not marginal");
+        CHECK(!tp::firm_skip(true, true, first(nullptr), 3, mg), "(b) no file record does not skip");
+        calls = 0;
+        CHECK(!tp::firm_skip(tp::env_on("0"), true, first(&fo), 3, mg) && calls == 0, "(c) LLAMA_MOE_CPU_MISS_FIRM_SKIP=0 disables the skip");
+        CHECK( tp::env_on(nullptr) && tp::env_on("1") && !tp::env_on("0"), "(c) the switch is on unless 0");
+        CHECK( tp::firm_skip(tp::env_on(nullptr), true, first(&fo), 3, mg), "(c) unset: the skip is on");
+        // (d) the trusted scope needs a 12..31-CPU host (defaults: wide from 32, mid from 12)
+        auto mid = [](int n) { return tp::wide_mid_host(n, tp::wide_host(n, nullptr, nullptr), nullptr, nullptr); };
+        CHECK(!mid(4) && !mid(8) && !mid(11) && mid(12) && mid(16) && mid(31) && !mid(32) && !mid(64) && !mid(192), "(d) 12..31 CPUs only");
+        calls = 0;
+        for (int n : { 1, 4, 8, 11, 32, 48, 64, 192 }) {
+            CHECK(!tp::firm_skip(true, mid(n), first(&fo), 3, mg), "(d) %d CPUs must not skip", n);
+        }
+        CHECK(calls == 0, "(d) the record is not read outside the scope");
+        for (int n : { 12, 20, 31 }) {
+            CHECK( tp::firm_skip(true, mid(n), first(&fo), 3, mg), "(d) %d CPUs skip", n);
+        }
+        CHECK(!tp::wide_mid_host(16, tp::wide_host(16, nullptr, nullptr), "0", nullptr), "(d) LLAMA_MOE_SINGLE_WIDE_MID=0: not a mid host");
+        CHECK(!tp::wide_mid_host(16, tp::wide_host(16, nullptr, "16"), nullptr, nullptr), "(d) a 16-CPU wide host is not a mid host");
+        CHECK( tp::wide_mid_host(40, tp::wide_host(40, "0", nullptr), nullptr, nullptr), "(d) LLAMA_MOE_SINGLE_WIDE=0: 40 CPUs are mid");
+
         // round trip of an open record; a line in the old form reads as firm
         std::vector<tp::rec> r(2);
         r[0].on = 0; r[0].gap = 128; r[0].len = 40; r[0].ratio = 35.7/37.3; r[0].firm = 0; r[0].tries = 1;
