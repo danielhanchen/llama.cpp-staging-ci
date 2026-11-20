@@ -319,7 +319,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
     if (h_idx) {
         // LLAMA_MTP_DEV_H: the rows come from the device sink; row of ubatch entry i = its batch index
-        GGML_ASSERT(ubatch->data && ubatch->data->batch_idxs.size() == n_tokens);
+        GGML_ASSERT(ubatch->data && (int64_t) ubatch->data->batch_idxs.size() == n_tokens);
         ggml_backend_tensor_set(h_idx, ubatch->data->batch_idxs.data(), 0, n_tokens*sizeof(int32_t));
         return;
     }
@@ -1922,8 +1922,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
-    h_dev_src        (params.h_dev_src),
     samplers         (params.samplers),
+    h_dev_src        (params.h_dev_src),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),

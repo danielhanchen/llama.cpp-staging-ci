@@ -59,7 +59,6 @@ private:
 
     enum llama_ple_prefetch_mode mode;
 
-    const ggml_tensor * tensor;
     const char *        data;
     size_t              row_bytes;
     size_t              row_stride;

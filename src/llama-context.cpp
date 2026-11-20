@@ -7311,7 +7311,6 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     std::vector<std::vector<int>>               cuts(group.size()); // first node of each piece
     std::vector<std::vector<const ggml_tensor *>> cw(group.size());   // the weight that starts each piece (nullptr: the first piece)
     bool aligned = true;
-    size_t n_total = 0;
     for (size_t k = 0; k < group.size(); ++k) {
         ggml_cgraph * gf = group[k].gf;
         std::unordered_set<const ggml_tensor *> seen;
@@ -7337,7 +7336,6 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 }
             }
         }
-        n_total += (size_t) ggml_graph_n_nodes(gf) + group[k].n_leafs;
         if (getenv("LLAMA_LM_TAIL_DEBUG") != nullptr && (k + 1 == group.size() || k == 0) && cuts[k].size() > 4) {
             for (size_t c = 1; c < 5; ++c) {
                 const int at = cuts[k][c];
