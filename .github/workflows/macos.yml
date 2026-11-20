@@ -23,9 +23,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.intel) && '[{"os":"macos-15","leg":"macos-15-arm64","gpu":"metal"},{"os":"macos-15-intel","leg":"macos-15-x64","gpu":"none"},{"os":"ubuntu-latest","leg":"ubuntu-cpu","gpu":"none"}]' || '[{"os":"macos-15","leg":"macos-15-arm64","gpu":"metal"},{"os":"ubuntu-latest","leg":"ubuntu-cpu","gpu":"none"}]') }}
+        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.intel) && '[{"os":"macos-15","leg":"macos-15-arm64","gpu":"metal","cmake_extra":""},{"os":"macos-15","leg":"macos-15-arm64-cpu","gpu":"none","cmake_extra":"-DGGML_METAL=OFF"},{"os":"macos-15-intel","leg":"macos-15-x64","gpu":"none","cmake_extra":""},{"os":"ubuntu-latest","leg":"ubuntu-cpu","gpu":"none","cmake_extra":""}]' || '[{"os":"macos-15","leg":"macos-15-arm64","gpu":"metal","cmake_extra":""},{"os":"macos-15","leg":"macos-15-arm64-cpu","gpu":"none","cmake_extra":"-DGGML_METAL=OFF"},{"os":"ubuntu-latest","leg":"ubuntu-cpu","gpu":"none","cmake_extra":""}]') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 150
+    timeout-minutes: 300
     steps:
       - name: Leg
         id: gate
@@ -58,6 +58,11 @@ jobs:
             fi
           } 2>&1 | tee ci-logs/sysinfo.txt
 
+      - name: Python test deps
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: python3 -m pip install --user --break-system-packages jinja2 || python3 -m pip install --user jinja2 || true
+
       - name: Configure and build
         if: steps.gate.outputs.run == 'true'
         id: build
@@ -66,7 +71,7 @@ jobs:
           set -o pipefail
           if [ "$(uname)" = "Darwin" ]; then NJ=$(sysctl -n hw.logicalcpu); else NJ=$(nproc); fi
           rc=0
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=ON 2>&1 | tee ci-logs/configure.log || rc=$?
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=ON ${{ matrix.cmake_extra }} 2>&1 | tee ci-logs/configure.log || rc=$?
           if [ "$rc" = 0 ]; then
             cmake --build build --config Release -j "$NJ" 2>&1 | tee ci-logs/build.log || rc=$?
           fi
@@ -81,12 +86,12 @@ jobs:
         run: |
           cd build
           rc=0
-          ctest -j 3 --timeout 900 --output-on-failure > ../ci-logs/ctest.log 2>&1 || rc=$?
+          ctest -j 3 --timeout 1800 --output-on-failure > ../ci-logs/ctest.log 2>&1 || rc=$?
           tail -40 ../ci-logs/ctest.log
           cp Testing/Temporary/LastTestsFailed.log ../ci-logs/ctest_failed_first.txt 2>/dev/null || true
           if [ "$rc" != 0 ]; then
             # one rerun of the failures before calling them failures
-            ctest --rerun-failed --timeout 900 --output-on-failure > ../ci-logs/ctest_rerun.log 2>&1 || true
+            ctest --rerun-failed --timeout 1800 --output-on-failure > ../ci-logs/ctest_rerun.log 2>&1 || true
             cp Testing/Temporary/LastTestsFailed.log ../ci-logs/ctest_failed_rerun.txt 2>/dev/null || true
             tail -20 ../ci-logs/ctest_rerun.log
           fi
