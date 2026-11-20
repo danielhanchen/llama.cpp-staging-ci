@@ -11,6 +11,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama-cpp.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
 #include <atomic>
@@ -218,6 +219,108 @@ static model_result run_model(const std::string & model_path,
     return res;
 }
 
+// --accel: an accelerator device that, like BLAS, accepts every host buffer and is listed before the CPU backend, but runs no op
+// at all (a graph with a node to compute aborts). Contexts add every accelerator device, so a graph that is sent to the first
+// backend taking its buffer type, instead of to one that takes its ops, aborts here on any build
+static const char * test_accel_name(ggml_backend_t) { return "TestAccel"; }
+static void test_accel_free(ggml_backend_t backend) { delete backend; }
+static enum ggml_status test_accel_graph_compute(ggml_backend_t, ggml_cgraph * cgraph) {
+    for (int i = 0; i < ggml_graph_n_nodes(cgraph); ++i) {
+        const ggml_tensor * node = ggml_graph_node(cgraph, i);
+        switch (node->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                break;
+            default:
+                GGML_ABORT("TestAccel: unsupported op %s (node %s)", ggml_op_desc(node), node->name);
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static const ggml_backend_i test_accel_backend_i = {
+    /* .get_name            = */ test_accel_name,
+    /* .free                = */ test_accel_free,
+    /* .set_tensor_async    = */ NULL,
+    /* .get_tensor_async    = */ NULL,
+    /* .set_tensor_2d_async = */ NULL,
+    /* .get_tensor_2d_async = */ NULL,
+    /* .cpy_tensor_async    = */ NULL,
+    /* .synchronize         = */ NULL,
+    /* .graph_plan_create   = */ NULL,
+    /* .graph_plan_free     = */ NULL,
+    /* .graph_plan_update   = */ NULL,
+    /* .graph_plan_compute  = */ NULL,
+    /* .graph_compute       = */ test_accel_graph_compute,
+    /* .event_record        = */ NULL,
+    /* .event_wait          = */ NULL,
+    /* .graph_optimize      = */ NULL,
+};
+
+static ggml_guid test_accel_guid = { 0x74, 0x65, 0x73, 0x74, 0x61, 0x63, 0x63, 0x65, 0x6c, 0x00, 0x6c, 0x6c, 0x63, 0x74, 0x78, 0x01 };
+
+static const char * test_accel_dev_name(ggml_backend_dev_t) { return "TestAccel"; }
+static const char * test_accel_dev_description(ggml_backend_dev_t) { return "accelerator that takes host buffers and no op"; }
+static void test_accel_dev_memory(ggml_backend_dev_t, size_t * free, size_t * total) {
+    *free  = 0;
+    *total = 0;
+}
+static enum ggml_backend_dev_type test_accel_dev_type(ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_ACCEL; }
+static void test_accel_dev_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    memset(props, 0, sizeof(*props));
+    props->name        = test_accel_dev_name(dev);
+    props->description = test_accel_dev_description(dev);
+    props->type        = GGML_BACKEND_DEVICE_TYPE_ACCEL;
+}
+static ggml_backend_t test_accel_dev_init(ggml_backend_dev_t dev, const char *) {
+    return new ggml_backend{ &test_accel_guid, test_accel_backend_i, dev, NULL };
+}
+static ggml_backend_buffer_type_t test_accel_dev_buft(ggml_backend_dev_t) { return ggml_backend_cpu_buffer_type(); }
+static bool test_accel_dev_supports_op(ggml_backend_dev_t, const ggml_tensor *) { return false; }
+static bool test_accel_dev_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) { return ggml_backend_buft_is_host(buft); }
+
+static const char * test_accel_reg_name(ggml_backend_reg_t) { return "TestAccel"; }
+static size_t test_accel_reg_count(ggml_backend_reg_t) { return 1; }
+static ggml_backend_dev_t test_accel_reg_dev(ggml_backend_reg_t, size_t);
+
+static ggml_backend_reg test_accel_reg = {
+    /* .api_version = */ GGML_BACKEND_API_VERSION,
+    /* .iface = */ {
+        /* .get_name         = */ test_accel_reg_name,
+        /* .get_device_count = */ test_accel_reg_count,
+        /* .get_device       = */ test_accel_reg_dev,
+        /* .get_proc_address = */ NULL,
+    },
+    /* .context = */ NULL,
+};
+
+static ggml_backend_device test_accel_dev = {
+    /* .iface = */ {
+        /* .get_name             = */ test_accel_dev_name,
+        /* .get_description      = */ test_accel_dev_description,
+        /* .get_memory           = */ test_accel_dev_memory,
+        /* .get_type             = */ test_accel_dev_type,
+        /* .get_props            = */ test_accel_dev_props,
+        /* .init_backend         = */ test_accel_dev_init,
+        /* .get_buffer_type      = */ test_accel_dev_buft,
+        /* .get_host_buffer_type = */ NULL,
+        /* .buffer_from_host_ptr = */ NULL,
+        /* .supports_op          = */ test_accel_dev_supports_op,
+        /* .supports_buft        = */ test_accel_dev_supports_buft,
+        /* .offload_op           = */ NULL,
+        /* .event_new            = */ NULL,
+        /* .event_free           = */ NULL,
+        /* .event_synchronize    = */ NULL,
+    },
+    /* .reg     = */ &test_accel_reg,
+    /* .context = */ NULL,
+};
+
+static ggml_backend_dev_t test_accel_reg_dev(ggml_backend_reg_t, size_t) { return &test_accel_dev; }
+
 static void print_usage(int /* argc */, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n  %s -m your_model.gguf\n", argv[0]);
@@ -233,6 +336,7 @@ static void print_usage(int /* argc */, char ** argv) {
     LOG("\n  --logs DIR                keep the log of each model in DIR instead of discarding it\n");
     LOG("\n  --logs-on-fail always     after the table, print the log of every failed model (default)\n");
     LOG("\n  --logs-on-fail never      never print the logs of the failed models\n");
+    LOG("\n  --accel                   add an accelerator device that takes host buffers but no op (as BLAS)\n");
     LOG("\n");
 }
 
@@ -263,6 +367,7 @@ int main(int argc, char ** argv) {
     std::string test_filter;
 
     bool list_cases        = false;
+    bool test_accel        = false;
     bool dump_logs_on_fail = true;
 
     int parallel_workers = 1; // 0 = auto, same flag as in test-backend-ops
@@ -358,6 +463,11 @@ int main(int argc, char ** argv) {
             continue;
         }
 
+        if (std::strcmp(argv[i], "--accel") == 0) {
+            test_accel = true;
+            continue;
+        }
+
         filtered_argv.push_back(argv[i]);
     }
     filtered_argv.push_back(nullptr);
@@ -405,6 +515,10 @@ int main(int argc, char ** argv) {
     llama_log_set(test_log_callback, nullptr);
 
     llama_backend_init();
+
+    if (test_accel) {
+        ggml_backend_register(&test_accel_reg);
+    }
 
     // the threads a context runs on, resolved by the common parser - in table mode every worker
     //   builds a context of its own, so the run uses n_pool times this many
