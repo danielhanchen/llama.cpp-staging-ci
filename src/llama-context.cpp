@@ -1973,9 +1973,39 @@ void llama_context::rs_replay_setup() {
         chk(mem->rv_l[il]);
         chk(mem->rg_l[il]);
     }
+    ggml_context_ptr ctx_own;
+    ggml_cgraph * gf = nullptr;
     if (one && rs_buft != nullptr) {
+        // the worst-case commit graph: the backend that runs the commits must take all of its ops, not only the state's buffer type
+        // (an accelerator such as BLAS accepts any host buffer but runs only a few ops, CONT / CPY / GATED_DELTA_NET not among them)
+        ggml_init_params ip = { ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true };
+        ctx_own.reset(ggml_init(ip));
+        gf = ggml_new_graph_custom(ctx_own.get(), max_nodes, false);
+        rs_commit_build(ctx_own.get(), gf, /*worst =*/ true);
         for (auto * be : backend_ptrs) {
-            if (ggml_backend_supports_buft(be, rs_buft)) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(be);
+            if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                continue;
+            }
+            if (!ggml_backend_supports_buft(be, rs_buft)) {
+                continue;
+            }
+            bool ops_ok = true;
+            for (int i = 0; i < ggml_graph_n_nodes(gf) && ops_ok; ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                switch (node->op) {
+                    case GGML_OP_NONE:
+                    case GGML_OP_VIEW:
+                    case GGML_OP_RESHAPE:
+                    case GGML_OP_PERMUTE:
+                    case GGML_OP_TRANSPOSE:
+                        break;
+                    default:
+                        ops_ok = ggml_backend_supports_op(be, node);
+                        break;
+                }
+            }
+            if (ops_ok) {
                 rs_backend = be;
                 break;
             }
@@ -1990,10 +2020,6 @@ void llama_context::rs_replay_setup() {
     if (!fb_on) {
         return;
     }
-    ggml_init_params ip = { ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true };
-    ggml_context_ptr ctx_own { ggml_init(ip) };
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx_own.get(), max_nodes, false);
-    rs_commit_build(ctx_own.get(), gf, /*worst =*/ true);
     if (ggml_graph_n_nodes(gf) == 0) {
         return;
     }
