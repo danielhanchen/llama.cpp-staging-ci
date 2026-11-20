@@ -137,7 +137,14 @@ static int run_case(ggml_backend_t backend, ggml_backend_dev_t dev, const conv_c
     std::vector<float> a(c.H * c.T), b(c.H * c.T);
     ggml_backend_tensor_get(ref, a.data(), 0, ggml_nbytes(ref));
     ggml_backend_tensor_get(fus, b.data(), 0, ggml_nbytes(fus));
-    const int r = memcmp(a.data(), b.data(), a.size() * 4) != 0 ? 1 : 0;
+    // bit-exact, except that two NaNs count as equal (their payload / sign may differ with the compiler's vector code)
+    int r = 0;
+    for (size_t i = 0; i < a.size() && r == 0; ++i) {
+        if (std::isnan(a[i]) && std::isnan(b[i])) {
+            continue;
+        }
+        r = memcmp(&a[i], &b[i], sizeof(float)) != 0 ? 1 : 0;
+    }
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return r;
