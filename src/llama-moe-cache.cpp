@@ -3054,10 +3054,7 @@ struct llama_moe_cache::impl {
     // misses: there the host path was level per pass and cost MTP 6% (round 1)
     static bool single_wide_host() {
         static const bool v = [] {
-            const char * e  = getenv("LLAMA_MOE_SINGLE_WIDE");
-            const char * em = getenv("LLAMA_MOE_SINGLE_WIDE_MIN_CPUS");
-            const int min_cpus = em != nullptr ? atoi(em) : 32;
-            return !(e != nullptr && atoi(e) == 0) && llama_moe_n_cpus() >= min_cpus;
+            return llama_moe_tp::wide_host(llama_moe_n_cpus(), getenv("LLAMA_MOE_SINGLE_WIDE"), getenv("LLAMA_MOE_SINGLE_WIDE_MIN_CPUS"));
         }();
         return v;
     }
@@ -3069,10 +3066,8 @@ struct llama_moe_cache::impl {
     // 61.5. The cached-share floor of single_max still applies, and the rule stops at the share of the small-batch timing trials (see single_max)
     static bool single_wide_mid_host() {
         static const bool v = [] {
-            const char * e  = getenv("LLAMA_MOE_SINGLE_WIDE_MID");
-            const char * em = getenv("LLAMA_MOE_SINGLE_WIDE_MID_CPUS");
-            const int min_cpus = em != nullptr ? atoi(em) : 12;
-            return !(e != nullptr && atoi(e) == 0) && !single_wide_host() && llama_moe_n_cpus() >= min_cpus;
+            return llama_moe_tp::wide_mid_host(llama_moe_n_cpus(), single_wide_host(), getenv("LLAMA_MOE_SINGLE_WIDE_MID"),
+                getenv("LLAMA_MOE_SINGLE_WIDE_MID_CPUS"));
         }();
         return v;
     }
@@ -8670,12 +8665,11 @@ struct llama_moe_cache::impl {
         // path off costs most of a short request (LLAMA_MOE_CPU_MISS_FIRM_SKIP=0: the recorded trials replay as before). A clear "on" or
         // any "off" replays as recorded. Colab L4 (12 vCPU), Qwen3.6-35B-A3B UD-Q4_K_XL with its MTP head capped at 16 GB (58% cached)
         bool skip_firm = false;
-        if (!skip_share && cm_trial && !cm_force && cmt_n == 0 && cmt_done < 0 && cmt_firm_skip_on() && cmt_trust_marginal()) {
-            cmt_ps_setup();
-            if (cmt_ps_state == 1 && cmt_rec_file > 0) {
-                const llama_moe_tp::rec & r0 = cmt_rec[0];
-                skip_firm = r0.firm != 0 && r0.on != 0 && r0.tries >= cmt_ps_tries() && r0.ratio > 1.0 - cmt_ps_min_gain() && r0.ratio < 1.0;
-            }
+        if (!skip_share && cm_trial && !cm_force && cmt_n == 0 && cmt_done < 0) {
+            skip_firm = llama_moe_tp::firm_skip(cmt_firm_skip_on(), cmt_trust_marginal(), [&]() -> const llama_moe_tp::rec * {
+                cmt_ps_setup();
+                return cmt_ps_state == 1 && cmt_rec_file > 0 ? &cmt_rec[0] : nullptr;
+            }, cmt_ps_tries(), cmt_ps_min_gain());
         }
         const bool skip = skip_share || skip_firm;
         if (late) {
@@ -10836,10 +10830,7 @@ struct llama_moe_cache::impl {
     }
     // LLAMA_MOE_CPU_MISS_FIRM_SKIP=0: a first trial made firm "on" by agreeing marginal timings replays its blocks (see cm_skip_trials)
     static bool cmt_firm_skip_on() {
-        static const bool on = [] {
-            const char * e = getenv("LLAMA_MOE_CPU_MISS_FIRM_SKIP");
-            return e == nullptr || atoi(e) != 0;
-        }();
+        static const bool on = llama_moe_tp::env_on(getenv("LLAMA_MOE_CPU_MISS_FIRM_SKIP"));
         return on;
     }
     // A marginal "on" (a gain smaller than cmt_ps_min_gain) is taken in the launch that timed it on a 12..31-CPU host whose host misses go
