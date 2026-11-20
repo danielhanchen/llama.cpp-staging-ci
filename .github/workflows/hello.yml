@@ -1,0 +1,13 @@
+name: hello
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  hello:
+    strategy:
+      matrix:
+        os: [macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: uname -a && (sw_vers || true)
