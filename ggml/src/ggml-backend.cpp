@@ -3536,7 +3536,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     }
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
-        const size_t staging_all = ggml_backend_sched_prefetch_staging(sched, b);
+        size_t staging_all = ggml_backend_sched_prefetch_staging(sched, b);
         if (!dry) {
             pf->lent_all = false;
         }
@@ -3591,6 +3591,9 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 }
             }
         }
+        // the first attempt at every depth (see the depth fallback below)
+        const bool lend_full0  = lend_full;
+        const bool full_first0 = full_first;
         lend_again:
         ggml_backend_buffer_t own_buf  = lend_full ? NULL : pf->own_buf;
         const size_t          own_size = lend_full ? 0 : pf->own_size;
@@ -3633,6 +3636,36 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             // the user could not lend the rest in one part: the whole allocation, as without the own region
             lend_full = true;
             goto lend_again;
+        }
+        // the user lends memory for the copies but could not place them at this depth (it says so with the offset of the first entry set
+        // to SIZE_MAX and its buffer NULL; any other answer keeps the binding as it is): bind again at
+        // a smaller depth, whose fewer live copies may fit, before the copies go to a staging arena of their own; the binding settles at
+        // that depth. A G4 with Qwen3.8-Flash-Next UD-IQ4_XS, an MTP drafter and an 11 GB MoE cache: depth 5 needs 1567 slots, more than
+        // the half of the largest group (1008 of 2016) the cache lends to copies; the 2750 MiB arena then left no room for the 1053 MiB
+        // compute buffer, the prefetch was turned off and every 8k prompt uploaded its experts synchronously (4.2 s); depth 3 fits in 921
+        // slots and the prompt takes 1.8 s (GGML_SCHED_LEND_DEPTH_FALLBACK=0: off)
+        if (!dry && !sync_lend[b] && pf->n_async > 0 && pf->depth > 2 && n_copies > 0 &&
+                pf->lend_copies[0].buffer == NULL && pf->lend_copies[0].offset == SIZE_MAX) {
+            static const bool depth_fallback = getenv("GGML_SCHED_LEND_DEPTH_FALLBACK") == nullptr || atoi(getenv("GGML_SCHED_LEND_DEPTH_FALLBACK")) != 0;
+            bool placed = false;
+            for (int k = 0; k < n_copies && !placed; k++) {
+                placed = pf->lend_copies[k].buffer != NULL;
+            }
+            if (depth_fallback && !placed) {
+                const int from = pf->depth;
+                pf->depth--;
+                if (!pf->scoped) {
+                    sched->pf_depth = std::min(sched->pf_depth, pf->depth);
+                    sched->pf_adapt = false;
+                }
+                staging_all = ggml_backend_sched_prefetch_staging(sched, b);
+                GGML_LOG_INFO("%s: %s: the lender could not place the copies at depth %d: depth %d (GGML_SCHED_LEND_DEPTH_FALLBACK=0 to disable)\n",
+                    __func__, ggml_backend_name(sched->backends[b]), from, pf->depth);
+                lend_full  = lend_full0;
+                full_first = full_first0;
+                free_own   = false;
+                goto lend_again;
+            }
         }
 
         // a dry run only measures, the user may not have allocated its memory (e.g. no_alloc)
