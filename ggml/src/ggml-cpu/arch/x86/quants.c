@@ -503,8 +503,78 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 }
 
 // placeholder implementation for Apple targets
-void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q8_K_ref(x, y, k);
+// k19-cpupass: the Q8_K activations of every K-quant / IQ vec_dot (the host experts' up / gate rows: each host thread quantizes its
+// batch's tokens, 100 us of a 2.3 ms batch on a Colab A100 VM's Xeon with the reference) in AVX2, the reference's bytes: the first
+// element of the largest magnitude sets the scale, each value is the float product iscale*x rounded to the nearest integer, ties to
+// even (the reference's 1.5*2^23 trick does the same for these magnitudes), at most 127, and the 16-value sums. A block with a NaN or
+// an infinity, and an all-zero block (the reference leaves its sums as they were), take the reference. GGML_CPU_Q8K_SIMD=0: the reference
+#if defined(__AVX2__)
+static int ggml_q8k_simd_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GGML_CPU_Q8K_SIMD");
+        on = e == NULL || atoi(e) != 0;
+    }
+    return on;
+}
+#endif
+
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+#if defined(__AVX2__)
+    if (ggml_q8k_simd_on()) {
+        assert(k % QK_K == 0);
+        block_q8_K * GGML_RESTRICT y = vy;
+        const int64_t nb = k / QK_K;
+        const __m256 sign = _mm256_set1_ps(-0.0f);
+        const __m256i top = _mm256_set1_epi32(127);
+        const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for (int64_t i = 0; i < nb; ++i, x += QK_K) {
+            __m256 vmax = _mm256_setzero_ps();
+            __m256 bad  = _mm256_setzero_ps();
+            for (int j = 0; j < QK_K; j += 8) {
+                const __m256 v = _mm256_loadu_ps(x + j);
+                vmax = _mm256_max_ps(vmax, _mm256_andnot_ps(sign, v));
+                bad  = _mm256_or_ps(bad, _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
+            }
+            __m128 m4 = _mm_max_ps(_mm256_extractf128_ps(vmax, 1), _mm256_castps256_ps128(vmax));
+            m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+            m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+            const float amax = _mm_cvtss_f32(m4);
+            if (_mm256_movemask_ps(bad) != 0 || !isfinite(amax) || amax == 0.0f) {
+                quantize_row_q8_K_ref(x, y + i, QK_K);
+                continue;
+            }
+            const __m256 va = _mm256_set1_ps(amax);
+            int jm = 0;
+            for (int j = 0; j < QK_K; j += 8) {
+                const int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_andnot_ps(sign, _mm256_loadu_ps(x + j)), va, _CMP_EQ_OQ));
+                if (m != 0) {
+                    int b = 0;
+                    while (!((m >> b) & 1)) {
+                        ++b;
+                    }
+                    jm = j + b;
+                    break;
+                }
+            }
+            const float iscale = -127.f/x[jm];
+            const __m256 vs = _mm256_set1_ps(iscale);
+            for (int j = 0; j < QK_K; j += 32) {
+                __m256i q[4];
+                for (int u = 0; u < 4; ++u) {
+                    q[u] = _mm256_min_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(vs, _mm256_loadu_ps(x + j + 8*u))), top);
+                }
+                y[i].bsums[j/16]     = (int16_t) hsum_i32_8(_mm256_add_epi32(q[0], q[1]));
+                y[i].bsums[j/16 + 1] = (int16_t) hsum_i32_8(_mm256_add_epi32(q[2], q[3]));
+                const __m256i b8 = _mm256_packs_epi16(_mm256_packs_epi32(q[0], q[1]), _mm256_packs_epi32(q[2], q[3]));
+                _mm256_storeu_si256((__m256i *) (y[i].qs + j), _mm256_permutevar8x32_epi32(b8, perm));
+            }
+            y[i].d = 1/iscale;
+        }
+        return;
+    }
+#endif
+    quantize_row_q8_K_ref(x, vy, k);
 }
 
 //===================================== Dot products =================================
