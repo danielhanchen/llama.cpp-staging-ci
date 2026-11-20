@@ -37,6 +37,7 @@
 #include <vector>
 
 static int g_fail = 0;
+static int g_lazy_modes = 0; // profile x mode pairs whose lazy grammar cases ran
 
 static void check(const std::string & name, bool ok) {
     printf("%-100s %s\n", name.c_str(), ok ? "OK" : "FAIL");
@@ -499,7 +500,22 @@ static int run_main(int argc, char ** argv) {
         }
         llama_token t_mid = LLAMA_TOKEN_NULL;
         size_t at_mid = 0;
-        for (size_t i = 8; i < 40 && t_mid < 0; ++i) {
+        // positions 8..39 first; a reply that repeats one word from early on (the tiny random model on some CPUs) falls back to
+        // 2..7, then 40..55
+        std::vector<size_t> at_try;
+        for (size_t i = 8; i < 40; ++i) {
+            at_try.push_back(i);
+        }
+        for (size_t i = 2; i < 8; ++i) {
+            at_try.push_back(i);
+        }
+        for (size_t i = 40; i < 56; ++i) {
+            at_try.push_back(i);
+        }
+        for (size_t i : at_try) {
+            if (t_mid >= 0) {
+                break;
+            }
             const llama_token t = r0.toks[i];
             const std::string pc = common_token_to_piece(g_vocab, t, true);
             const bool printable = !pc.empty() && std::all_of(pc.begin(), pc.end(), [](char ch) { return ch > 0x20 && ch < 0x7f && ch != '"' && ch != '\\'; });
@@ -515,12 +531,15 @@ static int run_main(int argc, char ** argv) {
         for (llama_token t = 300; std::find(r0.toks.begin(), r0.toks.end(), t_never) != r0.toks.end(); ++t) {
             t_never = t;
         }
-        check(std::string(pr.name) + " / " + mname + ": a trigger token mid-reply", t_mid >= 0);
         if (t_mid < 0) {
-            // the reply repeats itself from the start: the lazy cases cannot be set up (a FAIL above, not a skip)
-            printf("  no token of the reply at 8..39 is new (as a token and as text) and printable: %s\n", text_of(r0.toks).c_str());
+            // the reply repeats itself from the start: the lazy cases of this mode cannot be set up (SKIP; the run fails at the end
+            // when no profile and mode could set them up)
+            printf("%-100s SKIP\n", (std::string(pr.name) + " / " + mname + ": a trigger token mid-reply").c_str());
+            printf("  no token of the reply at 2..55 is new (as a token and as text) and printable: %s\n", text_of(r0.toks).c_str());
             continue;
         }
+        check(std::string(pr.name) + " / " + mname + ": a trigger token mid-reply", true);
+        ++g_lazy_modes;
         const std::string p_mid = common_token_to_piece(g_vocab, t_mid, true);
 
         struct gcase { std::string name; common_params_sampling sp; llama_token pre = LLAMA_TOKEN_NULL; std::string expect = {}; bool ref0 = false; };
@@ -677,6 +696,7 @@ static int run_main(int argc, char ** argv) {
     llama_model_free(g_model);
     std::remove(spm.c_str());
     llama_backend_free();
+    check("the lazy grammar cases ran for at least one profile and mode", g_lazy_modes > 0);
     printf("%s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;
 }
