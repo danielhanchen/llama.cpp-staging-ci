@@ -1162,13 +1162,15 @@ struct llama_moe_cache::impl {
     // beside 0.81 ms of device work and the device waited 1.19 ms of it; at 1/2 1.30 ms beside 1.58 ms, 0.08 ms of waiting. A host
     // that is cheap per expert against the link keeps 1/4: Colab L4 Qwen3.6-35B-A3B UD-Q4_K_XL at 8 GB, 51 us against 162 us (raw
     // 0.24), loses 29% at 1/2 (the extra uploads run in the device's own stream). The 0.6 level stays where the trials run (Flint
-    // 16 GB, 56% cached)
+    // 16 GB, 56% cached) and on hosts of fewer than 12 usable CPUs (the small-host team of k19-hostovl, e.g. a Colab T4 VM's 8 vCPUs):
+    // there a slow start-up sample is the usual way to land above the midpoint (Colab T4 q4x calibrations 82-85 us per expert, a few
+    // 128-141), and 8 GB pinned at such a sample (127.6 us, raw 0.40) decoded 17% slower at 1/2 (chat 66.6 -> 55.4 tok/s)
     bool cm_team_mid() const {
         static const bool on = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_TEAM_MID");
             return e == nullptr || atoi(e) != 0;
         }();
-        return on && getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM") == nullptr && cache_frac >= 0.0 &&
+        return on && getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM") == nullptr && llama_moe_n_cpus() >= 12 && cache_frac >= 0.0 &&
             cache_frac < llama_moe_cache::trial_frac_single();
     }
     double cm_small_half_eff() const {
