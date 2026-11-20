@@ -3640,9 +3640,10 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         // the user lends memory for the copies but could not place them at this depth (it says so with the offset of the first entry set
         // to SIZE_MAX and its buffer NULL; any other answer keeps the binding as it is): bind again at
         // a smaller depth, whose fewer live copies may fit, before the copies go to a staging arena of their own; the binding settles at
-        // that depth. A G4 with Qwen3.8-Flash-Next UD-IQ4_XS, an MTP drafter and a 13 GB MoE cache: depth 5 needs 1567 slots, more than
-        // the half of the largest group (1008) the cache lends to copies; the 2750 MiB arena then left no room for the 1053 MiB compute
-        // buffer, the prefetch was turned off and every 8k prompt uploaded its experts synchronously (GGML_SCHED_LEND_DEPTH_FALLBACK=0: off)
+        // that depth. A G4 with Qwen3.8-Flash-Next UD-IQ4_XS, an MTP drafter and an 11 GB MoE cache: depth 5 needs 1567 slots, more than
+        // the half of the largest group (1008 of 2016) the cache lends to copies; the 2750 MiB arena then left no room for the 1053 MiB
+        // compute buffer, the prefetch was turned off and every 8k prompt uploaded its experts synchronously (4.2 s); depth 3 fits in 921
+        // slots and the prompt takes 1.8 s (GGML_SCHED_LEND_DEPTH_FALLBACK=0: off)
         if (!dry && !sync_lend[b] && pf->n_async > 0 && pf->depth > 2 && n_copies > 0 &&
                 pf->lend_copies[0].buffer == NULL && pf->lend_copies[0].offset == SIZE_MAX) {
             static const bool depth_fallback = getenv("GGML_SCHED_LEND_DEPTH_FALLBACK") == nullptr || atoi(getenv("GGML_SCHED_LEND_DEPTH_FALLBACK")) != 0;
