@@ -2549,6 +2549,21 @@ private:
                     SRV_INF("k19-depth: MTP drafts 4 in every window below position %s (LLAMA_SPEC_DEPTH_POS; LLAMA_SPEC_DEPTH=0: off)\n",
                         dp != nullptr ? dp : "12288");
                 }
+                // With the deeper chat windows on the whole card (compute capability 12.0, MoE target, an MTP drafter of its own) the
+                // drafter's restricted head keeps 49152 rows instead of 65536: the head is the largest kernel of a draft step (99 of 331
+                // us there) and a chat window drafts 6 steps. Only the drafts change, the verify keeps the text. Colab G4, Qwen3.8-Flash-Next
+                // UD-IQ4_XS + its MTP drafter, Studio argv, whole card, two VMs x 3 launches: chat +1.7% / +2.1%, 8k +0.8% / +2.4%, the
+                // same tokens per pass (5.22 / 3.46) and text; 32768 rows lost tokens per pass in chat (5.22 -> 5.12).
+                // LLAMA_SPEC_MTP_VOCAB_FULL=0: 65536; an explicit LLAMA_MTP_DRAFT_VOCAB keeps its value
+                const bool vocab_full = [] {
+                    const char * x = getenv("LLAMA_SPEC_MTP_VOCAB_FULL");
+                    return x == nullptr || atoi(x) != 0;
+                }();
+                if (deep && chat_ok && vocab_full && getenv("LLAMA_MTP_DRAFT_VOCAB") == nullptr) {
+                    common_set_env("LLAMA_MTP_DRAFT_VOCAB", "49152");
+                    SRV_INF("%s", "MTP drafter on the whole card (compute capability 12.0): its restricted head keeps 49152 rows "
+                        "(LLAMA_SPEC_MTP_VOCAB_FULL=0: 65536)\n");
+                }
             } else if (mtp_shape && cache_expected && !exact_mtp && [] {
                     const char * a = getenv("LLAMA_SPEC_ADRAFT");
                     return a != nullptr && atoi(a) != 0;
