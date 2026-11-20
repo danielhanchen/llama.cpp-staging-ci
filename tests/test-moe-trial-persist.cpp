@@ -256,6 +256,18 @@ int main() {
         CHECK(!tp::settle(&ta, false, false, 3, td, true) && td.on == 0 && td.firm == 1 && td.tries == 2, "a trusted open on timed off: firm off");
         tp::rec te;
         CHECK( tp::settle(&ta, true, false, 3, te, true) && te.on == 1 && te.firm == 1 && te.tries == 2, "a trusted open on timed clear: firm on");
+        // trusted firm "on" count (LLAMA_MOE_CPU_MISS_TRUST_TRIES): default 2, at least 1, the untrusted firm "off" count is not changed
+        CHECK(tp::trust_tries(nullptr) == 2 && tp::trust_tries("3") == 3 && tp::trust_tries("1") == 1 && tp::trust_tries("0") == 1 &&
+            tp::trust_tries("-2") == 1, "trust tries: default 2, at least 1");
+        tp::rec t2;
+        CHECK( tp::settle(&ta, true, true, tp::trust_tries(nullptr), t2, true) && t2.on == 1 && t2.firm == 1 && t2.tries == 2,
+            "second trusted marginal on with the default count: firm on");
+        tp::rec t2x;
+        CHECK(!tp::settle(&ta, false, false, tp::trust_tries(nullptr), t2x, true) && t2x.on == 0 && t2x.firm == 1 && t2x.tries == 2,
+            "an off second timing is still firm off with the default count");
+        tp::rec u2a, u2b;
+        CHECK(!tp::settle(nullptr, true, true, 3, u2a) && !tp::settle(&u2a, true, true, 3, u2b) && u2b.firm == 0 && u2b.on == 0,
+            "untrusted: two marginal on timings stay open and off");
 
         // the firm "on" skip: a first trial made firm "on" by agreeing marginal timings skips the warm phase and the trials in later
         // launches, only on such a record, only on 12..31-CPU hosts and only while LLAMA_MOE_CPU_MISS_FIRM_SKIP is not 0
@@ -279,6 +291,11 @@ int main() {
         CHECK(!tp::firm_skip(true, true, first(&cl), 3, mg), "(b) a clear firm on replays as recorded");
         tp::rec few = fo; few.tries = 2;
         CHECK(!tp::firm_skip(true, true, first(&few), 3, mg), "(b) firm on with fewer tries than needed does not skip");
+        tp::rec two = t2; two.ratio = 0.935;                                // firm on after two trusted marginal timings
+        CHECK( tp::firm_skip(true, true, first(&two), tp::trust_tries(nullptr), mg), "(a) two agreeing timings skip with the default count");
+        CHECK(!tp::firm_skip(true, true, first(&two), tp::trust_tries("3"), mg), "(b) two timings do not skip with LLAMA_MOE_CPU_MISS_TRUST_TRIES=3");
+        tp::rec one = ta; one.ratio = 0.935;                                // open after one timing
+        CHECK(!tp::firm_skip(true, true, first(&one), tp::trust_tries(nullptr), mg), "(b) one open timing does not skip with the default count");
         tp::rec r1 = fo; r1.ratio = 1.0;
         CHECK(!tp::firm_skip(true, true, first(&r1), 3, mg), "(b) ratio 1 is not on");
         tp::rec r95 = fo; r95.ratio = 1.0 - mg;
