@@ -1819,7 +1819,27 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 static constexpr bool mmq_pipe_instantiated() {
     return !fallback && prec_src1 == GGML_PREC_Q8 && J <= 64 &&
         (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q4_K ||
-         type == GGML_TYPE_Q5_K  || type == GGML_TYPE_Q6_K);
+         type == GGML_TYPE_Q5_K  || type == GGML_TYPE_Q6_K  || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_Q5_0);
+}
+
+// The IQ3_XXS gate / up and Q5_0 down experts (UD-IQ4_XS Flash-Next quant) on the pipe as well: same tiles, bit-identical; RTX PRO 6000,
+// J 40: IQ3_XXS 782 -> 686 us, Q5_0 925 -> 778 us per launch (IQ2_S experts measured slower on the pipe, 817 -> 1088 us: base kernel).
+// GGML_CUDA_MMQ_PIPE_EXT: unset = the policy below, 0 = these types keep the base kernel, N > 0 = the MMQ_PIPE_* bits N for them only.
+// On the A100 (sm 80) they keep the base kernel unless GGML_CUDA_MMQ_PIPE_EXT_SM80=1 (measured on the RTX PRO 6000 only).
+static constexpr bool mmq_pipe_ext_type(const ggml_type type) {
+    return type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_Q5_0;
+}
+
+static int ggml_cuda_mmq_pipe_ext_env(const bool sm80) {
+    static const int v = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_PIPE_EXT");
+        return e == nullptr || *e == '\0' ? -1 : std::max(0, atoi(e));
+    }();
+    static const bool on_sm80 = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_PIPE_EXT_SM80");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return sm80 && !on_sm80 ? 0 : v;
 }
 
 // The bits measured fastest on an RTX PRO 6000 (G4, tests/test-mmq-pipe) per type, tile width and grid form.
@@ -1836,6 +1856,8 @@ static int mmq_pipe_policy(const ggml_type type, const int J, const bool one_til
         case GGML_TYPE_Q4_K:   return J <= 40 ? (MMQ_PIPE_YREG | MMQ_PIPE_L2X | MMQ_PIPE_OCC2) : (MMQ_PIPE_L2X | MMQ_PIPE_OCC2);
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:   return MMQ_PIPE_L2X | MMQ_PIPE_OCC2;
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_Q5_0:   return MMQ_PIPE_YREG | MMQ_PIPE_L2X | MMQ_PIPE_OCC2;
         default:               return 0;
     }
 }
@@ -1933,9 +1955,10 @@ static mmq_kernel_t mmq_pipe_kernel(const mmq_args & args, const int cc, const i
     mmq_kernel_t k = nullptr;
     int code = 0;
     if constexpr (mmq_pipe_instantiated<type, J, fallback, prec_src1>()) {
-        const int env = ggml_cuda_mmq_pipe_env();
-        if (env != 0 && uintptr_t(args.y) % 16 == 0) {
-            code = env > 0 ? env : mmq_pipe_policy(type, J, one_tile_per_block);
+        const int env     = ggml_cuda_mmq_pipe_env();
+        const int env_ext = mmq_pipe_ext_type(type) ? ggml_cuda_mmq_pipe_ext_env(sm80 && !sm12x) : -1;
+        if (env != 0 && env_ext != 0 && uintptr_t(args.y) % 16 == 0) {
+            code = env > 0 ? env : env_ext > 0 ? env_ext : mmq_pipe_policy(type, J, one_tile_per_block);
             if (type != GGML_TYPE_IQ3_S) {
                 code &= ~MMQ_PIPE_TAB;
             }
