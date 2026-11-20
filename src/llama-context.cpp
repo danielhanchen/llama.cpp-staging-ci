@@ -422,7 +422,7 @@ static bool tiny_rel_trace() {
 // glibc only, as in ggml.c: musl has no <execinfo.h>, Android bionic has it from API 33
 #if defined(__linux__) && defined(__GLIBC__)
 #include <execinfo.h>
-static void tiny_rel_sig(int sig) {
+[[noreturn]] static void tiny_rel_sig(int sig) {
     fprintf(stderr, "tiny_rel_trace: fatal signal %d\n", sig);
     void * frames[64];
     const int n = backtrace(frames, 64);
