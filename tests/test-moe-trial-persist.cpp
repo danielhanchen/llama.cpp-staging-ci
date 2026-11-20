@@ -245,6 +245,17 @@ int main() {
         CHECK( tp::settle(&a, true, false, 3, d) && d.on == 1 && d.firm == 1 && d.tries == 2, "a clear re-timing: firm with its verdict");
         tp::rec e;
         CHECK( tp::settle(nullptr, true, false, 3, e) && e.on == 1 && e.firm == 1 && e.tries == 1, "a clear first timing: firm");
+        // trusted marginal "on" (12..31-CPU mailbox hosts): taken in the timing launch, open; three in a row: firm on; an off re-timing: firm off
+        tp::rec ta;
+        CHECK( tp::settle(nullptr, true, true, 3, ta, true) && ta.on == 1 && ta.firm == 0 && ta.tries == 1, "trusted marginal on: on and open");
+        tp::rec tb;
+        CHECK( tp::settle(&ta, true, true, 3, tb, true) && tb.on == 1 && tb.firm == 0 && tb.tries == 2, "second trusted marginal: on, open");
+        tp::rec tc;
+        CHECK( tp::settle(&tb, true, true, 3, tc, true) && tc.on == 1 && tc.firm == 1 && tc.tries == 3, "third trusted marginal on: firm on");
+        tp::rec td;
+        CHECK(!tp::settle(&ta, false, false, 3, td, true) && td.on == 0 && td.firm == 1 && td.tries == 2, "a trusted open on timed off: firm off");
+        tp::rec te;
+        CHECK( tp::settle(&ta, true, false, 3, te, true) && te.on == 1 && te.firm == 1 && te.tries == 2, "a trusted open on timed clear: firm on");
 
         // round trip of an open record; a line in the old form reads as firm
         std::vector<tp::rec> r(2);
