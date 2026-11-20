@@ -724,6 +724,8 @@ struct case_k19_fuzz : ctx_test {
                 std::mt19937 rng(seed * 7919u + n_seqs);
                 std::vector<llama_pos> pos(n_seqs, 0);
                 std::vector<int> win(n_seqs, 0); // tokens of the last decode of the seq (a window when 2..3)
+                float worst_l = 0.0f; // the largest logit / state difference relative to its scale, against the bounds below
+                float worst_s = 0.0f;
                 for (int step = 0; step < n_steps; ++step) {
                     // a slot that takes a new request: the whole sequence removed (post-release prompt_clear / memory_seq_rm [0, end))
                     for (uint32_t s = 0; s < n_seqs; ++s) {
@@ -780,6 +782,7 @@ struct case_k19_fuzz : ctx_test {
                                 la_max = std::max(la_max, std::fabs(l_s[v]));
                             }
                         }
+                        worst_l = std::max(worst_l, l_max / std::max(la_max, 1e-30f));
                         CTX_REQUIRE(l_max <= 1e-3f*la_max + 1e-6f, "seed " + std::to_string(seed) + " seqs " + std::to_string(n_seqs) + " step " +
                                 std::to_string(step) + ": the logits of seq " + std::to_string(sp[0]) + " differ from one sequence per ubatch (max diff " +
                                 std::to_string(l_max) + " of " + std::to_string(la_max) + ")");
@@ -831,12 +834,14 @@ struct case_k19_fuzz : ctx_test {
                                 a_max = std::max(a_max, std::fabs(b));
                             }
                         }
+                        worst_s = std::max(worst_s, d_max / std::max(a_max, 1e-30f));
                         CTX_REQUIRE(d_max <= 1e-3f*a_max + 1e-6f, "seed " + std::to_string(seed) + " seqs " + std::to_string(n_seqs) + " step " +
                                 std::to_string(step) + ": the state of seq " + std::to_string(s) + " differs from one sequence per ubatch (max diff " +
                                 std::to_string(d_max) + " of " + std::to_string(a_max) + ")");
                     }
                 }
-                TLOG_INF("%s: seqs %u seed %u: %d steps match\n", __func__, n_seqs, seed, n_steps);
+                TLOG_INF("%s: seqs %u seed %u: %d steps match (worst logits diff %g, state diff %g of the scale; bound 1e-3)\n", __func__,
+                        n_seqs, seed, n_steps, (double) worst_l, (double) worst_s);
             }
         }
         return case_result::pass();

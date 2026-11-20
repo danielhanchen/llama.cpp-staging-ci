@@ -145,6 +145,11 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
         return false;
     }
 
+    // TF32 tensor cores for F32 weights (see ggml_cuda_no_tf32)
+    if (type == GGML_TYPE_F32 && ggml_cuda_no_tf32()) {
+        return false;
+    }
+
     const size_t ts = ggml_type_size(type);
     if (src0_ne[0] % (warp_size * (4/ts)) != 0) {
         return false;

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <clocale>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -256,6 +257,18 @@ int main(int argc, char ** argv) {
     params.sampling.seed = 1234;
 
     common_init();
+
+    // The recurrent cases compare a batch of several sequences against a context that decodes one sequence per ubatch. On CUDA the
+    // F32 products of the generated models run in TF32 from a batch width on and in FP32 for a single column, which alone moves the
+    // logits and states by 1e-3 to 3e-3 of their scale, above the bounds of those cases: keep them in FP32 (GGML_CUDA_NO_TF32=0
+    // keeps the default math). No effect on other backends.
+#ifdef _WIN32
+    if (getenv("GGML_CUDA_NO_TF32") == nullptr) {
+        _putenv_s("GGML_CUDA_NO_TF32", "1");
+    }
+#else
+    setenv("GGML_CUDA_NO_TF32", "1", 0);
+#endif
 
     // extract our own options before handing the rest to the common parser
     std::string models_dir;

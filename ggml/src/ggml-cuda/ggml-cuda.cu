@@ -3027,7 +3027,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
         CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_TF32_TENSOR_OP_MATH));
+        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), ggml_cuda_no_tf32() ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH));
         return;
     }
 

@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "common.cuh"
 #include "ggml.h"
 #include "solve_tri.cuh"
@@ -71,7 +72,7 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
                                     CUBLAS_DIAG_NON_UNIT, k, n, &alpha, A_ptrs_dev, n, X_ptrs_dev, k, total_batches));
 
     // revert to standard mode from common.cuh
-    CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_TF32_TENSOR_OP_MATH));
+    CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), ggml_cuda_no_tf32() ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH));
 
     GGML_UNUSED_VARS(s12, s13);
 }

@@ -1772,6 +1772,18 @@ struct ggml_cuda_qsa_maskless {
 #define GGML_CUDA_MOE_DEFER_LAYERS 512
 #define GGML_CUDA_MOE_DEFER_STRIDE 256
 
+// GGML_CUDA_NO_TF32=1: F32 x F32 products run in full FP32: no TF32 tensor cores (mul_mat_f is not used for F32 weights, cuBLAS keeps
+// its default math). By default a batch of more than a few columns runs them in TF32 (10-bit mantissa) and a single column in FP32
+// (mul_mat_vec_f), so the same row differs by about 1e-3 of its scale between a batched and a one-sequence-per-ubatch decode; tests
+// that compare the two (test-llama-context) set it. Off by default: the default math is unchanged.
+static inline bool ggml_cuda_no_tf32() {
+    static const bool no_tf32 = [] {
+        const char * e = getenv("GGML_CUDA_NO_TF32");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return no_tf32;
+}
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1980,7 +1992,7 @@ struct ggml_backend_cuda_context {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
+            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], ggml_cuda_no_tf32() ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH));
             CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
             if (cublas_workspace_sizes[device] == 0) {
