@@ -271,11 +271,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # the same with an accelerator device that takes host buffers but no op (as BLAS does): every graph must still run on a
     # backend that supports its ops (without the realloc abort: a second backend on the CPU buffer type makes the scheduler,
     # not the graph allocator, re-plan a graph whose recurrent state gather changed size)
+    # (the recurrent cases, which run the replay commit graphs; its own directory for the session files of the cases)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/llama-context-accel")
     llama_test(
         test-llama-context
         NAME test-llama-context-accel
         LABEL main
-        ARGS --models "${MODEL_DIR}" --accel
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/llama-context-accel"
+        ARGS --models "${MODEL_DIR}" --accel --test "rollback|replay.*|shared|.*_move|.*_fuzz" -t 2
     )
     set_tests_properties(test-llama-context-accel PROPERTIES
         FIXTURES_REQUIRED generate-models
