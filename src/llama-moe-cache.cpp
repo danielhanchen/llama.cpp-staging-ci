@@ -1157,11 +1157,12 @@ struct llama_moe_cache::impl {
     // LLAMA_MOE_CPU_MISS_TEAM_MID (default 1; 0 = the 0.6 level at every cache share): on such a host, a cache that holds less than the
     // trial share (cm_team_mid: no timing trials, the cost model alone decides) takes 1/2 above the geometric midpoint 0.354 of the two
     // levels, the boundary of every other batch size. There the host experts are the critical path of a small batch and the link is
-    // not: Colab A100 40 GB VM (12 vCPU, 6 cores), Qwen3.8-Flash-Next UD-IQ4_XS at 16 GB (14% cached), the VM's own calibration 125-141
-    // us per expert against an upload of 205-215 us (raw 0.37-0.41): at 1/4 the device waited on the host for 45% of a verify pass
-    // (host batch 2.3 ms per layer beside 0.8 ms of device work), at 1/2 the host batch is 1.4 ms per layer. Cells whose raw share
-    // stays below the midpoint keep 1/4 (Colab L4 / A100 Qwen3.6-35B-A3B UD-Q4_K_XL 0.23-0.33, LFM2.5 0.20-0.32), and the 0.6 level
-    // stays where the trials run (Flint 16 GB, 56% cached)
+    // not: Colab A100 40 GB VM (12 vCPU, 6 cores), Qwen3.8-Flash-Next UD-IQ4_XS at 16 / 32 GB (15 / 42% cached), the VM's own
+    // calibration 137.8-140.5 us per expert against an upload of 205-206 us (raw 0.40): at 1/4 a host batch took 1.97 ms per layer
+    // beside 0.81 ms of device work and the device waited 1.19 ms of it; at 1/2 1.30 ms beside 1.58 ms, 0.08 ms of waiting. A host
+    // that is cheap per expert against the link keeps 1/4: Colab L4 Qwen3.6-35B-A3B UD-Q4_K_XL at 8 GB, 51 us against 162 us (raw
+    // 0.24), loses 29% at 1/2 (the extra uploads run in the device's own stream). The 0.6 level stays where the trials run (Flint
+    // 16 GB, 56% cached)
     bool cm_team_mid() const {
         static const bool on = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_TEAM_MID");
