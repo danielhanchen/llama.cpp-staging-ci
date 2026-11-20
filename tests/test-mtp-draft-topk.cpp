@@ -125,6 +125,56 @@ static bool same(const topk_out & a, const topk_out & b) {
     return a.ids == b.ids && memcmp(a.logits.data(), b.logits.data(), a.logits.size()*sizeof(float)) == 0;
 }
 
+// ggml_top_k returns its k indices "in no particular order": a backend other than the CPU and CUDA ones (whose order the draft path
+// relies on and this test checks bit for bit) may order them, and pick among the logits tied at the k-th value, differently in the
+// two graphs. 0: equal bit for bit; 1: the same candidates in another order; 2: the same logits, the candidates differing only among
+// the tokens tied at the k-th logit; 3: a real difference (another logit, a token that does not have its logit, a duplicate)
+static int topk_diff_kind(const topk_out & a, const topk_out & b, const std::vector<float> & tok_logit) {
+    if (same(a, b)) {
+        return 0;
+    }
+    const size_t k = a.ids.size();
+    if (b.ids.size() != k) {
+        return 3;
+    }
+    for (const topk_out * o : { &a, &b }) {
+        std::vector<int32_t> s_ids = o->ids;
+        std::sort(s_ids.begin(), s_ids.end());
+        if (std::adjacent_find(s_ids.begin(), s_ids.end()) != s_ids.end()) {
+            return 3;
+        }
+        for (size_t i = 0; i < k; ++i) {
+            const int32_t t = o->ids[i];
+            if (t < 0 || (size_t) t >= tok_logit.size() || memcmp(&o->logits[i], &tok_logit[t], sizeof(float)) != 0) {
+                return 3;
+            }
+        }
+    }
+    std::vector<float> la = a.logits, lb = b.logits;
+    std::sort(la.begin(), la.end(), std::greater<float>());
+    std::sort(lb.begin(), lb.end(), std::greater<float>());
+    if (la != lb) {
+        return 3;
+    }
+    std::vector<int32_t> ia = a.ids, ib = b.ids;
+    std::sort(ia.begin(), ia.end());
+    std::sort(ib.begin(), ib.end());
+    if (ia == ib) {
+        return 1;
+    }
+    // every candidate above the k-th logit is in both
+    const float kth = la.back();
+    for (const topk_out * o : { &a, &b }) {
+        const topk_out & other = o == &a ? b : a;
+        for (size_t i = 0; i < k; ++i) {
+            if (o->logits[i] > kth && std::find(other.ids.begin(), other.ids.end(), o->ids[i]) == other.ids.end()) {
+                return 3;
+            }
+        }
+    }
+    return 2;
+}
+
 static int part_ops(int & n_control_diff) {
     int fails = 0;
     n_control_diff = 0;
@@ -145,11 +195,13 @@ static int part_ops(int & n_control_diff) {
             continue;
         }
         const bool is_cpu = type == GGML_BACKEND_DEVICE_TYPE_CPU;
+        // bit for bit (order and ties too) where the draft path relies on it; elsewhere the op's contract: same logits, ties free
+        const bool exact = is_cpu || strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0;
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         if (backend == nullptr) {
             continue;
         }
-        int n_run = 0, n_bad = 0, n_ctl = 0;
+        int n_run = 0, n_bad = 0, n_ctl = 0, n_order = 0, n_tie = 0;
         for (const head_case & hc : cases) {
             const int32_t n_sub = hc.n_base + hc.n_ctx;
             if (!is_cpu && n_sub <= 4096) {
@@ -185,6 +237,11 @@ static int part_ops(int & n_control_diff) {
                 std::vector<int32_t> perm, cand, perm_u, cand_u;
                 order_rows(ids, hc.n_base, true, perm, cand);
                 order_rows(ids, hc.n_base, false, perm_u, cand_u);
+                // each token's logit in the full vocabulary (-inf where the head has no row)
+                std::vector<float> tok_logit(hc.n_vocab, -INFINITY);
+                for (int32_t r = 0; r < n_sub; ++r) {
+                    tok_logit[ids[r]] = sub[r];
+                }
                 for (int k : { 1, 10, 40 }) {
                     topk_out ref, got, ctl;
                     if (!run_topk(backend, hc, sub, ids, perm, cand, 0, k, ref) ||
@@ -195,19 +252,24 @@ static int part_ops(int & n_control_diff) {
                         continue;
                     }
                     n_run++;
-                    if (!same(ref, got)) {
+                    const int kind = topk_diff_kind(ref, got, tok_logit);
+                    n_order += kind == 1;
+                    n_tie   += kind == 2;
+                    if (kind == 3 || (kind != 0 && exact)) {
                         n_bad++;
                         if (n_bad <= 3) {
-                            fprintf(stderr, "%s: V %lld n_sub %d levels %d k %d: candidates differ (first %d vs %d)\n", ggml_backend_dev_name(dev),
-                                    (long long) hc.n_vocab, n_sub, hc.levels, k, ref.ids[0], got.ids[0]);
+                            fprintf(stderr, "%s: V %lld n_sub %d levels %d k %d: candidates differ (first %d vs %d, %s)\n", ggml_backend_dev_name(dev),
+                                    (long long) hc.n_vocab, n_sub, hc.levels, k, ref.ids[0], got.ids[0],
+                                    kind == 1 ? "same candidates, other order" : kind == 2 ? "same logits, other tokens among the ties at the k-th logit" :
+                                    "another logit or token");
                         }
                     }
                     n_ctl += !same(ref, ctl);
                 }
             }
         }
-        printf("part 1 %-8s: %d top-k cases, %d differ from the full-vocabulary top-k; control (row order, no gather) differs in %d\n",
-                ggml_backend_dev_name(dev), n_run, n_bad, n_ctl);
+        printf("part 1 %-8s: %d top-k cases, %d differ from the full-vocabulary top-k (%s; order-only %d, tie-only %d); control (row order, "
+                "no gather) differs in %d\n", ggml_backend_dev_name(dev), n_run, n_bad, exact ? "bit for bit" : "tie-aware", n_order, n_tie, n_ctl);
         fails += n_bad + (n_run == 0);
         n_control_diff += n_ctl;
         ggml_backend_free(backend);
