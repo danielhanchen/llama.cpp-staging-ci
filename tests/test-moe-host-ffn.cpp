@@ -162,6 +162,20 @@ static int perf_main() {
     return 0;
 }
 
+static bool cpu_has_openmp() {
+    ggml_backend_reg_t reg = ggml_backend_cpu_reg();
+    auto get_features = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+    if (get_features == nullptr) {
+        return true;
+    }
+    for (ggml_backend_feature * f = get_features(reg); f->name != nullptr; ++f) {
+        if (strcmp(f->name, "OPENMP") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int main(int argc, char ** argv) {
     if (getenv("GGML_CPU_TILED_MM") == nullptr) {
         setenv("GGML_CPU_TILED_MM", "0", 1); // the tiled kernels accumulate in another order (see test-mmid-multi)
@@ -185,12 +199,17 @@ int main(int argc, char ** argv) {
     };
     int fails = 0, runs = 0, unhandled = 0;
     printf("host team: %s\n", ggml_cpu_moe_host_team_on() ? "on" : "off (GGML_MOE_HOST_TEAM=0: OpenMP region)");
+    // team 0 is the OpenMP-region path, which a build without OpenMP refuses by design: only the host team runs there
+    const int team0 = cpu_has_openmp() ? 0 : 1;
+    if (team0 != 0) {
+        printf("CPU backend built without OpenMP: OpenMP-region runs skipped\n");
+    }
     uint32_t seed = 1;
     for (const tc & k : cases) {
         ffn_case c;
         make_case(c, k.tu, k.td, k.n_embd, k.n_ff, k.n_exp, k.n_used, k.n_tokens, seed++, k.skip);
         const std::vector<float> ref = run_graph(c, 4);
-        for (int team = 0; team < 2; ++team)
+        for (int team = team0; team < 2; ++team)
         // k19-hostadapt: then fewer threads than the team has, and back (the idle workers skip those batches)
         for (int nt : { 1, 2, 3, 5, 7, 11, 16, 6, 5, 4, 6, 5 }) {
             for (int rep = 0; rep < 3; ++rep) {
