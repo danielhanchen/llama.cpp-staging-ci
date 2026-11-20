@@ -11858,6 +11858,12 @@ struct llama_moe_cache::impl {
             }
         }
         if (n_lend == 0) {
+            // the copies do not fit at this depth: the scheduler may bind again at a smaller one (not for a graph-only lend, whose
+            // staging copies stay in the arena anyway)
+            if (!graph_only && n_all > 0) {
+                all[0].buffer = nullptr;
+                all[0].offset = SIZE_MAX;
+            }
             if (!dry && g.lru.n_lent > 0) {
                 unlend(g);
             }
