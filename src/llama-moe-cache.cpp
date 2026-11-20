@@ -8663,9 +8663,29 @@ struct llama_moe_cache::impl {
             const char * et = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST_TRIALS");
             return e != nullptr && atoi(e) != 0 && !(et != nullptr && atoi(et) != 0);
         }();
-        const bool skip = cm_trial && !cm_force && ((cache_frac >= 0.0 && cache_frac < trial_frac) || per_req_no_trials);
+        const bool skip_share = cm_trial && !cm_force && ((cache_frac >= 0.0 && cache_frac < trial_frac) || per_req_no_trials);
+        // A launch on a 12..31-CPU mailbox host whose calibration file holds a first trial made firm "on" by agreeing marginal timings
+        // (cmt_trust_marginal: cmt_ps_tries() timings, each on by less than the persist margin) runs no warm phase and no trials: those
+        // timings already decided the host path for this machine, model and cache size, and re-running the trial's blocks with the host
+        // path off costs most of a short request (LLAMA_MOE_CPU_MISS_FIRM_SKIP=0: the recorded trials replay as before). A clear "on" or
+        // any "off" replays as recorded. Colab L4 (12 vCPU), Qwen3.6-35B-A3B UD-Q4_K_XL with its MTP head capped at 16 GB (58% cached)
+        bool skip_firm = false;
+        if (!skip_share && cm_trial && !cm_force && cmt_n == 0 && cmt_done < 0 && cmt_firm_skip_on() && cmt_trust_marginal()) {
+            cmt_ps_setup();
+            if (cmt_ps_state == 1 && cmt_rec_file > 0) {
+                const llama_moe_tp::rec & r0 = cmt_rec[0];
+                skip_firm = r0.firm != 0 && r0.on != 0 && r0.tries >= cmt_ps_tries() && r0.ratio > 1.0 - cmt_ps_min_gain() && r0.ratio < 1.0;
+            }
+        }
+        const bool skip = skip_share || skip_firm;
         if (late) {
             cm_trials_late_done = true;
+        }
+        if (skip_firm) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no warm phase or timing trials at %.1f%% of the host experts cached: the first trial is "
+                "firm on after %d agreeing marginal timings (t_on / t_off %.3f) in %s, small batches take the host path where the cost model "
+                "allows%s (LLAMA_MOE_CPU_MISS_FIRM_SKIP=0: replayed)\n", tag, 100.0*cache_frac, cmt_rec[0].tries, cmt_rec[0].ratio,
+                cmt_ps_path.c_str(), late ? ", from now on" : "");
         }
         if (skip) {
             cm_trials_skipped = true;
@@ -8676,10 +8696,12 @@ struct llama_moe_cache::impl {
             cm_small_ok   = true;
             cm_small_live = true;
             cm_gen++;
-            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (%s%.0f%%%s%s): small "
-                "batches follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
-                tag, 100.0*cache_frac, per_req_no_trials ? "LLAMA_MOE_CPU_MISS_PER_REQUEST; trial share " : "below ", 100.0*trial_frac,
-                mailbox ? ", single-graph mailbox" : "", late ? ", from now on" : "");
+            if (!skip_firm) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (%s%.0f%%%s%s): small "
+                    "batches follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
+                    tag, 100.0*cache_frac, per_req_no_trials ? "LLAMA_MOE_CPU_MISS_PER_REQUEST; trial share " : "below ", 100.0*trial_frac,
+                    mailbox ? ", single-graph mailbox" : "", late ? ", from now on" : "");
+            }
         }
         return skip;
     }
@@ -10811,6 +10833,14 @@ struct llama_moe_cache::impl {
             return e != nullptr ? std::max(0.0, std::min(0.9, atof(e))) : 0.10;
         }();
         return b;
+    }
+    // LLAMA_MOE_CPU_MISS_FIRM_SKIP=0: a first trial made firm "on" by agreeing marginal timings replays its blocks (see cm_skip_trials)
+    static bool cmt_firm_skip_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_FIRM_SKIP");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
     }
     // A marginal "on" (a gain smaller than cmt_ps_min_gain) is taken in the launch that timed it on a 12..31-CPU host whose host misses go
     // through the single-graph mailbox (LLAMA_MOE_CPU_MISS_MARGIN_TRUST=0: kept off as on other hosts); the record stays open, the next
