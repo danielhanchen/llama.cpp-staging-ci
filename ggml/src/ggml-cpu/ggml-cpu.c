@@ -556,6 +556,48 @@ static int ggml_spin_yield_rounds(void) {
     return v;
 }
 
+// the CPUs this process may run on (affinity mask where the OS has one), counted once
+static int ggml_spin_n_cpus(void) {
+    static atomic_int n_cpus = 0;
+    int v = atomic_load_explicit(&n_cpus, memory_order_relaxed);
+    if (v <= 0) {
+#if defined(__linux__) && defined(CPU_COUNT)
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        v = sched_getaffinity(0, sizeof(set), &set) == 0 ? CPU_COUNT(&set) : 0;
+#endif
+        if (v <= 0) {
+#if defined(_WIN32)
+            SYSTEM_INFO si;
+            GetSystemInfo(&si);
+            v = (int) si.dwNumberOfProcessors;
+#else
+            v = (int) sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+        }
+        v = v > 0 ? v : 1;
+        atomic_store_explicit(&n_cpus, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+// the MoE host team's waits sit on the decode's critical path (the device waits for the host batch): they spin only, as before,
+// unless the team has more threads than the process has CPUs (then a pure spin starves the waited-for thread and they yield as the
+// barrier does). GGML_SPIN_YIELD_TEAM=0: always spin only, =1: always yield past GGML_SPIN_YIELD rounds
+static int ggml_spin_yield_rounds_team(int n_threads) {
+    static atomic_int mode = -2;
+    int m = atomic_load_explicit(&mode, memory_order_relaxed);
+    if (m == -2) {
+        const char * e = getenv("GGML_SPIN_YIELD_TEAM");
+        m = e != NULL ? atoi(e) : -1;
+        atomic_store_explicit(&mode, m, memory_order_relaxed);
+    }
+    if (m == 0 || (m < 0 && n_threads <= ggml_spin_n_cpus())) {
+        return 0;
+    }
+    return ggml_spin_yield_rounds();
+}
+
 static inline void ggml_thread_spin_wait(int * spins, int limit) {
     if (limit > 0 && *spins >= limit) {
         sched_yield();
@@ -1763,7 +1805,7 @@ static void ggml_moe_host_ffn_thread_sliced(struct ggml_moe_host_job * j, int it
     }
     atomic_fetch_add_explicit(&j->done_gu, 1, memory_order_acq_rel);
     {
-        const int spin_limit = ggml_spin_yield_rounds();
+        const int spin_limit = ggml_spin_yield_rounds_team(n_thr);
         int spins = 0;
         while (atomic_load_explicit(&j->done_gu, memory_order_acquire) < n_thr) {
             ggml_thread_spin_wait(&spins, spin_limit);
@@ -1775,7 +1817,7 @@ static void ggml_moe_host_ffn_thread_sliced(struct ggml_moe_host_job * j, int it
     }
     atomic_fetch_add_explicit(&j->done_act, 1, memory_order_acq_rel);
     {
-        const int spin_limit = ggml_spin_yield_rounds();
+        const int spin_limit = ggml_spin_yield_rounds_team(n_thr);
         int spins = 0;
         while (atomic_load_explicit(&j->done_act, memory_order_acquire) < n_thr) {
             ggml_thread_spin_wait(&spins, spin_limit);
@@ -1890,7 +1932,7 @@ static void ggml_moe_host_ffn_thread_impl(struct ggml_moe_host_job * j, int ith,
 
     // the one barrier: every up and gate row is written
     {
-        const int spin_limit = ggml_spin_yield_rounds();
+        const int spin_limit = ggml_spin_yield_rounds_team(j->n_thr);
         int spins = 0;
         while (atomic_load_explicit(&j->done_gu, memory_order_acquire) < j->n_task) {
             ggml_thread_spin_wait(&spins, spin_limit);
@@ -2172,7 +2214,7 @@ static void ggml_moe_pf_finish(struct ggml_moe_team * t) {
     }
     atomic_store_explicit(&ggml_moe_pf_g.abort, 1, memory_order_relaxed);
     {
-        const int spin_limit = ggml_spin_yield_rounds();
+        const int spin_limit = ggml_spin_yield_rounds_team(t->n + 1);
         int spins = 0;
         while (atomic_load_explicit(&t->left, memory_order_acquire) != 0) {
             ggml_thread_spin_wait(&spins, spin_limit);
@@ -2245,7 +2287,7 @@ static bool ggml_moe_team_run(struct ggml_moe_host_job * j, int n_threads) {
     }
     ggml_moe_host_ffn_thread(j, 0);
     {
-        const int spin_limit = ggml_spin_yield_rounds();
+        const int spin_limit = ggml_spin_yield_rounds_team(n_threads);
         int spins = 0;
         while (atomic_load_explicit(&t->left, memory_order_acquire) != 0) {
             ggml_thread_spin_wait(&spins, spin_limit);
