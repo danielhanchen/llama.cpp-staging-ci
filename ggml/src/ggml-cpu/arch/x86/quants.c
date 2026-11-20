@@ -503,7 +503,7 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 }
 
 // placeholder implementation for Apple targets
-// k19-cpupass: the Q8_K activations of every K-quant / IQ vec_dot (the host experts' up / gate rows: each host thread quantizes its
+// The Q8_K activations of every K-quant / IQ vec_dot (the host experts' up / gate rows: each host thread quantizes its
 // batch's tokens, 100 us of a 2.3 ms batch on a Colab A100 VM's Xeon with the reference) in AVX2, the reference's bytes: the first
 // element of the largest magnitude sets the scale, each value is the float product iscale*x rounded to the nearest integer, ties to
 // even (the reference's 1.5*2^23 trick does the same for these magnitudes), at most 127, and the 16-value sums. A block with a NaN or
@@ -4757,7 +4757,7 @@ GGML_VDM_INLINE void ggml_vec_dot_iq3_s_q8_K_multi_n(int n, float * GGML_RESTRIC
     }
 }
 
-// k19-cpupass: Q5_0 (q8_0 activations) for an expert routed to 2-8 rows: each block's weights decoded once (nibbles, 5th bits), then
+// Q5_0 (q8_0 activations) for an expert routed to 2-8 rows: each block's weights decoded once (nibbles, 5th bits), then
 // for every column the single-column kernel's own sequence (the signed byte products summed per 4 bytes, the block's scale, one fma
 // per block in block order), so each result is ggml_vec_dot_q5_0_q8_0's bit for bit. Qwen3.8-Flash-Next UD-IQ4_XS keeps its down
 // experts in Q5_0 in most layers: 24% of the host batches' kernel time on a Colab A100 VM, 1.2-1.6x per column at 2-4 columns there
@@ -5460,7 +5460,7 @@ ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type) {
         case GGML_TYPE_Q6_K:    return on_k ? ggml_vec_dot_q6_K_q8_K_multi    : NULL;
         case GGML_TYPE_IQ3_XXS: return on_k ? ggml_vec_dot_iq3_xxs_q8_K_multi : NULL;
         case GGML_TYPE_MXFP4:   return on_k ? ggml_vec_dot_mxfp4_q8_0_multi   : NULL;
-        // k19-cpupass (GGML_CPU_Q50_MULTI=0: one column at a time again)
+        // GGML_CPU_Q50_MULTI=0: one column at a time again
         case GGML_TYPE_Q5_0:    return on_q50 ? ggml_vec_dot_q5_0_q8_0_multi  : NULL;
         default:               return NULL;
     }

@@ -1676,7 +1676,7 @@ struct ggml_moe_host_job {
     int    n_thr;
     char * qact;
     atomic_int done_act;
-    // k19-cpupass GGML_MOE_HOST_DEP (default on; 0 = the one barrier): per group, the up and gate rows written so far; a down range waits
+    // GGML_MOE_HOST_DEP (default on; 0 = the one barrier): per group, the up and gate rows written so far; a down range waits
     // only for the groups it reads instead of for every up and gate row of the batch
     atomic_int * gdone;
     // 1: a read-ahead job (ggml_moe_host_pf_thread), not a batch
@@ -2477,7 +2477,7 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
     atomic_store_explicit(&job.next_gu, 0, memory_order_relaxed);
     atomic_store_explicit(&job.next_dn, 0, memory_order_relaxed);
     atomic_store_explicit(&job.done_gu, 0, memory_order_relaxed);
-    // k19-cpupass GGML_MOE_HOST_DEP: the per-group counters (the barrier form: NULL). Only the range form uses them (the sliced form
+    // GGML_MOE_HOST_DEP: the per-group counters (the barrier form: NULL). Only the range form uses them (the sliced form
     // keeps its barriers). Colab A100 VM (6 cores / 12 threads, 10 host threads), Flash-Next 7-row host batches: the barrier was 8% of
     // each thread's batch time
     static int dep_mode = -1;
