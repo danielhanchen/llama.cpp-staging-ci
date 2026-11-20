@@ -16,6 +16,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -229,8 +230,8 @@ static bool run_spec(const char * path, int n_predict, int n_max, float p_min, s
     params.n_gpu_layers = 0;
     params.warmup       = false;
     params.load_mtp     = true;
-    params.cpuparams.n_threads       = 4;
-    params.cpuparams_batch.n_threads = 4;
+    params.cpuparams.n_threads       = std::max(1, std::min(4, (int) std::thread::hardware_concurrency())); // no more threads than cores
+    params.cpuparams_batch.n_threads = params.cpuparams.n_threads;
     params.sampling.temp  = 0.0f;
     params.sampling.top_k = 1;
     params.speculative.types         = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };

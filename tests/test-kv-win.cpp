@@ -16,6 +16,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -44,8 +45,8 @@ static llama_context * make_ctx(llama_model * model, const cfg & c) {
     cp.n_rs_seq        = 4; // recurrent states of hybrid models roll back with the drafts
     cp.kv_unified      = c.unified;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    cp.n_threads       = 4;
-    cp.n_threads_batch = 4;
+    cp.n_threads       = std::max(1, std::min(4, (int) std::thread::hardware_concurrency())); // no more threads than cores
+    cp.n_threads_batch = cp.n_threads;
     cp.type_k          = c.type;
     cp.type_v          = c.type;
     cp.kv_win          = c.win;

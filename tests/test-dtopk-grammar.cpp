@@ -24,6 +24,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -221,8 +222,8 @@ static run_result run(const run_cfg & cfg, const std::vector<llama_token> & prom
     cp.n_ubatch  = 64;
     cp.n_outputs_max = 64;
     cp.n_outputs_max_per_seq = 8; // verify windows of up to 5 rows with the backend sampler
-    cp.n_threads = 4;
-    cp.n_threads_batch = 4;
+    cp.n_threads = std::max(1, std::min(4, (int) std::thread::hardware_concurrency())); // no more threads than cores
+    cp.n_threads_batch = cp.n_threads;
     llama_context * ctx = llama_init_from_model(g_model, cp);
     if (ctx == nullptr) {
         res.threw = true;

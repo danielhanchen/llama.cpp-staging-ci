@@ -324,7 +324,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --models "${MODEL_DIR}"
     )
-    set_tests_properties(test-kv-win PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-kv-win PROPERTIES FIXTURES_REQUIRED generate-models RUN_SERIAL TRUE)
 
     # k19-kvwin: the CPU two-source flash attention (ggml_flash_attn_ext_set_src2) against the concatenation and a double reference
     llama_build(test-fa-src2.cpp)
@@ -397,7 +397,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS "${MODEL_DIR}/mtp/qwen35moe-mtp.gguf"
     )
-    set_tests_properties(test-mtp-draft-topk PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-mtp-draft-topk PROPERTIES FIXTURES_REQUIRED generate-models RUN_SERIAL TRUE)
 
     # k19-p2qsa: the QSA selection without indexer scoring while every pool fits the top_k (LLAMA_QSA_ALLFIT) == the scored one, byte for byte
     llama_build(test-qsa-allfit-exact.cpp)
@@ -468,7 +468,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         else()
             llama_test(test-dtopk-grammar NAME ${DG_NAME} LABEL main ARGS "${MODEL_DIR}/qwen3tts-dense.gguf")
         endif()
-        set_tests_properties(${DG_NAME} PROPERTIES FIXTURES_REQUIRED generate-models)
+        # run alone: a thread pool of up to 4 threads per test; beside other tests on a 3-4 vCPU runner they starved for 15-30 min
+        set_tests_properties(${DG_NAME} PROPERTIES FIXTURES_REQUIRED generate-models RUN_SERIAL TRUE)
         if (DG_MODE STREQUAL "kill")
             set_tests_properties(${DG_NAME} PROPERTIES ENVIRONMENT "LLAMA_DEVICE_TOPK_GRAMMAR=0")
         endif()
