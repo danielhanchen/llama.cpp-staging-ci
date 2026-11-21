@@ -195,7 +195,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-server-component.cpp)
     target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-component PRIVATE server-context)
-    # k19-hostgap: the task-queue yield with and without its fast end (LLAMA_SERVER_YIELD_FAST)
+    # the task-queue yield with and without its fast end (LLAMA_SERVER_YIELD_FAST)
     llama_build(test-server-queue-yield.cpp)
     target_include_directories(test-server-queue-yield PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-queue-yield PRIVATE server-context)
@@ -297,7 +297,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --rs-decode-parity -s 1
     )
 
-    # k19-mgpucache: delta-net replay commits of a state split over two devices (two in-process RPC servers over the CPU; skipped without
+    # delta-net replay commits of a state split over two devices (two in-process RPC servers over the CPU; skipped without
     # the RPC backend) give the logits of one device, with the cached commit graphs of alternating windows reused through the scheduler
     llama_test(
         test-llama-archs
@@ -321,7 +321,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-exact-verify-cells PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    # k19-kvwin: the recent-window ring beside a quantized KV cache (probe = plain q8_0 and control = plain q4_0 bit for bit, routing,
+    # the recent-window ring beside a quantized KV cache (probe = plain q8_0 and control = plain q4_0 bit for bit, routing,
     # draft rollback, state save / restore, context shift, multi-sequence, the concat stopgap), on generated models of several families
     llama_build(test-kv-win.cpp)
     llama_test(
@@ -331,7 +331,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-kv-win PROPERTIES FIXTURES_REQUIRED generate-models RUN_SERIAL TRUE PROCESSORS 4)
 
-    # k19-kvwin: the CPU two-source flash attention (ggml_flash_attn_ext_set_src2) against the concatenation and a double reference
+    # the CPU two-source flash attention (ggml_flash_attn_ext_set_src2) against the concatenation and a double reference
     llama_build(test-fa-src2.cpp)
     llama_test(test-fa-src2 LABEL main)
 
@@ -344,9 +344,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-moe-cache-device PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    # k19-graph: flash attention with its KV length on the device vs the unpadded node, byte for byte (GPU; SKIP without one)
+    # flash attention with its KV length on the device vs the unpadded node, byte for byte (GPU; SKIP without one)
     llama_build(test-fa-kvlen-exact.cpp)
-    llama_build(test-fa-kvlen-rows.cpp)   # k19-nanfix: small-batch flash attention with the device KV length, finite and against a reference
+    llama_build(test-fa-kvlen-rows.cpp)   # small-batch flash attention with the device KV length, finite and against a reference
 
     # the SSD prompt-cache namespace covers the --override-kv metadata overrides (a restart with another override restored stale state)
     llama_build(test-server-prompt-ssd-ns.cpp)
@@ -359,7 +359,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-server-prompt-ssd-ns PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    # k19-rollback: a drafted window rolled back by the host copy of the recurrent state (no rollback rows) = the accepted tokens decoded alone
+    # a drafted window rolled back by the host copy of the recurrent state (no rollback rows) = the accepted tokens decoded alone
     llama_build(test-rs-snap.cpp)
     llama_test(
         test-rs-snap
@@ -394,7 +394,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-mtp-meta PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    # k19-dtopk: the MTP draft top-k over the restricted head's rows in token order gives the full-vocabulary top-k's candidates,
+    # the MTP draft top-k over the restricted head's rows in token order gives the full-vocabulary top-k's candidates,
     # logits and order (ops on every backend, with ties), and the same tokens and drafts as LLAMA_MTP_DRAFT_TOPK_FULL=1
     llama_build(test-mtp-draft-topk.cpp)
     llama_test(
@@ -404,7 +404,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-mtp-draft-topk PROPERTIES FIXTURES_REQUIRED generate-models RUN_SERIAL TRUE PROCESSORS 4)
 
-    # k19-p2qsa: the QSA selection without indexer scoring while every pool fits the top_k (LLAMA_QSA_ALLFIT) == the scored one, byte for byte
+    # the QSA selection without indexer scoring while every pool fits the top_k (LLAMA_QSA_ALLFIT) == the scored one, byte for byte
     llama_build(test-qsa-allfit-exact.cpp)
     llama_test(
         test-qsa-allfit-exact
@@ -413,7 +413,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-qsa-allfit-exact PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    # k19-hostgap: KV seq_rm over the used cells (LLAMA_KV_SEQ_RM_USED) leaves tokens, drafts and the memory state unchanged
+    # KV seq_rm over the used cells (LLAMA_KV_SEQ_RM_USED) leaves tokens, drafts and the memory state unchanged
     llama_build(test-hostgap-exact.cpp)
     llama_test(
         test-hostgap-exact
@@ -445,7 +445,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         endif()
     endforeach()
 
-    # k19-sharednoise: the shared-noise draw samples the chain's distribution (with and without LLAMA_SHARED_NOISE=1), and a drafter with
+    # the shared-noise draw samples the chain's distribution (with and without LLAMA_SHARED_NOISE=1), and a drafter with
     # the target's logits proposes the target's token
     llama_build(test-shared-noise.cpp)
     foreach(SN_ENV "LLAMA_SHARED_NOISE=0" "LLAMA_SHARED_NOISE=1")
@@ -459,7 +459,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         set_tests_properties(test-shared-noise-${SN_SUFFIX} PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "${SN_ENV}")
     endforeach()
 
-    # k19-gramdev: grammar / reasoning budget requests sample the same tokens from device top-k candidates (CPU backend sampler) as
+    # grammar / reasoning budget requests sample the same tokens from device top-k candidates (CPU backend sampler) as
     # from the full rows; the kill switch keeps them on the full rows; the deliberately inexact no-fallback mode must make it fail
     llama_build(test-dtopk-grammar.cpp)
     foreach(DG_MODE "" "kill" "broken")
@@ -480,7 +480,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         endif()
     endforeach()
 
-    # k19-p3topk: the verify window's backend top-k in one launch (LLAMA_DEV_TOPK_BATCH) gives every row the candidates, logits and
+    # the verify window's backend top-k in one launch (LLAMA_DEV_TOPK_BATCH) gives every row the candidates, logits and
     # tokens of one top-k per row
     llama_build(test-topk-batch-sampling.cpp)
     llama_test(test-topk-batch-sampling LABEL main ARGS "${MODEL_DIR}/qwen3tts-dense.gguf")
@@ -495,7 +495,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-ple-prefetch PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    # k19-plerow: the PLE row cache leaves every gather and the logits bit-identical
+    # the PLE row cache leaves every gather and the logits bit-identical
     llama_build(test-ple-rowcache.cpp)
     llama_test(
         test-ple-rowcache
@@ -563,41 +563,41 @@ llama_build_and_test(test-fit-faoff.cpp)
 llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 # the ops added here (KQ_MASK, MOE_CACHE_LOOKUP, the GDN replay window) are refused by the meta backend (-sm tensor) and RPC and run on the CPU
 llama_build_and_test(test-meta-k15-ops.cpp LINK ggml)
-# k19-fuse prompt fusions of qwen4exp (PLE conv taps, conv-input concat, QSA mask) vs the plain graphs, byte for byte (F4 also on the CPU)
+# prompt fusions of qwen4exp (PLE conv taps, conv-input concat, QSA mask) vs the plain graphs, byte for byte (F4 also on the CPU)
 llama_build_and_test(test-k19-fuse-exact.cpp LINK ggml)
-# k19-p1fuse: GDN fusion predicate (replay windows), silu gated norm, one-barrier mmvf == the code before them and the unfused graph, byte for byte
+# GDN fusion predicate (replay windows), silu gated norm, one-barrier mmvf == the code before them and the unfused graph, byte for byte
 llama_build_and_test(test-k19-p1fuse-exact.cpp LINK ggml)
-# k19-p5mmq: MoE cache-bank MMQ products one block per exact tile == the compact tiling without the bank, else the split as before;
+# MoE cache-bank MMQ products one block per exact tile == the compact tiling without the bank, else the split as before;
 # the fused-SwiGLU down reusing its gate / up routing maps and the match-any scatter == the code before them, byte for byte (SKIP without CUDA)
 llama_build_and_test(test-k19-p5mmq-exact.cpp LINK ggml)
 llama_build_and_test(test-topk384-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-oneblock-exact.cpp LINK ggml)
-llama_build_and_test(test-topk-twostage-exact.cpp LINK ggml)   # k19-dtopk: two-stage one-launch top-k == radix select, byte for byte
-llama_build_and_test(test-topk-batch-exact.cpp LINK ggml)      # k19-p3topk: one top-k over a verify window == one per row, byte for byte
-llama_build_and_test(test-fa-sparse-smem-exact.cpp LINK ggml)   # k19-p2qsa: sparse MMA flash attention at its one-stage shared memory == the two-stage launch, byte for byte
-llama_build_and_test(test-fattn-q8-exact.cpp LINK ggml)   # k19-fattnq8: MMA flash attention reading q8_0 K / V in place == the staged f16 copy, byte for byte
-llama_build_and_test(test-fattn-q4-exact.cpp LINK ggml)   # k19-fattnq4: MMA flash attention reading q4_0 / mixed q4_0 + q8_0 K / V in place == the staged f16 copy, byte for byte
-llama_build_and_test(test-fattn-src2-exact.cpp LINK ggml) # k19-fattnq4: two-source flash attention (body + window ring) in place == staged == one node over the concatenation, byte for byte
-# k19-moebw routed-expert mat-vec vs the kernels it replaces, byte for byte (SKIP without a CUDA device)
+llama_build_and_test(test-topk-twostage-exact.cpp LINK ggml)   # two-stage one-launch top-k == radix select, byte for byte
+llama_build_and_test(test-topk-batch-exact.cpp LINK ggml)      # one top-k over a verify window == one per row, byte for byte
+llama_build_and_test(test-fa-sparse-smem-exact.cpp LINK ggml)   # sparse MMA flash attention at its one-stage shared memory == the two-stage launch, byte for byte
+llama_build_and_test(test-fattn-q8-exact.cpp LINK ggml)   # MMA flash attention reading q8_0 K / V in place == the staged f16 copy, byte for byte
+llama_build_and_test(test-fattn-q4-exact.cpp LINK ggml)   # MMA flash attention reading q4_0 / mixed q4_0 + q8_0 K / V in place == the staged f16 copy, byte for byte
+llama_build_and_test(test-fattn-src2-exact.cpp LINK ggml) # two-source flash attention (body + window ring) in place == staged == one node over the concatenation, byte for byte
+# routed-expert mat-vec vs the kernels it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)
 llama_build_and_test(test-moe-tc-exact.cpp LINK ggml)
-# k19-handoff: ggml_dflash2_conv vs the add / mul / pad chain of the DFlash2 drafter's conv, byte for byte on every device (CPU always)
+# ggml_dflash2_conv vs the add / mul / pad chain of the DFlash2 drafter's conv, byte for byte on every device (CPU always)
 llama_build_and_test(test-dflash2-conv-exact.cpp LINK ggml)
-# k19-mmvqcols: the rows-per-block lever of the dense 2..8 column mat-vec vs the launch it replaces, byte for byte (SKIP without a CUDA device)
+# the rows-per-block lever of the dense 2..8 column mat-vec vs the launch it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-mmvqcols-exact.cpp LINK ggml)
-# k19-kqtc: the ported few-row int8 MMQ (GGML_CUDA_MMQ_FEW) on dense K-quant / IQ4_XS / Q8_0 products at 2..8 columns vs mmvq + fp64 reference (NMSE gates,
+# the ported few-row int8 MMQ (GGML_CUDA_MMQ_FEW) on dense K-quant / IQ4_XS / Q8_0 products at 2..8 columns vs mmvq + fp64 reference (NMSE gates,
 # column invariance and exact-verify bytes; SKIP without a CUDA device)
 llama_build_and_test(test-kqtc-exact.cpp LINK ggml)
-# k19-iqsmem: IQ3 MUL_MAT_ID grid rows + IQ2_XS / IQ2_S codebook in shared memory vs the launches they replace, byte for byte (SKIP without a CUDA device)
+# IQ3 MUL_MAT_ID grid rows + IQ2_XS / IQ2_S codebook in shared memory vs the launches they replace, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-iqsmem-exact.cpp LINK ggml)
-# k19-exactdet: single column MUL_MAT_ID with a partial last row block stays inside its expert's rows (sentinel, CPU reference, repeat bytes; SKIP without a CUDA device)
+# single column MUL_MAT_ID with a partial last row block stays inside its expert's rows (sentinel, CPU reference, repeat bytes; SKIP without a CUDA device)
 llama_build_and_test(test-mmid-tail.cpp LINK ggml)
-# k19-ikfix: the CUDA mat-vec does not read past the last weight row of a partial last row block (weights before an unmapped page,
+# the CUDA mat-vec does not read past the last weight row of a partial last row block (weights before an unmapped page,
 # CPU reference, same bytes as an ordinary buffer; SKIP without a CUDA device)
 llama_build_and_test(test-mmvq-lastrow.cpp LINK ggml)
-# k19-q4xt: single token MUL_MAT_ID warp per row launch (short K-quant / IQ4 expert rows) vs the launch it replaces, byte for byte (SKIP without a CUDA device)
+# single token MUL_MAT_ID warp per row launch (short K-quant / IQ4 expert rows) vs the launch it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-q4xt-exact.cpp LINK ggml)
-# k19-p6dsv: DeepSeek-V4.1 candidate scoring (lightning indexer over the candidate blocks only) == indexer + block mask, byte for byte
+# DeepSeek-V4.1 candidate scoring (lightning indexer over the candidate blocks only) == indexer + block mask, byte for byte
 # (scores and top-k ids, ties and -inf), with a negative control; the CPU, and the first CUDA / ROCm device (SKIP without one)
 llama_build_and_test(test-dsv41-cand-score-exact.cpp LINK ggml)
 llama_test(test-dsv41-cand-score-exact NAME test-dsv41-cand-score-gpu-exact ARGS --gpu)
@@ -605,7 +605,7 @@ set_tests_properties(test-dsv41-cand-score-exact test-dsv41-cand-score-gpu-exact
 llama_build_and_test(test-spec-type-gguf.cpp)
 # the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
 llama_build_and_test(test-cal-build-id.cpp LINK ggml)
-llama_build_and_test(test-moe-trial-persist.cpp)   # k19-cmtpersist: CPU-miss trial verdicts in the calibration file
+llama_build_and_test(test-moe-trial-persist.cpp)   # CPU-miss trial verdicts in the calibration file
 if (NOT WIN32)
     target_link_libraries(test-cal-build-id PRIVATE ${CMAKE_DL_LIBS})
 endif()
@@ -614,8 +614,8 @@ endif()
 if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-weight-store.cpp)
     llama_build_and_test(test-moe-host-cache.cpp)
-    llama_build_and_test(test-moe-ram-profile.cpp) # k19-ramprof: routing profile file + RAM-tier fill order
-    llama_build_and_test(test-autoprof.cpp)        # k19-autoprof: self-learned profile files, atomic write, PLE row recorder
+    llama_build_and_test(test-moe-ram-profile.cpp) # routing profile file + RAM-tier fill order
+    llama_build_and_test(test-autoprof.cpp)        # self-learned profile files, atomic write, PLE row recorder
     llama_build_and_test(test-moe-cache-tail-skip.cpp)
 endif()
 
@@ -623,7 +623,7 @@ endif()
 if (NOT WIN32)
     llama_build_and_test(test-cpu-wsize-guard.cpp LINK ggml)
 endif()
-# k19-q4xcache: the assign standing in for the plain lookup keeps the lookup's cache state (GPU backend, skipped without one)
+# the assign standing in for the plain lookup keeps the lookup's cache state (GPU backend, skipped without one)
 if (NOT WIN32)
     llama_build_and_test(test-moe-cache-plain-assign.cpp)
 endif()
@@ -642,10 +642,10 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
-# k19-mmq-pipe: the pipelined MMQ MoE GEMM, md5 + time per case (needs a GPU backend; not a ctest)
+# the pipelined MMQ MoE GEMM, md5 + time per case (needs a GPU backend; not a ctest)
 llama_build(test-mmq-pipe.cpp LINK ggml)
-llama_build(test-graph-src-type.cpp LINK ggml) # k15-mmid: a CUDA graph is not replayed for a source of another type
-llama_build(test-gdn-replay.cpp LINK ggml) # k16-draft: ggml_gated_delta_net_replay vs the unfused replay path, bitwise
+llama_build(test-graph-src-type.cpp LINK ggml) # a CUDA graph is not replayed for a source of another type
+llama_build(test-gdn-replay.cpp LINK ggml) # ggml_gated_delta_net_replay vs the unfused replay path, bitwise
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

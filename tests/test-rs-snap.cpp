@@ -1,5 +1,5 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// k19-rollback: the host copy of a recurrent state (llama_rs_snap_save / llama_rs_snap_restore) as the rollback of a drafted verify
+// the host copy of a recurrent state (llama_rs_snap_save / llama_rs_snap_restore) as the rollback of a drafted verify
 // window without per-token rows on the device (n_rs_seq 0). A run that saves, decodes a 4-token window, restores, removes the window's
 // positions and decodes the accepted tokens again gives the logits of a run that decoded those tokens without the window, byte for byte
 // (the same batches from the same state); a run whose windows are all accepted (no restore) gives the logits of the window decodes

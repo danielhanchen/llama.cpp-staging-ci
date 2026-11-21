@@ -1,4 +1,4 @@
-// Bit identity of the k19-fuse prompt fusions of qwen4exp (Qwen3.8-Flash-Next), at the real prompt shapes:
+// Bit identity of the prompt fusions of qwen4exp (Qwen3.8-Flash-Next), at the real prompt shapes:
 //   F4: the PLE conv taps read from a channels-first padded input (llama_model_qwen4exp::graph::build_ple, LLAMA_QWEN4EXP_PLE_CF) vs
 //       the token-major input with one transposed copy per tap: both graphs run on the CPU backend (always) and on the GPU backend (in
 //       both children), the outputs and the written conv-state rows must match byte for byte;
@@ -6,10 +6,10 @@
 //       the per-rollback-slot tail copies into the cache (slot 0 over the state row the convolution reads);
 //   F6: the CUDA QSA prompt mask built in one launch (GGML_CUDA_DISABLE_QSA_PROMPT_MASK): the dense selection mask of build_qsa_sel
 //       feeding flash attention;
-//   k19-fu2 F1: the gated hc combine (SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST) computed in the next mix's grouped norm, which writes
+//   F1: the gated hc combine (SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST) computed in the next mix's grouped norm, which writes
 //       the q8_1 MMQ copy of its Q8_0 product (GGML_CUDA_DISABLE_FUSE_HC_POST_CONV);
-//   k19-fu2 F2: the gated delta net output norm writing the q8_1 MMQ copy of its out projection (GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ);
-//   k19-fu2 F3: the routed SWIGLU computed in the gathered quantize of the down MUL_MAT_ID (GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID); the SWIGLU
+//   F2: the gated delta net output norm writing the q8_1 MMQ copy of its out projection (GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ);
+//   F3: the routed SWIGLU computed in the gathered quantize of the down MUL_MAT_ID (GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID); the SWIGLU
 //       output itself is not written when fused, so only the product is compared.
 // The CUDA kill switches are read once per process, so each mode runs in a child process (this binary with --child MODE FILE) that
 // dumps every case's outputs; the parent compares the dumps byte for byte. GGML_CUDA_CONV_CAT_PROMPT_LOG=1 / GGML_CUDA_QSA_PROMPT_LOG=1
@@ -122,7 +122,7 @@ static std::vector<fuse_case> gpu_cases() {
         }
     }
     s.push_back({K_QSA, 4096, 40, 8, 2051});
-    // k19-fu2: the Flash-Next prompt shapes (hc 4 x 2560 into the Q8_0 hc down 10240 -> 320; GDN 48 heads x 128 into the Q8_0 out
+    // the Flash-Next prompt shapes (hc 4 x 2560 into the Q8_0 hc down 10240 -> 320; GDN 48 heads x 128 into the Q8_0 out
     // projection 6144 -> 2560; 8 of 64 experts, n_ff 640, IQ4_NL down 640 -> 2560), a partial tile and the ubatch sizes
     for (int64_t nt : {33, 512, 2048}) {
         s.push_back({K_HCN, 2560, nt, 1, 0});

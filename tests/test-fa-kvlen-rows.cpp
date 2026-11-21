@@ -1,10 +1,10 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// k19-nanfix: flash attention of a small batch of query rows (a verify window) at the shape of Qwen3.8-Flash-Next's QSA attention
+// flash attention of a small batch of query rows (a verify window) at the shape of Qwen3.8-Flash-Next's QSA attention
 // (head size 256, 24 query heads over 2 KV heads, q8_0 or f16 K / V in the KV cache layout), with the KV length read on the device
 // (ggml_flash_attn_ext_set_kv_len, the n_kv bucket of LLAMA_KV_BUCKET_DEV) and without it, against a double precision reference of
 // the visible cells. Every output must be finite and within the tolerance of the reference: row t of T sees the cells [0, L - T + 1 + t)
 // of a padded node of P cells (the causal mask of a window that ends at cell L - 1), the cells past L hold zeros (a cleared cache), the
-// device length is L rounded up to 256 cells. The 8 GB G4 token-0 bug: T = 2, P = 2048, q8_0, L = 2 (the seq_rm
+// device length is L rounded up to 256 cells. The 8 GB RTX PRO 6000 token-0 bug: T = 2, P = 2048, q8_0, L = 2 (the seq_rm
 // probe) or 643 (a verify window after a 640 token prompt) take the vector kernel at the live length, which read row j of the mask at
 // j*ne11 (the live cells) instead of its row stride (the padded cells): row 1 read row 0's masked tail, saw no cell and wrote NaN.
 // usage: test-fa-kvlen-rows [-v]. No GPU: the CPU backend (checks the reference only).
@@ -235,7 +235,7 @@ int main(int argc, char ** argv) {
     int n_cases = 0, n_bad = 0;
     const int64_t P = 2048;
     for (const ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
-        // lengths: the seq_rm probe (2 cells), the G4 reproducer window (643), a pool boundary, a tile boundary, a full bucket
+        // lengths: the seq_rm probe (2 cells), the RTX PRO 6000 reproducer window (643), a pool boundary, a tile boundary, a full bucket
         for (const int64_t L : { (int64_t) 2, (int64_t) 3, (int64_t) 9, (int64_t) 256, (int64_t) 643, (int64_t) 700, (int64_t) 1024,
                                  (int64_t) 1500, (int64_t) 2048 }) {
             kv_store st;

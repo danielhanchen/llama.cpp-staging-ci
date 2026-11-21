@@ -1,4 +1,4 @@
-// k19-kqtc: the few-row int8 MMQ ported from upstream (GGML_CUDA_MMQ_FEW: unset = AUTO per architecture, 0 = off, 1 = upstream's
+// the few-row int8 MMQ ported from upstream (GGML_CUDA_MMQ_FEW: unset = AUTO per architecture, 0 = off, 1 = upstream's
 // per-type table, N = from N columns) on dense Q4_K / Q5_K / Q6_K / IQ4_XS / Q8_0 products of 2..8 columns, against the mul_mat_vec_q /
 // MMQ launch it replaces (GGML_CUDA_MMQ_FEW=0) and an fp64 CPU reference (dequantized weights x f32 activations). It quantizes the
 // activations itself (x * (127 / amax)), so it cannot be bit-identical; the gates are:
@@ -509,7 +509,7 @@ int main(int argc, char ** argv) {
     const auto is_lever = [&](int i) { return strncmp(modes[i].name, "few", 3) == 0; };
     const auto is_few   = [&](int i) { return strncmp(modes[i].name, "few", 3) == 0; };
     const bool few_dev  = cc < 0 || cc >= 800; // the few-row MMQ needs the Ampere MMA
-    const bool auto_dev = cc == 800 || cc == 890; // devices of its AUTO table (k19-int3fix: cc 12.0 off)
+    const bool auto_dev = cc == 800 || cc == 890; // devices of its AUTO table (cc 12.0 off)
 
     // engagement: base never logs, every lever mode logs (single and multi-matrix launches)
     for (int i = 0; i < nm; ++i) {
@@ -529,7 +529,7 @@ int main(int argc, char ** argv) {
     // the byte offset of every case in a dump, and its twin: the same type / shape / columns with the other verify flag. Both take the
     // same weights and activations (get_host), so the twin's base output is a second launch of the product the lever replaces: on devices
     // whose mmvq table sends a K-quant of 5..8 columns to MMQ (cc 12.0: Q4_K from 6, Q5_K from 7, Q6_K at 8) the unflagged base is MMQ
-    // and the flagged one keeps mmvq (k19-vrow3), so the accuracy gate is anchored to the better of the two
+    // and the flagged one keeps mmvq, so the accuracy gate is anchored to the better of the two
     std::vector<size_t> case_off(cases.size());
     std::vector<int>    twin(cases.size(), -1);
     {
@@ -590,7 +590,7 @@ int main(int argc, char ** argv) {
             const double e_tw   = twin[ci] >= 0 ? nmse_ref((const float *) (dumps[ib_i].data() + case_off[twin[ci]]), ref.data(), n) : e_bi;
             const double e_anc  = std::min(e_bi, e_tw);
             // few-row MMQ: its own src1 quantization, and the product it replaces may be MMQ (the device table) with yet another one, so
-            // only the distance to the fp64 reference is gated (G4: within 1.065x of mmvq at 2..3 columns, 4x closer than MMQ at 6..8)
+            // only the distance to the fp64 reference is gated (RTX PRO 6000: within 1.065x of mmvq at 2..3 columns, 4x closer than MMQ at 6..8)
             const bool ok = is_few(i) ? e_tc <= 1.10*e_anc + 1e-12 : d_base <= 1e-10 && e_tc <= 1.02*e_bi + 1e-12;
             if (is_few(i)) {
                 worst_few       = std::max(worst_few, d_base);

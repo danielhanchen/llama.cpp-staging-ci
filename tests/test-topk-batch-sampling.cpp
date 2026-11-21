@@ -1,4 +1,4 @@
-// k19-p3topk: backend sampler chains that start with a top-k give the same per-row outputs (candidate ids and their order, the
+// backend sampler chains that start with a top-k give the same per-row outputs (candidate ids and their order, the
 // top logits, the sampled token and probabilities) whether build_sampling runs that top-k once per verify window
 // (LLAMA_DEV_TOPK_BATCH, default on) or once per row (LLAMA_DEV_TOPK_BATCH=0). Each mode runs in a child process (the engagement
 // log line is printed once per process) that decodes a prompt and then windows of 1 .. 8 and 17 rows with every row an output, a window

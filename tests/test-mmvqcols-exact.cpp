@@ -1,4 +1,4 @@
-// k19-mmvqcols: the rows-per-block lever of the dense 2..8 column mul_mat_vec_q (IQ3_S / IQ2_XXS / Q3_K, default on per arch,
+// the rows-per-block lever of the dense 2..8 column mul_mat_vec_q (IQ3_S / IQ2_XXS / Q3_K, default on per arch,
 // GGML_CUDA_MMVQ_COLS_CFG = AUTO | 0 | R4 | R8) against the launch it replaces (GGML_CUDA_MMVQ_COLS_CFG=0), byte for byte, at the shapes of
 // Qwen3.8-27B (K 5120 / 6144 / 17408) and odd ones (rows not a multiple of 4, K of one super-block, broadcast channels), 1..8 columns,
 // plain and as a verify batch (batch invariant + verify flags, so also the exact verify path under GGML_CUDA_VERIFY_REASSOC=0), with and
@@ -382,7 +382,7 @@ int main(int argc, char ** argv) {
         { "r8",          self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0", "GGML_CUDA_MMVQ_COLS_CFG=R8", 1 },
         { "r4_reassoc0", self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_MMVQ_COLS_CFG=R4 GGML_CUDA_VERIFY_REASSOC=0", 1 },
         { "r8_reassoc0", self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_MMVQ_COLS_CFG=R8 GGML_CUDA_VERIFY_REASSOC=0", 1 },
-        // k19-q38next: the K-quant / IQ4_XS rows (GGML_CUDA_MMVQ_KQ_ROWS=R4) against the same launch without them, plain, verify and exact
+        // the K-quant / IQ4_XS rows (GGML_CUDA_MMVQ_KQ_ROWS=R4) against the same launch without them, plain, verify and exact
         // (the IQ lever off on both sides, so only the K-quant launches log)
         { "kq_r4",       self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=0", "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=R4", 1 },
         { "kq_r4_reassoc0", self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_VERIFY_REASSOC=0",
@@ -393,7 +393,7 @@ int main(int argc, char ** argv) {
         // the shipped default (unset = AUTO; off on archs without a measurement, so bytes only)
         { "default",     self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0", "MMVQCOLS_DEFAULT=1", -1 },
         { "default_exact", self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", -1 },
-        // k19-q38t: IQ3_S / IQ3_XXS grid tables in shared memory (default) against the global tables (GGML_CUDA_MMVQ_GRID_SMEM=0),
+        // IQ3_S / IQ3_XXS grid tables in shared memory (default) against the global tables (GGML_CUDA_MMVQ_GRID_SMEM=0),
         // with the rows lever off, at its default and on the exact verify path (logs: not counted, -2)
         { "grid",        self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_GRID_SMEM=0", "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0", -2 },
         { "grid_cols",   self, "GGML_CUDA_MMVQ_GRID_SMEM=0", "MMVQCOLS_DEFAULT=1", -2 },

@@ -1,11 +1,11 @@
-// k19-p5mmq: the cached-tier MoE prompt MMQ changes, on the GPU backend, at the Qwen3.6-35B-A3B / Flash-Next MoE prompt shapes:
+// the cached-tier MoE prompt MMQ changes, on the GPU backend, at the Qwen3.6-35B-A3B / Flash-Next MoE prompt shapes:
 //   exact tiles: a MUL_MAT_ID over a bank of MoE cache slots (op param 2 > 0, skip_empty) runs one block per non-empty tile (the
 //                exact prefix of ceil(count/J) tiles) when those fill the SMs, else the stream-k split over one block per SM as before
 //                (GGML_CUDA_MMQ_EXACT_TILES=0: always the split, =2: always one block per tile);
 //   memo down:   the fused-SwiGLU down product reuses the routing maps its gate / up built (GGML_CUDA_MMID_MEMO_DOWN=0: built again);
 //   match any:   the stable scatter ranks the lanes of one expert by __match_any_sync (GGML_CUDA_MMID_MATCH_ANY=0: 32 shuffles).
 // Three children of this binary run every case and dump the outputs: "head" (defaults), "kill" (the three switches off = the code
-// before k19-p5mmq) and "force" (one block per tile for every bank product). Checks, byte for byte:
+// before this change) and "force" (one block per tile for every bank product). Checks, byte for byte:
 //   - force: bank product == the same product without the bank (op param 2 = 0: the compact tiling of the products without skip_empty,
 //     one block per tile at the large sizes: >= 10 waves on any card up to 204 SMs). Both sum all of K per tile: same bytes. The small
 //     cases are not compared (their plain product is split too).
@@ -55,7 +55,7 @@ static std::vector<p5_case> cases() {
     cs.push_back({ "fn_gate_iq3s_4096",   false, GGML_TYPE_IQ3_S,  GGML_TYPE_COUNT, 2560,  640, 512, 10, true,  4096, 0.0f,  0.5f, 4 });
     cs.push_back({ "fn_down_iq4nl_4096",  false, GGML_TYPE_IQ4_NL, GGML_TYPE_COUNT,  640, 2560, 512, 10, false, 4096, 0.1f,  0.5f, 5 });
     // small products (16 experts, 4 used, 32 tokens: 16 column tiles of J 8 x 4 or 8 row tiles, at most 80% of the last wave on T4 /
-    // L4 / A100 / G4 / B200, so the split stays for the gate)
+    // L4 / A100 / RTX PRO 6000 / B200, so the split stays for the gate)
     cs.push_back({ "small_gate_q4k_32",   false, GGML_TYPE_Q4_K,   GGML_TYPE_COUNT, 2048,  512,  16,  4, true,    32, 0.0f,  0.0f, 6 });
     cs.push_back({ "small_down_q6k_32",   false, GGML_TYPE_Q6_K,   GGML_TYPE_COUNT,  512, 2048,  16,  4, false,   32, 0.2f,  0.0f, 7 });
     // no column at all

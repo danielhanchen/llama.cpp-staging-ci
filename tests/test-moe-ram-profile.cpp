@@ -1,4 +1,4 @@
-// k19-ramprof: the routing profile of the MoE cache (llama_moe_profile_*): write / load round trip, the checks a load makes (layer count,
+// the routing profile of the MoE cache (llama_moe_profile_*): write / load round trip, the checks a load makes (layer count,
 // ranges, duplicates, truncation, missing file), the RAM-tier fill order (heat descending, ties in file order) and the ordered reservation
 // of RAM-tier slots (per layout up to its slots, never evicting, skipping held / unwanted experts and uncached layers)
 // usage: test-moe-ram-profile [scratch file path]
@@ -142,7 +142,7 @@ static void test_reserve() {
     CHECK(n2 == 0);
 }
 
-// k19-ramprof2: profile-filled slots are guesses (set_spec): a reservation takes an unused one as if it were free, before any CLOCK
+// profile-filled slots are guesses (set_spec): a reservation takes an unused one as if it were free, before any CLOCK
 // eviction (finished layers of a prompt pass first, else the layers before the reserving one), never a pinned one, never for the
 // profile's own fill (llama_moe_profile_reserve); a use (touching find, read, write) keeps it
 static void test_spec() {

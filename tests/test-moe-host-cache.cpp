@@ -93,7 +93,7 @@ static void test_decide() {
     auto decide = [&](double v, double avail, int64_t host_mib = -1, int pol = -1, bool force = false, bool disk_incl = false) {
         return llama_moe_host_decide(e, mib(v), mapped, mib(avail), tok, host_mib, pol, force, disk_incl);
     };
-    // k19-disktier: below the minimum on a disk tier (mapped > avail): on, inclusive, the auto budget; off where RAM holds the mapped
+    // below the minimum on a disk tier (mapped > avail): on, inclusive, the auto budget; off where RAM holds the mapped
     // weights, with a forced exclusive policy, without routing (token_bytes 0) or with the kill switch (disk_incl false, the cases below)
     {
         const llama_moe_host_plan p = decide(1020.4, 29212.6, -1, -1, false, true);
@@ -110,7 +110,7 @@ static void test_decide() {
         CHECK(l.on && l.policy == 1 && l.budget > mib(22858) && l.budget < mib(22878) && !l.disk);
         // the default argument is the new rule
         CHECK(llama_moe_host_decide(e, mib(1020.4), mapped, mib(29212.6), tok, -1, -1, false).on);
-        // a budget below LLAMA_MOE_HOST_DISK_MIN_FRAC of the experts: off (22.8 of 38 GiB = 60%: on at 0.6, off at 0.61; the Kaggle
+        // a budget below LLAMA_MOE_HOST_DISK_MIN_FRAC of the experts: off (22.8 of 38 GiB = 60%: on at 0.6, off at 0.61; the T4
         // 33% tier: off; tc_n2's L4 budget, 35.6 of 57.6 GiB: on)
         CHECK( llama_moe_host_decide(e, mib(1020.4), mapped, mib(29212.6), tok, -1, -1, false, true, 0.59).on);
         CHECK(!llama_moe_host_decide(e, mib(1020.4), mapped, mib(29212.6), tok, -1, -1, false, true, 0.61).on);
@@ -133,7 +133,7 @@ static void test_decide() {
         const llama_moe_host_plan q = decide(1020.4, 29212.6, 4096);
         CHECK(q.on && q.budget == mib(4096) && q.policy == 1);
     }
-    // L4 12 GB (6.9 tokens, forced on: 8k prompt -27%), G4 16 GB (12.4 tokens, -40%), Kaggle T4 (10.7 tokens, -48%) -> on, exclusive, the
+    // L4 12 GB (6.9 tokens, forced on: 8k prompt -27%), RTX PRO 6000 16 GB (12.4 tokens, -40%), T4 (10.7 tokens, -48%) -> on, exclusive, the
     // logged budgets (the path the measured runs took)
     {
         const llama_moe_host_plan l = decide(5114.7, 29299.5);
@@ -456,7 +456,7 @@ static void test_slots(ggml_backend_t backend) {
         CHECK(hc.st.waits == 0);
     }
 
-    // k19-ramevict: a prompt pass streaming layer L evicts from the layers <= L first, then (none left) from any layer. The rule is
+    // a prompt pass streaming layer L evicts from the layers <= L first, then (none left) from any layer. The rule is
     // off by default (LLAMA_MOE_HOST_EVICT_DONE=1 on, read when the cache is built): the default is checked, then the rule with it on
     {
         const std::vector<std::vector<size_t>> lsz(6, std::vector<size_t>{ 3000, 3000 });
@@ -590,7 +590,7 @@ struct test_tier : llama_weight_tier {
     void uploaded(ggml_backend_t backend) override { hc->commit(backend); }
 };
 
-// k19-l4held: per-layer quota of a layout's slots (set_layer_quota)
+// per-layer quota of a layout's slots (set_layer_quota)
 static void test_quota() {
     const int32_t n_expert = 8;
     const std::vector<std::vector<size_t>> lsz = { { 3000, 3000 }, { 3000, 3000 }, { 3000, 3000 } };
@@ -664,7 +664,7 @@ static void test_quota() {
     printf("test_quota: done\n");
 }
 
-// k19-l4fill: can_take_alloc names exactly the reservations a refill may make without evicting or pinning a new chunk
+// can_take_alloc names exactly the reservations a refill may make without evicting or pinning a new chunk
 static void test_fill_take() {
     const int32_t n_expert = 8;
     const std::vector<std::vector<size_t>> lsz = { { 3000, 3000 }, { 3000, 3000 } };

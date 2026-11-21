@@ -1,7 +1,7 @@
 // test-fit-faoff: the margin beside a MoE cache without flash attention (common_fit_moe_margin_fa_plan, common/fit.h) and the flash
 // attention the fit's measure reads back from the context it created (common_fit_last_flash_attn, llama_get_flash_attn).
 //
-// The numbers are those of the run that ran out of memory: Kaggle 2x T4, DeepSeek-V4.1 fake dsf8 (24.1 GiB), -fa off, ctx 16384,
+// The numbers are those of the run that ran out of memory: a 2x T4 host, DeepSeek-V4.1 fake dsf8 (24.1 GiB), -fa off, ctx 16384,
 // --moe-cache-mib auto. The fit projected CUDA1 at 13507 MiB used of 14804 MiB free (1297 MiB free at the 1024 MiB margin). The reduced
 // margin beside the cache is 256 MiB, so the cache took +768 MiB on each device, leaving 529 MiB. The first 2100-token prompt then took
 // F16 copies of its KQ matrix from the CUDA pool, outside the measured compute buffer, and aborted in cuMemCreate.
@@ -23,7 +23,7 @@ static int n_fail = 0;
 int main() {
     constexpr int64_t MiB = 1024*1024;
     const int64_t m         = 1024*MiB;   // the default margin
-    const int64_t m_reduced =  256*MiB;   // LLAMA_MOE_FIT_MARGIN beside a cache (k17-models)
+    const int64_t m_reduced =  256*MiB;   // LLAMA_MOE_FIT_MARGIN beside a cache
 
     // the plan: the full margin without flash attention unless switched off, the reduced one with it
     CHECK(common_fit_moe_margin_fa_plan(m, m_reduced, /*flash_attn =*/ false, /*keep_faoff =*/ true)  == m);
@@ -39,7 +39,7 @@ int main() {
         const int64_t free_kept    = free_cuda1 - (m - common_fit_moe_margin_fa_plan(m, m_reduced, false, true));
         CHECK(free_reduced == 529*MiB);
         CHECK(free_kept    == 1297*MiB);
-        // the full margin was not enough either: with it kept (k19-fitfaoff first step) the 7986-token prompt still aborted in a pool
+        // the full margin was not enough either: with it kept (the first step) the 7986-token prompt still aborted in a pool
         // allocation. One F16 copy of the KQ matrix at the full context (64 heads x 2048 x 16384) is what the margin has to hold
         const int64_t kq = common_fit_faoff_kq_bytes(64, 2048, 16384);
         CHECK(kq == int64_t(4096)*MiB);

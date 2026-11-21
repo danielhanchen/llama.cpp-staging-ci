@@ -1,4 +1,4 @@
-// k19-iqsmem: bit identity of the IQ shared-memory table launches against the launches they replace, byte for byte:
+// bit identity of the IQ shared-memory table launches against the launches they replace, byte for byte:
 //   - GGML_CUDA_MMVQ_GRID_IDS: IQ3_S / IQ3_XXS single token MUL_MAT_ID (MoE experts) with 2 / 4 / 8 rows per block (0 = one row),
 //     2 warps instead of 4 where 2 cover a row's K blocks in one pass (GGML_CUDA_MMVQ_GRID_IDS_WARPS=0: always 4);
 //   - GGML_CUDA_MMVQ_IQ2_TAB: IQ2_XS / IQ2_S single column mat-vec (dense and MUL_MAT_ID) with the codebook in shared memory
@@ -463,7 +463,7 @@ int main(int argc, char ** argv) {
     };
     if (const char * be = getenv("IQS_BASE_EXE")) {
         // a copy of this test in the other build's bin dir (the CUDA backend is loaded from the executable's directory, so
-        // LD_LIBRARY_PATH alone does not switch it): that build's defaults (no k19-iqsmem code: never logs) vs this build's
+        // LD_LIBRARY_PATH alone does not switch it): that build's defaults (no such code: never logs) vs this build's
         const std::string b = be;
         modes.push_back({ "xbin_default", "", "", -1, false, b });
         modes.push_back({ "xbin_off",     "", off, 0, false, b });
@@ -520,7 +520,7 @@ int main(int argc, char ** argv) {
             ok ? "OK  " : "FAIL", md.name, rb, lb, (unsigned long long) fnv(db.data(), db.size()), rh, lh,
             (unsigned long long) fnv(dh.data(), dh.size()), db.size(), ndiff);
         fflush(stdout);
-        // the exact verify modes count too: their run-to-run variation (66-row MUL_MAT_ID) was the single column row guard, fixed in k19-exactdet
+        // the exact verify modes count too: their run-to-run variation (66-row MUL_MAT_ID) was the single column row guard, fixed in this change
         n_fail += !ok;
     }
     printf("%s: %d of %zu modes failed\n", n_fail ? "FAIL" : "PASS", n_fail, modes.size());

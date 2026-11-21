@@ -1,4 +1,4 @@
-// k19-kvwin: the recent-window ring beside a quantized KV cache (llama_context_params::kv_win), on the CPU, on generated models of
+// the recent-window ring beside a quantized KV cache (llama_context_params::kv_win), on the CPU, on generated models of
 // several families. Every check compares logits of whole runs:
 //   probe     window over every cell (q4_0 cache, q8_0 ring)        == plain q8_0 cache, bit for bit (prompt in several ubatches + decode)
 //   control   window 0, sinks 0 (empty ring, the mode engaged)       == plain q4_0 cache, bit for bit

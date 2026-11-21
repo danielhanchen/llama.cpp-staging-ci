@@ -1,11 +1,11 @@
-// k19-dtopk: the MTP draft step's backend top-k over the restricted draft head's logits (gathered in token order, the unwritten
+// the MTP draft step's backend top-k over the restricted draft head's logits (gathered in token order, the unwritten
 // request rows on a -inf column) must give the candidates, their logits and their order that the top-k over the scatter into the
 // full vocabulary gives.
 //   part 1 (ops, every backend of this build): random logits with many ties (at the k-th value too), +0.0 / -0.0, frequent-token
 //          rows + request rows in ring order + unwritten rows; candidates and logit bits equal. Control: the same top-k over the rows
 //          in row order (no token-order gather) must differ somewhere, else the cases do not exercise the order.
 //   part 2 (qwen35moe-mtp model, CPU, children with LLAMA_MTP_DRAFT_TOPK_FULL=0 / 1): greedy MTP speculative decoding gives the same
-//          tokens and every draft, with request rows (written and unwritten) and p_min; the default child logs the k19-dtopk line,
+//          tokens and every draft, with request rows (written and unwritten) and p_min; the default child logs the draft top-k line,
 //          the kill-switch child does not.
 #include "common.h"
 #include "sampling.h"
@@ -65,7 +65,7 @@ struct topk_out {
     std::vector<float>   logits;
 };
 
-// mode 0: scatter into the full vocabulary (build_draft_head) + top-k; mode 1: token-order gather (build_sampling, k19-dtopk)
+// mode 0: scatter into the full vocabulary (build_draft_head) + top-k; mode 1: token-order gather (build_sampling)
 static bool run_topk(ggml_backend_t backend, const head_case & hc, const std::vector<float> & sub, const std::vector<int64_t> & ids,
                      const std::vector<int32_t> & perm, const std::vector<int32_t> & cand, int mode, int k, topk_out & out) {
     const int64_t n_sub = (int64_t) ids.size();

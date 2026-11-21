@@ -1,5 +1,5 @@
-// Bit identity of the k19-moebw routed-expert mat-vec changes against the kernels they replace, at the MoE shapes of the models we ship
-// (Qwen3.8-Flash-Next UD-IQ4_XS: IQ3_S / IQ4_XS gate+up, IQ4_NL / Q8_0 down; Qwen3.6-35B-A3B and LFM2.5-24B-A2B UD-Q4_K_XL: Q4_K / Q5_K
+// Bit identity of the routed-expert mat-vec changes against the kernels they replace, at the MoE shapes of the models we ship
+// (Qwen3.8-Flash-Next 4-bit: IQ3_S / IQ4_XS gate+up, IQ4_NL / Q8_0 down; Qwen3.6-35B-A3B and LFM2.5-24B-A2B 4-bit: Q4_K / Q5_K
 // gate+up, Q5_K / Q6_K down) and odd ones (rows not a multiple of 4 / 8, K of one block, more than 128 entries, skipped slots),
 // 1..8 tokens, with and without the batch invariant (verify) flag:
 //   - the K-unrolled multi-token MoE kernels (GGML_CUDA_MOE_UNROLL, GGML_CUDA_MMVQ_MOE_GROUP_UNROLL) vs their kill switches;
@@ -38,7 +38,7 @@
 
 static int n_bw_logs = 0;
 
-// MOE_BW_LOG_MATCH=s: count only the launch lines that contain s (k19-moegrp: "vl8,4" = mul_mat_vec_q_moe_vl<8 threads, 4 entries>)
+// MOE_BW_LOG_MATCH=s: count only the launch lines that contain s ("vl8,4" = mul_mat_vec_q_moe_vl<8 threads, 4 entries>)
 static const char * log_match = nullptr;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
@@ -240,7 +240,7 @@ struct moe_graph {
             ggml_set_output(out[l]);
             ggml_build_forward_expand(gf, out[l]);
         }
-        // k19-ampere: MOE_BENCH_VERIFY_TAG=1 tags every node as a speculative verify graph (GGML_TENSOR_FLAG_VERIFY), so the
+        // MOE_BENCH_VERIFY_TAG=1 tags every node as a speculative verify graph (GGML_TENSOR_FLAG_VERIFY), so the
         // verify-window kernel choices (GGML_CUDA_VERIFY_WIDE) apply to the bench as they do to a server's verify batches
         static const bool vtag = getenv("MOE_BENCH_VERIFY_TAG") != nullptr && atoi(getenv("MOE_BENCH_VERIFY_TAG")) != 0;
         if (vtag) {
@@ -272,7 +272,7 @@ struct moe_graph {
 static const moe_shape bench_shapes[] = {
     { "fn4gu",  GGML_TYPE_IQ3_S,  2560,  640, 128, 10, true  },
     { "fn4gux", GGML_TYPE_IQ4_XS, 2560,  640, 128, 10, true  },
-    { "fn4gun", GGML_TYPE_IQ3_S,  2560,  640, 128, 10, false },   // k19-ampere: the gate or up alone (MoE cache tiers: no fused gate)
+    { "fn4gun", GGML_TYPE_IQ3_S,  2560,  640, 128, 10, false },   // the gate or up alone (MoE cache tiers: no fused gate)
     { "fn4dn",  GGML_TYPE_IQ4_NL,  640, 2560, 128, 10, false },
     { "fn4dq8", GGML_TYPE_Q8_0,    640, 2560, 128, 10, false },
     { "q4xgu",  GGML_TYPE_Q4_K,   2048,  512, 256,  8, true  },
@@ -280,7 +280,7 @@ static const moe_shape bench_shapes[] = {
     { "q4xdn6", GGML_TYPE_Q6_K,    512, 2048, 256,  8, false },
     { "lfmgu",  GGML_TYPE_Q4_K,   2048, 1536,  64,  4, true  },
     { "lfmdn",  GGML_TYPE_Q5_K,   1536, 2048,  64,  4, false },
-    // k19-ampmoe: the other Qwen3.8-Flash-Next UD-IQ4_XS (fn4n) routed types
+    // the other Qwen3.8-Flash-Next 4-bit routed types
     { "fn4nq5",  GGML_TYPE_Q5_0,    640, 2560, 128, 10, false },
     { "fn4nxx",  GGML_TYPE_IQ3_XXS, 2560,  640, 128, 10, true  },
     { "fn4n2s",  GGML_TYPE_IQ2_S,   2560,  640, 128, 10, true  },
@@ -565,7 +565,7 @@ int main(int argc, char ** argv) {
         { "rpb8_g0",     self, { off, "GGML_CUDA_MMVQ_MOE_GROUP=0" }, { "GGML_CUDA_MOE_RPB=8 GGML_CUDA_MOE_BW=0 GGML_CUDA_MMVQ_MOE_GROUP=0" } },
         { "group0_u4",   self, { off, "GGML_CUDA_MMVQ_MOE_GROUP=0" }, { "GGML_CUDA_MMVQ_MOE_GROUP=0 GGML_CUDA_MOE_UNROLL=4 GGML_CUDA_MOE_BW=0" } },
         { "reassoc0_bw", self, { off, "GGML_CUDA_VERIFY_REASSOC=0" }, { "GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MOE_BW=1" } },
-        // k19-moegrp: c_tpr threads per row, c_g entries per weight decode (GGML_CUDA_MOE_VL=tpr,g; the IQ3_S gate / up), every
+        // c_tpr threads per row, c_g entries per weight decode (GGML_CUDA_MOE_VL=tpr,g; the IQ3_S gate / up), every
         // width; MOE_BW_LOG_MATCH counts only that kernel's launches
         { "vl8_4",       self, { off }, { "GGML_CUDA_MOE_VL=8,4 MOE_BW_LOG_MATCH=vl8,4" } },
         { "vl16_4",      self, { off }, { "GGML_CUDA_MOE_VL=16,4 MOE_BW_LOG_MATCH=vl16,4" } },

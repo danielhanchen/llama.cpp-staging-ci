@@ -1,4 +1,4 @@
-// k19-dtopk: the CUDA deterministic top-k (ggml_top_k) with the two-stage one-launch selection for few rows and a small k
+// the CUDA deterministic top-k (ggml_top_k) with the two-stage one-launch selection for few rows and a small k
 // (GGML_CUDA_TOPK_TWO_STAGE, default on: rows <= 8, k <= 10 (k 32 cases: the radix select in both modes), columns past the one-block path) vs the radix select
 // (GGML_CUDA_TOPK_TWO_STAGE=0), and vs a host reference of the documented order (keys above the k-th largest in column order, then
 // the first kept ties in column order; -0 == +0). Each mode runs in a child process (the switch is read once per process) that dumps

@@ -36,7 +36,7 @@ int main() {
     const std::string cg = (root / "cgroup").string();
     const std::string sys = (root / "sys").string();
 
-    // the Kaggle T4 case: a 31 GiB cgroup limit, 30 GiB of it page cache, MemAvailable 30455 MiB
+    // the T4 case: a 31 GiB cgroup limit, 30 GiB of it page cache, MemAvailable 30455 MiB
     put(mi, "MemTotal:       32864756 kB\nMemFree:          500000 kB\nMemAvailable:   31185920 kB\n");
     put(cg, "0::/kaggle\n");
     put(root / "sys/kaggle/memory.max", std::to_string(31*1024*MiB) + "\n");
@@ -93,7 +93,7 @@ int main() {
     check("no /proc/self/cgroup: no limit", llama_sysmem::cgroup_available((root / "none").string(), sys), UINT64_MAX);
     check("no meminfo: unknown", llama_sysmem::available((root / "none").string(), cg, sys), 0);
 
-    // k19: one cgroup v2 directory (the weight store's namespace-root read); the numbers of the 8 GiB scope probes
+    // one cgroup v2 directory (the weight store's namespace-root read); the numbers of the 8 GiB scope probes
     // (tests/k19_ram_avail/probe.cpp, MiB): mlock 4 GiB of the model's mapping + 1 GiB anon, memfd (shmem) 3 GiB + 1 GiB anon, mmap 4 GiB clean
     {
         const fs::path d = root / "ns";
@@ -122,7 +122,7 @@ int main() {
     // the live system gives a value
     printf("live: %llu MiB\n", (unsigned long long) (llama_sysmem::available() >> 20));
 
-    // k19-core2: the reclaimable figure (MemAvailable minus the registered model pages; 1 when nothing is left, 0 when unknown)
+    // the reclaimable figure (MemAvailable minus the registered model pages; 1 when nothing is left, 0 when unknown)
     {
         constexpr uint64_t GiB = 1024*MiB;
         check("reclaimable: nothing pinned", llama_sysmem::reclaimable(79*GiB, 0), 79*GiB);

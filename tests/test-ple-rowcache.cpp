@@ -1,4 +1,4 @@
-// k19-plerow: the PLE row cache (src/llama-row-cache.*) in front of a lazily mapped table must not change any output.
+// the PLE row cache (src/llama-row-cache.*) in front of a lazily mapped table must not change any output.
 //   1. ggml level, per table type (F32, F16, BF16, Q8_0, Q4_0, IQ4_NL): a GET_ROWS over random row sets (duplicates included) gives
 //      bit-identical results with the cache as the row source (cold, then warm, with evictions, with a skip range) and without it;
 //      every cached row's bytes equal the table's; a saved profile preloads static rows with the table's bytes; a stale profile (one

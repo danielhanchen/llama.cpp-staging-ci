@@ -1,4 +1,4 @@
-// k19-handoff: bit identity of ggml_dflash2_conv (one op) and the add / mul / pad chain of build_dflash2_conv (src/models/dflash.cpp)
+// bit identity of ggml_dflash2_conv (one op) and the add / mul / pad chain of build_dflash2_conv (src/models/dflash.cpp)
 // it replaces, on every backend device that supports the op (the CPU always). Random inputs with negative zeros, infinities and NaNs;
 // shapes of the Flash-Next DFlash2 drafter (H 2560, group 16, K 2: noise blocks of 7 / 8 rows, 2048-row feature batches) and corners
 // (K up to 4, blocks shorter than K, two blocks). A negative control flips one input bit of the fused op: its output must differ.

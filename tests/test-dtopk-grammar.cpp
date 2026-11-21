@@ -1,4 +1,4 @@
-// k19-gramdev: a request with a grammar (JSON schema, a lazy tool-call grammar that triggers mid-reply or never, a grammar that
+// a request with a grammar (JSON schema, a lazy tool-call grammar that triggers mid-reply or never, a grammar that
 // rejects most tokens) or a reasoning budget samples the same tokens from the device top-k candidates (common_sampler_device_topk,
 // the raw rows kept on the host by llama_set_sampler_keep_logits) as from the full rows (today's host path), greedy and sampled
 // (Studio presets), one row per pass and in multi-row verify windows (common_sampler_sample_and_accept_n and the rejection sampler).

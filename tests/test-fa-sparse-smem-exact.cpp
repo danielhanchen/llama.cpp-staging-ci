@@ -1,5 +1,5 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// k19-p2qsa: the sparse (gathered) tensor-core flash attention launched with the shared memory of its one K / V stage instead of two
+// the sparse (gathered) tensor-core flash attention launched with the shared memory of its one K / V stage instead of two
 // (GGML_CUDA_FA_SPARSE_SMEM_FIX, fattn-mma-f16.cuh), byte for byte on the GPU backend. Each mode runs in a child process (the switch is
 // read once per process) that dumps every output, the median time of the timed graph runs per case and whether the fix logged:
 //   0: the two-stage size as before; 1 (default): one-stage size, the occupancy (stream-k split) of the two-stage size; 2: the occupancy of

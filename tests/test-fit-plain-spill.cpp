@@ -1,4 +1,4 @@
-// test-fit-plain-spill: the k19-fitplain margin step-down of a plain dense launch (common/fit.h): the step list, the trial margins it
+// test-fit-plain-spill: the margin step-down of a plain dense launch (common/fit.h): the step list, the trial margins it
 // gives and the display gate. The fit itself needs a model file and a device; these are the rules it applies around the fit:
 //   - the default list 512,448,256,192 MiB tried from the 1024 MiB default margin, never above a margin given
 //   - the step-down acts only where every used device reports no display (1); a display (0) or an unknown signal (-1) keeps the margin

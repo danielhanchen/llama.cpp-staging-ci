@@ -1,8 +1,8 @@
 // test-fit-small-reserve: the run-time reserve of a small-device --fit placement (common_fit_small_reserve_plan / _mib, common/fit.h)
 //
 // The planner itself needs a model file and a real device (it measures the placement through llama_model_load with no_alloc), so
-// this checks the arithmetic it applies, with the numbers of the placement that ran out of memory: G4 RTX PRO 6000 capped at 8 GB
-// (7792 MiB free), Qwen3.8-Flash-Next UD-IQ4_XS, -c 32768 -ub 2048, Q8_0 MTP drafter dropped by --fit:
+// this checks the arithmetic it applies, with the numbers of the placement that ran out of memory: RTX PRO 6000 capped at 8 GB
+// (7792 MiB free), Qwen3.8-Flash-Next 4-bit, -c 32768 -ub 2048, Q8_0 MTP drafter dropped by --fit:
 //   - the small-device rule kept every layer at a margin of 256 MiB beside a 141 MiB cache, 277 MiB projected free
 //   - 110.56 MiB were free at the first 8k layer-major group with the route tail skip on (166.4 MiB taken by buffers the measurement
 //     does not have), none with it off (the CUDA graphs of the chat decode failed to instantiate, then a stream creation aborted)
@@ -30,7 +30,7 @@ int main() {
     unsetenv("LLAMA_FIT_SMALL_RESERVE_MIN_CACHE_MIB");
 #endif
 
-    // G4 8 GB Flash-Next
+    // RTX PRO 6000 capped at 8 GB Flash-Next
     {
         const int64_t free_mib       = 7792;
         const int64_t used_mib       = 7514;   // model 4459 + context 742 + compute 2312, cache 141 included

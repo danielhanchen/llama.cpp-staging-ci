@@ -1,9 +1,9 @@
-// k19-autoprof: the self-learned profile files (src/llama-autoprof.h, the PLE row recorder of src/llama-row-cache.*).
+// the self-learned profile files (src/llama-autoprof.h, the PLE row recorder of src/llama-row-cache.*).
 //   1. the directory (the CPU-miss calibration's: LLAMA_MOE_CPU_MISS_CAL_DIR, LLAMA_CACHE, XDG_CACHE_HOME, HOME; LLAMA_MOE_AUTOPROF_DIR
 //      overrides), the switch LLAMA_MOE_AUTOPROF (0 off, 1 record + use, 2 record only, 3 use only), the file names and the model key;
 //   2. the atomic write: the file holds the new body, no temporary is left, a write that cannot complete leaves the old file;
 //   3. the MoE routing profile body (as written by the cache) reads back with llama_moe_profile_load; no file / a cut file reads nothing;
-//      llama_moe_profile_pick (k19-mgpu2, resident device prefill): hottest pairs of a group first, then the lowest ids in turn;
+//      llama_moe_profile_pick (resident device prefill): hottest pairs of a group first, then the lowest ids in turn;
 //   4. the PLE recorder: a record-only cache (no slots) gathers bit-identical rows, counts every read and keeps each row's bytes; its
 //      profile preloads exactly the recorded rows in a later cache (gathers still bit-identical, static hits); a second session adds its
 //      reads to the halved loaded counts; the memory cap holds; a missing profile preloads nothing.
@@ -143,7 +143,7 @@ static void test_moe_body(const fs::path & root) {
     CHECK(!llama_moe_profile_load(f, ne, out), "a cut file is refused");
 }
 
-// k19-mgpu2: llama_moe_profile_pick, the resident device prefill from a profile: the hottest pairs of the group's layers over all of them
+// llama_moe_profile_pick, the resident device prefill from a profile: the hottest pairs of the group's layers over all of them
 // (heat descending, zero heat and other layers ignored), then the lowest ids not taken, one layer after the other, up to the slot count
 static void test_pick() {
     // layers 4 and 6 form the group (6 experts each), layer 5 is another group's
@@ -293,7 +293,7 @@ static void test_recorder(const fs::path & root) {
             (unsigned long long) rc.st.n_hits_static.load(), (unsigned long long) rc.st.n_verify_bad.load());
         CHECK(rc.save_profile(prof), "save 2");
         CHECK(prof_entries(prof) == seen.size(), "profile rows after session 2: %llu", (unsigned long long) prof_entries(prof));
-        // k19-autoprof2: a profile directory that does not exist yet is created (the first save on a host-lookup tier)
+        // a profile directory that does not exist yet is created (the first save on a host-lookup tier)
         const fs::path sub = root / "new_dir" / "deeper";
         CHECK(!fs::exists(sub), "fresh directory");
         CHECK(rc.save_profile((sub / "autoprof_ple_test.5000").string()), "save into a missing directory");

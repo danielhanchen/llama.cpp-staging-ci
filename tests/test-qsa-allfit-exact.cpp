@@ -1,5 +1,5 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// k19-p2qsa: the QSA selection of qwen4exp without indexer scoring while every sequence of the ubatch holds at most top_k / kpool pools
+// the QSA selection of qwen4exp without indexer scoring while every sequence of the ubatch holds at most top_k / kpool pools
 // (LLAMA_QSA_ALLFIT, llama_memory_hybrid_idx_context::get_kpool_allfit) against the scored selection (LLAMA_QSA_ALLFIT=0), byte for byte.
 // The generated qwen4exp (MoE) model with the indexer top_k overridden to 32 (8 pools of 4 cells), so the switch between the two graphs happens
 // at 32..36 cells instead of 2048: two sequences in a unified KV cache, prompts in several ubatches (all-fit, scored, and an all-fit

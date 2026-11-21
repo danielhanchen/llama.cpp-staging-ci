@@ -1,4 +1,4 @@
-// k19-ampmoe: the int8 tensor-core multi-token MUL_MAT_ID (ggml-cuda mmvq-moetc.cu, GGML_CUDA_MOE_TC) against
+// the int8 tensor-core multi-token MUL_MAT_ID (ggml-cuda mmvq-moetc.cu, GGML_CUDA_MOE_TC) against
 //   - an fp64 reference from the dequantized weights and the f32 activations (NMSE per case; the kernel's error may be at most
 //     MOE_TC_TOL (1.05) x the mul_mat_vec_q path's own error + 1e-9: both read the same q8_1 activations, only the f32 order differs),
 //   - the mul_mat_vec_q MoE kernels (kill switch GGML_CUDA_MOE_TC=0): NMSE between the two <= 4 x the mmvq error + 1e-6,

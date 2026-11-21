@@ -1,4 +1,4 @@
-// k19-p3topk: build_sampling's batched verify-window top-k (one ggml_top_k over n consecutive rows of the padded logits + one
+// build_sampling's batched verify-window top-k (one ggml_top_k over n consecutive rows of the padded logits + one
 // get_rows of every row's top logits, then a slice per row) vs what each row's chain built before (a top-k over that row alone + a
 // get_rows), byte for byte: the candidate ids, their order and the logits. Every backend of the build (CPU, CUDA / ROCm when present)
 // runs every case; the gate is what build_sampling batches (cparams.topk_batch: the CPU any width, CUDA past 32768 columns and at most

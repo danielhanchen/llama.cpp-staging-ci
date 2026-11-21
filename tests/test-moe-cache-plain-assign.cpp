@@ -1,4 +1,4 @@
-// k19-q4xcache: the hybrid assign at fetch share 1 with ggml_moe_cache_assign_lookup_counts (+ its fetch) stands in for the plain
+// the hybrid assign at fetch share 1 with ggml_moe_cache_assign_lookup_counts (+ its fetch) stands in for the plain
 // device lookup (ggml_moe_cache_lookup) of a verify window whose host path is off (LLAMA_MOE_OVERLAP_SMALL_PLAIN). On a GPU backend
 // that supports GGML_OP_MOE_CACHE_LOOKUP, two copies of one cache state run the same sequence of windows (1..8 tokens, CLOCK and
 // decayed counts, route tail skip off / rank 7): one through the lookup, one through the assign. After every window the slots, the
@@ -16,7 +16,7 @@
 #include <random>
 #include <vector>
 
-// defined in ggml.c (k19-q4xcache), declared by its users
+// defined in ggml.c, declared by its users
 extern "C" { GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op); }
 
 static int g_fail = 0;

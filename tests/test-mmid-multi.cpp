@@ -1,4 +1,4 @@
-// k17-ttft: MUL_MAT_ID on the CPU backend is bit-identical to one ggml_vec_dot per (weight row, routed row), for the weight types
+// MUL_MAT_ID on the CPU backend is bit-identical to one ggml_vec_dot per (weight row, routed row), for the weight types
 // with multi-column kernels (ggml_cpu_vec_dot_multi: an expert routed to 2 or more rows decodes each weight block once for up to 8
 // of them). Experts routed to 1, 2..8 and more than 8 rows are all covered; any byte difference fails.
 // The upstream tiled kernels (ggml-cpu/tiled) take an expert routed to 8 or more rows of an IQ / K-quant type; they accumulate

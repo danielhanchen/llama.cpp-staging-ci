@@ -1,4 +1,4 @@
-// k19-igpu: tpp_fit_gpus (tools/server/server-tpp.h) with mock device lists: the GPUs the k19-tpp MTP window policy prices are the ones
+// tpp_fit_gpus (tools/server/server-tpp.h) with mock device lists: the GPUs the MTP window policy prices are the ones
 // llama_model_load picks (src/llama.cpp): discrete GPUs, integrated ones only without a discrete one (of the first one's backend only),
 // --device's list as given, --split-mode none the main GPU of that list
 

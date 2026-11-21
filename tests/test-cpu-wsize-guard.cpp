@@ -151,7 +151,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // multi-threaded GET_ROWS of a quantized table (k19: rows split over the threads above a size threshold)
+    // multi-threaded GET_ROWS of a quantized table (rows split over the threads above a size threshold)
     for (int nr : { 3, 4096 }) {
         cases.push_back({ "get_rows q4_0 rows=" + std::to_string(nr), [=](ggml_context * ctx) {
             ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 512, 300);
@@ -179,7 +179,7 @@ int main(int argc, char ** argv) {
             } });
         }
     }
-    // the replay window (k16-draft): stored window of 4 tokens, keep 2 / 3, halves 0 / 1
+    // the replay window: stored window of 4 tokens, keep 2 / 3, halves 0 / 1
     cases.push_back({ "gated_delta_net_replay W=4 T=4", [=](ggml_context * ctx) {
         const int S = 32, Hk = 2, Hv = 4, NS = 2, T = 4, W = 4;
         ggml_tensor * q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, Hk, T, NS);
