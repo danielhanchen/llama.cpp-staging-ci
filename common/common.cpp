@@ -3893,6 +3893,13 @@ uma_restart:
         if (draft_cpu && !draft_needs_target && common_gguf_arch(params_dft.model.path) == "gemma4-assistant") {
             draft_needs_target = true;
         }
+        // a tool that cannot leave the draft out (no fit_can_drop: llama-speculative-simple, llama-dflash-tfa) keeps a draft that
+        // needs its target on its device placement: on the CPU it would abort in its first graph reservation
+        if (draft_cpu && draft_needs_target && !params.speculative.draft.fit_can_drop) {
+            COM_WRN("%s: --fit: the draft model does not fit beside the main model and its MoE cache, but it runs on the target's tensors "
+                "and cannot run on the CPU: it keeps its device placement\n", __func__);
+            draft_cpu = false;
+        }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
         // a draft that runs on the target's context (a gemma-4 assistant reads the target's KV cache) cannot run on the CPU
         // while that cache is on the device: T4 4 GB with LLAMA_FIT_DRAFT_CPU=1 aborted in its first graph reservation (a CPU context
