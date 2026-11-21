@@ -2639,6 +2639,44 @@ struct common_fit_draft_hx {
 // set while the launch is fitted again with K/V host chunks for its DFlash / DSpark drafter (the small-device refit below)
 static bool g_fit_dflash_kv_host = false;
 
+// bytes of a GGUF file and its splits (NAME-0000k-of-0000n.gguf), 0 if unknown
+static uint64_t common_fit_gguf_bytes(const std::string & path) {
+    std::error_code ec;
+    if (path.empty()) {
+        return 0;
+    }
+    int k = 0, n = 0;
+    const size_t at = path.rfind("-of-");
+    if (at != std::string::npos && at >= 6 && path.size() >= at + 4 + 5 + 5 &&
+            sscanf(path.c_str() + at - 5, "%5d-of-%5d.gguf", &k, &n) == 2 && n > 1) {
+        const std::string prefix = path.substr(0, at - 6);
+        uint64_t sum = 0;
+        for (int i = 0; i < n; ++i) {
+            char sp[4096];
+            llama_split_path(sp, sizeof(sp), prefix.c_str(), i, n);
+            const auto b = std::filesystem::file_size(sp, ec);
+            if (ec) {
+                return 0;
+            }
+            sum += b;
+        }
+        return sum;
+    }
+    const auto b = std::filesystem::file_size(path, ec);
+    return ec ? 0 : (uint64_t) b;
+}
+
+// the target is read from the disk during decode: its GGUF is larger than the available host memory and not on a memory file
+// system, so the expert misses the RAM tier does not hold come from the disk (as the server's deep-window rule decides it)
+static bool common_fit_target_on_disk(const std::string & path) {
+    if (common_fit_file_in_ram_fs(path)) {
+        return false;
+    }
+    const uint64_t bytes = common_fit_gguf_bytes(path);
+    const uint64_t avail = llama_available_memory();
+    return bytes > 0 && avail > 0 && bytes > avail;
+}
+
 static bool common_fit_draft_on_cpu(
         const common_params & params, const llama_model_params & mparams, const llama_context_params & cparams,
         const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level,
@@ -2909,6 +2947,20 @@ static bool common_fit_draft_on_cpu(
         const char * em = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT_MULTI");
         rq_min_tok = em != nullptr ? std::max(0.0, atof(em)) : 0.75;
     }
+    // (LLAMA_FIT_DRAFT_DISK, default 1; 0 = the rescue below there too): where the target's expert misses are read from the disk
+    // (common_fit_target_on_disk), a draft refused at its file's types is not requantized: the host-expert placement below (its
+    // experts in host memory, a few hundred MiB on the device) or no draft takes it. The requantized rescue was measured with the
+    // target in RAM, where a verify row reads its misses from pinned memory and costs a fraction of a token; from the disk each verify
+    // row reads its own misses and costs about a token, so the 1.6 GB the requantized drafter takes from the cache cost more than
+    // its drafts save. L4, Qwen3.8-Flash-Next at 4 bits (93.7 GB on the VM disk, 52 GB of RAM) + its Q8_0 MTP drafter, Studio argv,
+    // the same text: 12 GB (requantized 3.7 tokens per layer, cache 3775 MiB) chat 4.84 -> 5.11 tok/s (host-expert drafter, 5007
+    // MiB), 8k 4.34 -> 4.64; 13 GB (4.6 tokens, 4799 MiB) 5.01 -> 5.54 (6444 MiB). A draft admitted at its types and requantized by
+    // the share rule below is unchanged (14 GB, A100 40 GB at 16 GB)
+    const bool rq_disk = [&] {
+        const char * e = getenv("LLAMA_FIT_DRAFT_DISK");
+        return (e == nullptr || atoi(e) != 0) && getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT") == nullptr &&
+            common_fit_target_on_disk(params.model.path);
+    }();
     if (const char * e = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT")) {
         rq_min_tok = std::max(0.0, atof(e));
     }
@@ -2925,7 +2977,12 @@ static bool common_fit_draft_on_cpu(
     const bool rq_heavy = gpu && rq_share > 0.0 && cache > 0 && take > rq_share*(double) cache;
     double rq_tok = -1.0, rq_dft = 0.0;
     bool   rq_taken = false;
-    if ((!gpu || rq_heavy) && !rq_off && !rq_set && rq_min_tok > 0.0 && host > 0.0 && (needs_target == nullptr || !*needs_target)) {
+    const bool rq_disk_skip = rq_disk && !gpu && !rq_heavy && !rq_off && !rq_set && hx_ok;
+    if (rq_disk_skip) {
+        LOG_INF("%s: the target's expert misses are read from the disk: the draft refused at its types is not requantized, the "
+            "host-expert placement is weighed instead (LLAMA_FIT_DRAFT_DISK=0: requantized)\n", __func__);
+    }
+    if ((!gpu || rq_heavy) && !rq_disk_skip && !rq_off && !rq_set && rq_min_tok > 0.0 && host > 0.0 && (needs_target == nullptr || !*needs_target)) {
         std::vector<llama_model_kv_override> kvo;
         if (mparams_dft.kv_overrides != nullptr) {
             for (const llama_model_kv_override * p = mparams_dft.kv_overrides; p->key[0] != 0; ++p) {
@@ -2987,7 +3044,10 @@ static bool common_fit_draft_on_cpu(
     } else if (!gpu && rq_off) {
         LOG_INF("%s: draft refused at its file's types; requantization off (LLAMA_DRAFT_REQUANT=off)\n", __func__);
     }
-    if (!gpu && !rq_set && (needs_target == nullptr || !*needs_target)) {
+    // (LLAMA_FIT_DRAFT_DISK_HX, default 1; 0 = not tried there): the draft with its experts in host memory where the disk-tier
+    // rule above skipped the requantized one (0: no draft there; the 8k text then differs from the drafted one)
+    static const bool disk_hx = getenv("LLAMA_FIT_DRAFT_DISK_HX") == nullptr || atoi(getenv("LLAMA_FIT_DRAFT_DISK_HX")) != 0;
+    if (!gpu && !rq_set && (needs_target == nullptr || !*needs_target) && (disk_hx || !rq_disk)) {
         gpu = try_hx();
     }
     return !gpu;

@@ -6320,7 +6320,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // 12 GB 391 -> 359 ms (base 361), decode unchanged or better (12 GB 137.2 -> 137.8, 16 GB 150.5 -> 162.6 tok/s, other texts)
     static const int64_t place8_chunk_env = getenv("LLAMA_MOE_PLACE8_CHUNK_MAX") ? std::max(0, atoi(getenv("LLAMA_MOE_PLACE8_CHUNK_MAX"))) : -1;
     const int64_t place8_chunk_max = place8_chunk_env >= 0 ? place8_chunk_env : (place8_grow > 0 && !place8_lean ? 64 : 0);
-    const uint32_t n_ubatch_split = place8_rel && place8_chunk_max > 0 && tiny_rel_ub > 0 && !cparams.verify && !embd_all &&
+    // (a recurrent memory keeps the last 1 + n_rs_seq tokens of a sequence in one ubatch, so the split needs ubatches longer than
+    // that: deeper speculative windows than the decode size can hold keep the one-ubatch prompt instead)
+    const bool place8_split_ok = cparams.n_rs_seq == 0 || (int64_t) tiny_rel_ub > (int64_t) cparams.n_rs_seq + 1;
+    const uint32_t n_ubatch_split = place8_rel && place8_chunk_max > 0 && tiny_rel_ub > 0 && !cparams.verify && !embd_all && place8_split_ok &&
         (int64_t) n_tokens_all > tiny_rel_ub && (int64_t) n_tokens_all <= place8_chunk_max ? (uint32_t) tiny_rel_ub : cparams.n_ubatch;
 
     while (true) {
