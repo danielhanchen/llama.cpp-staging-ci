@@ -1163,7 +1163,11 @@ static __device__ __forceinline__ int mmq_moe_tile_start(const int32_t * __restr
     return tile_prefix ? tile_prefix[e] : expert_bounds[e]/J + e;
 }
 
+// d == 0 (every routed slot of the product skipped: an empty tile range, the values are never used): zeros, no division by zero
 static __device__ __forceinline__ uint3 mmq_fastdiv_values_dev(const uint32_t d) {
+    if (d == 0) {
+        return make_uint3(0, 0, 0);
+    }
     uint32_t L = 0;
     while (L < 32 && (uint32_t{ 1 } << L) < d) {
         L++;
