@@ -9336,6 +9336,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    // the MoE cache adds a slot lookup to each MoE layer, and with host-computed misses a second expert path (up to ~16 tensors
+    // per layer), which the per-tensor estimates above do not cover for models with few tensors per layer
+    // (LLAMA_MOE_CACHE_NODE_BUDGET=0: off)
+    static const bool moe_cache_budget = getenv("LLAMA_MOE_CACHE_NODE_BUDGET") == nullptr || atoi(getenv("LLAMA_MOE_CACHE_NODE_BUDGET")) != 0;
+    if (moe_cache_budget && cparams.moe_cache_size > 0) {
+        res += 32u*model.hparams.n_layer_all;
+    }
+
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
