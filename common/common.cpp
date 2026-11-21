@@ -2492,7 +2492,8 @@ static size_t common_fit_dflash_estimate(const std::string & path_dft, const lla
     const int64_t n_seq = std::max<int64_t>(1, cp.n_seq_max);
     const int64_t n_ub  = std::max<int64_t>(1, std::min<int64_t>(cp.n_ubatch, cp.n_ctx));
     int64_t cells = cp.n_ctx;
-    if (all_swa) {
+    // --swa-full: the sliding layers get the full context too (llama_kv_cache_iswa)
+    if (all_swa && !cp.swa_full) {
         cells = std::min<int64_t>(cp.n_ctx, GGML_PAD(n_swa*n_seq + n_ub, 256));
     }
     const double kv_row = (double) n_head_kv*((double) d_k*ggml_type_size(cp.type_k)/ggml_blck_size(cp.type_k) +
