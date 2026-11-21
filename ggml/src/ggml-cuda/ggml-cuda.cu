@@ -2827,6 +2827,32 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+// On datacenter Blackwell, cuBLAS beats mmf for wide BF16 weights with few destination columns,
+// which is the batched decode shape. Measured on a B200 (cc 1000), Qwen3.8-27B BF16 decode:
+// 2 seqs 1.75x, 4 seqs 1.59x, 8 seqs 1.51x, 16 seqs 1.49x, and exactly neutral at 1 seq (mmvf
+// takes it) and at 24/32 seqs (already past the mmf cap). Prefill is unchanged.
+//
+// The bounds are deliberately narrow, each one covering only what was measured:
+//  - mul_mat_id is excluded because there cuBLAS is 2-4x SLOWER than mmf.
+//  - only the plain 2D cuBLAS entry point, so this cannot select the pointer-batched path.
+//  - only cc 1000..1099. Blackwell spans cc 1000/1100/1200 and only 1000 was measured.
+static bool ggml_cuda_mmf_loses_to_cublas(const ggml_tensor * src0, const ggml_tensor * src1,
+        const int cc, const int64_t ne11) {
+    if (src0->type != GGML_TYPE_BF16 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < 1000 || cc >= 1100) {
+        return false;
+    }
+    // ne11 == 1 belongs to mmvf, which is faster than both mmf and cuBLAS there.
+    if (ne11 < 2) {
+        return false;
+    }
+    if (src0->ne[2]*src0->ne[3] != 1 || src1->ne[2]*src1->ne[3] != 1) {
+        return false;
+    }
+    // Small weights cannot amortise the cuBLAS launch and the F32->BF16 activation conversion.
+    // 4 Mi elements, chosen from a threshold sweep over 0, 1 Mi, 4 Mi and 16 Mi on both models.
+    return src0->ne[0]*src0->ne[1] >= 4*1024*1024;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -3118,7 +3144,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    if (!ggml_cuda_mmf_loses_to_cublas(src0, src1, cc, ne11)
+            && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
