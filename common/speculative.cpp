@@ -1570,6 +1570,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        // LLAMA_DFLASH_FULL_BLOCK=1: a DFlash2 draft decodes the whole trained block (the anchor + block_size - 1 masks)
+        // and walks only its first n_max rows. The attention over the block is not causal, so a block cut to n_max + 1 rows changes
+        // every row's draft against the block the drafter was trained on. The blocks of one decode share one width (the selector
+        // splits the rows into equal blocks), so the whole block is used only when it fits for every drafting sequence
+        static const bool full_block = getenv("LLAMA_DFLASH_FULL_BLOCK") != nullptr && atoi(getenv("LLAMA_DFLASH_FULL_BLOCK")) != 0;
+        bool full_block_fits = is_dflash2 && full_block;
+        for (llama_seq_id seq_id = 0; full_block_fits && seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const auto & dp = dparams[seq_id];
+            if (dp.drafting && (int32_t) dp.pos0 + block_size > (int32_t) llama_n_ctx(ctx_dft)) {
+                full_block_fits = false;
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1581,12 +1594,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_draft = params.n_max;
-            // LLAMA_DFLASH_FULL_BLOCK=1: a DFlash2 draft decodes the whole trained block (the anchor + block_size - 1 masks)
-            // and walks only its first n_max rows. The attention over the block is not causal, so a block cut to n_max + 1 rows changes
-            // every row's draft against the block the drafter was trained on
-            static const bool full_block = getenv("LLAMA_DFLASH_FULL_BLOCK") != nullptr && atoi(getenv("LLAMA_DFLASH_FULL_BLOCK")) != 0;
             const int32_t n_block_tokens = is_lilicorr ? block_size :
-                (is_dflash2 && full_block && n + block_size <= (int32_t) llama_n_ctx(ctx_dft)) ? std::max<int32_t>(block_size, n_draft + 1) : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+                full_block_fits ? std::max<int32_t>(block_size, n_draft + 1) : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
