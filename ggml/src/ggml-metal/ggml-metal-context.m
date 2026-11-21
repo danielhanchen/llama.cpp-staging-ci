@@ -12,6 +12,9 @@
 
 #import <Metal/Metal.h>
 
+#include <stdlib.h>
+#include <unistd.h>
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -323,13 +326,43 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
     return ggml_metal_buffer_get_id(buffer->context, t);
 }
 
+// a shared Metal buffer over the host pages holding [data, data + size) without a copy (the pointer and length that
+// newBufferWithBytesNoCopy takes must be page aligned: the whole pages are wrapped and *offs is the offset of data in them);
+// nil if Metal refuses the range. The host memory must stay valid until the copy that reads or writes it has completed
+static id<MTLBuffer> ggml_metal_wrap_host_pages(id<MTLDevice> device, const void * data, size_t size, size_t * offs) {
+    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t p    = (uintptr_t) data;
+    const uintptr_t p0   = p & ~(page - 1);
+    const uintptr_t p1   = (p + size + page - 1) & ~(page - 1);
+    *offs = (size_t) (p - p0);
+    return [device newBufferWithBytesNoCopy:(void *) p0
+                                     length:(NSUInteger) (p1 - p0)
+                                    options:MTLResourceStorageModeShared
+                                deallocator:nil];
+}
+
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     @autoreleasepool {
-        // wrap the source data into a Metal buffer
+        // wrap the source data into a Metal buffer: uploads of 64 KiB or more read the caller's pages in place (the asynchronous
+        // contract keeps them valid until the context synchronizes, which waits for this command buffer), smaller ones and any range
+        // Metal refuses copy it into a new buffer as before; GGML_METAL_UPLOAD_NOCOPY=0: always the copy
+        static int nocopy = -1;
+        if (nocopy < 0) {
+            const char * e = getenv("GGML_METAL_UPLOAD_NOCOPY");
+            nocopy = e == NULL || atoi(e) != 0;
+        }
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_src = [device newBufferWithBytes:data
-                                                    length:size
-                                                   options:MTLResourceStorageModeShared];
+        size_t src_offs = 0;
+        id<MTLBuffer> buf_src = nil;
+        if (nocopy && size >= 64*1024) {
+            buf_src = ggml_metal_wrap_host_pages(device, data, size, &src_offs);
+        }
+        if (buf_src == nil) {
+            src_offs = 0;
+            buf_src = [device newBufferWithBytes:data
+                                          length:size
+                                         options:MTLResourceStorageModeShared];
+        }
 
         GGML_ASSERT(buf_src);
 
@@ -347,7 +380,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
         [encoder copyFromBuffer:buf_src
-                   sourceOffset:0
+                   sourceOffset:src_offs
                        toBuffer:bid_dst.metal
               destinationOffset:bid_dst.offs
                            size:size];
@@ -371,11 +404,10 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     @autoreleasepool {
+        // the destination pages wrapped in place (a pointer that is not page aligned, e.g. a later row of the logits, as well)
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
-                                                          length:size
-                                                         options:MTLResourceStorageModeShared
-                                                     deallocator:nil];
+        size_t dst_offs = 0;
+        id<MTLBuffer> buf_dst = ggml_metal_wrap_host_pages(device, data, size, &dst_offs);
 
         GGML_ASSERT(buf_dst);
 
@@ -395,7 +427,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
         [encoder copyFromBuffer:bid_src.metal
                    sourceOffset:bid_src.offs
                        toBuffer:buf_dst
-              destinationOffset:0
+              destinationOffset:dst_offs
                            size:size];
 
         [encoder endEncoding];
