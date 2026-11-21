@@ -128,6 +128,20 @@ static llama_kv_sel_procs llama_kv_sel_get_procs(ggml_backend_buffer_type_t buft
     return p;
 }
 
+static thread_local int g_kv_eager_depth = 0;
+
+static bool llama_kv_eager_active() {
+    return g_kv_eager_depth > 0;
+}
+
+llama_kv_eager_scope::llama_kv_eager_scope() {
+    ++g_kv_eager_depth;
+}
+
+llama_kv_eager_scope::~llama_kv_eager_scope() {
+    --g_kv_eager_depth;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -361,7 +375,7 @@ llama_kv_cache::llama_kv_cache(
 
     // LLAMA_KV_LAZY=1 reserves a device buffer's address range and backs only the cells in use (see lazy_ensure)
     // (unset = auto, see llama_kv_lazy_mode; read at every allocation, common sets the grant after the fit's measurements)
-    const bool kv_lazy = hparams.no_alloc ? llama_kv_lazy_measure_on() : llama_kv_lazy_alloc_on();
+    const bool kv_lazy = !llama_kv_eager_active() && (hparams.no_alloc ? llama_kv_lazy_measure_on() : llama_kv_lazy_alloc_on());
     // the cells backed at load
     const uint32_t lazy_n0 = [&]() {
         const char * e_init = getenv("LLAMA_KV_LAZY_INIT");
