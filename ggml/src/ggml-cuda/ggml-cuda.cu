@@ -3131,12 +3131,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // one GEMM with ne12 columns rather than ne12 separate GEMVs. Left as is, the weight crosses
     // memory ne12 times. Fold the channel axis into the column axis so it is read once; the
     // dispatch below then picks mmf or cuBLAS for the wider shape.
+    // Require both operands contiguous. The folded channel stride becomes the GEMM leading
+    // dimension, and a padded view could present ldb < K, which cuBLAS rejects, or a layout mmf
+    // does not accept. Contiguity makes the promoted strides exactly the packed ones.
     if (ne11 == 1 && src1->ne[2] > 1 && src1->ne[3] == 1
             && src0->ne[2] == 1 && src0->ne[3] == 1
-            && src1->nb[0] == ggml_type_size(src1->type)
-            &&  dst->nb[0] == ggml_type_size(dst->type)
-            && src1->nb[2] % ggml_type_size(src1->type) == 0
-            &&  dst->nb[2] % ggml_type_size(dst->type)  == 0) {
+            && dst->ne[1] == 1
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
         ggml_tensor src1_folded = *src1;
         src1_folded.ne[1] = src1->ne[2];
         src1_folded.ne[2] = 1;
