@@ -1975,7 +1975,7 @@ static void common_params_fit_impl(
                 const char * e_sm3 = getenv("LLAMA_FIT_MTP_SMALL_MARGIN_MIB");
                 // only below compute capability 8.0 (the T4 hosts it was measured on): RTX PRO 6000 (cc 12.0) 4 GB a 4-bit MoE 16k at 160 MiB kept the
                 // drafter with 130.6 MiB free after it, the target grew 474 -> 506 MiB, and the first prompt ran out of memory creating a
-                // cuBLAS handle (rs_replay_commit, 2 of 2 launches); at 256 the fit drops the drafter there and every cell runs 
+                // cuBLAS handle (rs_replay_commit, 2 of 2 launches); at 256 the fit drops the drafter there and every cell runs
                 const int64_t mtp_min_mib = e_sm3 != nullptr ? std::max<int64_t>(0, atoll(e_sm3)) : (common_fit_pre_ampere() ? 160 : 0);
                 const char * e_sm2 = getenv("LLAMA_FIT_SMALL_MARGIN_MIN_MIB");
                 const int64_t small_min_mib = std::min<int64_t>(small_mib, e_sm2 != nullptr ? std::max<int64_t>(0, atoll(e_sm2)) :
