@@ -125,6 +125,7 @@ jobs:
           done
 
       - name: dflash2 conv NaN diagnostic
+        continue-on-error: true
         if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0' && hashFiles('tests/test-dflash2-conv-exact.cpp') != ''
         shell: bash
         run: |
@@ -132,7 +133,10 @@ jobs:
           import re
           src = open('tests/test-dflash2-conv-exact.cpp').read()
           old = "const int r = memcmp(a.data(), b.data(), a.size() * 4) != 0 ? 1 : 0;"
-          assert old in src
+          if old not in src:
+              print("dflash2 diagnostic: the tree already compares NaN-aware, skipped")
+              open('dflash2_skip', 'w').write('1')
+              raise SystemExit(0)
           new = ("int n_real = 0, n_nan = 0;\n"
                  "    for (size_t i = 0; i < a.size(); ++i) {\n"
                  "        uint32_t ua, ub; memcpy(&ua, &a[i], 4); memcpy(&ub, &b[i], 4);\n"
@@ -144,6 +148,7 @@ jobs:
                  "    const int r = n_real != 0 ? 1 : 0;")
           open('dflash2_diag.cpp', 'w').write(src.replace(old, new))
           PY
+          if [ -f dflash2_skip ]; then echo "dflash2_diag: skipped (NaN-aware compare in tree)" >> ci-logs/summary.txt; exit 0; fi
           c++ -O2 -std=c++17 -Iggml/include dflash2_diag.cpp -Lbuild/bin -lggml -lggml-base -Wl,-rpath,"$PWD/build/bin" -o dflash2_diag > ci-logs/dflash2_diag_build.log 2>&1 || { cat ci-logs/dflash2_diag_build.log; exit 0; }
           ./dflash2_diag > ci-logs/dflash2_diag.txt 2>&1 || true
           cat ci-logs/dflash2_diag.txt
