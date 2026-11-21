@@ -631,8 +631,9 @@ if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-moe-cache-tail-skip.cpp)
 endif()
 
-# CPU work buffer: every node stays inside the size ggml_graph_plan() reserved (guard page after the buffer)
-if (NOT WIN32)
+# CPU work buffer: every node stays inside the size ggml_graph_plan() reserved (guard page after the buffer); it calls the CPU
+# backend's graph API directly, which a loadable CPU backend (GGML_BACKEND_DL) does not link
+if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-cpu-wsize-guard.cpp LINK ggml)
 endif()
 # the assign standing in for the plain lookup keeps the lookup's cache state (GPU backend, skipped without one)
