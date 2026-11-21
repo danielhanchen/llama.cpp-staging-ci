@@ -136,6 +136,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 // the cells makes the lists ascending and duplicate free, so they equal the compacted ones element by element
 #define FATTN_SEL_THREADS 1024
 #define FATTN_SEL_UNROLL  4
+static_assert(FATTN_SEL_THREADS/32 == 32, "ggml_cuda_qsa_maskless_gather_ok counts 32 warp sums");
 template <int ncols1>
 __launch_bounds__(FATTN_SEL_THREADS, 1)
 static __global__ void flash_attn_sel_to_sparse_indices(
@@ -284,7 +285,9 @@ int ggml_cuda_qsa_maskless_mode() {
 }
 
 bool ggml_cuda_qsa_maskless_gather_ok(const ggml_cuda_qsa_maskless & qsa) {
-    return size_t(qsa.kq->ne[0] + 31)/32*sizeof(uint32_t) <= 48*1024;
+    // the bitmap (dynamic shared memory) and the list kernel's static warp sums (1024 threads: 32 ints) within the default 48 KiB
+    // per block (no opt-in above it)
+    return size_t(qsa.kq->ne[0] + 31)/32*sizeof(uint32_t) + 32*sizeof(int) <= 48*1024;
 }
 
 void ggml_cuda_qsa_maskless_compact(
