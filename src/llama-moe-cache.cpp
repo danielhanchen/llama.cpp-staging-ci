@@ -11840,13 +11840,18 @@ struct llama_moe_cache::impl {
     // the scheduler places the prefetched copies of a large batch: they go to the last slots of the largest group of the device, which
     // are evicted while lent, so the device does not keep a staging arena that only large batches use; n_copies = 0 takes the slots back
     void lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, int64_t n_tokens) {
-        rf_join_all(); // asynchronous refill (see rf_on)
         const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
         // released (see release): no slots to lend, nothing to take back
         if (it_dev == devices.end() || !it_dev->buf_bank || it_dev->released) {
             return;
         }
         const int32_t id = (int32_t) (it_dev - devices.begin());
+
+        // asynchronous refill (see rf_on): a graph that lends or places copies waits for it first; the graph of a small batch (no copies,
+        // where the refill itself starts) and a measurement do not touch the slots
+        if (!dry && (n_copies > 0 || inplace_graph)) {
+            rf_join_all();
+        }
 
         // k15-lfm2: a graph of in-place prompts lends one layer of slots for its missing experts; its other copies (if any) stay in the
         // scheduler's arena
@@ -14001,7 +14006,9 @@ struct llama_moe_cache::impl {
     // before the graph runs (after its allocation, which places the lent slots): enable or disable its seed plans; the device state of the
     // groups it seeds is brought up to date with the host first
     void devseed_prepare(ggml_cgraph * gf, bool enable) {
-        rf_join_all(); // asynchronous refill (see rf_on)
+        if (enable) {
+            rf_join_all(); // asynchronous refill (see rf_on): the seed plans of this graph write slots (disabled, they are only zeroed)
+        }
         std::vector<bool> used(groups.size(), false);
         // a plan runs only if every bank of its group gets exactly one fill after it, from an expert product the scheduler left on the
         // group device that reads a device copy of the experts (else, e.g. without op offload, it is disabled and its fills copy nothing),
