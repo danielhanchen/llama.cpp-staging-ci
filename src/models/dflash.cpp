@@ -480,6 +480,23 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_build_forward_expand(g.gf, out);
 }
 
+// whether the device holding a weight runs the node; true without a device (an unallocated weight, as the fused op always was);
+// LLAMA_DFLASH2_CONV_DEV_CHECK=0: the fused op on every device
+static bool dflash2_conv_dev_ok(const ggml_tensor * w, const ggml_tensor * node) {
+    static const bool check = getenv("LLAMA_DFLASH2_CONV_DEV_CHECK") == nullptr || atoi(getenv("LLAMA_DFLASH2_CONV_DEV_CHECK")) != 0;
+    if (!check) {
+        return true;
+    }
+    while (w->view_src != nullptr) {
+        w = w->view_src;
+    }
+    if (w->buffer == nullptr) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer));
+    return dev == nullptr || ggml_backend_dev_supports_op(dev, node);
+}
+
 static ggml_tensor * build_dflash2_conv(
         llm_graph_context & g,
         ggml_tensor * hidden,
@@ -514,13 +531,18 @@ static ggml_tensor * build_dflash2_conv(
     }();
     if (fused && hidden->type == GGML_TYPE_F32 && dynamic->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32 &&
             ggml_is_contiguous(dynamic) && ggml_is_contiguous(base) && dynamic->ne[0] == n_groups * kernel_size * 2) {
-        static bool logged = false;
-        if (!logged) {
-            logged = true;
-            LLAMA_LOG_INFO("DFlash2 conv fused (ggml_dflash2_conv, LLAMA_DFLASH2_CONV_FUSED=0 off)\n");
-        }
         ggml_tensor * base_1d = ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]);
-        return ggml_dflash2_conv(ctx0, hidden, dynamic, base_1d, (int) kernel_size, (int) group_size, (int) n_blocks, side);
+        ggml_tensor * conv = ggml_dflash2_conv(ctx0, hidden, dynamic, base_1d, (int) kernel_size, (int) group_size, (int) n_blocks, side);
+        // only where the device of the weights runs the op (a device without it would run it as a CPU split between the drafter's
+        // device nodes, with the copies there and back): elsewhere the chain below, on the device
+        if (dflash2_conv_dev_ok(base, conv)) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LLAMA_LOG_INFO("DFlash2 conv fused (ggml_dflash2_conv, LLAMA_DFLASH2_CONV_FUSED=0 off)\n");
+            }
+            return conv;
+        }
     }
 
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);

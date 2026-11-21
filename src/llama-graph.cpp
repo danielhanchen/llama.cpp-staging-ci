@@ -53,13 +53,14 @@ static bool kq_mask_settable(const ggml_tensor * t) {
 // cells and the tokens (I32 inputs of 3 x n_kv and 5 x n_tokens) instead of a host mask of n_kv x n_tokens, the same values
 // (llama_kv_cache::set_input_kq_mask fills either). A layer-major group kept the host masks of all its members until computed
 // (16384 tokens: 288 MiB of f16 host masks, plus their build on the host). Only where the host mask has no ALiBi, sequence ids
-// < 64, and not the non-causal SWA_FULL span, with the attention offloaded; LLAMA_KQ_MASK_DEVICE=0 off
+// < 64, and not the non-causal SWA_FULL span, with the attention offloaded to devices that run the op (cparams.kq_mask_dev);
+// LLAMA_KQ_MASK_DEVICE=0 off
 // decode / verify ubatches (fewer than LLAMA_KQ_MASK_DEVICE_MIN_TOKENS, 64) keep the host mask: their host masks are small, while the
 // cells input is n_kv rows each step (RTX PRO 6000 the 4-bit model 12 GB with device masks at every ubatch: decode 8k / 16k -13 / -18%)
 static bool kq_mask_device_ok(const llama_ubatch & ubatch, const llama_hparams & hparams, const llama_cparams & cparams) {
     static const bool env = getenv("LLAMA_KQ_MASK_DEVICE") == nullptr || atoi(getenv("LLAMA_KQ_MASK_DEVICE")) != 0;
     static const uint32_t min_tokens = getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS"))) : 64;
-    return env && ubatch.n_tokens >= min_tokens && cparams.offload_kqv && !hparams.use_alibi && cparams.n_seq_max <= 64 &&
+    return env && ubatch.n_tokens >= min_tokens && cparams.offload_kqv && cparams.kq_mask_dev && !hparams.use_alibi && cparams.n_seq_max <= 64 &&
         (cparams.causal_attn || hparams.non_causal_type != LLAMA_NON_CAUSAL_TYPE_SWA_FULL);
 }
 

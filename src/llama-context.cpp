@@ -69,6 +69,34 @@
 
 static bool moe_cache_released_counts(); // (defined beside moe_cache_refill_from_ids)
 
+// whether every device of the model runs GGML_OP_KQ_MASK: a device without it (Metal, Vulkan, the meta device of -sm tensor) gets the
+// device KQ mask as a CPU split and a copy of the mask, where the host mask has the same values in an input; then the graphs keep the
+// host mask. LLAMA_KQ_MASK_DEVICE_CHECK=0: the device mask regardless, as before
+static bool model_devices_kq_mask(const llama_model & model) {
+    static const bool check = getenv("LLAMA_KQ_MASK_DEVICE_CHECK") == nullptr || atoi(getenv("LLAMA_KQ_MASK_DEVICE_CHECK")) != 0;
+    if (!check || model.devices.empty()) {
+        return true;
+    }
+    ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return true;
+    }
+    ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 5, 256, 1);
+    ggml_tensor * toks  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 8, 64, 1);
+    bool ok = true;
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        ggml_tensor * m = ggml_kq_mask(ctx, cells, toks, type);
+        for (const auto & d : model.devices) {
+            if (d.dev != nullptr && !ggml_backend_dev_supports_op(d.dev, m)) {
+                ok = false;
+            }
+        }
+    }
+    ggml_free(ctx);
+    return ok;
+}
+
 // the lowest compute capability (major*100 + minor*10) of the model's GPU devices, -1 if one is not a CUDA device or there is none
 static int model_gpu_min_cc(const llama_model & model) {
     int cc_min = -1;
@@ -500,6 +528,7 @@ llama_context::llama_context(
     cparams.exact_split             = 0;
     cparams.dsv41_far               = 0;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.kq_mask_dev             = model_devices_kq_mask(model);
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
