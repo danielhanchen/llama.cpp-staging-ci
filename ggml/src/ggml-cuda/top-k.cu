@@ -505,7 +505,7 @@ static void top_k_radix_cuda(
     }
 }
 
-// k19 (idea from ik_llama.cpp, author Joel Farthing, MIT): the radix select above in one launch per call, one block per
+// (idea from ik_llama.cpp, author Joel Farthing, MIT): the radix select above in one launch per call, one block per
 // row. The same four 8-bit histogram passes over the same keys pick the same threshold key and the same count of kept ties, and the
 // gather writes the same order: the keys above the threshold in column order, then the first kept ties in column order. So the output
 // is bitwise that of top_k_radix_cuda (init + 4 x (histogram + select) + gather = 10 launches per call). GGML_CUDA_TOPK_ONEBLOCK=0: off.
@@ -637,7 +637,7 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block(
     }
 }
 
-// k19-dsv4long: top_k_radix_one_block with IPT contiguous columns per thread and pass (vector loads when aligned): the same histograms
+// top_k_radix_one_block with IPT contiguous columns per thread and pass (vector loads when aligned): the same histograms
 // (counts do not depend on the visit order), the same threshold / kept-tie count, and the same gather order (keys above the threshold
 // in column order, then the first kept ties in column order: one block scan of per-thread counts per BLOCK_SIZE*IPT columns), so the
 // output is bitwise that of top_k_radix_one_block / top_k_radix_cuda. The old kernel issued one 4-byte load per thread and step, so a
@@ -789,7 +789,7 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block_v2
     }
 }
 
-// k19-dtopk: few rows of many columns and a small k (the MTP draft step's backend top_k(10) over 69632 / 248320 logits): the
+// few rows of many columns and a small k (the MTP draft step's backend top_k(10) over 69632 / 248320 logits): the
 // multi-block radix select is 10 dependent launches (init, 4 x histogram + select, gather), latency-bound at one row. Here one
 // launch: each block picks its k best columns of its slice by (key desc, column asc), one per round (key = top_k_float_to_ordered:
 // -0 == +0, the radix order of every value incl. NaN); the block that finishes last for a row merges the blocks' picks the same way
@@ -1080,8 +1080,8 @@ static void ggml_cuda_op_top_k_deterministic(ggml_cuda_pool & pool, const float 
     }
 #endif // GGML_CUDA_USE_CUB
 
-    // k19: few rows (one wave of blocks): the same selection and order in one launch, see top_k_radix_one_block
-    // k19-dsv4long (Kaggle T4, test-topk-oneblock-exact): one block per row wins up to ~32k columns (v2: 15360 cols 37 us vs 43
+    // few rows (one wave of blocks): the same selection and order in one launch, see top_k_radix_one_block
+    // (T4, test-topk-oneblock-exact): one block per row wins up to ~32k columns (v2: 15360 cols 37 us vs 43
     // multi-block vs 58 old one-block; 30000: 54 / 58 / 105) and for many rows (40 x 60000: 190 / 355 / 308); for 1-2 rows of more
     // columns the 64-block-per-row multi-block path is faster (60000: 68 vs 96 v2 vs 194 old; 122880: 62 vs 167), so with v2 on, few
     // long rows go there (before, the old one-block kernel took them up to 65536 columns)

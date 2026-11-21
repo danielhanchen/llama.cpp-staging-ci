@@ -15,7 +15,7 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// k15-hostcut: a recurrent state clear (SCALE by 0, in place, of one row of the states) and the GET_ROWS of the states after it in one
+// a recurrent state clear (SCALE by 0, in place, of one row of the states) and the GET_ROWS of the states after it in one
 // launch (llm_graph_context::build_rs at a new sequence). The cleared row gets scale*x + bias as the scale kernel writes it, and every
 // gathered copy of that row the same value (x*0 + 0 again gives the same bits, so a gather that reads the row after the clear agrees).
 // ggml_cuda_rs_zero_get_rows_ok: whether the pair qualifies. GGML_CUDA_RS_ZERO_FUSE=0: two launches

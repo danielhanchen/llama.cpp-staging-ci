@@ -306,7 +306,7 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 /* gated ops */
 
-// k15-fn: xn0 > 0: the rows of x are split into blocks of xn0 values xs1 apart (the strided view a CONT that did not run would have
+// xn0 > 0: the rows of x are split into blocks of xn0 values xs1 apart (the strided view a CONT that did not run would have
 // copied, see ggml_cuda_try_unary_src_cont_elide); the value read is the one that copy would hold
 template <float (*op)(float), typename T, bool x_split = false>
 static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
@@ -326,13 +326,13 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[j0])) * ggml_cuda_cast<float>(g[j1]));
 }
 
-// k15-mm2: unary_gated_op_kernel (F32) plus the q8_1 copy of dst for the mul_mat_vec_q that reads it (see ggml_cuda_q8_1_cache).
+// unary_gated_op_kernel (F32) plus the q8_1 copy of dst for the mul_mat_vec_q that reads it (see ggml_cuda_q8_1_cache).
 // The copy is in the reader's rows: rows of ne10 values (the reader's src1 row width, any width; dst may be a reshape of them) padded
-// to ne10q = ne10 rounded up to MATRIX_ROW_PADDING, as quantize_q8_1 lays the reader's src1 out (k15-fn 414e7c2d4a5's layout, which
+// to ne10q = ne10 rounded up to MATRIX_ROW_PADDING, as quantize_q8_1 lays the reader's src1 out (commit 414e7c2d4a5's layout, which
 // covers the gated rows themselves and the flat run of rows of a multiple of MATRIX_ROW_PADDING). Thread i holds q8_1 element i, computes
 // dst element e = row*ne10 + col (gated row e / n, column e % n) with the expression of unary_gated_op_kernel (0 in the padding) and
 // quantizes it as quantize_q8_1 does (one value per lane, the same 32-lane reductions), so dst and the copy have the bytes of the unfused
-// unary_gated_op_kernel + quantize_q8_1 pair. x_split: the strided x of k15-fn 6e134f1f896 (column c at (c / xn0)*xs1 + c % xn0)
+// unary_gated_op_kernel + quantize_q8_1 pair. x_split: the strided x of commit 6e134f1f896 (column c at (c / xn0)*xs1 + c % xn0)
 template <float (*op)(float), bool x_split = false>
 static __global__ void unary_gated_q8_1_kernel(const float * x, const float * g, float * dst, void * vq, const int64_t kq, const int64_t n,
         const int64_t ne10, const int64_t ne10q, const int64_t o0, const int64_t o1, const int64_t xn0 = 0, const int64_t xs1 = 0) {
@@ -374,9 +374,9 @@ static __global__ void unary_gated_q8_1_kernel(const float * x, const float * g,
     }
 }
 
-// k15-mm2: GGML_CUDA_GATED_Q8_1=0 turns the q8_1 copy of gated / unary-mul outputs off
+// GGML_CUDA_GATED_Q8_1=0 turns the q8_1 copy of gated / unary-mul outputs off
 static bool ggml_cuda_gated_q8_1_disabled() {
-    // GGML_CUDA_DISABLE_GLU_Q8_1=1 (k15-fn 414e7c2d4a5, which this replaces) is an alias
+    // GGML_CUDA_DISABLE_GLU_Q8_1=1 (commit 414e7c2d4a5, which this replaces) is an alias
     static const bool off = [] {
         const char * e = getenv("GGML_CUDA_GATED_Q8_1");
         const char * d = getenv("GGML_CUDA_DISABLE_GLU_Q8_1");
@@ -492,7 +492,7 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             src1_p += swapped ? 0 : nc;
         }
 
-        // k15-mm2: a mul_mat_vec_q reads dst: its q8_1 copy from this kernel
+        // a mul_mat_vec_q reads dst: its q8_1 copy from this kernel
         int64_t ne10 = 0, ne10q = 0;
         void * q8_1_out = unary_gated_q8_1_reserve(ctx, dst, nc, ne10, ne10q);
         unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream,
@@ -826,7 +826,7 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     const ggml_tensor * unary_src = unary_node->src[0];  // input to the unary op
     const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
 
-    // k15-fn: the unary input is a CONT that did not run: read its source, a 3D f32 view [n0, n1, rows] (ggml_cuda_try_unary_src_cont_elide)
+    // the unary input is a CONT that did not run: read its source, a 3D f32 view [n0, n1, rows] (ggml_cuda_try_unary_src_cont_elide)
     if (split_src != nullptr) {
         GGML_ASSERT(unary_src->type == GGML_TYPE_F32 && other_src->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32);
         GGML_ASSERT(split_src->type == GGML_TYPE_F32 && split_src->nb[0] == sizeof(float) && split_src->ne[3] == 1);
@@ -868,7 +868,7 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
                              (nv_bfloat16 *) mul_node->data, k, nc,
                              unary_stride / sizeof(nv_bfloat16), other_stride / sizeof(nv_bfloat16), stream);
     } else {
-        // k15-mm2: a mul_mat_vec_q reads the product: its q8_1 copy from this kernel
+        // a mul_mat_vec_q reads the product: its q8_1 copy from this kernel
         int64_t ne10 = 0, ne10q = 0;
         void * q8_1_out = unary_gated_q8_1_reserve(ctx, mul_node, nc, ne10, ne10q);
         unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
@@ -1019,7 +1019,7 @@ static __global__ void ew_chain_f32_kernel(const float * x, float * dst, const i
 
 // ew_chain_f32_kernel plus the q8_1 copy of the output: element i is computed and quantized by thread i, as quantize_q8_1
 // does it (one value per lane, the same 32-lane reductions; CUDA_NEG_BLOCK_SIZE % QK8_1 == 0), padding values are 0
-// k15-mm2: rows of ne0 values, their q8_1 copy padded to ne0q per row (ne0q == ne0 or a single row: the layout as before)
+// rows of ne0 values, their q8_1 copy padded to ne0q per row (ne0q == ne0 or a single row: the layout as before)
 static __global__ void ew_chain_q8_1_f32_kernel(const float * x, float * dst, void * vq, const int64_t ne0, const int64_t ne0q, const int64_t kq,
         const ggml_cuda_ew_chain chain) {
     ggml_cuda_pdl_lc();
@@ -1242,7 +1242,7 @@ static __global__ void unary_mul_gate_f32_kernel(const float * g, const float * 
     dst[i] = op(g[row*sg]) * x[row*sx + i % n];
 }
 
-// k15-fn: the gated product added to a (ADD(a, MUL(x, UNARY(g))), the shared expert added to the routed experts): one kernel for the
+// the gated product added to a (ADD(a, MUL(x, UNARY(g))), the shared expert added to the routed experts): one kernel for the
 // three ops. a + v equals v + a (float addition commutes), so this is bit-identical to the unfused ops
 template <float (*op)(float)>
 static __global__ void unary_mul_gate_add_f32_kernel(const float * g, const float * x, const float * a, float * dst, const int64_t k,

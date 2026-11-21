@@ -1291,7 +1291,7 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
-        // k19-moebw: the signs of the 8 values, as 0x01 in each byte of a negative value (bit i of the sign byte -> bit 8 i: the
+        // the signs of the 8 values, as 0x01 in each byte of a negative value (bit i of the sign byte -> bit 8 i: the
         // partial products of the multiply do not overlap), then -g = (g ^ 0xFF) + 1 in each such byte: every iq3s_grid byte is
         // 1..15, so no byte carries into the next one and the ints are those of __vsub4(g ^ m, m) with the __vcmpne4 masks m (fewer
         // instructions: the MoE mat-vec of IQ3_S experts is bound by them)

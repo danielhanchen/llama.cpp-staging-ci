@@ -1,4 +1,4 @@
-// k11-decode: LFM2 short-conv block fusions for small batches (decode and speculative verify windows, at most 32 tokens per sequence).
+// LFM2 short-conv block fusions for small batches (decode and speculative verify windows, at most 32 tokens per sequence).
 //
 // The short-conv block of LFM2 / LFM2-MoE (src/models/lfm2.cpp build_shortconv_block) is, per layer:
 //   bx   = b * x                        MUL      (b, x: views of the in_proj output)
@@ -22,7 +22,7 @@ static bool shortconv_fuse_enabled() {
     return on;
 }
 
-// k15-lfm2: windows of 2..32 tokens (speculative verify) spread the tokens over the grid instead of a loop per thread (the same
+// windows of 2..32 tokens (speculative verify) spread the tokens over the grid instead of a loop per thread (the same
 // float operations per element, so bit-identical; decode keeps the one-token kernels). GGML_CUDA_SHORTCONV_TOKENS=0: off
 static bool shortconv_tokens_enabled() {
     static const bool on = [] {
@@ -38,7 +38,7 @@ static bool shortconv_f32(const ggml_tensor * t) {
 
 // ---------------------------------------------------------------------------------------------------------- 1. b * x into the window
 // out[t, ch, s] = t < d ? state[t, ch, s] : b[ch, t - d, s] * x[ch, t - d, s]
-// k15: + the conv state snapshots (the CPYs of views of the window into the recurrent cache that follow it, lfm2.cpp): snapshot k
+// + the conv state snapshots (the CPYs of views of the window into the recurrent cache that follow it, lfm2.cpp): snapshot k
 // writes dst[k] + s*dst_nb1[k] + (ch*d + c)*4 = out[off[k] + c, ch, s], the values this thread just wrote (GGML_CUDA_SHORTCONV_STATE=0: off)
 struct shortconv_snaps {
     static constexpr int n_max = 8;
@@ -76,7 +76,7 @@ static __global__ void shortconv_window_f32(const char * state, const char * b, 
     }
 }
 
-// k15-lfm2: one thread per window element (t, ch, s), grid z = window column t. A snapshot element is written by the thread of the
+// one thread per window element (t, ch, s), grid z = window column t. A snapshot element is written by the thread of the
 // window column it copies (the same value: a copy of state or the same b * x product); a snapshot into the state cell it was read
 // from (same_cell) is written by the thread that reads that state element, after its read, so no thread reads an overwritten value.
 static __global__ void shortconv_window_tok_f32(const char * state, const char * b, const char * x, char * out,
@@ -166,14 +166,14 @@ int ggml_cuda_try_fuse_shortconv_window(ggml_backend_cuda_context & ctx, ggml_cg
             return 0;
         }
     }
-    // k15: the state snapshots right after the window (views and CPYs; any other node ends the scan)
+    // the state snapshots right after the window (views and CPYs; any other node ends the scan)
     static const bool state_on = [] {
         const char * e = getenv("GGML_CUDA_SHORTCONV_STATE");
         return e == nullptr || atoi(e) != 0;
     }();
     shortconv_snaps snaps = {};
     int n_extra = 0;
-    int same_cell_mask = 0;   // k15-lfm2: snapshots written into the state cell they were read from
+    int same_cell_mask = 0;   // snapshots written into the state cell they were read from
     if (state_on) {
         for (int j = i + 3; j < cgraph->n_nodes && snaps.n < shortconv_snaps::n_max; ++j) {
             const ggml_tensor * node = cgraph->nodes[j];
@@ -219,7 +219,7 @@ int ggml_cuda_try_fuse_shortconv_window(ggml_backend_cuda_context & ctx, ggml_cg
         }
     }
     const int threads = 128;
-    // k15-lfm2: the token-parallel kernel for 2+ tokens, unless two snapshots share destination bytes (their order would matter) or a
+    // the token-parallel kernel for 2+ tokens, unless two snapshots share destination bytes (their order would matter) or a
     // same-cell snapshot would copy a column another same-cell snapshot overwrites first
     bool tok = shortconv_tokens_enabled() && n_t > 1;
     for (int a = 0; tok && a < snaps.n; ++a) {
@@ -269,7 +269,7 @@ static __global__ void shortconv_conv_mul_f32(const float * __restrict__ src0, c
                                               const int64_t c_nb0, const int64_t c_nb1, const int64_t c_nb2,
                                               float * __restrict__ dst, const int dst_nb0, const int dst_nb1, const int dst_nb2,
                                               const int64_t n_t, void * __restrict__ vq = nullptr, const int ncols_padded = 0) {
-    // k15: vq (nullable): the q8_1 copy of the output for the out_proj mul_mat_vec_q (ggml_cuda_q8_1_cache), rows = tokens; a warp holds
+    // vq (nullable): the q8_1 copy of the output for the out_proj mul_mat_vec_q (ggml_cuda_q8_1_cache), rows = tokens; a warp holds
     // 32 consecutive channels of a token, lane = element of its q8_1 block, the same 32-lane reductions as quantize_q8_1, so the copy is
     // bit-identical to quantizing the f32 output
     const int tid  = threadIdx.x;
@@ -332,7 +332,7 @@ static __global__ void shortconv_conv_mul_f32(const float * __restrict__ src0, c
     }
 }
 
-// k15-lfm2: shortconv_conv_mul_f32 with one token per block (grid z): token i sums window columns i .. i + d_conv - 1 times w in the
+// shortconv_conv_mul_f32 with one token per block (grid z): token i sums window columns i .. i + d_conv - 1 times w in the
 // same order (j = 0, 1, 2, starting from 0.0f, then + b), so every output and its q8_1 copy are bit-identical to the loop kernel's
 template <size_t split_d_inner, size_t d_conv>
 static __global__ void shortconv_conv_mul_tok_f32(const float * __restrict__ src0, const float * __restrict__ src1, const char * cmul,
@@ -435,7 +435,7 @@ int ggml_cuda_try_fuse_shortconv_conv_mul(ggml_backend_cuda_context & ctx, ggml_
             return 0;
         }
     }
-    // k15: the q8_1 copy of the product for the out_proj reader (GGML_CUDA_SHORTCONV_Q8_1=0: off)
+    // the q8_1 copy of the product for the out_proj reader (GGML_CUDA_SHORTCONV_Q8_1=0: off)
     static const bool q8_on = [] {
         const char * e = getenv("GGML_CUDA_SHORTCONV_Q8_1");
         return e == nullptr || atoi(e) != 0;
@@ -450,7 +450,7 @@ int ggml_cuda_try_fuse_shortconv_conv_mul(ggml_backend_cuda_context & ctx, ggml_
         ggml_cuda_q8_1_cache::key_contiguous(mul->ne[0], ggml_nrows(mul), key);
         q8_1_out = cache.reserve(mul->data, ggml_nbytes(mul), key, ggml_nrows(mul)*ncols_padded/QK8_1*sizeof(block_q8_1));
     }
-    // k15-lfm2: the token-parallel kernel for 2+ tokens; the output may be in place on c only element for element (checked above),
+    // the token-parallel kernel for 2+ tokens; the output may be in place on c only element for element (checked above),
     // and each element's c is read by the thread that writes it, so the order across tokens does not matter
     if (shortconv_tokens_enabled() && n_t > 1) {
         const dim3 blocks_t((unsigned) n_s, (unsigned) ((nr + threads - 1)/threads), (unsigned) n_t);

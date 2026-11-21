@@ -2899,7 +2899,7 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     // KQ_MASK (llama, batches of 64+ tokens) is computed by the client's CPU and its mask uploaded, as the host mask was: the remote
     // backend may lack it (Metal, Vulkan), and an older server does not know the op; the same for the GATED_DELTA_NET replay window
     // (op_params[1] != 0, llama builds it only on CUDA / ROCm / MUSA / CPU state buffers), which the server refuses too
-    // k19-handoff: DFLASH2_CONV is computed by the client's CPU too (an older server does not know the op)
+    // DFLASH2_CONV is computed by the client's CPU too (an older server does not know the op)
     return op->op != GGML_OP_MOE_CACHE_LOOKUP && op->op != GGML_OP_KQ_MASK && op->op != GGML_OP_DFLASH2_CONV &&
         !(op->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(op, 1) != 0);
 }

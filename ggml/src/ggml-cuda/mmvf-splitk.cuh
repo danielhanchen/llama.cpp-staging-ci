@@ -2,7 +2,7 @@
 
 #include "common.cuh"
 
-// k15-mm2: one block of the split-K F32 mat-vec (see mul_mat_vec_f_splitk_try in mmvf.cu): block (row, split) of nsplit sums the
+// one block of the split-K F32 mat-vec (see mul_mat_vec_f_splitk_try in mmvf.cu): block (row, split) of nsplit sums the
 // K range [split*chunk2, (split+1)*chunk2) of float2 pairs, writes its partial sums and the last block of the row to arrive adds
 // them in split order. Used by mul_mat_vec_f_splitk and by the hyper-connection down + inject launch (mmvq.cu), which run the same
 // code, so both write the same bytes. tid = the 1D thread index of a MMVF_SPLITK_BLOCK thread block (warp = tid / 32).

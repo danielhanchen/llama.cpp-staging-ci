@@ -85,7 +85,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-// k15-fn: the multi-section rope applied to each normed row by the norm kernel itself (RMS_NORM -> MUL -> ROPE, the q / k norms of
+// the multi-section rope applied to each normed row by the norm kernel itself (RMS_NORM -> MUL -> ROPE, the q / k norms of
 // qwen4exp attention): row = head, channel = token, sample = sequence of the rope, see ggml_cuda_op_rms_norm_rope_fused
 struct ggml_cuda_rms_rope_args {
     float *         dst          = nullptr;
@@ -462,7 +462,7 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
                                              const float * ra = nullptr,
                                              const float * rb = nullptr,
                                              const ggml_cuda_hc_post_args hcp = {}) {
-    // k15: ra / rb (both or neither): x = ra + rb is computed here (the ADD before the norm, a residual add) and stored to x, with the
+    // ra / rb (both or neither): x = ra + rb is computed here (the ADD before the norm, a residual add) and stored to x, with the
     // same float add as k_bin_bcast's op_add; the norm reads the same values, so every output is bit-identical to ADD + RMS_NORM + MUL
     static_assert(block_size % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
     ggml_cuda_pdl_lc();
@@ -565,7 +565,7 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
             // one pass: element i0 is computed, stored and quantized by the same thread, and lane i0 % QK8_1 of its warp is
             // the q8_1 lane quantize_q8_1 uses for it (block_size % QK8_1 == 0), so no read-back is needed
             block_q8_1 * y = (block_q8_1 *) vq + irow*(ncols_padded/QK8_1);
-            // k15-mm2: a batch of RMS_Q8_1_BATCH elements per thread has its loads issued before its math (GGML_CUDA_RMS_Q8_1_BATCH=0:
+            // a batch of RMS_Q8_1_BATCH elements per thread has its loads issued before its math (GGML_CUDA_RMS_Q8_1_BATCH=0:
             // one element at a time); every element is computed by the same expressions and lanes, so the outputs do not change
             for (int i00 = tid; i00 < ncols_padded; i00 += batch*block_size) { // ncols_padded % WARP_SIZE == 0: whole warps
                 float xv[batch];
@@ -866,7 +866,7 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
-// k11: rms_norm(x) * mul that also writes the copy of its output that the next matrix products convert it to (prompt batches,
+// rms_norm(x) * mul that also writes the copy of its output that the next matrix products convert it to (prompt batches,
 // see ggml_cuda_src1_memo): mode 0 / 1 = the q8_1 MMQ rows (block_q8_1_mmq, D4 / DS4 scales) of the products' [K_out, N_out]
 // view of the output, mode 2 = its BF16 copy. Only the launch rms_norm_f32_dispatch picks for float4 rows of at most 1024
 // float4 (vpt 1), so the f32 output is computed by the same expressions in the same order; each thread holds the same 4
@@ -992,7 +992,7 @@ static __global__ void rms_norm_mul_conv_f32(const float * x,
     }
 }
 
-// k11: launch rms_norm_mul_conv_f32 when rms_norm_f32_dispatch would pick the float4, vpt 1 kernel for this norm; false if not
+// launch rms_norm_mul_conv_f32 when rms_norm_f32_dispatch would pick the float4, vpt 1 kernel for this norm; false if not
 static bool rms_norm_mul_conv_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * x_t, const ggml_tensor * mul_t, float * dst_d,
         int mode, void * out, int64_t K_out, int64_t N_out, float eps) {
     const int64_t ne00 = x_t->ne[0], ne01 = x_t->ne[1], ne02 = x_t->ne[2], ne03 = x_t->ne[3];
@@ -1047,7 +1047,7 @@ static bool rms_norm_mul_conv_launch(ggml_backend_cuda_context & ctx, const ggml
     return true;
 }
 
-// k19-fu2 F1: rms_norm_mul_conv_f32 whose input row is the DSV4_HC_POST output (no comb, the gated SCALE -> SIGMOID -> SCALE weight of
+// rms_norm_mul_conv_f32 whose input row is the DSV4_HC_POST output (no comb, the gated SCALE -> SIGMOID -> SCALE weight of
 // qwen4exp's hc_combine) that it computes first: the hyper-connection combine of block i and the grouped norm of block i + 1's mix
 // in one launch. The post value of element (i0, stream, token) is the expression of dsv4_hc_post_f32<false, true> (the weight, then
 // sum = bo*w; sum += residual), stored to the DSV4_HC_POST output; the norm, its mul and the products' copy are the code of
@@ -1269,7 +1269,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                                  const ggml_tensor * add_tensor, const ggml_cuda_hc_post_args * hcp) {
     GGML_ASSERT(hcp == nullptr || (q8_1_out != nullptr && add_tensor == nullptr));
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
-    // k15: add_tensor (the ADD producing rms_norm_src, fused before it): only with the q8_1 output (see ggml_cuda_try_fuse_add_rms_norm)
+    // add_tensor (the ADD producing rms_norm_src, fused before it): only with the q8_1 output (see ggml_cuda_try_fuse_add_rms_norm)
     GGML_ASSERT(add_tensor == nullptr || (add_tensor == rms_norm_src && q8_1_out != nullptr));
     float eps = 0.0f;
 
@@ -1315,7 +1315,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
-    // k11: the next products' conversion of this output, written by the norm (see ggml_cuda_src1_memo)
+    // the next products' conversion of this output, written by the norm (see ggml_cuda_src1_memo)
     ggml_cuda_src1_memo & memo = ctx.src1_memo;
     if (q8_1_out == nullptr && add_tensor == nullptr && memo.producer == mul_tensor && memo.held && ggml_is_contiguous(mul_tensor) &&
             ggml_are_same_shape(rms_norm_src, mul_tensor) && ggml_is_contiguous(rms_norm_src)) {
@@ -1393,7 +1393,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           eps, stream);
 }
 
-// k15-fn: RMS_NORM -> MUL -> ROPE (multi-section, not vision) in the rms_norm + mul kernel: the norm launch and the rope arithmetic
+// RMS_NORM -> MUL -> ROPE (multi-section, not vision) in the rms_norm + mul kernel: the norm launch and the rope arithmetic
 // are the unfused ones (rms_norm_f32_dispatch, rope_multi_rotate), so the output is bitwise the unfused one; the rope reads the
 // mul output row back from global memory after a block sync. See ggml_cuda_should_fuse_rms_norm_mul_mrope for the conditions
 void ggml_cuda_op_rms_norm_mul_mrope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope) {
@@ -1455,7 +1455,7 @@ void ggml_cuda_op_rms_norm_mul_mrope_fused(ggml_backend_cuda_context & ctx, ggml
         nullptr, 0, 0, 0, zero_packed, zero_packed, zero_packed, zero_packed, ctx.stream(), 1.0f, a);
 }
 
-// k15-fn: a QSA layer's new pooled keys in one warp per pool (qwen4exp build_qsa_sel: GET_ROWS of the kpool member keys -> CONT + ADDs
+// a QSA layer's new pooled keys in one warp per pool (qwen4exp build_qsa_sel: GET_ROWS of the kpool member keys -> CONT + ADDs
 // (their sum) -> SCALE (the mean) -> RMS_NORM -> MUL -> ROPE (multi-section) -> SET_ROWS into the pooled half of the rep row). Every
 // step is the unfused kernel's float arithmetic in its order: the member keys converted as get_rows does, summed member 0 first, the
 // scale kernel's scale * x + bias, the norm of rms_norm_f32<32, 1, true, true> (the launch rms_norm_f32_dispatch picks for these rows,
@@ -1741,14 +1741,14 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
-// k19: the gated delta net output norm (qwen4exp build_norm_gated): RMS_NORM -> MUL (weight) -> MUL by UNARY SIGMOID (z), in one kernel
+// the gated delta net output norm (qwen4exp build_norm_gated): RMS_NORM -> MUL (weight) -> MUL by UNARY SIGMOID (z), in one kernel
 // instead of rms_norm_f32<do_multiply> + unary_gated_q8_1_kernel. The sum of squares is rms_norm_f32's (the same loads and expressions
 // for the block size, vpt and float4 choice rms_norm_f32_dispatch makes), each output is op_sigmoid(z) * (scale * x * w) as the two
 // kernels compute it, and the q8_1 copy (vq != nullptr) is in the reader's rows (ne10 values padded to ne10q, the layout of
 // unary_gated_q8_1_kernel) with one value per lane and the same 32-lane reductions as quantize_q8_1. So dst and the copy are bitwise
 // those of the unfused kernels. Needs ncols % QK8_1 == 0 and ne10 % QK8_1 == 0 (checked by the caller); the weight row is not broadcast
 // along the columns (mul_ncols == ncols).
-// k19-p1fuse: the gate of the fused gated norm: op_sigmoid(z) (qwen4exp) or op_silu(z) (qwen35 / qwen35moe, GGML_CUDA_GATED_NORM_SILU=0
+// the gate of the fused gated norm: op_sigmoid(z) (qwen4exp) or op_silu(z) (qwen35 / qwen35moe, GGML_CUDA_GATED_NORM_SILU=0
 // off), each the expression unary_gated_q8_1_kernel / unary_gated_op_kernel apply for that op, so the product is bitwise theirs
 template <bool silu>
 static __device__ __forceinline__ float k19_gated_norm_gate(const float z) {
@@ -1871,7 +1871,7 @@ static __global__ void rms_norm_mul_sigmoid_gate_f32(const float * x,
     }
 }
 
-// k19-fu2 F2: rms_norm_mul_sigmoid_gate_f32 (prompt batches) that also writes the copy its out projection converts it to: the q8_1 MMQ
+// rms_norm_mul_sigmoid_gate_f32 (prompt batches) that also writes the copy its out projection converts it to: the q8_1 MMQ
 // rows with D4 scales (block_q8_1_mmq; the products' [K_out, N_out] view of the output, ggml_cuda_src1_memo). The f32 output is the code
 // of rms_norm_mul_sigmoid_gate_f32 (same launch choice); each warp holds 32 consecutive outputs (ncols % 32 == 0, K_out % 128 == 0),
 // one q8_1 scale group of quantize_mmq_q8_1, whose D4 scale only needs their largest magnitude (a max, so the lane order does not
@@ -2094,7 +2094,7 @@ bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, con
     if (ggml_nrows(z) > 1 && (z->nb[2] != z->ne[1]*z->nb[1] || z->nb[3] != z->ne[2]*z->nb[2])) {
         return false;
     }
-    // k19-p1fuse: the gate op (sigmoid, or silu unless GGML_CUDA_GATED_NORM_SILU=0)
+    // the gate op (sigmoid, or silu unless GGML_CUDA_GATED_NORM_SILU=0)
     if (unary->op != GGML_OP_UNARY) {
         return false;
     }
@@ -2168,7 +2168,7 @@ bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, con
     return true;
 }
 
-// k19: two RMS_NORM -> SCALE pairs over sources of one shape and stride (the gated delta net's q and k L2 norm, build_gdn_l2_norm) in
+// two RMS_NORM -> SCALE pairs over sources of one shape and stride (the gated delta net's q and k L2 norm, build_gdn_l2_norm) in
 // one launch: blockIdx.z picks the pair. Each block runs rms_norm_f32<do_scale>'s expressions for the block size, vpt and float4 choice
 // rms_norm_f32_dispatch makes, so both outputs are bitwise those of the two separate launches.
 template <int block_size, int vpt, bool do_vec>

@@ -3536,7 +3536,7 @@ struct ggml_tensor * ggml_kq_mask_win(
     return result;
 }
 
-// k19-kvlong: see ggml-sel-mask.h
+// see ggml-sel-mask.h
 struct ggml_tensor * ggml_sel_mask(
         struct ggml_context * ctx,
         struct ggml_tensor  * idx,
@@ -3565,7 +3565,7 @@ struct ggml_tensor * ggml_moe_cache_lookup(
         int                   n_banks,
         int                   il) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && map->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32);
-    // k15-fn: the rows of ids may be strided (a view of the argsort, e.g. ggml_argsort_top_k), the elements of a row contiguous
+    // the rows of ids may be strided (a view of the argsort, e.g. ggml_argsort_top_k), the elements of a row contiguous
     GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ids->nb[1] >= ids->ne[0]*sizeof(int32_t) && ids->ne[2] == 1 && ids->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(map) && ggml_is_contiguous(state));
     GGML_ASSERT(il >= 0 && il < map->ne[1]);
@@ -3612,7 +3612,7 @@ struct ggml_tensor * ggml_moe_cache_assign(
         float                 fetch,
         int                   il) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && map->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32 && counts->type == GGML_TYPE_I32);
-    // k15-fn: the rows of ids may be strided (a view of the argsort, e.g. ggml_argsort_top_k), the elements of a row contiguous
+    // the rows of ids may be strided (a view of the argsort, e.g. ggml_argsort_top_k), the elements of a row contiguous
     GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ids->nb[1] >= ids->ne[0]*sizeof(int32_t) && ids->ne[2] == 1 && ids->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(map) && ggml_is_contiguous(state) && ggml_is_contiguous(counts));
     GGML_ASSERT(il >= 0 && il < map->ne[1]);
@@ -3621,7 +3621,7 @@ struct ggml_tensor * ggml_moe_cache_assign(
 
     const int64_t n_slots = (ggml_nelements(state) - 8)/3;
     GGML_ASSERT(n_slots > 0 && ggml_nelements(state) == 8 + 3*n_slots);
-    // k19-hostrow: no "distinct experts <= slots" condition here (the plain lookup keeps it): the assign admits at most the slots
+    // no "distinct experts <= slots" condition here (the plain lookup keeps it): the assign admits at most the slots
     // the lookup does not pin and leaves the other misses to the host (LLAMA_MOE_HYBRID_WIDE windows)
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], 5*ids->ne[1] + 1);
@@ -3842,7 +3842,7 @@ void ggml_moe_cache_set_defer(struct ggml_tensor * assign, struct ggml_tensor * 
     ggml_set_op_params_i32(fetch, 12, 2);
 }
 
-// k19-q4xcache: an assign at fetch share 1 that stands in for ggml_moe_cache_lookup leaves the use counters unwritten, as the lookup
+// an assign at fetch share 1 that stands in for ggml_moe_cache_lookup leaves the use counters unwritten, as the lookup
 // (declared by its caller, llama-moe-cache.cpp, so that ggml.h and every file including it stay unchanged)
 GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op);
 GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op) {
@@ -3851,7 +3851,7 @@ GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op) {
     ggml_set_op_params_i32(op, 8, 1);
 }
 
-// k19-ptres: the first n_core slots of the cache are a core that no lookup, assign or seed plan evicts (their victims come from the
+// the first n_core slots of the cache are a core that no lookup, assign or seed plan evicts (their victims come from the
 // slots above it); 0 = no core (the default). Op param 9 of a lookup (unused with at most 3 banks), 7 of an assign or a seed plan.
 // (declared by its caller, llama-moe-cache.cpp, so that ggml.h and every file including it stay unchanged)
 GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int32_t n_core);
@@ -3867,7 +3867,7 @@ GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int32_t n_core) {
     }
 }
 
-// k19-g4pref: cross-layer prefetch of a cache layer (il) from a prediction of its routing (logits: F32 [n_expert, n_tokens], e.g. the
+// cross-layer prefetch of a cache layer (il) from a prediction of its routing (logits: F32 [n_expert, n_tokens], e.g. the
 // router of il run on the input of the layer before it). The backend picks the n_top experts with the largest logits of each token,
 // admits the missing ones into the cache as a lookup of those ids would (victims, core, eviction state; no use counters, scores or
 // lookup statistics), at most max_fill per call (0: no cap), and copies them from host memory beside the graph; the next cache op of

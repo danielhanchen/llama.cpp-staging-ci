@@ -5,7 +5,7 @@
 #include "cpy.cuh"
 #include "concat.cuh"
 
-// k15-fn: conv-state copies the short-token kernel also writes (see ggml_cuda_try_conv_state_defer): copy c writes, for every channel
+// conv-state copies the short-token kernel also writes (see ggml_cuda_try_conv_state_defer): copy c writes, for every channel
 // and sequence, the cols floats of the channel's input row starting at column s_idx[c] to dst[c] + seq * seq_stride[c] + ch * ch_stride[c]
 struct ssm_conv_state_copies {
     static constexpr int max_copies = ssm_conv_state_max_copies;
@@ -80,7 +80,7 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
     }
 }
 
-// k15-fn: the conv input is the CONCAT (dim 0) of d_conv - 1 state columns a and the n_t <= max_t new columns b, not run
+// the conv input is the CONCAT (dim 0) of d_conv - 1 state columns a and the n_t <= max_t new columns b, not run
 // (ggml_cuda_try_conv_cat_elide): a thread loads all of its channel's inputs into registers first, then writes the deferred conv-state
 // copies (which may write the very state row it read: each channel's row is private to its thread, checked by the caller), then the
 // convolution, with the same float operations in the same order as ssm_conv_f32
@@ -156,7 +156,7 @@ static __global__ void ssm_conv_cat_f32(const ssm_conv_cat cat, const float * sr
     }
 }
 
-// from_cat (k19-fuse F5, ggml_cuda_try_conv_cat_elide_prompt): src0 is a CONCAT (dim 0) that did not run, the d_conv - 1 state columns
+// from_cat (ggml_cuda_try_conv_cat_elide_prompt): src0 is a CONCAT (dim 0) that did not run, the d_conv - 1 state columns
 // cat.a and the transposed new tokens cat.b: a thread loads its own channel's columns from the two parts (channels adjacent in b),
 // the convolution is the same code
 template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t, bool from_cat = false>
@@ -328,7 +328,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(ggml_nelements(bias) == nr);
     }
 
-    // k15-fn: the conv-state copies deferred to this convolution (ggml_cuda_try_conv_state_defer); a long input runs them as copies first
+    // the conv-state copies deferred to this convolution (ggml_cuda_try_conv_state_defer); a long input runs them as copies first
     ssm_conv_state_copies cs = {};
     std::vector<ggml_tensor *> cpys;
     auto pend = ctx.conv_state_pending.find(dst);
@@ -337,11 +337,11 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         ctx.conv_state_pending.erase(pend);
     }
 
-    // k15-fn: the conv input is a CONCAT that did not run (ggml_cuda_try_conv_cat_elide): read its two parts, or run it now when this
+    // the conv input is a CONCAT that did not run (ggml_cuda_try_conv_cat_elide): read its two parts, or run it now when this
     // launch cannot (too many tokens or copies, a copy or the output over a part other than the thread-private state row)
     ssm_conv_cat cat = {};
     bool use_cat = false;
-    bool prompt  = false;                  // k19-fuse F5: a prompt concat, its conv-state copies moved behind this launch
+    bool prompt  = false;                  // a prompt concat, its conv-state copies moved behind this launch
     std::vector<ggml_tensor *> prompt_cpys;
     if (!ctx.conv_cat_elided.empty() && ctx.conv_cat_elided.count(src0)) {
         ctx.conv_cat_elided.erase(src0);
@@ -422,7 +422,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream, cs, use_cat ? &cat : nullptr);
     }
 
-    // k19-fuse F5: the conv-state copies of the elided prompt concat, from its new-token part: copy c's column range starts at
+    // the conv-state copies of the elided prompt concat, from its new-token part: copy c's column range starts at
     // concat column s >= d_conv - 1, which is column s - (d_conv - 1) of b
     if (!prompt_cpys.empty()) {
         const ggml_tensor * b = src0->src[1];

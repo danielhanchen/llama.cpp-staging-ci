@@ -79,7 +79,7 @@ extern "C" {
     //
 
     // x86
-    // k18: the host experts of one single-graph MoE mailbox batch (see ggml-cpu.c): out[t*n_used + j] = down_e(swiglu(gate_e(x_t), up_e(x_t)))
+    // the host experts of one single-graph MoE mailbox batch (see ggml-cpu.c): out[t*n_used + j] = down_e(swiglu(gate_e(x_t), up_e(x_t)))
     // for e = ids[t*n_used + j] >= 0, rows of -1 left as they are (GGML_MOE_HOST_LEAN=0: zeroed); bit-identical to the graph mul_mat_id
     // up / gate, swiglu_split, mul_mat_id down.
     // false: not handled (no OpenMP build, types, scratch too small); the caller computes the graph.
@@ -87,13 +87,13 @@ extern "C" {
             int n_used, int n_tokens, int n_threads);
     GGML_BACKEND_API bool   ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
             const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize);
-    // k19-l4b: the same batch on a team of threads of its own instead of an OpenMP region (bit-identical; GGML_MOE_HOST_TEAM=0: the
+    // the same batch on a team of threads of its own instead of an OpenMP region (bit-identical; GGML_MOE_HOST_TEAM=0: the
     // OpenMP region), whether that team is on, and a stop of the team (joins its threads)
     GGML_BACKEND_API bool   ggml_cpu_moe_host_ffn_team(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
             const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize);
     GGML_BACKEND_API bool   ggml_cpu_moe_host_team_on(void);
     GGML_BACKEND_API void   ggml_cpu_moe_host_team_stop(void);
-    // k19-hostovl: how long an idle team worker spins before it sleeps when GGML_MOE_HOST_TEAM_SPIN_US is unset (default 2000 us);
+    // how long an idle team worker spins before it sleeps when GGML_MOE_HOST_TEAM_SPIN_US is unset (default 2000 us);
     // only before the first batch
     GGML_BACKEND_API void   ggml_cpu_moe_host_team_set_spin_us(int64_t us);
     // GGML_MOE_HOST_PF=1 (opt-in on the team): starts a read-ahead, on the team's workers, of the row slices of the given experts that a
@@ -175,7 +175,7 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
-    // k19-plerow: a row source for the GET_ROWS of one host matrix (a lazily mapped embedding table): fn returns the address of the
+    // a row source for the GET_ROWS of one host matrix (a lazily mapped embedding table): fn returns the address of the
     // bytes of row `row` (the tensor's own row, or a copy of it written to tmp, which holds GGML_CPU_ROW_SOURCE_MAX_BYTES); the gather
     // dequantizes those bytes as before, so a source that returns copies of the same bytes leaves the results bit-identical.
     // fn == NULL removes the source of t. At most 4 tensors; rows of more than GGML_CPU_ROW_SOURCE_MAX_BYTES bytes are refused.

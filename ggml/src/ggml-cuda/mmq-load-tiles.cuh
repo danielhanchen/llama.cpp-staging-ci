@@ -1376,7 +1376,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-// k19-mmq-pipe: the IQ3_S grid can be read from a copy in shared memory (mmq_iq3s_grid_shared, filled by the pipe kernel)
+// the IQ3_S grid can be read from a copy in shared memory (mmq_iq3s_grid_shared, filled by the pipe kernel)
 static __shared__ uint32_t mmq_iq3s_grid_shared[512];
 
 template <ggml_type type, int J, bool fallback, bool grid_smem = false> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_s(

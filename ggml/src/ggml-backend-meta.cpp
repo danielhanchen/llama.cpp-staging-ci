@@ -156,7 +156,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     // the MoE cache lookup reads and writes per-device slot state through raw pointers, it has no split state
-    // k19-handoff: DFLASH2_CONV (the DFlash2 drafter) has no split state
+    // DFLASH2_CONV (the DFlash2 drafter) has no split state
     if (op->op == GGML_OP_MOE_CACHE_LOOKUP || op->op == GGML_OP_DFLASH2_CONV) {
         return false;
     }
@@ -1045,7 +1045,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_pad(src_ss);
             } break;
             case GGML_OP_ARANGE: {
-                // k19-2xt4 (matches upstream llama.cpp (MIT)): no sources, every device computes the full range. Before, the
+                // (matches upstream llama.cpp (MIT)): no sources, every device computes the full range. Before, the
                 // generic rule found no source state and asserted: DeepSeek-V4.1 under -sm tensor (the --fit auto pick on 2 GPUs)
                 // aborted at warmup on its "top-k keeps all rows" arange. GGML_META_ARANGE_MIRRORED=0 = the old rule (kill switch).
                 static const bool mirrored = [] {

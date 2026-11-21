@@ -17,7 +17,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-// k15: ngqa > 1 (= ncols, one token per block): the ncols columns of a block are the ngqa query heads of one KV head instead of ncols
+// ngqa > 1 (= ncols, one token per block): the ncols columns of a block are the ngqa query heads of one KV head instead of ncols
 // tokens of one head, so K / V are read once per KV head. Each column computes exactly what the ncols = 1 kernel computes for its head
 // (same operations per column, same KV split from launch_fattn's pb_kernel), so the output is bit-identical
 // ngrp > 1 (ncols = 1, ngqa = 1): one block of ngrp thread groups (threadIdx.z) runs the ncols = 1 kernel for the ngrp query heads of
@@ -48,7 +48,7 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
         const ggml_cuda_fattn_dev_len dev_len) {
-    GGML_UNUSED(dev_len); // k19-graph: the device KV length is read by the MMA kernel only
+    GGML_UNUSED(dev_len); // the device KV length is read by the MMA kernel only
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -125,9 +125,9 @@ static __global__ void flash_attn_ext_vec(
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
-    // k19-nanfix: the rows of the mask are nb31 apart, not ne11 cells: a node at its live length (k19-graph, ggml_cuda_fattn_make_live)
+    // the rows of the mask are nb31 apart, not ne11 cells: a node at its live length (ggml_cuda_fattn_make_live)
     // keeps the row stride of the padded mask (2048 cells for 768 live ones), so row 1 of a 2-token verify window read the masked tail of
-    // row 0, saw no cell and wrote NaN (G4 Flash-Next 8 GB, n-gram windows of 1 draft: token 0 forever)
+    // row 0, saw no cell and wrote NaN (RTX PRO 6000 Flash-Next 8 GB, n-gram windows of 1 draft: token 0 forever)
     const int stride_mask = nb31 / sizeof(half);
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
@@ -591,14 +591,14 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    // batch invariant (k15-fv): one column per block for every query, as a single query launch
+    // batch invariant: one column per block for every query, as a single query launch
     if (Q->ne[1] == 1 || (KQV->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
         constexpr int cols_per_block = 1;
-        // k15: GQA 4 (LFM2.5: 32 query heads on 8 KV heads, head size 64, f16 KV), one block per KV head. GGML_CUDA_FA_VEC_GQA:
+        // GQA 4 (LFM2.5: 32 query heads on 8 KV heads, head size 64, f16 KV), one block per KV head. GGML_CUDA_FA_VEC_GQA:
         // 0 (default) = one block per query head, as before; 1 = 4 thread groups per block, each running the per-head kernel for one
         // of the 4 query heads (K / V rows shared through L1); 2 = one 4-column block reading K / V once for its 4 heads. Same KV split
         // and the same bits in all three, but 1 and 2 are slower at 8k on B200 (PDL off: 151-171 / 193 vs 123 us per token) and no
-        // faster on G4: the split launch_fattn picks leaves each block a single 128-cell KV tile, so the per-block fixed cost, not
+        // faster on RTX PRO 6000: the split launch_fattn picks leaves each block a single 128-cell KV tile, so the per-block fixed cost, not
         // the K / V reads, sets the time, and fewer or larger blocks only lose occupancy
         if constexpr (D == 64 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {
             static const int gqa_mode = [] {

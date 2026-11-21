@@ -2302,7 +2302,7 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
 
 // ne2 is passed explicitly to help compiler optimize repeated calls
 // the byte offset of batch batch_idx of dst (ne2 x ne3) in t: dst, src1 (same batches) or src0, which MUL_MAT broadcasts over dims 2
-// and 3 (ne2 / t->ne[2] batches share one matrix). k19-amx-np4: src0 was indexed with the batch of dst, and the kernels added these
+// and 3 (ne2 / t->ne[2] batches share one matrix). src0 was indexed with the batch of dst, and the kernels added these
 // byte offsets to float / weight pointers (scaled by the element size): a 2D weight times 3D activations (a delta-net ssm_out with
 // several sequences in a ubatch: llama-server --parallel 4 on an AMX CPU) read past the weight (heap overflow, the server died) and
 // wrote batch > 0 to the wrong rows

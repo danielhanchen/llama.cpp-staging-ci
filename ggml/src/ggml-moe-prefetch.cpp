@@ -1,7 +1,7 @@
 // Ported from ikawrakow/ik_llama.cpp ggml/src/ggml-moe-prefetch.cpp at e34d163a (author dmaivel), MIT.
 // Copyright (c) 2024-2025 The ik_llama.cpp authors. See LICENSE.
 //
-// k16-disk changes to the copy (the worker pool, the chunking, the mincore skip, the tickets and MADV_COLD are ik's):
+// Changes to the copy (the worker pool, the chunking, the mincore skip, the tickets and MADV_COLD are ik's):
 // - public API (ggml/include/ggml-moe-prefetch.h, GGML_API); GGML_OP_MOE_FUSED_UP_GATE removed (not an op of this ggml)
 // - the registry holds reference-counted ranges (llama registers the host expert tensors of file mappings, not whole mappings,
 //   so dense weights, embeddings and the PLE / Engram tables are never read by the engine); optional MADV_RANDOM on them
@@ -118,7 +118,7 @@ struct prefetch_pool {
         }
     }
 
-    // k16-disk: all_cold = no page of the chunk was resident (only such chunks are recorded for MADV_COLD: a partly warm chunk
+    // all_cold = no page of the chunk was resident (only such chunks are recorded for MADV_COLD: a partly warm chunk
     // holds working-set pages)
     static bool chunk_resident(uintptr_t addr, size_t len, bool & all_cold) {
         all_cold = false;
@@ -147,7 +147,7 @@ struct prefetch_pool {
 };
 
 struct prefetch_state {
-    std::shared_mutex          reg_mtx; // k16-disk: workers hold it shared while they touch a range, so an unregister waits for them
+    std::shared_mutex          reg_mtx; // workers hold it shared while they touch a range, so an unregister waits for them
     std::vector<mapping_entry> mappings;
 
     std::atomic<uint64_t> epoch{1};
@@ -203,7 +203,7 @@ void prefetch_pool::run() {
         s.n_jobs.fetch_add(1, std::memory_order_relaxed);
         bool done_read = false;
         bool all_cold  = false;
-        // k16-disk: the range must still be registered while the worker touches it (an unregister takes reg_mtx exclusively, so the
+        // the range must still be registered while the worker touches it (an unregister takes reg_mtx exclusively, so the
         // address can never belong to a later mapping here)
         std::shared_lock<std::shared_mutex> reg(s.reg_mtx);
         if (!is_mapped_locked((const void *) j.addr, j.len)) {
@@ -214,7 +214,7 @@ void prefetch_pool::run() {
         } else {
             const uintptr_t astart = j.addr & ~(uintptr_t)(page - 1);
             const size_t    alen   = ((j.addr + j.len + page - 1) & ~(uintptr_t)(page - 1)) - astart;
-            // k16-disk: exact-range async readahead first (one batch of IO for the chunk, also under MADV_RANDOM), then the populate
+            // exact-range async readahead first (one batch of IO for the chunk, also under MADV_RANDOM), then the populate
             // waits for it and maps the pages
             (void) madvise((void *)astart, alen, MADV_WILLNEED);
             if (madvise((void *)astart, alen, MADV_POPULATE_READ) == 0) {
@@ -227,7 +227,7 @@ void prefetch_pool::run() {
             lookahead_bytes.fetch_sub(std::min<size_t>(j.len, lookahead_bytes.load()), std::memory_order_relaxed);
         }
         if (j.tk) {
-            // k16-disk: the read is published before the ticket completes, so a waiter / MADV_COLD sees it
+            // the read is published before the ticket completes, so a waiter / MADV_COLD sees it
             std::lock_guard<std::mutex> lock(mtx);
             if (done_read && all_cold && j.tk->track_reads) {
                 j.tk->read_chunks.emplace_back(j.addr, j.len);
@@ -485,7 +485,7 @@ void ggml_moe_prefetch_cold(const struct ggml_tensor * w) {
         if (it == pool->tickets.end() || !it->second->track_reads) return;
         chunks.swap(it->second->read_chunks);
     }
-    // k16-disk: whole pages inside each chunk only (a page shared with a neighbouring tensor keeps its state), ranges still registered
+    // whole pages inside each chunk only (a page shared with a neighbouring tensor keeps its state), ranges still registered
     std::shared_lock<std::shared_mutex> reg(s.reg_mtx);
     for (const auto & c : chunks) {
         if (is_mapped_locked((const void *) c.first, c.second)) {

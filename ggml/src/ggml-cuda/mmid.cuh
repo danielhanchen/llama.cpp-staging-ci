@@ -19,7 +19,7 @@ void ggml_cuda_launch_mm_ids_invert(
 void ggml_cuda_launch_mm_ids_count_skipped(
         const int32_t * ids, int32_t * n_skipped, int n_tokens, int n_expert_used, int si1, cudaStream_t stream);
 
-// k15-hostcut: false if ids cannot hold -1 (no skipped slot), so the zeroing launch below is not needed: ids is a view chain (VIEW,
+// false if ids cannot hold -1 (no skipped slot), so the zeroing launch below is not needed: ids is a view chain (VIEW,
 // RESHAPE, PERMUTE, TRANSPOSE) of an ARGSORT / TOP_K result, whose values are column indices. GGML_CUDA_MMID_ZERO_SKIP=0: always true
 bool ggml_cuda_mm_ids_may_skip(const ggml_tensor * ids);
 

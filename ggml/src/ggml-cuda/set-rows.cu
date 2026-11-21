@@ -382,7 +382,7 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
-    // k15-fn debug (GGML_CUDA_SET_ROWS_CHECK=1): the row indices read back before the launch, an index outside dst's rows is logged
+    // debug (GGML_CUDA_SET_ROWS_CHECK=1): the row indices read back before the launch, an index outside dst's rows is logged
     // (an eager graph only: a capture cannot synchronize)
     static const bool check = getenv("GGML_CUDA_SET_ROWS_CHECK") != nullptr;
     if (check && src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1)) {
@@ -422,7 +422,7 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 }
 
-// k15-fn: two SET_ROWS of the same src / index / dst types in one launch (e.g. the K and V cache stores of a layer); the blocks of
+// two SET_ROWS of the same src / index / dst types in one launch (e.g. the K and V cache stores of a layer); the blocks of
 // the first one come first, every element is computed as by k_set_rows
 struct set_rows_pair_desc {
     const void * src0;

@@ -1,6 +1,6 @@
 #include "dflash2-conv.cuh"
 
-// k19-handoff: the DFlash2 drafter's dynamic grouped convolution (ggml_dflash2_conv) in one kernel. Each product and sum is rounded on
+// the DFlash2 drafter's dynamic grouped convolution (ggml_dflash2_conv) in one kernel. Each product and sum is rounded on
 // its own (__fmul_rn / __fadd_rn: nvcc never contracts them into a fused multiply-add), in the order of the add / mul / pad chain it
 // replaces, so the result has its bits: w_k = dyn + base, r = w_0 * v_0, r = r + w_k * v_k, v_k = 0.0f before the block's start.
 // HIP: clang's __fmul_rn / __fadd_rn are plain operators there, which its default -ffp-contract=fast fuses into v_fmac_f32, so the

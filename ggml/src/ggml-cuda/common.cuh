@@ -1214,7 +1214,7 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
-    // k17-small: mark() records the memory the pool holds now; trim() gives what it took beyond the mark (and beyond what is allocated)
+    // mark() records the memory the pool holds now; trim() gives what it took beyond the mark (and beyond what is allocated)
     // back to the device, so graphs captured before the mark keep their memory. The caller synchronized the device. Returns the bytes
     virtual void   mark() {}
     virtual size_t trim() { return 0; }
@@ -1299,7 +1299,7 @@ struct ggml_cuda_graph {
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
-    // k19-am17an (port of an upstream llama.cpp change by Aman Gupta, GGML_CUDA_GRAPH_CHUNK_SIZE): a ggml graph captured as a series of CUDA graphs keeps
+    // (port of an upstream llama.cpp change by Aman Gupta, GGML_CUDA_GRAPH_CHUNK_SIZE): a ggml graph captured as a series of CUDA graphs keeps
     // its first chunk in graph / instance and the chunks after it here, launched in order on the same stream
     std::vector<cudaGraph_t>     chunk_graphs;
     std::vector<cudaGraphExec_t> chunk_instances;
@@ -1310,7 +1310,7 @@ struct ggml_cuda_graph {
     uint64_t uid = 0;
     uint64_t compat_uid = 0;   // uid of the graph whose compatibility walk gave compat_ok (GGML_CUDA_GRAPH_UID)
     bool     compat_ok  = false;
-    // k15-fn: launches of the current exec since its capture (a warm key whose properties change captures again at once, no eager
+    // launches of the current exec since its capture (a warm key whose properties change captures again at once, no eager
     // warm-up pass)
     int64_t  n_launch_since_capture = 0;
     // fndec: launches of this key in all (a decode / verify graph replayed this often is kept past the 10 s age rule, see cuda_graph)
@@ -1326,11 +1326,11 @@ struct ggml_cuda_graph {
         // a source's type: a graph whose sources sit at the same addresses with the same shapes and strides but another type (F16 and
         // BF16 have the same strides) must not replay an exec captured for the other type (the kernels are chosen by it)
         int32_t  node_src_type[GGML_MAX_SRC];
-        // k19-graph: the launch signature of a flash attention node with a KV length (ggml_cuda_flash_attn_ext_kv_len_sig), 0 else
+        // the launch signature of a flash attention node with a KV length (ggml_cuda_flash_attn_ext_kv_len_sig), 0 else
         int64_t  fa_sig;
     };
     std::vector<node_properties> node_props;
-    // k19-graph: the flash attention nodes with a KV length, whose signatures are checked even when the graph uid is unchanged
+    // the flash attention nodes with a KV length, whose signatures are checked even when the graph uid is unchanged
     std::vector<int> fa_kvl_nodes;
 
     bool is_enabled() const {
@@ -1510,13 +1510,13 @@ struct ggml_cuda_q8_1_cache {
     size_t slot_size = 0;
     int    next      = 0;
     int    pending   = -1; // slot reserved by a producer, see reserve()
-    // k19-vcost: slots handed out so far (get() misses + reserve()), never reset within an evaluation: a side-stream branch that reads
+    // slots handed out so far (get() misses + reserve()), never reset within an evaluation: a side-stream branch that reads
     // slots is joined before the main stream could hand any of them out again (see ggml_cuda_side_chain_plan)
     uint64_t n_claims = 0;
     entry  entries[n_slots];
     std::unordered_set<const void *> norm_targets; // producer tensors whose kernel writes the q8_1 copy (see ggml_cuda_q8_1_cache_slot_size)
-    // k15-mm2: the reader's row length of a producer target whose rows differ from the reader's (any width: the gated producer writes its
-    // copy in the reader's rows, unary_gated_q8_1_kernel). The one field for this (k15-fn 414e7c2d4a5 called it target_ne10)
+    // the reader's row length of a producer target whose rows differ from the reader's (any width: the gated producer writes its
+    // copy in the reader's rows, unary_gated_q8_1_kernel). The one field for this (commit 414e7c2d4a5 called it target_ne10)
     std::unordered_map<const void *, int64_t> norm_target_ne10;
 
     bool active() const {
@@ -1711,7 +1711,7 @@ struct ggml_cuda_src1_memo {
     }
 };
 
-// k19-p5mmq: the routing maps (inverse map, compact -> slot map, expert bounds: mm_ids_helper with write_inverse) of the last MoE MMQ
+// the routing maps (inverse map, compact -> slot map, expert bounds: mm_ids_helper with write_inverse) of the last MoE MMQ
 // product that built them, kept in a buffer of the context so that the next products with the same ids (the gate / up of a layer and
 // its fused-SwiGLU down, whose maps are the same integers) do not build them again. Valid from the product that built them until the
 // end of the graph, the next build, or a node writing over the ids; never while a CUDA graph is captured.
@@ -1760,13 +1760,13 @@ struct ggml_cuda_mmid_route_memo {
     }
 };
 
-// k15-mm2: a QSA flash attention node whose dense selection mask is not built: the selected cells per token (I32 [n_sel, n_tokens],
+// a QSA flash attention node whose dense selection mask is not built: the selected cells per token (I32 [n_sel, n_tokens],
 // dead slots >= n_kv) and the causal mask the dense one adds them to
 struct ggml_cuda_qsa_maskless {
     const ggml_tensor * idx;
     const ggml_tensor * kq;
     bool alias;  // the mask node's buffer overlaps idx or kq
-    bool prompt; // k19-fuse F6: a prompt batch (more than GGML_CUDA_QSA_MASKLESS_MAX_TOKENS tokens), rebuilt in place, never gathered
+    bool prompt; // a prompt batch (more than GGML_CUDA_QSA_MASKLESS_MAX_TOKENS tokens), rebuilt in place, never gathered
 };
 
 #define GGML_CUDA_MOE_DEFER_LAYERS 512
@@ -1791,7 +1791,7 @@ struct ggml_backend_cuda_context {
     cudaEvent_t moe_fork   = nullptr; // overlapped MoE cache fetch (see ggml_moe_cache_fetch)
     cudaEvent_t moe_join   = nullptr;
     bool        moe_join_pending = false; // moe_join was recorded and the main stream has not waited for it yet
-    // k19-l4c deferred admission (ggml_moe_cache_set_defer): the copy list of each layer's deferred fetch, read by its copies on the
+    // deferred admission (ggml_moe_cache_set_defer): the copy list of each layer's deferred fetch, read by its copies on the
     // side stream after the graph has moved on (GGML_CUDA_MOE_DEFER_LAYERS entries of GGML_CUDA_MOE_DEFER_STRIDE int32)
     int32_t *   moe_defer_info = nullptr;
 
@@ -1804,7 +1804,7 @@ struct ggml_backend_cuda_context {
     int                      side_mv_n_nodes = 0;
     cudaEvent_t              side_mv_fork = nullptr;
     std::vector<cudaEvent_t> side_mv_join;
-    // k19-vcost: side-stream branches of several nodes (a shared expert: gate / up products, GLU, down product) that graph_optimize moved
+    // side-stream branches of several nodes (a shared expert: gate / up products, GLU, down product) that graph_optimize moved
     // right after their input's producer, run on the side stream while a decode-sized graph is captured, joined before their reader
     // (see ggml_cuda_side_chain_plan): first node -> { last node, first reader }; planned for the same node array as side_mv
     struct side_chain_t { const ggml_tensor * last; const ggml_tensor * reader; };
@@ -1820,29 +1820,29 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_q8_1_cache q8_1_cache;
-    // k15-mm: products of this graph evaluation already computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)
+    // products of this graph evaluation already computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)
     std::unordered_set<const ggml_tensor *> mmvq_done_early;
-    // k15-fn: gated_delta_net nodes of this graph evaluation that read their initial state straight from the recurrent cache rows (the
+    // gated_delta_net nodes of this graph evaluation that read their initial state straight from the recurrent cache rows (the
     // gather that copied the row was skipped, see ggml_cuda_try_gdn_state_in_place): node -> cache rows base, row stride (floats), row ids
     struct gdn_state_src { const float * base; int64_t row_stride; const int32_t * ids; };
     std::unordered_map<const ggml_tensor *, gdn_state_src> gdn_state_in_place;
-    // k15-fn: gated_delta_net nodes that apply their own gates (ggml_cuda_try_gdn_gates): beta = sigmoid(beta_raw), and the scalar decay
+    // gated_delta_net nodes that apply their own gates (ggml_cuda_try_gdn_gates): beta = sigmoid(beta_raw), and the scalar decay
     // g = softplus(a + bias[h]) * scale[h]; the skipped nodes' inputs stay unwritten until the gated_delta_net reads them
     struct gdn_gates { const float * beta_raw; const float * a; const float * bias; const float * scale; };
     std::unordered_map<const ggml_tensor *, gdn_gates> gdn_gates_in;
-    // k15-fn: conv-state copies (the CPY of a conv input's last d_conv - 1 columns into the recurrent cache, qwen4exp build_conv_state_at)
+    // conv-state copies (the CPY of a conv input's last d_conv - 1 columns into the recurrent cache, qwen4exp build_conv_state_at)
     // deferred into the short convolution that reads the same input (ggml_cuda_try_conv_state_defer): SSM_CONV node -> its CPY nodes
     std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> conv_state_pending;
-    // k15-fn: conv-input concats (state columns ++ the transposed new tokens) not run: the short convolution that reads them reads both
+    // conv-input concats (state columns ++ the transposed new tokens) not run: the short convolution that reads them reads both
     // parts itself (ggml_cuda_try_conv_cat_elide); any other node that reads one first makes it run then (ggml_cuda_conv_cat_materialize)
     std::unordered_set<const ggml_tensor *> conv_cat_elided;
-    // k19-fuse F5: elided conv-input concats of a prompt batch (ggml_cuda_try_conv_cat_elide): concat -> the conv-state CPYs of views of
+    // elided conv-input concats of a prompt batch (ggml_cuda_try_conv_cat_elide): concat -> the conv-state CPYs of views of
     // it, which all lie in the new-token part; they do not run where they are, the convolution writes them from that part after it ran
     std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> conv_cat_prompt;
     std::unordered_set<const ggml_tensor *> conv_cat_prompt_cpys;
-    // k15-fn: CONTs of a strided view whose only reader is a fused UNARY + MUL that reads the view itself (ggml_cuda_try_unary_src_cont_elide)
+    // CONTs of a strided view whose only reader is a fused UNARY + MUL that reads the view itself (ggml_cuda_try_unary_src_cont_elide)
     std::unordered_set<const ggml_tensor *> unary_cont_elided;
-    // k15-fn: QSA selection chains (ggml_cuda_qsa_sel_plan): the final i32 index node -> its inputs, and the chain nodes not run
+    // QSA selection chains (ggml_cuda_qsa_sel_plan): the final i32 index node -> its inputs, and the chain nodes not run
     struct qsa_sel_args {
         const int32_t * top_k; int64_t top_k_s1;     // [n_top, n_tok]
         const int32_t * pools; int64_t pools_s1;     // [kpool, n_pool]: the member cells of each pool
@@ -1856,12 +1856,12 @@ struct ggml_backend_cuda_context {
     };
     std::unordered_map<const ggml_tensor *, qsa_sel_args> qsa_sel;
     std::unordered_set<const ggml_tensor *> qsa_sel_skip;
-    // k15-mm2: QSA maskless (ggml_cuda_qsa_maskless_plan): flash attention node -> its selection, and the dense mask nodes not run
+    // QSA maskless (ggml_cuda_qsa_maskless_plan): flash attention node -> its selection, and the dense mask nodes not run
     std::unordered_map<const ggml_tensor *, ggml_cuda_qsa_maskless> qsa_maskless;
     std::unordered_set<const ggml_tensor *> qsa_skip;
     ggml_cuda_src1_memo  src1_memo;
-    ggml_cuda_mmid_route_memo mmid_route; // k19-p5mmq
-    // k19-fu2 F3: the SWIGLU node whose MUL_MAT_ID reader computes it in its gathered quantize (set around that product only)
+    ggml_cuda_mmid_route_memo mmid_route; // MoE MMQ routing maps memo
+    // the SWIGLU node whose MUL_MAT_ID reader computes it in its gathered quantize (set around that product only)
     const ggml_tensor *  mmq_swiglu_src1 = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
@@ -1871,10 +1871,10 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-    // k15-mm2: split-K few-row F32 mat-vec (mmvf.cu): per stream partial sums and self-resetting per-row arrival counters
+    // split-K few-row F32 mat-vec (mmvf.cu): per stream partial sums and self-resetting per-row arrival counters
     float        * mmvf_splitk_part = nullptr;
     unsigned int * mmvf_splitk_cnt  = nullptr;
-    // k15-mm2: self-resetting group arrival counters of the hyper-connection up + hc_pre launch (mmvq.cu), stream 0 only
+    // self-resetting group arrival counters of the hyper-connection up + hc_pre launch (mmvq.cu), stream 0 only
     unsigned int * hc_pre_cnt       = nullptr;
 
     // a graph was computed with this instance (a copy-only instance, e.g. the scheduler copy queue, is not a compute instance)
@@ -1888,7 +1888,7 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
-    // k15-pp: graphs computed once (a merged layer-major group: its node addresses are freed after it) skip the CUDA graph
+    // graphs computed once (a merged layer-major group: its node addresses are freed after it) skip the CUDA graph
     // bookkeeping (the per-node properties a warmup compares, ~1 KB per node), see ggml_backend_graph_skip_records
     bool graphs_skip = false;
 
@@ -2059,7 +2059,7 @@ struct ggml_cuda_mm_fusion_args_device {
     float * multi_dst[GGML_CUDA_MMVQ_MULTI_MAX] = {};
     uint32_t multi_nrows[GGML_CUDA_MMVQ_MULTI_MAX] = {};
     uint32_t multi_block0[GGML_CUDA_MMVQ_MULTI_MAX] = {};
-    // k15-mm2 (mul_mat_vec_q c_ewq): src1 is not given as q8_1 but as the F32 input ew_src of a SCALE / SILU chain (ew_n ops),
+    // (mul_mat_vec_q c_ewq): src1 is not given as q8_1 but as the F32 input ew_src of a SCALE / SILU chain (ew_n ops),
     // which each block applies and quantizes into shared memory itself (see ggml_cuda_mul_mat_vec_q_ew)
     const float * ew_src = nullptr;
     uint32_t ew_stride_col = 0;

@@ -169,7 +169,7 @@ static __global__ void mul_mat_f(
     }
 
 
-    // k13-pp: the global loads of the next k chunk are issued before the current chunk goes through shared memory and the mma,
+    // the global loads of the next k chunk are issued before the current chunk goes through shared memory and the mma,
     // so that a warp with few chunks (small batches: the 4-token prompt tail, K = 2048 over 8 warps) does not wait for the
     // memory latency once per chunk. The values written to shared memory, the mma sequence and the reduction are unchanged.
     // GGML_CUDA_MMF_PREFETCH=0 (compile time) restores the plain loop.

@@ -1,6 +1,6 @@
 #include "common.cuh"
 
-// more new tokens than this take the long-token kernel (k19-fuse F5: and the prompt concat elide)
+// more new tokens than this take the long-token kernel (and the prompt concat elide)
 static constexpr int64_t ssm_conv_long_token_min_t = 32;
 
 // conv-state copies one short-token convolution writes (ssm_conv_state_copies): a verify window of T rows with a rollback of T - 1

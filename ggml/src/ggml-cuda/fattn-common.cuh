@@ -20,7 +20,7 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
-// k19-graph: the live KV length of a padded flash attention node (ggml_flash_attn_ext_set_kv_len), read on the device by the dense
+// the live KV length of a padded flash attention node (ggml_flash_attn_ext_set_kv_len), read on the device by the dense
 // stream-k MMA kernel and its fixup. They take the loop bound and the stream-k block count that the launch of a node of kv_len cells
 // takes (ggml_cuda_fattn_stream_k_blocks, the same function), so the padded node computes the bits of the unpadded one while its
 // launch (the grid of the padded length) and so its CUDA graph stay fixed as the length grows. kv_len == nullptr: off
@@ -29,9 +29,9 @@ struct ggml_cuda_fattn_dev_len {
     int nbatch_fa;      // the host's KV tile, which the block count is planned with
     int ntiles_dst;
     int max_blocks;
-    int ntiles_dst_ref; // k19-tpp: the output tiles of the reference window (0: none)
+    int ntiles_dst_ref; // the output tiles of the reference window (0: none)
     int stream_k;       // 0: one block per output tile
-    // k19-fattnq4: the second KV source of a two-source node (ggml_flash_attn_ext_set_src2; it rides in this argument so the kernel
+    // the second KV source of a two-source node (ggml_flash_attn_ext_set_src2; it rides in this argument so the kernel
     // signature stays the one of every FA kernel). n_kv2 == 0: none. Its cells continue the first source's: KV tiles it1 ..
     // it1 + n_kv2/nbatch_fa - 1 of the kernel's loop (it1 = the first source's tiles), K2 / V2 / mask2 with their own byte strides
     // (V2 == K2 for a K-only cache whose V is a view of K). Read by the MMA kernel only (the others never get a two-source node)
@@ -56,7 +56,7 @@ struct ggml_cuda_fattn_dev_len {
     const int2 * body_range;
 };
 
-// k19-fattnq4: the first bit >= k (set: a set bit, else a clear bit) of bits, stop if there is none before stop
+// the first bit >= k (set: a set bit, else a clear bit) of bits, stop if there is none before stop
 template <bool set>
 static __device__ __forceinline__ int flash_attn_src2_next_bit(const uint32_t * bits, int k, const int stop) {
     int w = k >> 5;
@@ -81,7 +81,7 @@ static __host__ __device__ __forceinline__ int ggml_cuda_fattn_stream_k_blocks(
     const int rounded = (raw / ntiles_dst) * ntiles_dst;
     const int loss    = rounded > 0 ? 100 * (raw - rounded) / raw : 100;
     int nblocks = loss <= max_efficiency_loss_percent ? rounded : raw;
-    // k19-tpp: one-query tiles of a verify window wider than the reference: the blocks per output tile of the reference window,
+    // one-query tiles of a verify window wider than the reference: the blocks per output tile of the reference window,
     // so every query's KV range is split at the same cells as there (each tile's split depends only on its block count when the
     // count divides evenly). Only when the reference launch itself rounds to whole tiles; otherwise as before
     if (ntiles_dst_ref > 0) {
@@ -772,7 +772,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     }
 }
 
-// k19-fattnq4: the ring tiles a query tile of a two-source node can see: per (mask2 stream blockIdx.y, query tile blockIdx.x of ncols1
+// the ring tiles a query tile of a two-source node can see: per (mask2 stream blockIdx.y, query tile blockIdx.x of ncols1
 // rows < n_queries) the bits of the KV tiles of nbatch_fa cells with a finite mask2 value in any row of the tile, set with atomicOr into
 // words the host zeroed; blockIdx.z: a group of tpb tiles (many blocks: the scan reads the whole ring mask)
 __launch_bounds__(256, 1)
@@ -812,7 +812,7 @@ static __global__ void flash_attn_src2_ring_bits(
     ggml_cuda_pdl_lc();
 }
 
-// k19-fattnq4: the body tiles a query tile of a two-source node can see, [first, last + 1) of the KV tiles with a finite mask value
+// the body tiles a query tile of a two-source node can see, [first, last + 1) of the KV tiles with a finite mask value
 // in a row of the tile, (0, 0) for none; scanned from both ends in steps of 8 tiles with an early exit (the body's visible cells of a
 // prompt tile are a prefix: the scan reads the masked tail of about W + ubatch cells, not the whole mask)
 __launch_bounds__(256, 1)
@@ -986,7 +986,7 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
 
     ggml_cuda_pdl_sync();
 
-    // k19-graph: the blocks per tile of the launch at the live length (see ggml_cuda_fattn_dev_len); the buffer layout keeps the
+    // the blocks per tile of the launch at the live length (see ggml_cuda_fattn_dev_len); the buffer layout keeps the
     // launched grid (nblocks_stream_k), as the kernel's blocks write it
     int blocks_per_tile = blocks_per_tile_host;
     if (dev_len.kv_len != nullptr) {
@@ -1208,7 +1208,7 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-// k19-tpp: a verify window (GGML_TENSOR_FLAG_VERIFY, not batch invariant) of more rows than GGML_CUDA_VERIFY_REF_ROWS (default 3: the
+// a verify window (GGML_TENSOR_FLAG_VERIFY, not batch invariant) of more rows than GGML_CUDA_VERIFY_REF_ROWS (default 3: the
 // window of 2 drafts that every MTP verify forms) takes the launch choices of that reference window where they follow the row count:
 // the sparse / dense attention pick (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse) and the stream-k blocks per output tile of the
 // one-query sparse kernel. Its rows then sum in the order of a 3-row window's (0 = off)
@@ -1220,7 +1220,7 @@ static int ggml_cuda_fattn_verify_ref_rows(const ggml_tensor * KQV) {
     return ref > 0 && KQV->src[0]->ne[1] > ref ? ref : 0;
 }
 
-// k19-graph (ggml_cuda_flash_attn_ext): a node whose live KV length (ggml_flash_attn_ext_set_kv_len) is below its padded one is
+// (ggml_cuda_flash_attn_ext): a node whose live KV length (ggml_flash_attn_ext_set_kv_len) is below its padded one is
 // launched as the node of the live length (K / V / mask views of kv_len cells, the launch choices of that node). These tell
 // launch_fattn the graph node behind that copy and, for the device length, the padded length the grid is planned with
 struct ggml_cuda_fattn_kv_len_ctx {
@@ -1247,16 +1247,16 @@ void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
     const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
-    // k15: the number of parallel KV blocks is the one a launch of pb_kernel with pb_ncols2 query heads per block would pick (its
+    // the number of parallel KV blocks is the one a launch of pb_kernel with pb_ncols2 query heads per block would pick (its
     // occupancy and output tiles), so a kernel that packs the query heads of a KV head (ncols2 > 1) splits the KV exactly as the
     // per-head kernel does and its outputs are bit-identical (fattn-vec.cuh, GGML_CUDA_FA_VEC_GQA)
     fattn_kernel_t pb_kernel = nullptr, const int pb_ncols2 = 1,
-    // k15: thread groups per block (blockDim.z; fattn-vec.cuh grouped heads), the occupancy then is that of pb_kernel's group size
+    // thread groups per block (blockDim.z; fattn-vec.cuh grouped heads), the occupancy then is that of pb_kernel's group size
     const int block_z = 1,
-    // k15-mm2: the vector kernel's KV split may be capped (fattn_vec_kv_split_cap): it is a split-K over the KV cells with an f32
+    // the vector kernel's KV split may be capped (fattn_vec_kv_split_cap): it is a split-K over the KV cells with an f32
     // combine, and the vector kernel accumulates VKQ in f32 on NVIDIA, so a cap only reorders f32 sums
     const bool vec_kv_cap = false,
-    // k19-fattnq8: the occupancy (so the parallel / stream-k blocks) of this kernel at this shared memory instead of fattn_kernel's: a
+    // the occupancy (so the parallel / stream-k blocks) of this kernel at this shared memory instead of fattn_kernel's: a
     // kernel reading quantized K / V in place splits the KV as the f16 kernel of the staged launch does
     fattn_kernel_t occ_kernel = nullptr, const size_t occ_nbytes_shared = 0,
     // INT8 Q*K^T over an f16 K (ggml_cuda_flash_attn_ext_mma_i8_f16, 1 + the rotation mode): Q and K staged as int8 rows behind the output
@@ -1287,13 +1287,13 @@ void launch_fattn(
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
 
-    // k19-graph: the launch of a padded node at its live length (see ggml_cuda_fattn_kv_len_ctx), or a dry run of the choices
+    // the launch of a padded node at its live length (see ggml_cuda_fattn_kv_len_ctx), or a dry run of the choices
     const ggml_cuda_fattn_kv_len_ctx * kvl = ggml_cuda_fattn_kv_len_cur;
     ggml_cuda_fattn_probe * probe = ggml_cuda_fattn_probe_cur;
     const ggml_tensor * node      = kvl ? kvl->node : dst;
     const ggml_tensor * node_mask = node->src[3];
 
-    // k15-mm2 QSA maskless: the graph did not build this node's dense selection mask. A gather takes its lists from the selected
+    // QSA maskless: the graph did not build this node's dense selection mask. A gather takes its lists from the selected
     // cells and reads the causal mask, which equals the dense one at every listed cell; any other kernel gets the dense mask now
     const ggml_cuda_qsa_maskless * qsa = nullptr;
     if (!ctx.qsa_maskless.empty()) {
@@ -1305,7 +1305,7 @@ void launch_fattn(
     const bool qsa_gather = qsa && !qsa->prompt && use_sparse && ggml_cuda_qsa_maskless_gather_ok(*qsa) && ggml_cuda_qsa_maskless_mode() == 1;
     // the mask node's buffer may hold the selection or the causal mask (the allocator reused it), then a pool copy takes the mask;
     // allocated before the kernel's pool buffers, freed after them
-    // (k19-graph: the dense mask of the graph node, all of its padded cells; the launch reads the live ones through the same strides)
+    // (the dense mask of the graph node, all of its padded cells; the launch reads the live ones through the same strides)
     ggml_cuda_pool_alloc<half> qsa_mask(pool);
     const char * mask_data = mask ? (const char *) mask->data : nullptr;
     if (probe) {
@@ -1324,12 +1324,12 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V, i8_f16 != 0);
 
-    // k19-fattnq4: the f16 copies of a two-source node's second source, allocated before the buffers below (the pool frees in reverse order)
+    // the f16 copies of a two-source node's second source, allocated before the buffers below (the pool frees in reverse order)
     ggml_cuda_pool_alloc<half> K2_f16(pool);
     ggml_cuda_pool_alloc<half> V2_f16(pool);
     ggml_cuda_pool_alloc<int2> ring_range(pool);
     ggml_cuda_pool_alloc<int>    KV_max(pool);
-    // k19-kvsel: the compact staging of a sparse node whose K / V cells are partly in host memory (allocated right after KV_max)
+    // the compact staging of a sparse node whose K / V cells are partly in host memory (allocated right after KV_max)
     ggml_cuda_pool_alloc<char>   sel_K(pool);
     ggml_cuda_pool_alloc<char>   sel_V(pool);
     ggml_cuda_pool_alloc<half>   sel_M(pool);
@@ -1434,7 +1434,7 @@ void launch_fattn(
         }
     }
 
-    // k19-fattnq4: the second source of a two-source node (ggml_flash_attn_ext_set_src2, MMA kernel only): read in place by the
+    // the second source of a two-source node (ggml_flash_attn_ext_set_src2, MMA kernel only): read in place by the
     // kernel when the K / V of the first are (need_f16_K false), else staged to f16 from the pool. Rides in dev_len (see there)
     const ggml_tensor * K2 = dst->src[6];
     const ggml_tensor * V2 = dst->src[7];
@@ -1480,7 +1480,7 @@ void launch_fattn(
         src2.nb11_2 = (int32_t) k2nb[0]; src2.nb12_2 = (int32_t) k2nb[1]; src2.nb13_2 = (int64_t) k2nb[2];
         src2.nb21_2 = (int32_t) v2nb[0]; src2.nb22_2 = (int32_t) v2nb[1]; src2.nb23_2 = (int64_t) v2nb[2];
         src2.nb31_2 = (int32_t) M2->nb[1]; src2.nb33_2 = (int64_t) M2->nb[3];
-        // k19-fattnq4: skip the ring tiles a query tile cannot see (GGML_CUDA_FATTN_SRC2_SKIP=0: off), from
+        // skip the ring tiles a query tile cannot see (GGML_CUDA_FATTN_SRC2_SKIP=0: off), from
         // GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS query rows (default 17: prompt ubatches, where most of the ring is masked per tile)
         static const bool skip_on = getenv("GGML_CUDA_FATTN_SRC2_SKIP") == nullptr || atoi(getenv("GGML_CUDA_FATTN_SRC2_SKIP")) != 0;
         static const int64_t skip_min_rows = getenv("GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS") ? atoll(getenv("GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS")) : 17;
@@ -1536,7 +1536,7 @@ void launch_fattn(
             mask_m.data = const_cast<char *>(mask_data);
             ggml_cuda_flash_attn_ext_compact_mask(&mask_m, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
         }
-        // k19-kvsel (LLAMA_KV_SEL_HOST=1): K / V read in place with cells in host memory: gather the listed cells (K, V, mask values) into
+        // (LLAMA_KV_SEL_HOST=1): K / V read in place with cells in host memory: gather the listed cells (K, V, mask values) into
         // device staging in list order and point the lists at it, so the kernel reads device memory and loads the same values in the
         // same order (results unchanged). One stream, one mask plane, the tiles' lists fitting in the mask's columns
         const bool v_view = V_data == K_data;
@@ -1558,7 +1558,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    // (k19-fattnq4: not for a two-source node, whose kernel loop bound covers both sources)
+    // (not for a two-source node, whose kernel loop bound covers both sources)
     const bool scan_mask = !use_sparse && mask && K2 == nullptr && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
     if (scan_mask && !probe) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
@@ -1589,11 +1589,11 @@ void launch_fattn(
     int parallel_blocks = max_blocks_per_sm;
 
     const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
-    // (k19-fattnq4: + the second source's tiles of a two-source node)
+    // (+ the second source's tiles of a two-source node)
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa + (K2 ? src2.n_kv2 / nbatch_fa : 0); // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
-    // k19-graph: see ggml_cuda_fattn_dev_len / ggml_cuda_fattn_probe
+    // see ggml_cuda_fattn_dev_len / ggml_cuda_fattn_probe
     ggml_cuda_fattn_dev_len dev_len = {}; // all members zero (no device length, no second source)
     int  ntiles_dst_ref = 0;
     int  fixup_kind     = 0; // stream-k fixup: 0 none, 1 uniform, 2 general
@@ -1627,17 +1627,17 @@ void launch_fattn(
         blocks_num.z = 1;
 
         if(use_stream_k) {
-            // k19-tpp: one-query tiles of a verify window wider than the reference (see ggml_cuda_fattn_stream_k_blocks)
+            // one-query tiles of a verify window wider than the reference (see ggml_cuda_fattn_stream_k_blocks)
             const int ref_rows = ncols1 == 1 ? ggml_cuda_fattn_verify_ref_rows(KQV) : 0;
             ntiles_dst_ref = ref_rows > 0 ? ntiles_dst / ntiles_x * ref_rows : 0;
             blocks_num.x = ggml_cuda_fattn_stream_k_blocks(ntiles_KV, ntiles_dst, max_blocks, ntiles_dst_ref);
         }
 
-        // k19-graph: the fixup of the launch at this length; the device length takes the dense kernel with a uniform fixup (each
+        // the fixup of the launch at this length; the device length takes the dense kernel with a uniform fixup (each
         // tile the same number of blocks) or none, read again by the kernel and the fixup from the live length
         const int nblocks_live = blocks_num.x;
         fixup_kind = (nblocks_live % ntiles_dst == 0 && nblocks_live > ntiles_dst) ? 1 : (ntiles_dst % nblocks_live != 0 ? 2 : 0);
-        // (k19-fattnq8: or K / V read in place by the kernel, need_f16_* false: no conversion that follows the length)
+        // (or K / V read in place by the kernel, need_f16_* false: no conversion that follows the length)
         dev_ok = !use_sparse && !scan_mask && K2 == nullptr && (K->type == GGML_TYPE_F16 || !need_f16_K) && (V->type == GGML_TYPE_F16 || !need_f16_V) &&
             fixup_kind != 2;
         if (kvl && kvl->kv_len && !probe) {
@@ -1662,7 +1662,7 @@ void launch_fattn(
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
-        // batch invariant one column tiles (k15-fv): the KV split of a launch with one query, so every query is split as it alone is.
+        // batch invariant one column tiles: the KV split of a launch with one query, so every query is split as it alone is.
         // From the count above, which for a GQA-packed launch (GGML_CUDA_FA_VEC_GQA, pb_kernel, ncols2 > 1) is the per-head kernel's:
         // a count of its own here (ntiles_dst) dropped that, so the packed kernel no longer split as the per-head one, and verify
         // (ncols == 4 there, so not divided) split by the batch size
@@ -1692,7 +1692,7 @@ void launch_fattn(
         }
 
 #ifndef GGML_USE_HIP
-        // k15-mm2: fewer, longer KV blocks for the vector kernel, whose blocks otherwise get as little as one KV tile each, so that
+        // fewer, longer KV blocks for the vector kernel, whose blocks otherwise get as little as one KV tile each, so that
         // their fixed cost (Q load, the final reduction, the combine reads) sets the time. GGML_CUDA_FA_PB_MIN_TILES = KV tiles each
         // block keeps at least (0 = no minimum), GGML_CUDA_FA_PB_MAX = at most that many parallel blocks (0 = no cap). Not on HIP:
         // there the vector kernel accumulates VKQ in half2 (V_DOT2_F32_F16_AVAILABLE) and longer blocks would add more half sums.

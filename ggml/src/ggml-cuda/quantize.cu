@@ -613,7 +613,7 @@ void quantize_mmq_q8_1_cuda(
     }
 }
 
-// k19-fu2 F3: SWIGLU (split gate / up) computed in the gathered quantize of the MUL_MAT_ID that reads it: block x = source row r (token
+// SWIGLU (split gate / up) computed in the gathered quantize of the MUL_MAT_ID that reads it: block x = source row r (token
 // r / n_expert_used, slot r % n_expert_used), written to compact row ids_inv[r] (-1: a skipped slot, not written). The value is the
 // expression of unary_gated_op_kernel<op_silu> (silu(gate)*up), then the code of quantize_mmq_q8_1 on it (same thread layout, lanes
 // and reductions), so the q8_1 rows are the bytes of SWIGLU + quantize_mmq_q8_1 with the forward map. The f32 SWIGLU output is not

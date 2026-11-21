@@ -10,7 +10,7 @@
 
 constexpr int gdn_cols_per_warp = 4;
 
-// k15-fn: the gates the gated_delta_net applies itself (ggml_cuda_try_gdn_gates), the formulas of unary.cu's op_sigmoid / op_softplus and
+// the gates the gated_delta_net applies itself (ggml_cuda_try_gdn_gates), the formulas of unary.cu's op_sigmoid / op_softplus and
 // of add_unary_mul_f32_kernel, so the values are those the skipped kernels wrote
 static __device__ __forceinline__ float gdn_gate_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
@@ -51,7 +51,7 @@ static __device__ __forceinline__ float gdn_token_step(
     return warp_reduce_sum<lanes_per_col>(attn_partial);
 }
 
-// ggml_gated_delta_net_replay (k16-draft): the stored window of each sequence and where this window's inputs go; strides in floats
+// ggml_gated_delta_net_replay: the stored window of each sequence and where this window's inputs go; strides in floats
 struct gdn_win_args {
     float *         wk;  // [S_k, H_k, 2 * n_win, n_seqs]
     float *         wv;  // [S_v, H_v, 2 * n_win, n_seqs]
@@ -132,7 +132,7 @@ gated_delta_net_cuda(const float * q,
 
     ggml_cuda_pdl_sync();
     if (s_ids != nullptr) {
-        // k15-fn: the initial state read in place from its cache row (the gather into a contiguous copy was skipped)
+        // the initial state read in place from its cache row (the gather into a contiguous copy was skipped)
         curr_state += (int64_t) s_ids[sequence] * s_row_stride + h_idx * S_v * S_v + col * S_v;
     }
 #pragma unroll
@@ -550,7 +550,7 @@ static void launch_gated_delta_net(
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
     if constexpr (!KDA) {
-        // the tiled kernel reads neither an in-place state (s_ids, k15-fn 24dbe0fcacd) nor raw gates (k15-fn 153a4696ebb): those run the
+        // the tiled kernel reads neither an in-place state (s_ids, commit 24dbe0fcacd) nor raw gates (commit 153a4696ebb): those run the
         // AR kernel, as they skip the chunked MMA kernel
         if (!WIN && s_ids == nullptr && beta_raw == nullptr && ga == nullptr && gdn_use_tiled(ggml_cuda_get_device(), S_v, H*n_seqs, n_tokens)) {
             // GGML_CUDA_GDN_TILED_LOG=1: every launch (test-gdn-tiled-exact counts them), else the first one
@@ -605,8 +605,8 @@ static void launch_gated_delta_net(
 
 static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tensor * dst);
 
-// k15-fn: whether ggml_cuda_op_gated_delta_net may take the mma kernel for dst (the predicate of ggml_cuda_gdn_mma_args_from_tensor).
-// k19-p1fuse (GGML_CUDA_GDN_FUSE_PRED=0: the shape-only test as before): the dispatch itself, so that the fusions which make the op
+// whether ggml_cuda_op_gated_delta_net may take the mma kernel for dst (the predicate of ggml_cuda_gdn_mma_args_from_tensor).
+// (GGML_CUDA_GDN_FUSE_PRED=0: the shape-only test as before): the dispatch itself, so that the fusions which make the op
 // take the AR kernel (the in-place state read, the gates) are not refused where the AR kernel runs anyway: a replay window (the per-token
 // kernel, before the mma launch), fewer than 64 tokens, a GPU or head layout the mma kernel does not take. Conservative: a launch whose
 // kernel set-up would fail still counts as mma (fusion refused, as before)
@@ -617,9 +617,9 @@ bool ggml_cuda_gated_delta_net_may_use_mma(const ggml_tensor * dst) {
     if (!(g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && v->ne[0] == 128 && q->ne[0] == 128)) {
         return false;
     }
-    // k19-int3fix: GGML_CUDA_GDN_FUSE_PRED unset / 1 = the dispatch test below 64 tokens only (decode, verify and replay windows), the
+    // GGML_CUDA_GDN_FUSE_PRED unset / 1 = the dispatch test below 64 tokens only (decode, verify and replay windows), the
     // shape-only test for prompt chunks; 2 = the dispatch test for every op (d328d72e2cc); 0 = the shape-only test everywhere. On A100
-    // (cc 8.0: no chunked mma kernel) the dispatch test let the fusions into the prompt chunks and those run slower there: q4x 8k
+    // (cc 8.0: no chunked mma kernel) the dispatch test let the fusions into the prompt chunks and those run slower there: 4-bit 8k
     // TTFT 1.177 -> 1.256 s (+6.8%), decode unchanged; the decode / verify gains of the predicate are below 64 tokens
     static const int pred_mode = [] {
         const char * e = getenv("GGML_CUDA_GDN_FUSE_PRED");
@@ -751,7 +751,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
-    // k15-fn: the initial state read from the cache rows (ggml_cuda_try_gdn_state_in_place skipped the gather), only the simple kernel
+    // the initial state read from the cache rows (ggml_cuda_try_gdn_state_in_place skipped the gather), only the simple kernel
     const int32_t * s_ids        = nullptr;
     int64_t         s_row_stride = 0;
     {
@@ -779,7 +779,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     if (s_ids != nullptr || beta_raw != nullptr || ga != nullptr) {
         ggml_cuda_p1_stat(GGML_CUDA_P1_GDN_FUSED);
         if (src_g->ne[0] == 1 && K < n_tokens && S_v == 128 && neq0 == 128) {
-            ggml_cuda_p1_stat(GGML_CUDA_P1_GDN_FUSED_NEW); // refused by the shape-only test (k19-p1fuse)
+            ggml_cuda_p1_stat(GGML_CUDA_P1_GDN_FUSED_NEW); // refused by the shape-only test
         }
     }
 
