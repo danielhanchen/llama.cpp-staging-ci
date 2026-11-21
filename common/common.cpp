@@ -3317,6 +3317,10 @@ uma_restart:
     if (params.split_mode_auto) {
         params.split_mode      = LLAMA_SPLIT_MODE_LAYER;
         params.split_mode_auto = false;
+        if (params.moe_cache_size == 0 && params.moe_cache_size_auto > 0) {
+            params.moe_cache_size = params.moe_cache_size_auto;
+        }
+        params.moe_cache_size_auto = 0;
     }
 
     auto mparams = common_model_params_to_llama_impl(params, params.fit_params);
@@ -5169,6 +5173,7 @@ uma_restart:
                         mparams.tensor_buft_overrides = mparams_in.tensor_buft_overrides != nullptr && !params.tensor_buft_overrides.empty() ?
                             params.tensor_buft_overrides.data() : mparams_in.tensor_buft_overrides;
                         cparams.moe_cache_size = 0;
+                        params.moe_cache_size_auto = params.moe_cache_size;
                         params.moe_cache_size  = 0;
                     }
                     if (fits) {
