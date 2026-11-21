@@ -1340,9 +1340,7 @@ llama_context::llama_context(
             place8_rel      = true;
             moe_cache->set_restore_soft(true);
             if (const char * el = getenv("LLAMA_MOE_PLACE8_LEND"); el != nullptr && atoi(el) != 0 && llama_mtp_draft_lend_on()) {
-                place8_lend = true;
-                std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
-                llama_place8_lend_tgts.push_back(this);
+                place8_lend = true; // registered at the end of the constructor (llama_place8_lend_tgts)
             }
             tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
             // (LLAMA_MOE_PLACE8_MID, set with it by the fit of a mid-size device): prompts keep their layer-major groups,
@@ -1957,6 +1955,12 @@ llama_context::llama_context(
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
         llama_mtp_ctxs.push_back(this);
+    }
+    // a lending target too: a constructor that throws before here never runs the destructor that unregisters it, and the
+    // retry with a smaller MoE cache (common_init_from_params) would leave the drafter's restore reading the freed context
+    if (place8_lend) {
+        std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+        llama_place8_lend_tgts.push_back(this);
     }
 }
 
