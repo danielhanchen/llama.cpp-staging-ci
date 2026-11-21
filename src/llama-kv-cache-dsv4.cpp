@@ -1344,7 +1344,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, ratio_csa));
 
-    // k19-kvwin: in the window mode the raw window cache (its SWA cache, llama_kv_cache_iswa) and the indexer keys keep the window types,
+    // in the window mode the raw window cache (its SWA cache, llama_kv_cache_iswa) and the indexer keys keep the window types,
     // the compressed CSA / HCA rows the cache (4-bit) types
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, llama_kv_win_window_type(type_k, true), llama_kv_win_window_type(type_v, false),

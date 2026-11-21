@@ -506,7 +506,7 @@ static ggml_tensor * build_dflash2_conv(
     if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
         dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
     }
-    // k19-handoff: the chain below in one op with its values (ggml_dflash2_conv: 22 calls of ~9 small kernels per drafter pass on
+    // the chain below in one op with its values (ggml_dflash2_conv: 22 calls of ~9 small kernels per drafter pass on
     // Flash-Next's DFlash2); LLAMA_DFLASH2_CONV_FUSED=0: the chain
     static const bool fused = [] {
         const char * e = getenv("LLAMA_DFLASH2_CONV_FUSED");
@@ -1082,7 +1082,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         output_s = model_other->output_s;
     }
 
-    // k19-draftcost: a DFlash2 draft with a restricted head (llama_model::draft_head_from_target) projects onto its rows only; the
+    // a DFlash2 draft with a restricted head (llama_model::draft_head_from_target) projects onto its rows only; the
     // selector maps its top-k to token ids (build_dflash2_selector) and nothing reads these logits
     const auto & dh = model.draft_head;
     const bool dh_on = model.dflash_selector_hidden && !model.dspark_markov_w1 && dh.w != nullptr && dh.d2t_i32 != nullptr && dh.src == output;

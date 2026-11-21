@@ -1,14 +1,14 @@
 #pragma once
 
-// k19-cmtpersist: the MoE cache's CPU-miss timing trials, persisted (LLAMA_MOE_CPU_MISS_PERSIST, default 1; =0 off).
+// the MoE cache's CPU-miss timing trials, persisted (LLAMA_MOE_CPU_MISS_PERSIST, default 1; =0 off).
 //
 // A trial times small batches with and without the host path and keeps the path if it is at least cmt_margin faster. Where the
-// host and the upload cost about the same (Kaggle T4, 4 vCPU, Qwen3.6-35B-A3B UD-Q4_K_XL 12 GB: 155 vs 188 us per expert) the first
+// host and the upload cost about the same (T4, 4 vCPU, Qwen3.6-35B-A3B 4-bit quant 12 GB: 155 vs 188 us per expert) the first
 // trial decided "off" in one launch (-2.3%) and "on" in the next (-3.6%), and the two launches wrote other texts at temperature 0
 // (the host computes misses it does not fetch, so the cache, the route-tail skip and which rows run on the CPU all diverge).
 //
 // The verdict of every trial of a launch (on / off, the short-prompt flag, the gap to the next trial, how many small batches the trial
-// ran, and the measured ratio t_on / t_off) is kept as one line in the calibration file of k19-determinism, under a tag naming the cache
+// ran, and the measured ratio t_on / t_off) is kept as one line in the calibration file of, under a tag naming the cache
 // size (expert slots), the layer count and the small-batch limit; the file's key already names the build, the device, the threads, the
 // CPU count, the cache (main / MTP) and the expert form. A later launch with the same file and tag replays the recorded trials in order:
 // it runs each trial's schedule (the same blocks with and without the host path, so the cache is admitted to exactly as in the first
@@ -34,11 +34,11 @@ struct rec {
     int    gap     = 64;  // small batches until the next trial
     int    len     = 0;   // counted small batches the trial ran (it can end early)
     double ratio   = 0.0; // t_on / t_off measured by the launch that raced it (information: the margin)
-    int    firm    = 1;   // k19-calvmargin: replayed as recorded; 0 = a marginal timing, timed again by the next launch
-    int    tries   = 1;   // k19-calvmargin: launches that timed this trial
+    int    firm    = 1;   // replayed as recorded; 0 = a marginal timing, timed again by the next launch
+    int    tries   = 1;   // launches that timed this trial
 };
 
-// k19-calvpersist: the calibration file key of a pinned run (LLAMA_MOE_CPU_MISS_CAL_VALUES): the machine's key plus the pinned numbers,
+// the calibration file key of a pinned run (LLAMA_MOE_CPU_MISS_CAL_VALUES): the machine's key plus the pinned numbers,
 // so the pinned run has a file of its own (its trial verdicts persist) and a launch without the variable never reads pinned numbers
 inline std::string calv_key(const std::string & key, const double v[4]) {
     char buf[160];
@@ -81,7 +81,7 @@ inline bool parse_line(const std::string & line, const std::string & tag, std::v
             return false;
         }
         p += nc;
-        // k19-calvmargin: ":firm:tries" (a line without them, written before, is firm)
+        // ":firm:tries" (a line without them, written before, is firm)
         int nf = 0;
         if (sscanf(p, ":%d:%d%n", &x.firm, &x.tries, &nf) == 2 && nf > 0) {
             if (x.tries < 1) {
@@ -175,7 +175,7 @@ inline bool write(const std::string & path, const std::string & key, const std::
     return true;
 }
 
-// the verdict of a timed trial. The first trial (no earlier verdict) or hyst <= 0: on if at least `margin` faster (the k10 rule).
+// the verdict of a timed trial. The first trial (no earlier verdict) or hyst <= 0: on if at least `margin` faster (rule).
 // Later trials keep the previous verdict inside a band of +-hyst around the margin: on -> off only if the host path is no longer
 // (margin - hyst) faster, off -> on only if it is (margin + hyst) faster
 inline bool decide(double t_on, double t_off, size_t n_off, size_t n_on, bool have_prev, bool prev_on, double margin, double hyst) {
@@ -188,7 +188,7 @@ inline bool decide(double t_on, double t_off, size_t n_off, size_t n_on, bool ha
     return prev_on ? t_on < (1.0 - margin + hyst)*t_off : t_on < (1.0 - margin - hyst)*t_off;
 }
 
-// k19-calvmargin: the t_on / t_off ratio at which decide switches (the same cases as decide)
+// the t_on / t_off ratio at which decide switches (the same cases as decide)
 inline double threshold(bool have_prev, bool prev_on, double margin, double hyst) {
     if (!have_prev || hyst <= 0.0) {
         return 1.0 - margin;
@@ -196,14 +196,14 @@ inline double threshold(bool have_prev, bool prev_on, double margin, double hyst
     return prev_on ? 1.0 - margin + hyst : 1.0 - margin - hyst;
 }
 
-// k19-calvmargin: a timed "on" is clear only if the host path was at least min_gain faster (t_on <= (1 - min_gain) t_off; min_gain <= 0:
-// every "on" is clear, the k19-calvpersist rule). One noisy launch-1 trial decided "on" by 4% on an A100 40 (37.3 vs 35.7 ms), was
+// a timed "on" is clear only if the host path was at least min_gain faster (t_on <= (1 - min_gain) t_off; min_gain <= 0:
+// every "on" is clear, rule). One noisy launch-1 trial decided "on" by 4% on an A100 40 (37.3 vs 35.7 ms), was
 // persisted, and every later launch replayed the host path at 70-77 ms per pass against 50-52 ms without it
 inline bool marginal_on(bool on, double t_on, double t_off, double min_gain) {
     return on && min_gain > 0.0 && t_off > 0.0 && t_on > (1.0 - min_gain)*t_off;
 }
 
-// k19-calvmargin: what a timed trial keeps. A clear timing is firm (replayed as is from then on), and so is a marginal "off" (the timing and
+// what a timed trial keeps. A clear timing is firm (replayed as is from then on), and so is a marginal "off" (the timing and
 // the safe side agree). A marginal "on" keeps the host path off (the gain is inside the noise; the host path's loss when the timing was
 // wrong is not) and stays open: the next launch times it again, a clear timing then decides, and after max_tries timings without one it
 // is firm "off". So only a trial that timed "on" inside the band can change in a later launch, and only to a clear "on".
@@ -244,7 +244,7 @@ inline bool wide_mid_host(int n_cpus, bool wide, const char * e, const char * em
 
 // how many marginal "on" timings in a row make a trusted record firm "on" (value of LLAMA_MOE_CPU_MISS_TRUST_TRIES, default 2, at least 1;
 // 3 = as many as the untrusted firm "off" needs). An "off" timing makes the record firm "off" at any try, so this only decides how soon
-// a launch stops re-timing a host path that timed faster each time. Colab L4 (12 vCPU), Qwen3.6-35B-A3B UD-Q4_K_XL with its MTP head:
+// a launch stops re-timing a host path that timed faster each time. L4 (12 vCPU), Qwen3.6-35B-A3B 4-bit quant with its MTP head:
 // the first trial timed 0.919-0.952 in each of 42 launches at 16 GB on 9 VMs (a third timing never changed the verdict), at 20 GB
 // 0.955-0.983 with 4 "off" timings among 22; the settled launch against the trust-off arm over 12 texts: 16 GB chat +4%, 8k +8%,
 // 20 GB level

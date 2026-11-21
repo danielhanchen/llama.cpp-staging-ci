@@ -112,7 +112,7 @@ struct llm_graph_params;
 // number of rows that see fewer cells than the whole ubatch (a ubatch crossing a multiple of the 256 cell padding)
 int64_t  llm_graph_exact_row_n_kv(const llama_ubatch & ubatch, int64_t i, int64_t n_kv);
 uint32_t llm_graph_exact_split(const llama_ubatch & ubatch);
-uint32_t llm_graph_kq_mask_host_max_tokens(const llama_hparams & hparams, const llama_cparams & cparams); // k19-uma, see the definition
+uint32_t llm_graph_kq_mask_host_max_tokens(const llama_hparams & hparams, const llama_cparams & cparams); //, see the definition
 
 //
 // llm_graph_input
@@ -320,9 +320,9 @@ public:
     int32_t rs_z;
     int32_t alias; // first cache row of the in-place states during decode, -1 when they are gathered
 
-    // k16-draft: I32 [2, n_seqs] of ggml_gated_delta_net_replay (kept tokens of the stored window, its half), when this ubatch commits it
+    // I32 [2, n_seqs] of ggml_gated_delta_net_replay (kept tokens of the stored window, its half), when this ubatch commits it
     ggml_tensor * rs_rp = nullptr;
-    // k19-npmtp: a sequence of this ubatch reads its state from another row (find_slot moved its cell), see build_recurrent_attn
+    // a sequence of this ubatch reads its state from another row (find_slot moved its cell), see build_recurrent_attn
     bool rs_moved = false;
 };
 
@@ -362,7 +362,7 @@ public:
     const llama_cparams cparams;
 };
 
-// k19-kvwin: the inputs of a cache with a recent-window ring (llama_kv_cache::win_init): the ring row of every token and the ring
+// the inputs of a cache with a recent-window ring (llama_kv_cache::win_init): the ring row of every token and the ring
 // mask (the cells of each row's window, moved out of the body mask by llama_kv_cache::set_input_win)
 struct llm_graph_kv_win {
     ggml_tensor * idxs = nullptr; // I64 [n_batch]
@@ -374,7 +374,7 @@ struct llm_graph_kv_win {
     mutable bool used = false;
 };
 
-// k19-kvwin: the second KV source of an attention (the ring views and their mask), see build_attn_mha
+// the second KV source of an attention (the ring views and their mask), see build_attn_mha
 struct llm_graph_attn_src2 {
     ggml_tensor * k    = nullptr; // [n_embd_head_k, n_head_kv, n_slots, n_stream]
     ggml_tensor * v    = nullptr; // [n_embd_head_v, n_head_kv, n_slots, n_stream]
@@ -413,13 +413,13 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
-    // k19-graph: I32 [1], the live cells of a bucketed n_kv that flash attention reads on the device (llama_kv_cache_context::get_n_kv_live)
+    // I32 [1], the live cells of a bucketed n_kv that flash attention reads on the device (llama_kv_cache_context::get_n_kv_live)
     ggml_tensor * self_kv_len = nullptr;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
-    // k19-kvwin: ring inputs (of the base cache for iSWA), unset without a ring
+    // ring inputs (of the base cache for iSWA), unset without a ring
     llm_graph_kv_win win;
 
     const llama_hparams hparams;
@@ -458,7 +458,7 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    // k19-kvwin: ring inputs (of the base cache for iSWA), unset without a ring
+    // ring inputs (of the base cache for iSWA), unset without a ring
     llm_graph_kv_win win;
 
     const llama_hparams hparams;
@@ -594,7 +594,7 @@ public:
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
 
-    // k19-kvwin: ring inputs (of the base cache for iSWA), unset without a ring
+    // ring inputs (of the base cache for iSWA), unset without a ring
     llm_graph_kv_win win;
 
     const llama_hparams hparams;
@@ -636,7 +636,7 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_k_rot_swa = nullptr;
 
-    // k19-kvwin: ring inputs (of the base cache for iSWA), unset without a ring
+    // ring inputs (of the base cache for iSWA), unset without a ring
     llm_graph_kv_win win;
 
     const llama_hparams hparams;
@@ -821,7 +821,7 @@ public:
     const llama_memory_hybrid_iswa_context * mctx;
 };
 
-// k15-fn: a sampler set again (llama_set_sampler / swap) has no graph build until its next one: a kept graph is not reused for it
+// a sampler set again (llama_set_sampler / swap) has no graph build until its next one: a kept graph is not reused for it
 void llm_graph_sampler_unbind(const llama_sampler * smpl);
 
 class llm_graph_input_sampling : public llm_graph_input_i {
@@ -832,7 +832,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
-    // k15-fn: this graph's build; a sampler that writes per-step inputs (llama_sampler_graph_bound) binds them to its latest build
+    // this graph's build; a sampler that writes per-step inputs (llama_sampler_graph_bound) binds them to its latest build
     uint64_t build_id = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -1046,12 +1046,12 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
-    // k19-dtopk: an MTP draft step's restricted head logits [n_sub, n_outputs] before their scatter into t_logits, and its
+    // an MTP draft step's restricted head logits [n_sub, n_outputs] before their scatter into t_logits, and its
     // token-ordered row map (llama_model::draft_head perm / cand): build_sampling runs a leading top-k over them (draft_topk_rows)
     ggml_tensor * t_dh_logits   = nullptr;
     ggml_tensor * t_dh_perm     = nullptr;
     ggml_tensor * t_dh_cand     = nullptr;
-    // k19-graph: the KV length input of the attention (llm_graph_input_attn_kv::self_kv_len) and the n_kv of its K / V views
+    // the KV length input of the attention (llm_graph_input_attn_kv::self_kv_len) and the n_kv of its K / V views
     ggml_tensor * t_kv_len      = nullptr;
     int64_t       t_kv_len_n_kv = 0;
 
@@ -1071,7 +1071,7 @@ public:
 
     // memory buffers used to evaluate the model
     // not zero-filled (a std::vector would touch every byte): only the pages the graph uses become resident. The layer-major graph
-    // results (16 per context) held ~290 MiB of zeroed metadata in k9 (Qwen3.6-35B-A3B + MTP), most of it never used
+    // results (16 per context) held ~290 MiB of zeroed metadata in (Qwen3.6-35B-A3B + MTP), most of it never used
     std::unique_ptr<uint8_t[]> buf_compute_meta;
     size_t                     buf_compute_meta_size = 0;
 
@@ -1180,12 +1180,12 @@ struct llm_graph_context {
 
     // a prompt ubatch with outputs whose graph allocation the MoE cache lends (LLAMA_MOE_CACHE_LEND=2) keeps its last layer at full width
     // and narrows to the output rows after it: narrowed, the last layer's experts are looked up on the host, which reads the cache banks
-    // as weights, and the cache then lends nothing to the graph, which allocates on its own and fails on a full device (G4 at 32 GB,
+    // as weights, and the cache then lends nothing to the graph, which allocates on its own and fails on a full device (RTX PRO 6000 at 32 GB,
     // Flash-Next, --ctx-checkpoints 0: "allocating 1352.53 MiB ... cudaMalloc failed" on the first request; with checkpoints the
     // prompt ubatches carry no outputs). LLAMA_MOE_LEND_FULL_LAST unset or 2: always; 1: only after such a graph failed to allocate
     // (llama_context::process_ubatch retries it, moe_full_last; this does not catch the Flash-Next case, whose warm-up already turned the
     // host weight prefetch off when its staging copies could not be lent); 0: never. Costs where the unlent graph fits (Qwen3.6-35B-A3B
-    // UD-Q4_K_XL at 12 GB, --ctx-checkpoints 0): 2k prompt 7185 -> 8905 tok/s, decode after it 174.0 -> 170.5, 101-token prompt 424 -> 377
+    // 4-bit quant at 12 GB, --ctx-checkpoints 0): 2k prompt 7185 -> 8905 tok/s, decode after it 174.0 -> 170.5, 101-token prompt 424 -> 377
     bool moe_full_last;
     bool crop_full_last() const;
 
@@ -1390,12 +1390,12 @@ struct llm_graph_context {
     // GPU copy of the cached rows `view` [n_embd_head, n_head_kv, n_kv, 1] with the rows `cur` written at `idxs`
     ggml_tensor * kv_host_stage(ggml_tensor * view, ggml_tensor * cur, ggml_tensor * idxs) const;
 
-    // k19-kvlong: the dense selection mask of a sparse attention (I32 [n_sel, n_tokens] selected cells, dead slots >= n_kv) as one
+    // the dense selection mask of a sparse attention (I32 [n_sel, n_tokens] selected cells, dead slots >= n_kv) as one
     // ggml_sel_mask node, or nullptr where the layer's device does not run it or LLAMA_QSA_SEL_OP=0 (then the caller builds the
     // fill / repeat / set_rows / add chain, whose values it equals)
     ggml_tensor * build_sel_mask_op(ggml_tensor * sel_idx, ggml_tensor * kq_mask, ggml_backend_dev_t dev) const;
 
-    // k19-kvwin: store this ubatch's K / V in the ring of a windowed cache and return the ring as the attention's second source (empty
+    // store this ubatch's K / V in the ring of a windowed cache and return the ring as the attention's second source (empty
     // without a ring); n_embd_v_view > 0: V is a view of K (MLA)
     llm_graph_attn_src2 build_kv_win_src(const llm_graph_kv_win & w, const llama_kv_cache_context * mctx, ggml_tensor * k_cur,
             ggml_tensor * v_cur, int il, int64_t n_embd_v_view) const;
@@ -1414,7 +1414,7 @@ struct llm_graph_context {
             // the cache k / v are views of: an exact verify row reads fewer cells only when it sees none of the cells it drops
             // (nullptr: every row reads all n_kv cells)
             const llama_kv_cache_context * mctx_kv = nullptr,
-            // k19-kvwin: a second KV source (the recent-window ring), nullptr: none
+            // a second KV source (the recent-window ring), nullptr: none
             const llm_graph_attn_src2 * src2 = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
@@ -1611,7 +1611,7 @@ struct llm_graph_context {
 
     void build_sampling() const;
 
-    // k19-dtopk: true if every sampled row of this ubatch goes through a backend chain that starts with a top-k and no row needs the
+    // true if every sampled row of this ubatch goes through a backend chain that starts with a top-k and no row needs the
     // raw logits, so build_sampling takes the top-k over the restricted draft head's logits (res->t_dh_*) and t_logits (the scatter
     // into the full vocabulary) is not computed
     bool draft_topk_rows() const;

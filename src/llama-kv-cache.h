@@ -17,7 +17,7 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
-// k19-kvwin: the recent-window ring beside a (4-bit) KV cache, see llama_kv_cache::win_init
+// the recent-window ring beside a (4-bit) KV cache, see llama_kv_cache::win_init
 struct llama_kv_win_params {
     int32_t   n_win    = -1;              // last W positions of every sequence also in the ring (-1: off)
     int32_t   n_sinks  = 0;               // first S positions of every sequence also in the ring
@@ -196,7 +196,7 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
-    // k19-fixB: whether token i of the ubatch sees a cell in [c0, c1) of its stream: a used cell (or a cell of the ubatch) of one of
+    // whether token i of the ubatch sees a cell in [c0, c1) of its stream: a used cell (or a cell of the ubatch) of one of
     // its sequences at a position <= its own. A ubatch over several streams counts as seeing them
     bool exact_row_sees(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t i, uint32_t c0, uint32_t c1) const;
 
@@ -221,10 +221,10 @@ public:
     // graph_build API
     //
 
-    // (k19-graph: n_kv_live, if given, gets the 256-padded n_kv before any bucket; 0 when the ubatch takes no device KV length)
+    // (n_kv_live, if given, gets the 256-padded n_kv before any bucket; 0 when the ubatch takes no device KV length)
     uint32_t get_n_kv(const slot_info & sinfo, bool * bucketed = nullptr, uint32_t * n_kv_live = nullptr) const;
 
-    // k19-vgraph: coarser n_kv for small ubatches (decode, speculative verify), so their graphs keep their shapes, and their CUDA graphs
+    // coarser n_kv for small ubatches (decode, speculative verify), so their graphs keep their shapes, and their CUDA graphs
     // stay captured, while the context grows by up to an eighth instead of 256 cells (see llama_memory_hybrid_idx, the only user).
     // A ubatch of at most n_tokens_max tokens whose 256-padded n_kv is at least max(n_kv_min, n_tokens*n_kv_min_per_token) gets
     // n_kv padded to max(256, pow2floor(n_kv)/div) cells. Off when n_tokens_max == 0
@@ -233,7 +233,7 @@ public:
         uint32_t n_kv_min           = 0;
         uint32_t n_kv_min_per_token = 0;
         uint32_t div                = 8;
-        // k19-graph: the attention reads the live length on the device (ggml_flash_attn_ext_set_kv_len), so the bucket cannot move
+        // the attention reads the live length on the device (ggml_flash_attn_ext_set_kv_len), so the bucket cannot move
         // its sums: every ubatch of up to dev_n_tokens_max tokens is bucketed from the first cell, dev_div buckets per octave of at
         // least dev_step_min cells (where the context allows it, set_n_kv_bucket_dev_allowed; else the fields above)
         bool     dev_len            = false;
@@ -244,11 +244,11 @@ public:
     void set_n_kv_bucket(const n_kv_bucket_params & p) { n_kv_bucket = p; }
     // a context whose verify rows must equal single token decodes (llm_graph_exact_row_n_kv) keeps the 256 cell padding
     void set_n_kv_bucket_allowed(bool value) { n_kv_bucket_allowed = value; }
-    // k19-graph: the device KV length buckets (n_kv_bucket_params::dev_len) only where flash attention runs (the context's choice)
+    // the device KV length buckets (n_kv_bucket_params::dev_len) only where flash attention runs (the context's choice)
     void set_n_kv_bucket_dev_allowed(bool value) { n_kv_bucket_dev_allowed = value; }
-    // k19-fullcost: see llama_memory_hybrid_idx::set_n_kv_bucket_dev_wide
+    // see llama_memory_hybrid_idx::set_n_kv_bucket_dev_wide
     void set_n_kv_bucket_dev_step_min(uint32_t value) { n_kv_bucket.dev_step_min = value; }
-    // k19-graph: every attention layer's K / V sits on a device whose flash attention takes the KV length on the device
+    // every attention layer's K / V sits on a device whose flash attention takes the KV length on the device
     bool fa_kv_len_supported() const;
 
     // get views of the current state of the cache
@@ -282,7 +282,7 @@ public:
     };
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    // k19-rsbis: with `purged`, the cells the SWA purge changes outside the slot are saved there first (prepare() restores them)
+    // with `purged`, the cells the SWA purge changes outside the slot are saved there first (prepare() restores them)
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, std::vector<purge_backup> * purged = nullptr);
 
     //
@@ -309,7 +309,7 @@ public:
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
 
-    // k19-kvwin: the recent-window ring (see llama_kv_win_params). win_init allocates it once after the construction (false: the
+    // the recent-window ring (see llama_kv_win_params). win_init allocates it once after the construction (false: the
     // cache cannot take one, it stays as it was); the graph then stores every token in the ring too (cpy_k_win / cpy_v_win, the
     // ring row of each token in the win idxs input), and the attention reads the ring for the cells of a row's window (the win mask:
     // set_input_win moves those cells out of the body mask), see the two-source ggml_flash_attn_ext_set_src2
@@ -368,15 +368,15 @@ private:
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
-        // k19-kvwin: the ring [n_embd, win_r + 1, n_stream] (the last row of each stream is a dump row), null when off
+        // the ring [n_embd, win_r + 1, n_stream] (the last row of each stream is a dump row), null when off
         ggml_tensor * k_win = nullptr;
         ggml_tensor * v_win = nullptr;
 
-        // k19-kvsel: a per-cell tensor [aux cols, kv_size] in its own device buffer (aux_init), null when off
+        // a per-cell tensor [aux cols, kv_size] in its own device buffer (aux_init), null when off
         ggml_tensor * k_aux = nullptr;
     };
 
-    // k19-kvwin: the ring of one stream: slot -> cell and cell -> slot. A slot is live iff both agree and the cell is not empty, so
+    // the ring of one stream: slot -> cell and cell -> slot. A slot is live iff both agree and the cell is not empty, so
     // a cell emptied by seq_rm / seq_keep / clear needs no bookkeeping here (an empty cell is masked, and the ring mask is derived
     // from the body mask). free_slots holds the slots known free (lowest first)
     struct kv_ring {
@@ -400,7 +400,7 @@ private:
     bool     win_no_assign = false; // state_read: the restored cells get slots from the blob, not from apply_ubatch
     mutable std::vector<kv_ring> v_rings;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> win_ctxs_bufs;
-    // k19-kvsel: the buffers of the per-cell aux tensors (aux_init)
+    // the buffers of the per-cell aux tensors (aux_init)
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> aux_ctxs_bufs;
 
     bool win_slot_live(uint32_t strm, int32_t j) const;
@@ -417,7 +417,7 @@ private:
     // required padding
     const uint32_t n_pad = 1;
 
-    // k19-vgraph: see set_n_kv_bucket
+    // see set_n_kv_bucket
     n_kv_bucket_params n_kv_bucket;
     bool n_kv_bucket_allowed = true;
     bool n_kv_bucket_dev_allowed = false;
@@ -446,7 +446,7 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
-    // k17-small (LLAMA_KV_LAZY=1, opt-in): device KV buffers whose address range is reserved whole and backed with memory as the cells
+    // (LLAMA_KV_LAZY=1, opt-in): device KV buffers whose address range is reserved whole and backed with memory as the cells
     // in use grow (ggml_backend_buffer_commit of the CUDA backend), so a long context costs only the rows it has reached. One stream,
     // non-transposed V (flash attention) only: each layer's K and V rows of cells [0, n) are then one prefix of the tensor
     std::vector<ggml_backend_buffer_t> lazy_bufs;
@@ -454,7 +454,7 @@ private:
     size_t (*lazy_committed_fn)(ggml_backend_buffer_t) = nullptr;
     uint32_t lazy_cells = 0;   // cells [0, lazy_cells) of every layer are backed
     bool     lazy_sim   = false; // prepare places the ubatches (apply_ubatch only simulates them): the cells are backed after it
-    // k17-small (lazy KV step 2): the MoE cache that gives device memory back as the cells grow (lazy_set_shrink), the free memory a
+    // (lazy KV step 2): the MoE cache that gives device memory back as the cells grow (lazy_set_shrink), the free memory a
     // growth leaves on the device (LLAMA_KV_LAZY_MARGIN_MIB, at most what is free at the first growth; -1: not measured yet), and of a
     // measurement (no_alloc) the device KV bytes the lazy buffers would leave unbacked at load (see lazy_unbacked)
     std::function<size_t(ggml_backend_dev_t, size_t)> lazy_shrink_fn;
@@ -471,7 +471,7 @@ public:
     // load, reported only where the MoE cache shrinks, LLAMA_MOE_CACHE_SHRINK)
     std::map<ggml_backend_buffer_type_t, size_t> lazy_unbacked() const;
 
-    // k19-kvsel (LLAMA_KV_SEL_HOST=1, opt-in; armed by llama_kv_cache_sel_arm for an attention cache whose every layer reads only the
+    // (LLAMA_KV_SEL_HOST=1, opt-in; armed by llama_kv_cache_sel_arm for an attention cache whose every layer reads only the
     // cells an indexer selects): the device K/V buffer is one reserved address range whose chunks are backed by device memory for
     // LLAMA_KV_SEL_DEV_CELLS cells (32768) of every layer and by pinned host memory for the rest (ggml-cuda HOST_NUMA mappings). The
     // kernels read the same addresses, so the results are unchanged; only the cells a kernel loads from host chunks cross the bus.
@@ -482,7 +482,7 @@ public:
     std::map<ggml_backend_buffer_type_t, size_t> sel_host() const;
     // whether some K/V is (a measurement: would be) in host chunks
     bool sel_engaged() const { return !sel_bufs.empty() || !sel_host_est.empty(); }
-    // k19-kvsel: give every layer a per-cell tensor of cols values of the K type, in a buffer of the layer's buffer type, cleared with
+    // give every layer a per-cell tensor of cols values of the K type, in a buffer of the layer's buffer type, cleared with
     // the cache, counted in memory_breakdown and not part of the state (llama_memory_hybrid_idx: the pooled indexer keys)
     void aux_init(int64_t cols);
     ggml_tensor * get_k_aux(int32_t il) const;
@@ -520,7 +520,7 @@ private:
     std::vector<uint32_t> seq_to_stream;
 
 public:
-    // k19-vwidth: the first KQ mask row of a sequence in a decode, kept with the position of the cells' modification log it was read
+    // the first KQ mask row of a sequence in a decode, kept with the position of the cells' modification log it was read
     // at, so the next decode copies it and recomputes only the cells logged since then plus the cells of the sequence whose positions
     // lie between the two rows' positions (set_input_kq_mask)
     struct kq_row_entry {
@@ -588,7 +588,7 @@ private:
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
 
-    // k19-kvwin: the ring rows of the saved cells (llama-kv-cache-win.cpp)
+    // the ring rows of the saved cells (llama-kv-cache-win.cpp)
     void state_write_win(llama_io_write_i & io, const cell_ranges_t & cr) const;
     bool state_read_win (llama_io_read_i  & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
@@ -638,13 +638,13 @@ public:
 
     uint32_t get_n_kv() const;
 
-    // k19-vgraph: whether this ubatch's n_kv was padded past 256 cells (llama_kv_cache::set_n_kv_bucket)
+    // whether this ubatch's n_kv was padded past 256 cells (llama_kv_cache::set_n_kv_bucket)
     bool get_n_kv_bucketed() const { return n_kv_bucketed; }
 
-    // k19-graph: the cells the attention reads (256-padded, before the bucket) when it takes its length on the device, else 0
+    // the cells the attention reads (256-padded, before the bucket) when it takes its length on the device, else 0
     uint32_t get_n_kv_live() const { return n_kv_live; }
 
-    // k19-kvsel: the device cells per layer of a cache with host chunks (0: every cell in device memory)
+    // the device cells per layer of a cache with host chunks (0: every cell in device memory)
     uint32_t get_sel_dev_cells() const;
 
     ggml_type type_k() const;
@@ -685,7 +685,7 @@ public:
     // see llama_kv_cache::exact_row_sees(), for the current ubatch
     bool exact_row_sees(const llama_ubatch & ubatch, uint32_t i, uint32_t c0, uint32_t c1) const;
 
-    // k19-kvwin: see llama_kv_cache::win_init etc., for the current ubatch
+    // see llama_kv_cache::win_init etc., for the current ubatch
     bool          win_on() const { return kv != nullptr && kv->win_on(); }
     const llama_kv_cache * get_kv() const { return kv; }
     ggml_tensor * build_input_win_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
@@ -741,7 +741,7 @@ private:
     uint32_t n_kv_live    = 0;
 };
 
-// k19-kvsel: the next llama_kv_cache constructed on this thread is an attention cache whose every layer reads only selected cells
+// the next llama_kv_cache constructed on this thread is an attention cache whose every layer reads only selected cells
 // (llama_memory_hybrid_idx, qwen4exp QSA); it then honours LLAMA_KV_SEL_HOST=1 (see llama_kv_cache::sel_dev_cells). dev_cells > 0:
 // that many device cells per layer instead of LLAMA_KV_SEL_DEV_CELLS, static policy, no stats line (the split indexer key cache)
 void llama_kv_cache_sel_arm(bool on, uint32_t dev_cells = 0);

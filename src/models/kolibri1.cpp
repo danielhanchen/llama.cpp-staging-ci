@@ -9,7 +9,7 @@ void llama_model_kolibri1::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm);
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func);
-    // k19-agn: GGUFs from the community kolibri1 conversion patch (Hob-forge/Kolibri-1-GGUF) write gating
+    // GGUFs from the community kolibri1 conversion patch (Hob-forge/Kolibri-1-GGUF) write gating
     // func 5 (its SIGMOID_LOGIT_ADD: pick on logits + expert bias, weights = sigmoid of the unbiased logits, no renorm), which is
     // what this graph does for SIGMOID, the value upstream's converter writes (LLAMA_KOLIBRI1_GATING5=0: refused as before)
     if (hparams.expert_gating_func == 5) {

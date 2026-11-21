@@ -139,7 +139,7 @@ bool llama_batch_allocr::init(
         state_by_ref = batch_inp.tokens[i].state_ref != nullptr;
     }
     if (has_state && state_by_ref) {
-        // k19-host: rows the caller holds (llama_batch_ext_set_embd_state_ref), read in place; a ubatch over rows contiguous in memory
+        // rows the caller holds (llama_batch_ext_set_embd_state_ref), read in place; a ubatch over rows contiguous in memory
         // points at them, else its rows are copied (ubatch_add)
         state_ptrs.resize(n_tok);
         for (int32_t i = 0; i < n_tok; ++i) {
@@ -626,7 +626,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 
     std::vector<int32_t> idxs;
 
-    // a segment ends at the next break (k11 LLAMA_LM_CKPT_MERGE)
+    // a segment ends at the next break (LLAMA_LM_CKPT_MERGE)
     const uint32_t seg_end = ubatch_breaks.empty() ? (uint32_t) used.size() : (uint32_t) break_after((int32_t) cur_idx);
 
     while (true) {
@@ -712,7 +712,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     // at the end we will concat these to get the final ubatch
     std::vector<idx_vec_t> idxs_per_seq(n_seqs);
 
-    // k11 (LLAMA_LM_CKPT_MERGE): one sequence set, its segment ends at the next break (batch index == index in the set, checked)
+    // (LLAMA_LM_CKPT_MERGE): one sequence set, its segment ends at the next break (batch index == index in the set, checked)
     int32_t seg_end = -1;
     if (!ubatch_breaks.empty() && n_seqs == 1) {
         const auto & m = seq_set_map[cur_seq_set[0]];
@@ -763,7 +763,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         GGML_ASSERT(n_ubatch > n_keep_tail);
 
         auto n_remaining = [&](uint32_t s) {
-            // within a segment (k11): as if the segment were the whole batch
+            // within a segment: as if the segment were the whole batch
             if (seg_end >= 0 && s == 0) {
                 return (uint32_t) (seg_end - cur_idx[s]);
             }
@@ -940,7 +940,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     // the state rows of consecutive batch entries are already laid out as the ubatch needs them: the ubatch points at them
     // instead of a zero-filled copy (a prompt ubatch of the MTP draft carries n_tokens*n_embd floats of target hidden state)
-    // (k19-host: rows held by reference must also be consecutive in memory)
+    // (rows held by reference must also be consecutive in memory)
     static const bool state_in_place = llama_mtp_handoff_on("COPY");
     bool state_view = has_state && (state_in_place || state_by_ref);
     for (size_t i = 1; state_view && i < idxs.size(); ++i) {
@@ -1229,9 +1229,9 @@ llama_batch_ext::llama_batch_ext(llama_context * ctx) :
         n_vocab(llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)))),
         n_pos_per_embd(llama_get_model(ctx)->hparams.n_pos_per_embd()) {
     clear();
-    // k11 (LLAMA_BATCH_STATE_PREFAULT=0 turns it off): the state rows of a full batch are allocated and faulted in here, at load,
+    // (LLAMA_BATCH_STATE_PREFAULT=0 turns it off): the state rows of a full batch are allocated and faulted in here, at load,
     // instead of by the first long prompt: an 8k-token Flash-Next MTP prompt grew this vector to 335 MiB by insertion, ~240 ms of
-    // reallocation and page faults on the main thread between the target's last ubatch and the drafter (G4 nsys). At most 1 GiB.
+    // reallocation and page faults on the main thread between the target's last ubatch and the drafter (RTX PRO 6000 nsys). At most 1 GiB.
     static const bool prefault = getenv("LLAMA_BATCH_STATE_PREFAULT") == nullptr || atoi(getenv("LLAMA_BATCH_STATE_PREFAULT")) != 0;
     const size_t n_state = n_tokens_max*n_embd_state;
     if (prefault && n_state > 0 && n_state*sizeof(float) <= (1ull << 30)) {

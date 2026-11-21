@@ -362,7 +362,7 @@ struct llama_weight_store::impl {
         size_t               bytes = 0;
     };
     std::deque<ws_task *> spec;
-    int spec_parallel = 0; // k19-l4fill: at most this many speculative reads at once (0: no limit)
+    int spec_parallel = 0; // at most this many speculative reads at once (0: no limit)
     int spec_running  = 0;
     std::unordered_map<uint64_t, std::unique_ptr<spec_req>> spec_reqs; // tickets not collected yet (main thread)
     uint64_t spec_next = 1;
@@ -1324,7 +1324,7 @@ size_t llama_weight_store::ram_available() {
         }
     }
     // cgroup v2: the limit minus what is used; the reclaimable file pages of the group count as available, shmem and mlocked file
-    // pages do not (llama_sysmem::cgroup_v2_dir_available). LLAMA_SYSMEM_CREDIT_FILE=1: every page of memory.stat "file", as before k19
+    // pages do not (llama_sysmem::cgroup_v2_dir_available). LLAMA_SYSMEM_CREDIT_FILE=1: every page of memory.stat "file", as before
     {
         static const bool credit_file = [] { const char * e = getenv("LLAMA_SYSMEM_CREDIT_FILE"); return e != nullptr && atoi(e) != 0; }();
         const uint64_t cg = llama_sysmem::cgroup_v2_dir_available("/sys/fs/cgroup", credit_file);
@@ -1332,10 +1332,10 @@ size_t llama_weight_store::ram_available() {
             avail = avail == 0 ? (size_t) cg : std::min(avail, (size_t) cg);
         }
     }
-    // k16-disk: the limits of this process's own cgroup and of its parents (/proc/self/cgroup), not only of the namespace root read
+    // the limits of this process's own cgroup and of its parents (/proc/self/cgroup), not only of the namespace root read
     // above: under a systemd scope / service (MemoryMax=), Slurm or any cgroup that is not the root of a cgroup namespace, the root
     // has no limit, so the weight stream and its RAM tier stayed off and the experts were read by page faults (Qwen3.6-35B-A3B
-    // UD-Q4_K_XL in a 10 GiB scope: decode 0.37 tok/s and 3.7 GB read per token, against 9.56 tok/s and 90 MB with the stream on;
+    // 4-bit quant in a 10 GiB scope: decode 0.37 tok/s and 3.7 GB read per token, against 9.56 tok/s and 90 MB with the stream on;
     // same output). LLAMA_SYSMEM_CGROUP_WALK=0: the root only, as before
     static const bool walk = [] { const char * e = getenv("LLAMA_SYSMEM_CGROUP_WALK"); return e == nullptr || atoi(e) != 0; }();
     if (walk) {
@@ -1344,7 +1344,7 @@ size_t llama_weight_store::ram_available() {
             avail = avail == 0 ? (size_t) s : std::min(avail, (size_t) s);
         }
     }
-    // LLAMA_SYSMEM_LOG=1 (diagnostic, once): the readings that make up the value, with the pre-k19 root credit beside the current one
+    // LLAMA_SYSMEM_LOG=1 (diagnostic, once): the readings that make up the value, with the pre-root credit beside the current one
     static const bool sysmem_log = [] { const char * e = getenv("LLAMA_SYSMEM_LOG"); return e != nullptr && atoi(e) != 0; }();
     static bool sysmem_logged = false;
     if (sysmem_log && !sysmem_logged) {

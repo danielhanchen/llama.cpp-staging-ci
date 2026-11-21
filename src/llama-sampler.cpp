@@ -137,7 +137,7 @@ struct ring_buffer {
 
 // writes result in res, does not mutate cur
 static void llama_token_data_array_partial_sort(const llama_token_data_array & cur, int npartial, std::vector<llama_token_data> & res) {
-    // k15-fn: equal logits in id order (a total order), so a row and any subset of it holding its top npartial give the same sorted
+    // equal logits in id order (a total order), so a row and any subset of it holding its top npartial give the same sorted
     // top npartial (the device top-k candidates of common_sampler_device_topk)
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
         return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
@@ -197,7 +197,7 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
 
 // reduces the size of cur_p to npartial, keeping only the top npartial elements
 static void llama_token_data_array_partial_sort_inplace(llama_token_data_array * cur_p, int npartial) {
-    // k15-fn: equal logits in id order (a total order), so a row and any subset of it holding its top npartial give the same sorted
+    // equal logits in id order (a total order), so a row and any subset of it holding its top npartial give the same sorted
     // top npartial (the device top-k candidates of common_sampler_device_topk)
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
         return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
@@ -577,7 +577,7 @@ private:
     bool support;
 };
 
-// k15-fn: whether a sampler (or a member of a chain) keeps graph-input tensors of the graph built last (dist: its uniforms, penalties: the
+// whether a sampler (or a member of a chain) keeps graph-input tensors of the graph built last (dist: its uniforms, penalties: the
 // token counts, logit_bias: the biases): a kept graph built before must not be reused (llm_graph_input_sampling::can_reuse), else it
 // runs with the other graph's inputs set and its own uninitialized. greedy_masked keeps its mask in its own buffer instead
 static bool llama_sampler_graph_bound_one(const struct llama_sampler * smpl);
@@ -1111,7 +1111,7 @@ static void llama_sampler_greedy_backend_apply(
 
     data->sampled = curl;
 
-    // k15-fn: greedy over the raw logits of the row (nothing before it in the chain made candidates or probabilities): the token is the
+    // greedy over the raw logits of the row (nothing before it in the chain made candidates or probabilities): the token is the
     // whole result, the row's logits are not an output (they were copied to the host for every sampled row, 0.95 MiB each with a
     // 248320-token vocab). LLAMA_SAMPLER_GREEDY_KEEP_LOGITS=1 keeps them
     static const bool keep = getenv("LLAMA_SAMPLER_GREEDY_KEEP_LOGITS") != nullptr && atoi(getenv("LLAMA_SAMPLER_GREEDY_KEEP_LOGITS")) != 0;
@@ -1144,7 +1144,7 @@ struct llama_sampler * llama_sampler_init_greedy() {
     );
 }
 
-// k15-fn: greedy_masked - greedy with a fixed token set excluded (the -inf logit bias of an ignore_eos request), so a device greedy chain
+// greedy_masked - greedy with a fixed token set excluded (the -inf logit bias of an ignore_eos request), so a device greedy chain
 // serves those requests too: on the backend the masked tokens of the row are set to -inf and the argmax (lowest id on a tie)
 // is the token, the same token as the host greedy over the biased logits
 
@@ -1156,7 +1156,7 @@ struct llama_sampler_greedy_masked : public llama_sampler_backend {
     struct ggml_tensor * inp_vals = nullptr;
     struct ggml_tensor * inp_idxs = nullptr;
 
-    // k15-fn (LLAMA_SAMPLER_MASK_PERSIST=0 off): the mask as tensors of the sampler's own buffer, written once at backend_init. As graph
+    // (LLAMA_SAMPLER_MASK_PERSIST=0 off): the mask as tensors of the sampler's own buffer, written once at backend_init. As graph
     // inputs they were bound to the graph built last, so a kept graph reused later (the small-graph cache keeps one per ubatch size, e.g.
     // a 2-row n-gram verify next to the 1-row decode) set the other graph's inputs and ran its set_rows with uninitialized indices:
     // gpt-oss-20b ignore_eos greedy, intermittent illegal memory access (5 of 23 launches)
@@ -4648,7 +4648,7 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
     ctx->n_sample    = 0;
 }
 
-// k15-fn: see llama_sampler_graph_bound_one
+// see llama_sampler_graph_bound_one
 static bool llama_sampler_graph_bound_one(const struct llama_sampler * smpl) {
     return smpl != nullptr && (smpl->iface == &llama_sampler_dist_i || smpl->iface == &llama_sampler_penalties_i ||
                               smpl->iface == &llama_sampler_logit_bias_i);

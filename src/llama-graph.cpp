@@ -49,13 +49,13 @@ static bool kq_mask_settable(const ggml_tensor * t) {
     return t->buffer != nullptr;
 }
 
-// k15-pp: the KQ mask of a KV-cached attention is built on the device (GGML_OP_KQ_MASK) from the positions and sequences of the
+// the KQ mask of a KV-cached attention is built on the device (GGML_OP_KQ_MASK) from the positions and sequences of the
 // cells and the tokens (I32 inputs of 3 x n_kv and 5 x n_tokens) instead of a host mask of n_kv x n_tokens, the same values
 // (llama_kv_cache::set_input_kq_mask fills either). A layer-major group kept the host masks of all its members until computed
 // (16384 tokens: 288 MiB of f16 host masks, plus their build on the host). Only where the host mask has no ALiBi, sequence ids
 // < 64, and not the non-causal SWA_FULL span, with the attention offloaded; LLAMA_KQ_MASK_DEVICE=0 off
 // decode / verify ubatches (fewer than LLAMA_KQ_MASK_DEVICE_MIN_TOKENS, 64) keep the host mask: their host masks are small, while the
-// cells input is n_kv rows each step (G4 k15g4r1 q4x 12 GB with device masks at every ubatch: decode 8k / 16k -13 / -18%)
+// cells input is n_kv rows each step (RTX PRO 6000 the 4-bit model 12 GB with device masks at every ubatch: decode 8k / 16k -13 / -18%)
 static bool kq_mask_device_ok(const llama_ubatch & ubatch, const llama_hparams & hparams, const llama_cparams & cparams) {
     static const bool env = getenv("LLAMA_KQ_MASK_DEVICE") == nullptr || atoi(getenv("LLAMA_KQ_MASK_DEVICE")) != 0;
     static const uint32_t min_tokens = getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS"))) : 64;
@@ -63,7 +63,7 @@ static bool kq_mask_device_ok(const llama_ubatch & ubatch, const llama_hparams &
         (cparams.causal_attn || hparams.non_causal_type != LLAMA_NON_CAUSAL_TYPE_SWA_FULL);
 }
 
-// k19-uma: the largest ubatch whose KV-cached attention keeps the host KQ mask while larger ones build it on the device (0: every ubatch
+// the largest ubatch whose KV-cached attention keeps the host KQ mask while larger ones build it on the device (0: every ubatch
 // has the same kind of mask). The two kinds differ in graph nodes, so the worst-case pp reservation does not cover the small graphs
 uint32_t llm_graph_kq_mask_host_max_tokens(const llama_hparams & hparams, const llama_cparams & cparams) {
     llama_ubatch ub = {};
@@ -88,7 +88,7 @@ static ggml_tensor * build_attn_inp_kq_mask(
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    // (k19-kvwin: a windowed cache leaves out the window cells that have a ring copy: on the device ggml_kq_mask_win mode 1 with a
+    // (a windowed cache leaves out the window cells that have a ring copy: on the device ggml_kq_mask_win mode 1 with a
     // flags input (kv_win_set fills it), on the host set_input_win; LLAMA_KV_WIN_DEVICE_MASK=0: on the host)
     static const bool win_dev = getenv("LLAMA_KV_WIN_DEVICE_MASK") == nullptr || atoi(getenv("LLAMA_KV_WIN_DEVICE_MASK")) != 0;
     if (hparams_dev != nullptr && (!mctx->win_on() || (win_dev && !cparams.training)) && kq_mask_device_ok(ubatch, *hparams_dev, cparams)) {
@@ -109,7 +109,7 @@ static ggml_tensor * build_attn_inp_kq_mask(
                                              : ggml_kq_mask(ctx, cells, toks, type);
         ggml_set_name(res, "attn_inp_kq_mask");
         // the scheduler points the op's sources at their device copies: the host inputs set_input fills are kept in its op params
-        // (k19-kvwin: the flags as a third pointer, bytes 16..23; the window parameters sit at bytes 32..43)
+        // (the flags as a third pointer, bytes 16..23; the window parameters sit at bytes 32..43)
         ggml_tensor * srcs[3] = { cells, toks, flags };
         static_assert(sizeof(srcs) <= GGML_MAX_OP_PARAMS, "op params");
         memcpy(res->op_params, srcs, sizeof(srcs));
@@ -146,7 +146,7 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
-// k19-kvwin: the ring inputs of a windowed cache (see llm_graph_kv_win)
+// the ring inputs of a windowed cache (see llm_graph_kv_win)
 static void kv_win_build(llm_graph_kv_win & w, ggml_context * ctx0, const llama_ubatch & ubatch, const llama_cparams & cparams,
         const llama_kv_cache_context * mctx, ggml_tensor * kq_mask) {
     if (mctx == nullptr || !mctx->win_on() || cparams.training) {
@@ -213,7 +213,7 @@ static bool kv_win_can_reuse(const llm_graph_kv_win & w, const llama_kv_cache_co
            w.mask->ne[3] == n_stream_ub;
 }
 
-// k19-kvwin: whether the device that holds the ring (the node's second source) takes this two-source flash attention node
+// whether the device that holds the ring (the node's second source) takes this two-source flash attention node
 static bool kv_win_src2_supported(const ggml_tensor * node) {
     const ggml_tensor * k2 = node->src[6];
     while (k2 != nullptr && k2->view_src != nullptr) {
@@ -575,7 +575,7 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-// k16-draft: the replay window input (llama_memory_recurrent replay) of the three recurrent inputs below
+// the replay window input (llama_memory_recurrent replay) of the three recurrent inputs below
 static void rs_replay_set_input(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx) {
     if (inp->rs_rp != nullptr && inp->rs_rp->buffer != nullptr) {
         mctx->set_replay_input(inp->rs_rp);
@@ -738,7 +738,7 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-// k19-graph: the live length on the device, and its host copy for the backend's launch plan (ggml_flash_attn_ext_kv_len_set_host);
+// the live length on the device, and its host copy for the backend's launch plan (ggml_flash_attn_ext_kv_len_set_host);
 // every input that holds an attention KV length sets it here (llm_graph_input_attn_kv, llm_graph_input_mem_hybrid)
 static void set_input_kv_len(ggml_tensor * kv_len, const llama_kv_cache_context * mctx) {
     if (kv_len == nullptr || kv_len->buffer == nullptr) {
@@ -1398,7 +1398,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    // k19-pf: unallocated where the graph only stores K / V (the qwen4exp MTP drafter's kv_only prompt pass)
+    // unallocated where the graph only stores K / V (the qwen4exp MTP drafter's kv_only prompt pass)
     if (kq_mask_settable(inp_attn->self_kq_mask)) {
         mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
@@ -1450,7 +1450,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    // k19-graph: a graph with a KV length input only for a ubatch that has a live length (and the other way round)
+    // a graph with a KV length input only for a ubatch that has a live length (and the other way round)
     res &= (inp_attn->self_kv_len != nullptr) == (mctx->get_attn()->get_n_kv_live() > 0 && params.cparams.flash_attn);
 
     res &= kv_win_can_reuse(inp_attn->win, mctx->get_attn(), params.ubatch, params.cparams);
@@ -1649,7 +1649,7 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-// k15-fn (LLAMA_SAMPLER_REBIND_REUSE=0 off): the latest build of each sampler with per-step graph inputs (dist, penalties keep their input
+// (LLAMA_SAMPLER_REBIND_REUSE=0 off): the latest build of each sampler with per-step graph inputs (dist, penalties keep their input
 // tensors from the graph built last): a kept graph (the small-graph cache keeps one per ubatch size) built before is built again
 // instead of reused, so its own inputs are the ones set (else the other graph's were, and its own stayed uninitialized)
 static std::mutex                                       llm_sampler_bind_mutex;
@@ -2041,7 +2041,7 @@ ggml_tensor * llm_graph_context::build_draft_head(
     const int64_t n_sub     = res->ne[0];
     const int64_t n_outputs = res->ne[1];
     const int64_t n_vocab   = w->ne[1];
-    // k19-dtopk: the backend top-k may run over the restricted logits in token order (get_rows by perm) where it selects and orders
+    // the backend top-k may run over the restricted logits in token order (get_rows by perm) where it selects and orders
     // as over the full-vocabulary scatter: the ops' order rule depends only on the values and the columns' relative order there
     // (CPU: sorted by value, then the lowest column; CUDA deterministic top-k past the 4096-column sort paths: the keys above the k-th
     // value in column order, then the kept ties, lowest columns first: the full row always takes that path)
@@ -2115,7 +2115,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
         ggml_mul_mat_id(ctx0, slots_host ? w : moe_cache->get_experts(w), cur, slots);
-    // k15-lfm2: a product that reads the bank of the MoE cache in place (an in-place prompt map): its ids name at most the layer's experts,
+    // a product that reads the bank of the MoE cache in place (an in-place prompt map): its ids name at most the layer's experts,
     // op param 2 tells the kernels so (mmq picks its tile width for that many experts, not for every slot of the bank)
     if (slots != nullptr && !slots_host) {
         const ggml_tensor * s = slots;
@@ -2740,7 +2740,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
-    // k19-g4tier (debug, LLAMA_MOE_ROUTE_DUMP): the routed experts of decode / verify windows are kept for the dump (llama_context)
+    // (debug, LLAMA_MOE_ROUTE_DUMP): the routed experts of decode / verify windows are kept for the dump (llama_context)
     static const bool route_dump = getenv("LLAMA_MOE_ROUTE_DUMP") != nullptr;
     if (route_dump && n_tokens <= 16) {
         ggml_set_output(selected_experts);
@@ -2819,9 +2819,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * const gate_up_exps_b_h = gate_up_exps_b;
 
     // the experts of host-resident layers may be read from the MoE cache
-    // k16 route tail skip (see llama_moe_cache::tail_skip): only a decode / verify window of one sequence (every row an output), the
+    // route tail skip (see llama_moe_cache::tail_skip): only a decode / verify window of one sequence (every row an output), the
     // router's own top k in routing order, and no expert biases (a skipped expert's rows are 0, a bias would still be added)
-    // k19-fixB: exact verify through llama_set_verify_exact (the server's n-gram default) drops the default rule in every graph of the
+    // exact verify through llama_set_verify_exact (the server's n-gram default) drops the default rule in every graph of the
     // context, decodes included, as LLAMA_MTP_EXACT=1 does at init: a verify window skips an expert only where every row routes it at
     // rank >= 7, a single token decode decides per token, so the drafted text was not the bytes of plain decoding
     const bool tail_ok = moe_cache != nullptr && selected_experts_in == nullptr && arch != LLM_ARCH_GROVEMOE &&
@@ -2908,7 +2908,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         switch (type_op) {
             case LLM_FFN_SILU:
-                // k19-dsv4long: the merged gate_up layout clamps too (cur / up are its gate / up views); no arch with a clamp loads
+                // the merged gate_up layout clamps too (cur / up are its gate / up views); no arch with a clamp loads
                 // merged experts today, so this changes no current graph, it keeps a repacked checkpoint from dropping the limit silently
                 if (has_gate) {
                     if (il >= 0) {
@@ -3017,24 +3017,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = nullptr;
-    // k19-q4xcache: a window that takes the hybrid assign only for the overlap (in place of the plain lookup, see
+    // a window that takes the hybrid assign only for the overlap (in place of the plain lookup, see
     // llama_moe_cache::overlap_plain) notes the expert form as the plain lookup's graph does
     const bool ov_plain = hybrid != nullptr && !hybrid_host && moe_cache->overlap_plain(il, n_tokens);
     if (hybrid == nullptr || ov_plain) {
-        // k15: a cache layer's graph without the host path also notes the single-graph form, so the CPU-miss rule weighs the mailbox
+        // a cache layer's graph without the host path also notes the single-graph form, so the CPU-miss rule weighs the mailbox
         // split from the first graph on. Before, only a graph with the host path noted it: a cache whose rule kept every decode size
-        // off while it weighed a full split never built one (G4 Qwen3.6 UD-Q3_K_M 8 GB + MTP, 24% cached: host path on for [4, 128]
+        // off while it weighed a full split never built one (RTX PRO 6000 Qwen3.6 3-bit quant 8 GB + MTP, 24% cached: host path on for [4, 128]
         // only, 0 host experts in a whole launch). LLAMA_MOE_SINGLE_NOTE_PLAIN=0: only host-path graphs note it, as before
         static const bool note_plain = [] {
             const char * e = getenv("LLAMA_MOE_SINGLE_NOTE_PLAIN");
             return e == nullptr || atoi(e) != 0;
         }();
-        // k15-np (LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC, default = LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, 0.50; 2 = every cache): only a
+        // (LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC, default = LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, 0.50; 2 = every cache): only a
         // cache that skips its timing trials (less than that share of the host experts cached) notes the mailbox form early. There the
-        // prior is all the rule has (the win: G4 q3m 8 GB, 26% cached, +16-19% decode; q4x 12 GB, 39%, +9-19%). Above it the trials run
-        // anyway, and the early note only lowers the weighed split before they do: G4 q4x 16 GB + MTP (61% cached) and q3m 12 GB (55%)
-        // turned the host path on for the first windows' 7-12% misses (k15g4n), -5..-9% chat decode against NOTE_PLAIN=0; the gate
-        // gives NOTE_PLAIN=0's decode there (k15g4g: 316 vs 299, 336 vs 305 tok/s) and k15's where it wins, decisions and md5 included
+        // prior is all the rule has (the win: RTX PRO 6000 3-bit 8 GB, 26% cached, +16-19% decode; the 4-bit model 12 GB, 39%, +9-19%). Above it the trials run
+        // anyway, and the early note only lowers the weighed split before they do: RTX PRO 6000 the 4-bit model 16 GB + MTP (61% cached) and 3-bit 12 GB (55%)
+        // turned the host path on for the first windows' 7-12% misses, -5..-9% chat decode against NOTE_PLAIN=0; the gate
+        // gives NOTE_PLAIN=0's decode there (316 vs 299, 336 vs 305 tok/s) and 's where it wins, decisions and md5 included
         static const double note_plain_max = [] {
             const char * e = getenv("LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC");
             return e != nullptr ? atof(e) : llama_moe_cache::trial_frac_single();
@@ -3056,7 +3056,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the host path is added first: the scheduler starts the copies and the device path while the host computes (see ggml_backend_sched_set_overlap)
         ggml_tensor * experts_h = nullptr;
         ggml_tensor * single_pub = nullptr;
-        // k11 single-graph host misses (LLAMA_MOE_SINGLE): the host experts go through a mapped mailbox, no graph split; only the
+        // single-graph host misses (LLAMA_MOE_SINGLE): the host experts go through a mapped mailbox, no graph split; only the
         // expert form the host thread computes (separate gate and up, SiLU, no biases, scales or clamp)
         const bool single_form = type_op == LLM_FFN_SILU && up_exps && gate_exps && !gate_up_exps && !up_exps_s_h && !gate_exps_s_h &&
             !down_exps_s && !up_exps_b_h && !gate_exps_b_h && !gate_up_exps_b_h && !(il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f);
@@ -3094,12 +3094,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_backend_t dev = moe_cache->backend(il);
         ggml_tensor * experts_d = nullptr;
         // the overlap needs quantized experts: their single token products (mul_mat_vec_q) compute every slot on its own
-        // k19-overlap: small multi-token ubatches too (LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL; their mmvq kernels also give each entry its own sums)
+        // small multi-token ubatches too (LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL; their mmvq kernels also give each entry its own sums)
         bool overlap = moe_cache->overlap(n_tokens) || moe_cache->overlap_small(n_tokens);
         for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
             overlap = overlap && (w == nullptr || ggml_is_quantized(w->type));
         }
-        // k19-l4c deferred admission (LLAMA_MOE_FETCH_DEFER): the host computes the admitted experts too (they were published in the
+        // deferred admission (LLAMA_MOE_FETCH_DEFER): the host computes the admitted experts too (they were published in the
         // host ids of the assign above), the copies only fill their slots for later batches; the device computes the hits alone
         bool quant = true;
         for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
@@ -3147,7 +3147,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // every slot is computed by exactly one side, the other sides' rows are 0
         if (single_pub != nullptr) {
-            // k13-fn: the work of the layer that does not depend on the experts (the shared expert, see moe_overlap_extra) goes after the
+            // the work of the layer that does not depend on the experts (the shared expert, see moe_overlap_extra) goes after the
             // device experts and before the merge, so the device computes it while the host still computes its missing experts (the
             // merge waited for them first, then the shared expert ran); the same nodes and values, only their order (LLAMA_MOE_SINGLE_EXTRA=0: off)
             static const bool single_extra = getenv("LLAMA_MOE_SINGLE_EXTRA") == nullptr || atoi(getenv("LLAMA_MOE_SINGLE_EXTRA")) != 0;
@@ -3251,7 +3251,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
             ggml_backend_sched_set_tensor_backend(sched, res, moe_cache->backend(il));
             cb(res, "ffn_moe_assign", il);
             if (getenv("LLAMA_MOE_ROUTE_DUMP") != nullptr && n_tokens <= 16) {
-                ggml_set_output(res); // k19-g4tier debug: the fills of this lookup are dumped (llama_context)
+                ggml_set_output(res); // debug: the fills of this lookup are dumped (llama_context)
             }
             ggml_build_forward_expand(gf, res);
             *assign = res;
@@ -3265,7 +3265,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     // small batches: the slots are looked up on the device, which also copies the missing experts from host memory
     {
         ggml_tensor * ids = selected_experts;
-        // k15-fn (LLAMA_MOE_LOOKUP_IDS_VIEW=0 off): the lookup reads the router's top-k view (rows strided in the argsort) directly,
+        // (LLAMA_MOE_LOOKUP_IDS_VIEW=0 off): the lookup reads the router's top-k view (rows strided in the argsort) directly,
         // one CONT launch less per MoE layer in every decode and verify graph (fn: 47 of ~2400-2700 kernels per graph)
         static const bool ids_view = getenv("LLAMA_MOE_LOOKUP_IDS_VIEW") == nullptr || atoi(getenv("LLAMA_MOE_LOOKUP_IDS_VIEW")) != 0;
         const bool rows_ok = ids->nb[0] == ggml_type_size(ids->type) && ids->ne[2] == 1 && ids->ne[3] == 1;
@@ -3306,7 +3306,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
 
     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], n_tokens);
     if (slot_map == nullptr) {
-        // k17-strict: a small batch that neither the device lookup nor the slot map serves (n_tokens * n_expert_used above the slots)
+        // a small batch that neither the device lookup nor the slot map serves (n_tokens * n_expert_used above the slots)
         // reads the layer's host expert tensors: its MUL_MAT_ID runs on the CPU. Logged once per (size, batch invariant) for the gates
         if (n_tokens <= llama_moe_cache::n_small_max && !moe_cache->force_large()) {
             static std::atomic<uint64_t> seen{0};
@@ -3334,7 +3334,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, "ffn_moe_slots", il);
-    // k19-l4full: the route tail skip of the device lookup, for the host lookup of a streamed layer (LLAMA_MOE_ROUTE_TAIL_SKIP_HOST=0 off)
+    // the route tail skip of the device lookup, for the host lookup of a streamed layer (LLAMA_MOE_ROUTE_TAIL_SKIP_HOST=0 off)
     if (tail_ok) {
         moe_cache->tail_skip_host(slots, il, n_tokens);
     }
@@ -3716,7 +3716,7 @@ static ggml_backend_t kv_host_gpu_backend(ggml_backend_sched_t sched) {
     }
     ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    // discrete GPUs only (k19-igpu): the staged / streamed host KV paths pair with the pinned host KV (llama_kv_cache), which an integrated
+    // discrete GPUs only: the staged / streamed host KV paths pair with the pinned host KV (llama_kv_cache), which an integrated
     // GPU does not get; there the host KV attention stays as upstream runs it (both modes are opt-in: LLAMA_KV_STAGE, LLAMA_KV_DECODE)
     return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ? backend : nullptr;
 }
@@ -3757,7 +3757,7 @@ kv_host_mode llm_graph_context::kv_host_attn_mode(const ggml_tensor * k, const g
     }
     if (n_tokens >= min_batch) {
         // LLAMA_KV_STAGE=1: stage the rows on the GPU so the scheduler can upload them ahead; off by default, the pinned
-        // synchronous input copy measured faster (G4: Qwen3.6 30K prompt 7082 vs 6512 t/s, 100K 6088 vs 5443 t/s)
+        // synchronous input copy measured faster (RTX PRO 6000: Qwen3.6 30K prompt 7082 vs 6512 t/s, 100K 6088 vs 5443 t/s)
         static const bool stage = getenv("LLAMA_KV_STAGE") != nullptr && atoi(getenv("LLAMA_KV_STAGE")) != 0;
         return stage ? KV_HOST_STAGE : KV_HOST_NONE;
     }
@@ -3801,7 +3801,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         const llm_graph_attn_src2 * src2) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
-    // k19-kvwin: a second KV source (the recent-window ring): one two-source flash attention node where the device takes it, else
+    // a second KV source (the recent-window ring): one two-source flash attention node where the device takes it, else
     // (stopgap) one plain node over the cells of both, concatenated in F16 (cast through F32, which every backend converts from the
     // cache types). Decided at the node (kv_win_src2_node below)
     const bool has_src2 = src2 != nullptr && src2->k != nullptr;
@@ -3845,11 +3845,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // batch invariant verify (LLAMA_MTP_EXACT=1): one attention per query, over the cells a decode of that token alone
         // would see, so the backend picks the single query kernel and the KV split of that decode for every row
         const int64_t n_q = q->ne[1];
-        // (k19-kvwin: not with a second KV source: the rows read every cell of both)
+        // (not with a second KV source: the rows read every cell of both)
         if (cparams.batch_invariant && !has_src2 && n_q > 1 && n_stream == 1 && kq_mask != nullptr && kq_mask->ne[1] == n_q &&
                 ubatch.pos != nullptr && (int64_t) ubatch.n_tokens == n_q) {
             const int64_t n_kv = k->ne[1];
-            // k15-fv: consecutive queries over the same cells share one attention node (LLAMA_EXACT_FA_GROUP=0: one per query); the
+            // consecutive queries over the same cells share one attention node (LLAMA_EXACT_FA_GROUP=0: one per query); the
             // node is batch invariant like every node here, CUDA and CPU compute each of its queries as the single query node would
             // (f16 K and V only: the CUDA path for other types stages a converted copy behind the node's output)
             static const bool fa_group = [] {
@@ -3857,7 +3857,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 return e == nullptr || atoi(e) != 0;
             }();
             const bool group = fa_group && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
-            // k19-fixB: the cells a row's position implies (llm_graph_exact_row_n_kv) are kept only when the row sees none of the
+            // the cells a row's position implies (llm_graph_exact_row_n_kv) are kept only when the row sees none of the
             // cells past them: positions do not follow cells with several sequences in one unified cache (A in cells 0..127, B in
             // 128..382: B's row at position 255 kept 256 cells and lost B's positions 128..254), or after a seq_rm left holes
             const auto row_n_kv = [&](int64_t r) {
@@ -3883,9 +3883,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_tensor * m_i = ggml_view_4d(ctx0, kq_mask, n_kv_i, n_i, kq_mask->ne[2], kq_mask->ne[3],
                         kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i*kq_mask->nb[1]);
                 // a group of rows over fewer cells than the mask holds is a strided view, and flash attention takes a contiguous
-                // mask only (the values are copied unchanged): G4 Qwen3.8-Flash-Next UD-IQ4_XS 24 GB, Studio argv (4 slots, unified
+                // mask only (the values are copied unchanged): RTX PRO 6000 Qwen3.8-Flash-Next 4-bit quant 24 GB, Studio argv (4 slots, unified
                 // KV), LLAMA_MTP_EXACT=1 aborted in GGML_ASSERT(ggml_is_contiguous(mask)) on a verify batch
-                // (k15-lfm2 hit the same assert on G4 LFM2.5 32 GB, the request after a 16k prompt)
+                // (hit the same assert on RTX PRO 6000 LFM2.5 32 GB, the request after a 16k prompt)
                 if (!ggml_is_contiguous(m_i)) {
                     m_i = ggml_cont(ctx0, m_i);
                 }
@@ -3909,7 +3909,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_flash_attn_ext_add_sinks(t, sinks);
                 ggml_flash_attn_ext_set_n_kv_max(t, static_cast<int32_t>(n_kv_max_));
                 ggml_prec_set_acc(t, GGML_PREC_F32);
-                // k19-graph: the live cells of a bucketed n_kv, read on the device (the K / V views of the attention input's cache)
+                // the live cells of a bucketed n_kv, read on the device (the K / V views of the attention input's cache)
                 if (res->t_kv_len && k_->ne[1] == res->t_kv_len_n_kv && m_ && m_->ne[0] == k_->ne[1]) {
                     ggml_flash_attn_ext_set_kv_len(t, res->t_kv_len);
                 }
@@ -3919,7 +3919,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             if (has_src2) {
                 ggml_tensor * k2 = ggml_permute(ctx0, src2->k, 0, 2, 1, 3);
                 ggml_tensor * v2 = ggml_permute(ctx0, src2->v, 0, 2, 1, 3);
-                // k19-kvwin: the ring as the second source of the same node, where the device that holds it takes the node
+                // the ring as the second source of the same node, where the device that holds it takes the node
                 if (src2->fused) {
                     cur = make_fa(k, v, kq_mask, n_kv_max);
                     ggml_flash_attn_ext_set_src2(cur, k2, v2, src2->mask);
@@ -4125,7 +4125,7 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
-// k19-kvwin: store this ubatch's K / V in the ring too (the same rotated rows the cache takes) and return the ring as the attention's
+// store this ubatch's K / V in the ring too (the same rotated rows the cache takes) and return the ring as the attention's
 // second source. n_embd_v_view > 0: V is a view of K (MLA), so is the ring's
 static llm_graph_attn_src2 kv_win_store_src(ggml_context * ctx0, ggml_cgraph * gf, const llm_graph_kv_win & w,
         const llama_kv_cache_context * mctx, ggml_tensor * k_cur, ggml_tensor * v_cur, int il, int64_t n_embd_v_view) {
@@ -4184,7 +4184,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
-    // k19-graph: a bucketed n_kv whose live length the flash attention reads on the device (see llama_kv_cache::n_kv_bucket_params)
+    // a bucketed n_kv whose live length the flash attention reads on the device (see llama_kv_cache::n_kv_bucket_params)
     if (mctx_cur->get_n_kv_live() > 0 && cparams.flash_attn) {
         inp->self_kv_len = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
         ggml_set_name(inp->self_kv_len, "attn_kv_len");
@@ -4241,7 +4241,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k;
     ggml_tensor * v;
 
-    // (k19-kvwin: a windowed cache keeps the plain path: the ring lives beside the cache and is read by the same node)
+    // (a windowed cache keeps the plain path: the ring lives beside the cache and is read by the same node)
     const kv_host_mode host_mode = cparams.training || inp->win.idxs != nullptr ? KV_HOST_NONE : kv_host_attn_mode(mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il));
     llm_graph_attn_src2 src2;
 
@@ -4382,7 +4382,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    // k19-kvwin: the ring of the K-only cache, V = the same view of it
+    // the ring of the K-only cache, V = the same view of it
     const llm_graph_attn_src2 src2 = kv_win_store_src(ctx0, gf, inp->win, mctx_cur, k_cur, nullptr, il, v_cur->ne[0]);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, mctx_cur, src2.k ? &src2 : nullptr);
@@ -4551,7 +4551,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    // k19-kvwin: the ring of the base (full-attention) cache; a layer that reuses another layer's K / V (no k_cur) reads its ring as is
+    // the ring of the base (full-attention) cache; a layer that reuses another layer's K / V (no k_cur) reads its ring as is
     llm_graph_attn_src2 src2;
     if (!is_swa && !use_kv_cur && inp->win.idxs != nullptr) {
         if (k_cur && v_cur) {
@@ -4646,7 +4646,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    // k19-kvwin: the base cache's ring (V = the same view of it)
+    // the base cache's ring (V = the same view of it)
     llm_graph_attn_src2 src2;
     if (!is_swa && k_cur) {
         src2 = kv_win_store_src(ctx0, gf, inp->win, mctx_cur, k_cur, nullptr, il, v_cur->ne[0]);
@@ -5262,7 +5262,7 @@ void llm_graph_context::build_logits() const {
     }
 
     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
-    // (k19-dtopk: not when only the draft top-k reads it, see draft_topk_rows)
+    // (not when only the draft top-k reads it, see draft_topk_rows)
     if (res->t_logits != nullptr && !draft_topk_rows()) {
         ggml_build_forward_expand(gf, res->t_logits);
     }
@@ -5303,7 +5303,7 @@ void llm_graph_context::build_sampling() const {
         return;
     }
 
-    // k19-dtopk: the top-k over the restricted head's logits in token order: [logits | -inf] (the -inf column n_sub stands for the
+    // the top-k over the restricted head's logits in token order: [logits | -inf] (the -inf column n_sub stands for the
     // request rows not written yet), each chain's row gathered by perm, and its candidates mapped to token ids by cand
     const bool dtopk = draft_topk_rows();
     if (dtopk) {
@@ -5362,7 +5362,7 @@ void llm_graph_context::build_sampling() const {
         const auto it = sampling_rows.find(seq_id);
         const auto & rows = it != sampling_rows.end() ? it->second : no_rows;
 
-        // k19-p3topk: a chain that starts with a backend top-k (the server's device top-k for sampled requests) runs that top-k once
+        // a chain that starts with a backend top-k (the server's device top-k for sampled requests) runs that top-k once
         // per window of the sequence's consecutive output rows ([n_vocab, n] -> [k, n]) and one get_rows gathers every row's top logits;
         // each row's chain then continues after its top-k on its slice. Each slice holds the bits that row's own top-k / get_rows wrote
         // before (cparams.topk_batch: the output device's top-k works per row; the same columns, in the same order), so the

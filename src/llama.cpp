@@ -330,7 +330,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.lazy.mode = params.lazy_mode;
-        // k16-draft: an MTP draft model's token embeddings and lm head from the target (llama_model_loader::borrow_io)
+        // an MTP draft model's token embeddings and lm head from the target (llama_model_loader::borrow_io)
         ml.model_shared  = params.model_shared;
         ml.mtp_borrow_io = params.mtp_borrow_io;
 

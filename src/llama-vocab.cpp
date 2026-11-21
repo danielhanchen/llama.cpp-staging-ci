@@ -2401,7 +2401,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     tokenizer_pre == "deepseek-r1-qwen" ||
                     tokenizer_pre == "kormo" ||
                     tokenizer_pre == "f2llmv2" ||
-                    // k19-agn: Kolibri 1 GGUFs converted with the community kolibri1 patch (Hob-forge/Kolibri-1-GGUF)
+                    // Kolibri 1 GGUFs converted with the community kolibri1 patch (Hob-forge/Kolibri-1-GGUF)
                     // name the qwen2 regex "kolibri1"; upstream's converter writes "qwen2" for the same tokenizer
                     // (LLAMA_VOCAB_PRE_KOLIBRI1=0: refused as before)
                     (tokenizer_pre == "kolibri1" && (getenv("LLAMA_VOCAB_PRE_KOLIBRI1") == nullptr || atoi(getenv("LLAMA_VOCAB_PRE_KOLIBRI1")) != 0))) {

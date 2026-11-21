@@ -108,7 +108,7 @@ inline uint64_t cgroup_available(const std::string & proc_cgroup, const std::str
 
 // memory left under memory.max of one cgroup v2 directory (the weight store reads the cgroup namespace root, /sys/fs/cgroup, with it),
 // UINT64_MAX if there is no limit. Used = memory.current less the reclaimable file pages, the same set cgroup_available credits
-// (active_file + inactive_file + slab_reclaimable). k19: the weight store used to credit memory.stat "file", which also holds shmem
+// (active_file + inactive_file + slab_reclaimable). the weight store used to credit memory.stat "file", which also holds shmem
 // (tmpfs, /dev/shm, memfd: swap-backed, never reclaimed without swap) and mlocked file pages (unevictable, e.g. --mlock on the model's
 // own mapping): an 8 GiB scope with 1 GiB anon and a 4 GiB mlocked mapping read 7165 MiB available against 3069 MiB that fit, and
 // allocating it was OOM-killed (same for 3 GiB of memfd: 7158 vs 4093 MiB). credit_file = true: that formula, as before
@@ -189,8 +189,8 @@ inline uint64_t available() {
 #endif
 }
 
-// k19-core2: host bytes of file-backed mappings (the model file's pages) that a device registration pinned. They stay in Cached, so
-// MemAvailable counts them as reclaimable, but the kernel cannot reclaim them (Colab A100 fn4nd full card: 48.5 GiB of registered expert
+// host bytes of file-backed mappings (the model file's pages) that a device registration pinned. They stay in Cached, so
+// MemAvailable counts them as reclaimable, but the kernel cannot reclaim them (A100 the 4-bit model full card: 48.5 GiB of registered expert
 // pages + a 26.8 GiB PLE pin left 8.2 GiB, MemAvailable still read ~79 GiB, and a server's prompt cache froze the VM). The MoE cache and
 // the PLE pin add / subtract what they register; reclaimable() is MemAvailable minus it (1 when nothing is left, 0 when unknown).
 inline std::atomic<int64_t> & pinned_file_bytes() {
@@ -202,7 +202,7 @@ inline void pinned_file_add(int64_t bytes) {
     pinned_file_bytes().fetch_add(bytes);
 }
 
-// k19-fnttft: set (process-wide) when a model's lazy PLE table on a disk was not admitted whole into RAM: the page cache is the table's
+// set (process-wide) when a model's lazy PLE table on a disk was not admitted whole into RAM: the page cache is the table's
 // only room, so a model loaded after it (the MTP drafter) drops the page cache of the tensors it copied to a device (llama_model_loader)
 inline std::atomic<bool> & ple_page_cache_short() {
     static std::atomic<bool> v{false};

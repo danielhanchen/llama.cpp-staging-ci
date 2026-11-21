@@ -450,7 +450,7 @@ bool llama_row_cache::save_profile(const std::string & path) const {
             if (s.slot_row[q] == k_empty) {
                 continue;
             }
-            // carried over counts of the static rows decay by half per session (k19-autoprof: with the recorder, the reads of this launch
+            // carried over counts of the static rows decay by half per session (with the recorder, the reads of this launch
             // are its counts: the static rows carry their loaded count halved, the dynamic slots are left to the recorder)
             if (rec_on && q >= s.n_static) {
                 continue;
@@ -476,12 +476,12 @@ bool llama_row_cache::save_profile(const std::string & path) const {
         es.resize(o);
     }
     if (rec_on && es.empty()) {
-        return false; // k19-autoprof: nothing read in this launch, the file (if any) stays
+        return false; // nothing read in this launch, the file (if any) stays
     }
     // a temporary of this process only, created exclusively (an existing file or link of that name is not followed), then renamed over
     // the profile (std::filesystem::rename replaces an existing file on Windows too)
     const std::string tmp = path + ".tmp." + std::to_string((long long) llama_rc_getpid());
-    // k19-autoprof2: the directory may not exist yet (the self-learned profile's directory is made by the first write into it; where no
+    // the directory may not exist yet (the self-learned profile's directory is made by the first write into it; where no
     // MoE profile or CPU-miss calibration was written before, e.g. host-lookup tiers, the PLE profile was never saved: "cannot write")
     {
         std::error_code ec;
@@ -623,12 +623,12 @@ std::string llama_row_cache::describe() const {
 static const void * llama_row_cache_source(void * ud, const ggml_tensor * t, int64_t row, void * tmp) {
     auto * rc = (llama_row_cache *) ud;
     const auto * src = (const uint8_t *) t->data + (size_t) row*t->nb[1];
-    const bool rec = rc->recording(); // k19-autoprof: the row (and the bytes the gather reads) to the recorder
+    const bool rec = rc->recording(); // the row (and the bytes the gather reads) to the recorder
     if (row < rc->get_skip_below()) {
         if (rec) {
             rc->record(row, src);
         }
-        return src; // the part the page cache holds (k19-disktt)
+        return src; // the part the page cache holds
     }
     if (rc->get(row, (uint8_t *) tmp)) {
         if (rc->verify) {

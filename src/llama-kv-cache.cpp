@@ -81,7 +81,7 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
-// k19-kvsel: see llama_kv_cache_sel_arm
+// see llama_kv_cache_sel_arm
 static std::atomic<bool>     g_kv_sel_measure { false };
 
 void llama_kv_sel_measure(bool on) {
@@ -151,7 +151,7 @@ llama_kv_cache::llama_kv_cache(
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
-    // k19-kvsel: armed for this cache (llama_kv_cache_sel_arm), consumed here so no other cache takes it
+    // armed for this cache (llama_kv_cache_sel_arm), consumed here so no other cache takes it
     const bool     sel_armed     = g_kv_sel_armed;
     const uint32_t sel_dev_fixed = g_kv_sel_dev_cells;
     g_kv_sel_armed     = false;
@@ -296,7 +296,7 @@ llama_kv_cache::llama_kv_cache(
         if (ggml_backend_buft_is_host(buft) && kv_host_pinned()) {
             for (const auto & d : model.devices) {
                 ggml_backend_buffer_type_t host_buft = d.is_meta ? nullptr : ggml_backend_dev_host_buffer_type(d.dev);
-                // discrete GPUs only (k19-igpu): with an integrated GPU (unified memory) the host KV stays pageable, as upstream keeps
+                // discrete GPUs only: with an integrated GPU (unified memory) the host KV stays pageable, as upstream keeps
                 // it: pinning it takes from the pool the device allocates from, and the DMA it enables copies from RAM to RAM
                 if (host_buft != nullptr && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                     buft     = host_buft;
@@ -359,8 +359,8 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // k17-small: LLAMA_KV_LAZY=1 reserves a device buffer's address range and backs only the cells in use (see lazy_ensure)
-    // (k19-vramlend: unset = auto, see llama_kv_lazy_mode; read at every allocation, common sets the grant after the fit's measurements)
+    // LLAMA_KV_LAZY=1 reserves a device buffer's address range and backs only the cells in use (see lazy_ensure)
+    // (unset = auto, see llama_kv_lazy_mode; read at every allocation, common sets the grant after the fit's measurements)
     const bool kv_lazy = hparams.no_alloc ? llama_kv_lazy_measure_on() : llama_kv_lazy_alloc_on();
     // the cells backed at load
     const uint32_t lazy_n0 = [&]() {
@@ -368,7 +368,7 @@ llama_kv_cache::llama_kv_cache(
         return std::min<uint32_t>(kv_size, e_init != nullptr ? (uint32_t) std::max(256, atoi(e_init)) : 4096);
     }();
 
-    // k19-kvsel (LLAMA_KV_SEL_HOST=1): armed attention cache, flash attention layout (V not transposed), one stream, more cells than the
+    // (LLAMA_KV_SEL_HOST=1): armed attention cache, flash attention layout (V not transposed), one stream, more cells than the
     // device budget LLAMA_KV_SEL_DEV_CELLS (32768; 0 = every cell in host chunks, a test setting)
     // (auto: a measurement where the fit asks for it, an allocation where common granted it; read at every construction)
     const int  sel_mode = llama_kv_sel_mode();
@@ -393,14 +393,14 @@ llama_kv_cache::llama_kv_cache(
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
-            // k17-small (lazy KV step 2): a measurement reports the device KV bytes a lazy buffer would leave unbacked at load, where the
+            // (lazy KV step 2): a measurement reports the device KV bytes a lazy buffer would leave unbacked at load, where the
             // MoE cache can give them back as the cells grow (the fit gives them to the cache, see common_fit). A probe buffer (an address
             // range and one chunk, freed at once) tells whether the backend has lazy buffers and their chunk size; the tensors are then
-            // placed as the lazy buffer places them, and the chunks the first cells back are counted exactly (k17lkv_g4d: an estimate one
+            // placed as the lazy buffer places them, and the chunks the first cells back are counted exactly (an estimate one
             // chunk per tensor low left the cache 40 MiB short and the MTP drafter's staging took it, the first request ran out of memory)
             static const bool shrink_on = getenv("LLAMA_MOE_CACHE_SHRINK") == nullptr || atoi(getenv("LLAMA_MOE_CACHE_SHRINK")) != 0;
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-            // k19-kvsel: the bytes the host chunks would take (the device chunks hold cells [0, R) of every layer)
+            // the bytes the host chunks would take (the device chunks hold cells [0, R) of every layer)
             bool sel_est = false;
             if (sel_on && n_stream == 1 && !v_trans) {
                 const llama_kv_sel_procs sp = llama_kv_sel_get_procs(buft);
@@ -465,7 +465,7 @@ llama_kv_cache::llama_kv_cache(
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             // LLAMA_KV_LAZY_SUSPEND=1 (set by common where --fit keeps a drafter): the whole KV cache is backed at load, as without
             // LLAMA_KV_LAZY (read at every allocation: the fit's measurements run before the decision)
-            // k19-kvsel: device chunks for cells [0, R) of every layer, host chunks for the rest
+            // device chunks for cells [0, R) of every layer, host chunks for the rest
             const llama_kv_sel_procs sp = sel_on && n_stream == 1 && !v_trans ? llama_kv_sel_get_procs(buft) : llama_kv_sel_procs();
             const size_t sel_sz = sp.gran > 0 ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) : 0;
             if (sel_sz > 0) {
@@ -692,7 +692,7 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
-    // k19-kvwin: every slot free again
+    // every slot free again
     for (auto & rg : v_rings) {
         rg.reset(win_r, get_size());
     }
@@ -707,9 +707,9 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
-// k19-hostgap (LLAMA_KV_SEQ_RM_USED=0: off): seq_rm visits the cells below the last used one only. A cell at or past used_max_p1() is
+// (LLAMA_KV_SEQ_RM_USED=0: off): seq_rm visits the cells below the last used one only. A cell at or past used_max_p1() is
 // empty (pos -1, no sequence: pos_set() puts a cell in `used`, every path that empties it takes it out), so pos_in() is false there and
-// the loop does nothing; with a 32768-cell cache and a few hundred used cells the full loop cost ~27 us per call on a Colab A100 host,
+// the loop does nothing; with a 32768-cell cache and a few hundred used cells the full loop cost ~27 us per call on A100 host,
 // three calls per speculative pass (the drafter's rewind before the verify, the target's and the drafter's after the accept)
 static bool llama_kv_seq_rm_used() {
     static const bool v = getenv("LLAMA_KV_SEQ_RM_USED") == nullptr || atoi(getenv("LLAMA_KV_SEQ_RM_USED")) != 0;
@@ -1023,11 +1023,11 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    // k19-kvwin: the ring buffers count with the cache (a fixed cost, never lazily backed)
+    // the ring buffers count with the cache (a fixed cost, never lazily backed)
     for (const auto * bufs : { &ctxs_bufs, &win_ctxs_bufs, &aux_ctxs_bufs }) for (const auto & [ctx, buf] : *bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
-        // k19-kvsel: host chunks count as host memory
+        // host chunks count as host memory
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         ggml_backend_buffer_type_t cpu_buft = cpu_dev ? ggml_backend_dev_buffer_type(cpu_dev) : nullptr;
         if (hparams.no_alloc) {
@@ -1113,7 +1113,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         std::vector<purge_backup> purged; // the cells outside the slot that the SWA purge of the ubatch changed
     };
 
-    // k19-rsbis: the SWA purge of a ubatch (apply_ubatch: the positions of a sequence below a masked cell it overwrites) removes cells
+    // the SWA purge of a ubatch (apply_ubatch: the positions of a sequence below a masked cell it overwrites) removes cells
     // outside its slot, which the restore below did not put back, so the earlier ubatches of the same decode ran without them: a cell
     // masked only for the later ubatch (another sequence's tokens took it) was still in the window of the earlier ubatch's tokens
     // (e.g. llama-server -np N --kv-unified on SWA models; test-llama-context swa_prepare). LLAMA_KV_PREPARE_PURGE_RESTORE=0: as before
@@ -1184,7 +1184,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         return {};
     }
 
-    // k17-small (lazy KV step 2): the cells of every ubatch of the batch are backed now, before any of its graphs is built, so the MoE
+    // (lazy KV step 2): the cells of every ubatch of the batch are backed now, before any of its graphs is built, so the MoE
     // cache may give memory back for them (lazy_ensure); apply_ubatch then finds them backed
     if (!sel_bufs.empty() && !other) {
         uint32_t mx = v_cells.empty() ? 0 : v_cells[0].used_max_p1();
@@ -1195,7 +1195,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                 }
             }
         }
-        // k19-kvsel: the device window follows the cells before the batch's graphs are built (window policy only)
+        // the device window follows the cells before the batch's graphs are built (window policy only)
         sel_update(mx);
         sel_stats_tick();
     }
@@ -1254,7 +1254,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
                 }
 
-                // k19-kvwin: the ring rows of the stream go with it (the slot map is copied below)
+                // the ring rows of the stream go with it (the slot map is copied below)
                 for (ggml_tensor * w : { layer.k_win, layer.v_win }) {
                     if (w != nullptr) {
                         const size_t nb = w->nb[2];
@@ -1518,10 +1518,10 @@ bool llama_kv_cache::lazy_ensure(uint32_t n_cells, bool shrink_ok) {
     if (lazy_bufs.empty()) {
         return true;
     }
-    // k17-small (lazy KV step 2): before a batch (at most every 100 ms) the device keeps at least LLAMA_KV_LAZY_MIN_FREE_MIB (128) free
+    // (lazy KV step 2): before a batch (at most every 100 ms) the device keeps at least LLAMA_KV_LAZY_MIN_FREE_MIB (128) free
     // for the allocations of its graphs (the CUDA pool, cuBLAS), the MoE cache giving the rest back down to its floor. The cache holds
     // the KV bytes not backed yet, and a context created after this one (the drafter, after the warmup batch) can leave the device
-    // without room for them: k17lkv_g4e, G4 q4x 4 GB 16k + MTP, the cache lent the drafter's staging copies and 14 MiB were left, the
+    // without room for them:, RTX PRO 6000 the 4-bit model 4 GB 16k + MTP, the cache lent the drafter's staging copies and 14 MiB were left, the
     // first request ran out of memory in mul_mat_q (LLAMA_KV_LAZY=0: 190 MiB free, the staging not allocated)
     if (shrink_ok && lazy_shrink_fn != nullptr && (lazy_min_free_t < 0 || ggml_time_us() - lazy_min_free_t >= 100000)) {
         lazy_min_free_t = ggml_time_us();
@@ -1552,7 +1552,7 @@ bool llama_kv_cache::lazy_ensure(uint32_t n_cells, bool shrink_ok) {
     static const uint32_t step = getenv("LLAMA_KV_LAZY_STEP") != nullptr ? (uint32_t) std::max(256, atoi(getenv("LLAMA_KV_LAZY_STEP"))) : 1024;
     const uint32_t kv_size = v_cells.empty() ? 0 : v_cells[0].size();
     const uint32_t n = std::min(kv_size, ((n_cells + step - 1)/step)*step);
-    // k17-small (lazy KV step 2): the growth is paid by the MoE cache (lazy_set_shrink). Before backing the rows, each device keeps the
+    // (lazy KV step 2): the growth is paid by the MoE cache (lazy_set_shrink). Before backing the rows, each device keeps the
     // free memory it had when the cells first grew (at most LLAMA_KV_LAZY_MARGIN_MIB, 256: the margin the fit leaves a small device): if
     // the new rows would take it below that, the cache gives back the difference first; if backing still fails, it gives back the rest
     // and the rows are backed again. The fit keeps every layer beside the full-context KV with the cache at its floor, so the cache can
@@ -1804,7 +1804,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
     if (!lazy_bufs.empty() && !lazy_sim) {
         // the cells this ubatch writes, and every cell up to the padded n_kv the graph reads, must be backed
-        // (k17-small step 2: prepare backed them already, with the MoE cache giving memory back; this only checks)
+        // (step 2: prepare backed them already, with the MoE cache giving memory back; this only checks)
         uint32_t mx = 0;
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
@@ -1915,7 +1915,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         head = sinfo.idxs[s].back() + 1;
     }
 
-    // k19-kvwin: ring slots for the placed cells (not in prepare()'s simulation)
+    // ring slots for the placed cells (not in prepare()'s simulation)
     win_assign(sinfo, ubatch);
 }
 
@@ -2050,9 +2050,9 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, bool * bucketed, uint
         *n_kv_live = 0;
     }
 
-    // k19-vgraph: see set_n_kv_bucket. The step is a power of two, so the buckets of one octave end where the next one starts and
+    // see set_n_kv_bucket. The step is a power of two, so the buckets of one octave end where the next one starts and
     // n_kv only grows with the cells
-    // k19-graph: with the device KV length (dev_len) every ubatch of up to n_tokens_max tokens, steps of at least step_min cells
+    // with the device KV length (dev_len) every ubatch of up to n_tokens_max tokens, steps of at least step_min cells
     const uint32_t n_tokens = (uint32_t) sinfo.size();
     const bool dev = n_kv_bucket.dev_len && n_kv_bucket_dev_allowed;
     const uint32_t n_tokens_max = dev ? n_kv_bucket.dev_n_tokens_max : n_kv_bucket.n_tokens_max;
@@ -2370,11 +2370,11 @@ struct args_set_input_kq_mask {
     int64_t n_stream;
     int64_t n_tps;
 
-    // k19-vwidth: the kept first rows (nullptr: every row computed in full)
+    // the kept first rows (nullptr: every row computed in full)
     llama_kv_cache::kq_row_cache * rows = nullptr;
 };
 
-// k19-vwidth: the mask value of one cell for a token of sequence seq_id at position p1 (2D position p1_x, p1_y), spm the smallest
+// the mask value of one cell for a token of sequence seq_id at position p1 (2D position p1_x, p1_y), spm the smallest
 // position of that sequence in the ubatch: the rule of the loop in set_input_kq_mask_rows (no ALiBi)
 template<typename T, bool causal, bool swa, bool is_2d>
 static inline T kq_mask_cell(const args_set_input_kq_mask & args, const llama_kv_cells & cells, uint32_t j, llama_seq_id seq_id,
@@ -2402,7 +2402,7 @@ static inline T kq_mask_cell(const args_set_input_kq_mask & args, const llama_kv
     return mask_keep;
 }
 
-// k19-vwidth (LLAMA_KQ_MASK_INC=0: off): the first row of a sequence from its kept row. A cell's value depends only on the cell (its
+// (LLAMA_KQ_MASK_INC=0: off): the first row of a sequence from its kept row. A cell's value depends only on the cell (its
 // position, sequences, 2D position: every change is in the cells' log) and, through the causal / SWA / in-span rules, on whether its
 // position lies on one side or the other of p1 (p1 - n_swa, spm): so a cell that is not logged since the kept row and whose position
 // lies outside [min - n_swa - 2, max + n_swa + 2] of the two rows' p1 and spm has the same value in both rows. Those that remain
@@ -2507,7 +2507,7 @@ static bool kq_mask_row_inc(const args_set_input_kq_mask & args, uint32_t strm, 
     return true;
 }
 
-// k19-vwidth: keeps the first row of a sequence the full loop computed, for kq_mask_row_inc
+// keeps the first row of a sequence the full loop computed, for kq_mask_row_inc
 template<typename T, bool causal, bool swa, bool is_2d>
 static void kq_mask_row_keep(const args_set_input_kq_mask & args, uint32_t strm, const llama_kv_cells & cells, llama_seq_id seq_id,
         llama_pos p1, llama_pos p1_x, llama_pos p1_y, llama_pos spm, const T * src) {
@@ -2600,7 +2600,7 @@ static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const ll
             // note: this optimization is not compatible with Alibi position encoding
             // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
             bool prev = false;
-            bool first_full = false; // k19-vwidth: the sequence's first row, computed in full (kept for the next decode)
+            bool first_full = false; // the sequence's first row, computed in full (kept for the next decode)
 
             auto & idxs = seq_idxs[seq_id];
 
@@ -2793,7 +2793,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 
     if (n_threads <= 1) {
-        // k19-vwidth (LLAMA_KQ_MASK_INC=0: off): decode ubatches (up to 64 tokens per stream) start each sequence from its kept row
+        // (LLAMA_KQ_MASK_INC=0: off): decode ubatches (up to 64 tokens per stream) start each sequence from its kept row
         static const bool inc = getenv("LLAMA_KQ_MASK_INC") == nullptr || atoi(getenv("LLAMA_KQ_MASK_INC")) != 0;
         if (inc && !alibi && args.rows != nullptr && n_tps <= 64) {
             static std::atomic<bool> logged { false };
@@ -2893,7 +2893,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const uint32_t n_tokens = ubatch->n_tokens;
 
     if (dst->op == GGML_OP_KQ_MASK) {
-        // k15-pp: the device builds the mask (ggml_kq_mask, see build_attn_inp_kq_mask): the cells and the tokens it reads
+        // the device builds the mask (ggml_kq_mask, see build_attn_inp_kq_mask): the cells and the tokens it reads
         // the host inputs (build_attn_inp_kq_mask keeps them in the op params: the scheduler points src[] at the device copies)
         ggml_tensor * srcs[2];
         memcpy(srcs, dst->op_params, sizeof(srcs));
@@ -3282,7 +3282,7 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                                 : hparams.rope_type;
     ggml_tensor * tmp;
 
-    // (k19-kvwin: dequant forces this path for rotated rows of a type that is not quantized: an F16 ring beside a rotated cache)
+    // (dequant forces this path for rotated rows of a type that is not quantized: an F16 ring beside a rotated cache)
     if (ggml_is_quantized(cur->type) || dequant) {
         // dequantize to f32 -> RoPE -> quantize back
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
@@ -3317,7 +3317,7 @@ public:
 
     ggml_tensor * k_shift; // I32 [kv_size*n_stream]
 
-    // k19-kvwin: the shift of every ring row (its cell's shift), I32 [(win_r + 1)*n_stream]
+    // the shift of every ring row (its cell's shift), I32 [(win_r + 1)*n_stream]
     ggml_tensor * win_shift = nullptr;
 
     // note: assumes k_rot^2 == I
@@ -3388,7 +3388,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_build_forward_expand(gf, cur);
 
-        // k19-kvwin: the ring rows hold the same K: the same shift
+        // the ring rows hold the same K: the same shift
         if (layer.k_win != nullptr) {
             if (inp->win_shift == nullptr) {
                 inp->win_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) (win_r + 1)*n_stream);
@@ -3596,7 +3596,7 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
     const auto & cells = v_cells[cr.strm];
 
-    // k19-kvwin: bit 8 = ring rows follow the K / V rows (state_write_win); a reader without it rejects the blob as a V layout
+    // bit 8 = ring rows follow the K / V rows (state_write_win); a reader without it rejects the blob as a V layout
     // mismatch instead of misreading it
     const uint32_t v_trans = this->v_trans ? 1 : 0;
     const uint32_t n_layer = layers.size();
@@ -3800,7 +3800,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
-        // (k19-kvwin: the restored cells get ring slots from the blob, state_read_data, not from their positions)
+        // (the restored cells get ring slots from the blob, state_read_data, not from their positions)
         win_no_assign = true;
         apply_ubatch(sinfo, ubatch);
         win_no_assign = false;
@@ -3931,7 +3931,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     io.read(&n_rot_k_ref, sizeof(n_rot_k_ref));
     io.read(&n_rot_v_ref, sizeof(n_rot_v_ref));
 
-    // k19-kvwin: ring rows follow (state_write_data)
+    // ring rows follow (state_write_data)
     const bool blob_win = (v_trans & 0x100) != 0;
     v_trans &= 0xff;
 
@@ -4358,10 +4358,10 @@ bool llama_kv_cache_context::get_prev_tokens_ahead(const llama_ubatch & ubatch, 
     return kv->get_prev_tokens_ahead(ubatch, pending, n, res, known);
 }
 
-// k19-vramlend: see llama-ext.h
+// see llama-ext.h
 int llama_kv_lazy_mode() {
     const char * e = getenv("LLAMA_KV_LAZY");
-    // (k19-vramlend opt-in variant: unset = off; LLAMA_KV_LAZY=auto = the automatic mode, see llama-ext.h)
+    // (opt-in variant: unset = off; LLAMA_KV_LAZY=auto = the automatic mode, see llama-ext.h)
     if (e == nullptr || *e == '\0') {
         return 0;
     }

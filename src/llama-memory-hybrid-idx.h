@@ -78,18 +78,18 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
-    // k19-vgraph: see llama_kv_cache::set_n_kv_bucket_allowed (both caches)
+    // see llama_kv_cache::set_n_kv_bucket_allowed (both caches)
     void set_n_kv_bucket_allowed(bool value);
-    // k19-graph: see llama_kv_cache::set_n_kv_bucket_dev_allowed (both caches)
+    // see llama_kv_cache::set_n_kv_bucket_dev_allowed (both caches)
     void set_n_kv_bucket_dev_allowed(bool value);
-    // k19-fullcost: device KV buckets of at least 16384 cells (wide) instead of 2048, unless LLAMA_KV_BUCKET_DEV_STEP_MIN is set (both
+    // device KV buckets of at least 16384 cells (wide) instead of 2048, unless LLAMA_KV_BUCKET_DEV_STEP_MIN is set (both
     // caches; llama_context: a context without a MoE cache, where the server prewarms the verify graphs)
     void set_n_kv_bucket_dev_wide(bool wide);
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
 
-    // k19-vgraph: the pools the indexer selection keeps at most (top_k / kpool)
+    // the pools the indexer selection keeps at most (top_k / kpool)
     uint32_t get_kpool_top() const { return hparams_idx.indexer_kpool > 0 ? hparams_idx.indexer_top_k / hparams_idx.indexer_kpool : 0; }
 
     // Whether pools are kpool consecutive cells in sequence order (qwen4exp) instead of kpool consecutive positions.
@@ -127,7 +127,7 @@ private:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
 
-    // k19-kvsel: the indexer raw keys in the cache, the pooled keys in its aux tensors (see the constructor); set while mem_idx is built
+    // the indexer raw keys in the cache, the pooled keys in its aux tensors (see the constructor); set while mem_idx is built
     bool idx_split = false;
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
@@ -141,7 +141,7 @@ private:
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
-    bool dev_step_min_env = false; // k19-fullcost: LLAMA_KV_BUCKET_DEV_STEP_MIN given
+    bool dev_step_min_env = false; // LLAMA_KV_BUCKET_DEV_STEP_MIN given
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -151,7 +151,7 @@ public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
-        // k19-kvsel: the pooled keys are a tensor of their own (the cache rows hold the per-token part only)
+        // the pooled keys are a tensor of their own (the cache rows hold the per-token part only)
         bool split() const { return is_split; }
         // split: write values (the zero pooled keys of the ubatch's rows) into the pooled rows idxs, as the packed row write does
         ggml_tensor * set_pooled_rows(ggml_tensor * values, ggml_tensor * idxs) const;
@@ -211,7 +211,7 @@ public:
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
-    // k19-p2qsa: every token of this ubatch belongs to a sequence of at most indexer_top_k / kpool pools, so the indexer's top_k keeps
+    // every token of this ubatch belongs to a sequence of at most indexer_top_k / kpool pools, so the indexer's top_k keeps
     // all of its visible pools (LLAMA_QSA_ALLFIT=0: never)
     bool     get_kpool_allfit() const;
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;

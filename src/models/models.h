@@ -1513,20 +1513,20 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         std::map<int32_t, ggml_tensor *> gather_sel_of;
         std::map<int32_t, ggml_tensor *> gather_mask_of;
         std::map<int32_t, ggml_tensor *> gather_win_mask_of;
-        // k19-dsv4p window gather (LLAMA_DSV41_WIN_GATHER=0 disables): the raw (window) cache cells each query may see, picked once
+        // window gather (LLAMA_DSV41_WIN_GATHER=0 disables): the raw (window) cache cells each query may see, picked once
         // per graph from the shared raw mask, sorted; n_win = the sliding window padded to the FA stride
         bool          win_gather = true;
-        // k19-dsv4p (LLAMA_DSV41_TOPK_ALL=0 disables): skip the indexer + top-k when every compressed row would be selected
+        // (LLAMA_DSV41_TOPK_ALL=0 disables): skip the indexer + top-k when every compressed row would be selected
         bool          topk_all     = true;
         bool          cand_skipped = false;
-        bool          cand_all_env = true;  // k19-dsv4p (LLAMA_DSV41_CAND_ALL=0 disables): skip a block pick that keeps every block
-        // k19-dsv4next (LLAMA_DSV41_PREFILL_SPARSE=0 disables): the dense (prompt) attention passes the bound on finite mask entries
+        bool          cand_all_env = true;  // (LLAMA_DSV41_CAND_ALL=0 disables): skip a block pick that keeps every block
+        // (LLAMA_DSV41_PREFILL_SPARSE=0 disables): the dense (prompt) attention passes the bound on finite mask entries
         // per query (window + top-k) to flash attention, so CUDA gathers only those K rows instead of reading every compressed row;
         // 2 (default) also marks the node to prefer the gather from K >= 2 * bound, 1 = the backend's own threshold
         int           prefill_sparse = 2;
         ggml_tensor * win_sel    = nullptr;
         ggml_tensor * win_mask   = nullptr;
-        // k19-dsv4long far-token skip (LLAMA_DSV41_FAR_SKIP=0 disables): from layer hparams.dsv41_far_layer on the graph carries only
+        // far-token skip (LLAMA_DSV41_FAR_SKIP=0 disables): from layer hparams.dsv41_far_layer on the graph carries only
         // the ubatch rows from far_r0 on (llama_context::dsv41_far_rows); cut_tok views a per-token tensor at those rows
         int64_t       far_r0     = 0;
         ggml_tensor * cut_tok(ggml_tensor * t) const;
@@ -2748,7 +2748,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
-        // k19-pf: the K / V projections and cache writes of build_layer_attn only (kv_only)
+        // the K / V projections and cache writes of build_layer_attn only (kv_only)
         void build_attn_kv_store(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * cur,
@@ -2770,11 +2770,11 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
-        // k15-fn (LLAMA_QSA_HOIST=0 off): the QSA constants every layer builds alike (the zero half of the packed key, the head
+        // (LLAMA_QSA_HOIST=0 off): the QSA constants every layer builds alike (the zero half of the packed key, the head
         // weights, the tail liveness and the dump rows), built once per graph by the first QSA layer
         struct qsa_shared {
             ggml_tensor * pzero     = nullptr;
-            // k19-kvwin: the KV window ring inputs of the attention (set by build_layer_attn before build_qsa_sel) and the ring mask of the
+            // the KV window ring inputs of the attention (set by build_layer_attn before build_qsa_sel) and the ring mask of the
             // layer's selection (F16, the ring slots' selection plus the ring mask), see build_qsa_sel_mask / build_attn_qsa
             llm_graph_kv_win * win      = nullptr;
             ggml_tensor *      win_mask = nullptr;
@@ -2783,7 +2783,7 @@ struct llama_model_qwen4exp : public llama_model_base {
             ggml_tensor * dump      = nullptr;
         } qsa_c;
 
-        // k19-pf: an MTP drafter batch with no output row only writes its caches (graph_mtp): build_layer_attn stores K / V and
+        // an MTP drafter batch with no output row only writes its caches (graph_mtp): build_layer_attn stores K / V and
         // returns nullptr, build_qsa_sel writes the indexer keys and pooled keys and returns nullptr
         bool kv_only = false;
 
@@ -2797,7 +2797,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
-        // the mask of build_qsa_sel from the selected cells (k19-p2qsa: the scored or the all-fit selection)
+        // the mask of build_qsa_sel from the selected cells (the scored or the all-fit selection)
         ggml_tensor * build_qsa_sel_mask(
           llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * sel_idx,

@@ -1,6 +1,6 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 //
-// k19-kvwin: the recent-window ring of a KV cache. Every token is stored in the cache (the "body", typically q4_0) and, while it is
+// the recent-window ring of a KV cache. Every token is stored in the cache (the "body", typically q4_0) and, while it is
 // among the last W positions of its sequence or among its first S positions, in a ring slot of a wider type (typically q8_0) written
 // from the same rotated K / V. Query row r (position p) reads a visible cell from the ring iff the cell holds a live slot and
 // (pos > p - W or pos < S); otherwise from the body. The ring holds n_seq_per_stream*(W + S) + n_ubatch slots per stream, so every
@@ -93,7 +93,7 @@ bool llama_kv_cache::win_init(const llama_kv_win_params & p) {
 
     const char * why = nullptr;
     if (!sel_bufs.empty()) {
-        // k19-kvsel: the two-source attention reads the body densely, which would read every host chunk each token
+        // the two-source attention reads the body densely, which would read every host chunk each token
         why = "its K/V cells are partly in host memory (LLAMA_KV_SEL_HOST)";
     } else if (other) {
         why = "the cache shares the cells of another context";

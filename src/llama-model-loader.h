@@ -116,14 +116,14 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
-    // k16-draft (idea from ik_llama.cpp by ikawrakow): an MTP draft model (hparams.n_layer_nextn > 0) loaded with mtp_borrow_io
+    // (idea from ik_llama.cpp by ikawrakow): an MTP draft model (hparams.n_layer_nextn > 0) loaded with mtp_borrow_io
     // takes token_embd / output from model_shared, the target it drafts for, instead of its own copies (see borrow_io)
     const struct llama_model * model_shared = nullptr;
     bool   mtp_borrow_io        = false;
     bool   output_borrowed      = false;   // output is the target's tensor (load_tensors_draft_head copies its rows from it)
     ggml_backend_buffer_type_t output_dry_buft = nullptr; // no_alloc: the device buffer type output would have taken (the draft head's)
     size_t borrowed_bytes       = 0;
-    // k19-pr374: a shared MTP drafter (mtp-*-shared-*.gguf) has no token_embd / output of its own; with mtp_borrow_io it takes the
+    // a shared MTP drafter (mtp-*-shared-*.gguf) has no token_embd / output of its own; with mtp_borrow_io it takes the
     // target's. The memory measurement (no_alloc, no target loaded) prices them as a self-contained drafter's borrowed copies, in the
     // target's types (KV overrides general.mtp_borrow_token_embd_type / general.mtp_borrow_output_type, set by common)
     ggml_type borrow_missing_type(llm_tensor t) const;
@@ -138,7 +138,7 @@ struct llama_model_loader {
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
-    // k18: load-time requantization of the FFN / expert weights (KV override general.requant_type, set by common for a draft model):
+    // load-time requantization of the FFN / expert weights (KV override general.requant_type, set by common for a draft model):
     // the target type and, per requantized tensor, its type and size in the file
     ggml_type requant_type = GGML_TYPE_COUNT;
     ggml_type requant_output_type = GGML_TYPE_COUNT; // general.requant_output_type: the output (lm head) matrix
@@ -205,7 +205,7 @@ struct llama_model_loader {
     };
     std::vector<pinned_range> pinned_ranges;
     std::vector<pinned_range> mapped_ranges;
-    std::vector<pinned_range> device_ranges; // k19-fnttft: tensors copied from a mapping into a device buffer
+    std::vector<pinned_range> device_ranges; // tensors copied from a mapping into a device buffer
     void settle_pinned_cache();
     void drop_device_cache();
     std::string first_tensor_moved_name;
@@ -280,7 +280,7 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
-    // k16-draft: token_embd / output of an MTP draft model taken from model_shared (null: load the own copy). LLAMA_MTP_BORROW_IO=0 off
+    // token_embd / output of an MTP draft model taken from model_shared (null: load the own copy). LLAMA_MTP_BORROW_IO=0 off
     struct ggml_tensor * borrow_io(const llama_hparams & hparams, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;

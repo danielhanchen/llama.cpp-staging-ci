@@ -115,7 +115,7 @@ struct llama_batch_ext {
         size_t       embd_off = 0; // index offset in the embd array
         bool         has_state = false; // whether state_off is set
         size_t       state_off = 0; // index offset in the state array
-        const float * state_ref = nullptr; // k19-host: the caller's row instead of state_off (llama_batch_ext_set_embd_state_ref)
+        const float * state_ref = nullptr; // the caller's row instead of state_off (llama_batch_ext_set_embd_state_ref)
         bool         output = false; // TODO: have dedicated output flags
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         std::unordered_set<llama_seq_id> seq_ids;
@@ -180,7 +180,7 @@ public:
     // call once before splitting the batch to reset the internal state
     void split_reset();
 
-    // k11 (LLAMA_LM_CKPT_MERGE): batch indices where a ubatch must end (each segment between two breaks is split as if it were a batch
+    // (LLAMA_LM_CKPT_MERGE): batch indices where a ubatch must end (each segment between two breaks is split as if it were a batch
     // of its own), set for one batch and cleared by init(); only single sequence batches honour them
     std::vector<int32_t> ubatch_breaks;
     int32_t break_after(int32_t idx) const; // the first break > idx, or the number of tokens
@@ -232,7 +232,7 @@ private:
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
     const float *               state_src = nullptr; // the state rows of the batch: state_vec, or the input batch itself (no copy)
-    std::vector<const float *>  state_ptrs;   // k19-host: row i's state where the batch holds state rows by reference (state_src unused)
+    std::vector<const float *>  state_ptrs;   // row i's state where the batch holds state rows by reference (state_src unused)
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

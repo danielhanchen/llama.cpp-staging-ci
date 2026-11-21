@@ -1017,7 +1017,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
 
     GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
-    // k19-kvlong: one node where the layer's device runs it (no scatter buffer, see build_sel_mask_op)
+    // one node where the layer's device runs it (no scatter buffer, see build_sel_mask_op)
     if (ggml_tensor * m = build_sel_mask_op(ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1), kq_mask, model.dev_layer(il))) {
         cb(m, "indexer_sel", il);
         return m;
