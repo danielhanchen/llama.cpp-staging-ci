@@ -375,6 +375,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-rs-snap-qwen35 PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # a partial seq_rm into a prompt ubatch restores the delta-net snapshot row of that position (fresh prefill = rollback);
+    # the chunked CUDA kernel needs 16 key heads x 128 (a model with that layout, not this one, exercises it on a GPU)
+    llama_build(test-gdn-snap-rollback.cpp)
+    llama_test(
+        test-gdn-snap-rollback
+        LABEL main
+        ARGS "${MODEL_DIR}/qwen35-dense.gguf" 200 2 2
+    )
+    set_tests_properties(test-gdn-snap-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # -sm tensor (Meta(CPU, CPU)) with LLAMA_RS_REPLAY=1: the delta-net rollback keeps the snapshot rows and matches the CPU decode
     llama_build(test-rs-replay-meta.cpp)
     llama_test(

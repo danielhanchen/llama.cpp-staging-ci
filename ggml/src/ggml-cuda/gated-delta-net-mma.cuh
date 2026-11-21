@@ -30,6 +30,8 @@ struct ggml_cuda_gdn_mma_args {
     int64_t sb3;
     float   scale;
     bool    eligible;
+    // tokens per sequence of the output rows (0 = n_tokens): the kernel may run a leading part of the op's tokens
+    int64_t n_tokens_dst = 0;
 };
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream);
