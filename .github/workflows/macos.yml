@@ -135,6 +135,15 @@ jobs:
           done
           grep -E "Q8_K quantization|differ" ci-logs/q8k.txt | sed 's/^/q8k: /' | tee -a ci-logs/summary.txt
 
+      - name: Q8_K quantization speed (diagnostic, SIMD on vs the reference, 3 interleaved rounds)
+        if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0'
+        continue-on-error: true
+        shell: bash
+        run: |
+          c++ -O2 -std=c++17 ci-extra/q8kbench.cpp -Iggml/include -Lbuild/bin -lggml -lggml-base -lggml-cpu -Wl,-rpath,$PWD/build/bin -o q8kbench || exit 0
+          for r in 1 2 3; do for e in 1 0; do echo "round $r GGML_CPU_Q8K_SIMD=$e $(GGML_CPU_Q8K_SIMD=$e ./q8kbench 2>/dev/null | tail -1)" | tee -a ci-logs/q8kbench.txt; done; done
+          sed 's/^/q8kbench: /' ci-logs/q8kbench.txt >> ci-logs/summary.txt
+
       - name: dflash2 conv NaN diagnostic
         continue-on-error: true
         if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0' && hashFiles('tests/test-dflash2-conv-exact.cpp') != ''
