@@ -7877,6 +7877,7 @@ struct llama_moe_cache::impl {
     std::vector<rf_dev_t> rf_devs;
     bool rf_any      = false; // some group has a refill pending
     bool in_prepare  = false;
+    bool rf_allow    = false; // the unlend being run gives the slots back to a small batch's graph (the only case that refills beside a graph)
     struct { uint64_t async = 0, sync = 0, joins = 0, bytes = 0; } rfs;
     std::vector<int32_t> rf_layers;
 
@@ -11776,7 +11777,9 @@ struct llama_moe_cache::impl {
                 // the device lookup and the hybrid assign treat every slot as a cache entry: the lent slots come back first
                 // the scheduler already took them back when it allocated the graph of this small batch, this only guards the order
                 if (g.lru.n_lent > 0) {
+                    rf_allow = true;
                     unlend(g);
+                    rf_allow = false;
                 }
                 if (g.dev_gen != g.lru.gen) {
                     GGML_ASSERT(!g.dev_newer);
@@ -11854,11 +11857,14 @@ struct llama_moe_cache::impl {
 
         if (n_copies == 0) {
             if (!dry) {
+                // the graph of a small batch takes no slots: the refill may run beside it (see rf_on)
+                rf_allow = true;
                 for (group & g : groups) {
                     if (g.id == id && g.lru.n_lent > 0) {
                         unlend(g);
                     }
                 }
+                rf_allow = false;
             }
             return;
         }
@@ -12911,7 +12917,7 @@ struct llama_moe_cache::impl {
         }
         const size_t budget0 = budget;
         // asynchronous refill (see rf_on): every layer of the group is marked pending, and done on the upload stream after its uploads
-        ggml_backend_t up = refill_enabled && rf_eligible(g) ? rf_backend(g.id) : nullptr;
+        ggml_backend_t up = refill_enabled && rf_allow && rf_eligible(g) ? rf_backend(g.id) : nullptr;
         const int32_t ep = g.rf_epoch + 1;
         if (up != nullptr) {
             rf_layers.assign(g.layers.begin(), g.layers.end());
