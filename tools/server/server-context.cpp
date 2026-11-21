@@ -16,6 +16,7 @@
 #include "llama.h"
 #include "gguf.h"
 #include "../../src/llama-ext.h" // staging API: llama_set_verify
+#include "../../src/llama-env-alias.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -2264,7 +2265,7 @@ private:
             // (short_b == 0: every routed expert is expected on the devices and the need only reads high from the drafter and margin,
             // the earlier rule's A100 80 GB full card, where 4 drafts measured 8k -18.6%: not this rule's tier)
             const bool def_on    = deep_try && exp_b > 0 && short_b > 0 && deep_share >= deep_share_min && resident;
-            // (LLAMA_MOE_G4TAIL=0: off, the rule above alone): a cache expected to hold LLAMA_MOE_G4TAIL_LO .. _HI (0.07 ..
+            // (LLAMA_MOE_SMALLCACHE_PREFETCH=0: off, the rule above alone): a cache expected to hold LLAMA_MOE_SMALLCACHE_PREFETCH_LO .. _HI (0.07 ..
             // 0.17, the estimate; RTX PRO 6000 16 GB reads 10.8% here, 14.4% once placed) of the routed experts, on compute capability 12.0 cards
             // only, with the target in RAM: the windows draft n_def (4) too, and the MoE cache's cross-layer prefetch is on in its band
             // (LLAMA_MOE_PREFETCH_AUTO=2 for llama_moe_cache: top 10 predicted experts, at most 1 copied per layer, generation and verify
@@ -2273,16 +2274,16 @@ private:
             // (held-out text +9.5%), 8k +8.0 / +10.8% (held-out -1.3%); long48 KLD inside the -fa off band on all 8 statistics.
             // An explicit LLAMA_SPEC_DEPTH_CACHED / LLAMA_MOE_PREFETCH / LLAMA_MOE_PREFETCH_AUTO keeps its value
             const bool g4tail_on = [] {
-                const char * x = getenv("LLAMA_MOE_G4TAIL");
+                const char * x = llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH");
                 return x == nullptr || atoi(x) != 0;
             }();
-            const double g4t_lo = getenv("LLAMA_MOE_G4TAIL_LO") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_LO")) : 0.07;
-            const double g4t_hi = getenv("LLAMA_MOE_G4TAIL_HI") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_HI")) : 0.17;
+            const double g4t_lo = llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_LO") != nullptr ? atof(llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_LO")) : 0.07;
+            const double g4t_hi = llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_HI") != nullptr ? atof(llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_HI")) : 0.17;
             // not above LLAMA_FIT_LONGCTX_MIN_CTX (32768, where --fit's long-context ladder takes over; n_ctx 0 = the
             // trained context counts as above): there the deeper windows changed the fit itself. RTX PRO 6000 16 GB ctx 262144: priced at 4
             // drafts the requantized drafter was left out, and the placement moved (49 layers, n_ubatch 2048, cache 6233 MiB against
             // 50 layers, n_ubatch 512, 3915 MiB with the rule off): decode chat / 8k 87.4 / 82.3 tok/s against 133.0 / 125.2. Above the
-            // bound the rule sets nothing, as LLAMA_MOE_G4TAIL=0
+            // bound the rule sets nothing, as LLAMA_MOE_SMALLCACHE_PREFETCH=0
             const int64_t g4t_ctx_max = [] {
                 const char * x = getenv("LLAMA_FIT_LONGCTX_MIN_CTX");
                 return x != nullptr && x[0] != 0 ? (int64_t) atoll(x) : (int64_t) 32768;
@@ -2291,13 +2292,13 @@ private:
             const bool g4t_band = deep_try && !def_on && g4tail_on && exp_b > 0 && short_b > 0 && resident && deep_share >= g4t_lo && deep_share < g4t_hi &&
                 n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
             const bool g4t = g4t_band && g4t_ctx_ok;
-            // Between the two rules (from LLAMA_MOE_G4TAIL_HI, 0.17, up to LLAMA_SPEC_DEPTH_CACHED_SHARE, 0.30) the windows stayed at 2
+            // Between the two rules (from LLAMA_MOE_SMALLCACHE_PREFETCH_HI, 0.17, up to LLAMA_SPEC_DEPTH_CACHED_SHARE, 0.30) the windows stayed at 2
             // drafts on compute capability 12.0 cards. There the deep windows' rule applies too, under the same conditions as the band
             // below it (target in RAM, n_ctx not above LLAMA_FIT_LONGCTX_MIN_CTX), drafting LLAMA_SPEC_DEPTH_MID_N (default 3) per
             // window; no prefetch and no host-path change (both stay as at the rule's floor). RTX PRO 6000, Qwen3.8-Flash-Next at 4 bits +
             // its MTP drafter, Studio argv, 24 GB (25.0% expected), 3 launches: 3 drafts chat 185.7 -> 194.8 tok/s, 8k 163.0 -> 174.8;
             // 4 drafts chat 191.5, 8k 155.5 (each extra verify row misses more experts at this share). LLAMA_SPEC_DEPTH_MID=0,
-            // LLAMA_MOE_G4TAIL=0 or an explicit LLAMA_SPEC_DEPTH_CACHED_SHARE: off
+            // LLAMA_MOE_SMALLCACHE_PREFETCH=0 or an explicit LLAMA_SPEC_DEPTH_CACHED_SHARE: off
             const bool mid_on = [] {
                 const char * x = getenv("LLAMA_SPEC_DEPTH_MID");
                 return x == nullptr || atoi(x) != 0;
@@ -2418,8 +2419,8 @@ private:
             // (PLE rows read from the disk and expert misses copied at ~10 GB/s), against 3.4 -> 4.0 tokens per pass
             if (deep_try && !on) {
                 if (g4t_band && !g4t_ctx_ok) {
-                    SRV_INF("n_ctx %d is above LLAMA_FIT_LONGCTX_MIN_CTX (%lld): the g4tail rule stays off (MTP windows and "
-                        "the prefetch as with LLAMA_MOE_G4TAIL=0)\n", params.n_ctx, (long long) g4t_ctx_max);
+                    SRV_INF("n_ctx %d is above LLAMA_FIT_LONGCTX_MIN_CTX (%lld): the small-cache prefetch rule stays off (MTP windows and "
+                        "the prefetch as with LLAMA_MOE_SMALLCACHE_PREFETCH=0)\n", params.n_ctx, (long long) g4t_ctx_max);
                 }
                 spec_g4t_raised = g4t;
                 if (def_on || g4t || def_mid) {
@@ -2473,7 +2474,7 @@ private:
                 }
                 if (g4t) {
                     SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (band %.2f .. %.2f, compute capability 12.0, target "
-                        "in RAM): MTP windows of %d drafts and the cache's cross-layer prefetch in its band (LLAMA_MOE_G4TAIL=0: off)\n", 100.0*deep_share,
+                        "in RAM): MTP windows of %d drafts and the cache's cross-layer prefetch in its band (LLAMA_MOE_SMALLCACHE_PREFETCH=0: off)\n", 100.0*deep_share,
                         g4t_lo, g4t_hi, n_def);
                 }
                 SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (%.0f MiB short of %.0f MiB); target GGUF %.0f MiB %s "
@@ -2512,12 +2513,12 @@ private:
                     expert_bytes/1048576.0, ram_avail/1048576.0);
             }
             if (deep_cached) {
-                // under the g4tail rule --fit admits the drafter by the verify cost of the windows it had before the rule
+                // under the small-cache prefetch rule --fit admits the drafter by the verify cost of the windows it had before the rule
                 // (fit_n_max). The windows of n_def drafts then stand only where the placed cache takes the prefetch band (after
                 // common_init_from_params below), else they are cut back to 2. RTX PRO 6000 16 GB ctx 262144 (r1): priced at 4 drafts the
                 // requantized drafter needed a cache of 4 tokens per layer, left 3.2 and was left out, decode without drafts 87.8 / 81.7
-                // tok/s chat / 8k against 132.7 / 123.8 with the rule off (LLAMA_MOE_G4TAIL_PLACED_GATE=0: priced at n_def, as before)
-                const char * pg = getenv("LLAMA_MOE_G4TAIL_PLACED_GATE");
+                // tok/s chat / 8k against 132.7 / 123.8 with the rule off (LLAMA_MOE_SMALLCACHE_PREFETCH_PLACED_GATE=0: priced at n_def, as before)
+                const char * pg = llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_PLACED_GATE");
                 if (spec_g4t_raised && (pg == nullptr || atoi(pg) != 0)) {
                     sp.draft.fit_n_max = sp.draft.n_max;
                 }
@@ -2717,16 +2718,16 @@ private:
         ctx_tgt   = llama_init->context();
 
         // the rule's windows of n_def drafts stand only where the placed MoE cache took its prefetch band (the cache
-        // publishes LLAMA_MOE_G4TAIL_PLACED once placed). Its estimate before the fit leaves out the KV cache of n_ctx: at 262144 the
+        // publishes LLAMA_MOE_SMALLCACHE_PREFETCH_PLACED once placed). Its estimate before the fit leaves out the KV cache of n_ctx: at 262144 the
         // placed cache is smaller than at the measured 32768, and 4-draft windows beside a cache below the band were never measured
-        // to pay. Outside the band: 2 drafts per window, as without the rule (LLAMA_MOE_G4TAIL_PLACED_GATE=0: keep the windows)
+        // to pay. Outside the band: 2 drafts per window, as without the rule (LLAMA_MOE_SMALLCACHE_PREFETCH_PLACED_GATE=0: keep the windows)
         if (spec_g4t_raised && ctx_tgt != nullptr) {
-            const char * pg = getenv("LLAMA_MOE_G4TAIL_PLACED_GATE");
-            const char * pl = getenv("LLAMA_MOE_G4TAIL_PLACED");
+            const char * pg = llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_PLACED_GATE");
+            const char * pl = llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_PLACED");
             if ((pg == nullptr || atoi(pg) != 0) && (pl == nullptr || atoi(pl) == 0)) {
                 spec_g4t_cap = 2;
                 SRV_INF("the placed MoE cache is outside the prefetch band (%s): MTP windows of 2 drafts "
-                    "(LLAMA_MOE_G4TAIL_PLACED_GATE=0: keep the wider windows)\n", pl == nullptr ? "no verdict" : "verdict off");
+                    "(LLAMA_MOE_SMALLCACHE_PREFETCH_PLACED_GATE=0: keep the wider windows)\n", pl == nullptr ? "no verdict" : "verdict off");
             } else if (pl != nullptr && atoi(pl) != 0) {
                 SRV_INF("%s", "the placed MoE cache is in the prefetch band: the wider MTP windows stay\n");
             }
