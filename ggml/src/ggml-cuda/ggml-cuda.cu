@@ -8458,11 +8458,16 @@ static int ggml_backend_cuda_preload_graph(ggml_backend_t backend, ggml_cgraph *
     ggml_cuda_preload_n_new  = 0;
     ggml_cuda_preload_active = true;
     std::vector<const ggml_tensor *> chain, inputs;
+    // functions loaded per kind: lightning indexer, top-k, flash attention, mul_mat_vec, QSA selection chain
+    int n_kind[5] = { 0, 0, 0, 0, 0 };
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if ((on_device != nullptr && !on_device[i]) || ggml_is_empty(node)) {
             continue;
         }
+        const int n_before = ggml_cuda_preload_n_new;
+        const int kind = node->op == GGML_OP_LIGHTNING_INDEXER ? 0 : node->op == GGML_OP_TOP_K ? 1 : node->op == GGML_OP_FLASH_ATTN_EXT ? 2 :
+            node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID ? 3 : 4;
         switch (node->op) {
             case GGML_OP_LIGHTNING_INDEXER:
                 ggml_cuda_lightning_indexer(*cuda_ctx, node);
@@ -8491,12 +8496,16 @@ static int ggml_backend_cuda_preload_graph(ggml_backend_t backend, ggml_cgraph *
             default:
                 break;
         }
+        n_kind[kind] += ggml_cuda_preload_n_new - n_before;
     }
     ggml_cuda_preload_active = false;
     ggml_cuda_preload_seen   = nullptr;
     cuda_ctx->qsa_maskless = std::move(saved_maskless);
     cuda_ctx->qsa_skip     = std::move(saved_skip);
     (void) cudaGetLastError();
+    GGML_LOG_INFO("%s: device %d: %d kernels loaded ahead of their first launch (%d nodes): lightning indexer %d, top-k %d, flash attention %d, "
+        "mul_mat_vec %d, QSA selection %d\n", __func__, cuda_ctx->device, ggml_cuda_preload_n_new, cgraph->n_nodes, n_kind[0], n_kind[1],
+        n_kind[2], n_kind[3], n_kind[4]);
     return ggml_cuda_preload_n_new;
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
