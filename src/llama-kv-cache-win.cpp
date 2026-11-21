@@ -100,6 +100,9 @@ bool llama_kv_cache::win_init(const llama_kv_win_params & p) {
         why = "the cache shares the cells of another context";
     } else if (v_trans) {
         why = "flash attention is off (the V cache is transposed)";
+    } else if (model.arch == LLM_ARCH_T5) {
+        // the two-source attention takes no KQ bias (T5 decoder self-attention adds its relative-position bias)
+        why = "the attention adds a relative-position bias";
     } else if (layers.empty()) {
         why = "no attention layer";
     } else if (!ggml_is_quantized(layers[0].k->type) && !(layers[0].v != nullptr && ggml_is_quantized(layers[0].v->type))) {
