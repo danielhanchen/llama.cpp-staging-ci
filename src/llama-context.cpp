@@ -4622,8 +4622,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     // (cudaMallocHost, 320 MiB at n_batch 8192) ran beside the layer-major group but held the driver lock, so the request's own launches
     // waited on it: RTX PRO 6000 Flash-Next 4-bit quant + Q8_0 MTP drafter 48 GB, 42 ms of the first 8k / 30k request (cudaEventRecord blocked 42.6 ms).
     // The same store the first long prompt would make (it never shrinks); without a MoE cache the prompt rows go to the device sink
+    // (LLAMA_NEXTN_PREALLOC_NOCACHE=0: beside a MoE cache only, as before): without one the store is pinned at load as well, since
+    // the first prompt of a full ubatch still grows it to n_batch rows on its path: A100 80 GB full card, Flash-Next 4-bit + Q8_0 MTP
+    // drafter, n_batch 2048 (80 MiB), the first 8k request waited ~40 ms before its first kernel (sync, free, cudaMallocHost)
     static const bool prealloc = getenv("LLAMA_NEXTN_PREALLOC") == nullptr || atoi(getenv("LLAMA_NEXTN_PREALLOC")) != 0;
-    if (prealloc && value && !masked && moe_cache && (!buf_nextn || nextn_cap_rows < cparams.n_batch)) {
+    static const bool prealloc_nocache = getenv("LLAMA_NEXTN_PREALLOC_NOCACHE") == nullptr || atoi(getenv("LLAMA_NEXTN_PREALLOC_NOCACHE")) != 0;
+    if (prealloc && value && !masked && (moe_cache || prealloc_nocache) && (!buf_nextn || nextn_cap_rows < cparams.n_batch)) {
         static const bool nextn_lazy = getenv("LLAMA_NEXTN_LAZY") == nullptr || atoi(getenv("LLAMA_NEXTN_LAZY")) != 0;
         if (nextn_lazy) {
             const int64_t t0 = ggml_time_us();
