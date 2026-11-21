@@ -824,6 +824,7 @@ private:
     bool cap_prepare(int s);                   // the regions of the sequence's cell and their snapshot tensors; false: unsupported
     size_t cap_reserve_bytes(ggml_backend_buffer_type_t * buft) const; // the snapshots fit counts (memory_breakdown)
     size_t cap_planned_bytes(ggml_backend_buffer_type_t * buft) const; // the snapshots captures will allocate (0: none planned)
+    bool cap_starts(int s, const llama_ubatch & ub) const; // the ubatch starts at the batch row of capture s
     void cap_now(int s, llama_pos pos);        // copy the regions in stream order (state before the next ubatch)
     bool cap_any() const { for (const auto & c : cap) { if (c.idx >= 0 && !c.done) { return true; } } return false; }
     // (LLAMA_STATE_CAPTURE_SIDE=0 off): the read of a captured state's snapshots runs on a stream of its own, after an event
@@ -947,6 +948,15 @@ private:
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_used{};
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_nuse{}; // uses since the kept graph was built
     std::array<std::map<llama_seq_id, llama_sampler *>, GF_SMALL_N> gf_res_small_smpl{}; // the sampler chains a kept graph was built with
+    // the MoE cache modes a kept graph was built with (seed, hybrid, device seed, in place): the context-wide *_graph values follow
+    // the graph built last, which can be another size's
+    struct gf_small_modes {
+        bool seed    = false;
+        int  hybrid  = 0;
+        bool devseed = false;
+        bool inplace = false;
+    };
+    std::array<gf_small_modes, GF_SMALL_N> gf_res_small_modes{};
     uint64_t gf_res_epoch = 1;
     // set by restore_pp_plan around its graph_reserve: the kept graphs stay valid when the reserve replaced no buffer
     bool reserve_keep_small = false;

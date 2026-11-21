@@ -1325,6 +1325,10 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     const bool unified_compressed = false;
 
+    // the compressed caches are written and read (graphs, whole-context state) outside the lazy growth of llama_kv_cache:
+    // every cell backed at load, also with LLAMA_KV_LAZY
+    llama_kv_eager_scope eager_compressed;
+
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, ratio_csa));
 

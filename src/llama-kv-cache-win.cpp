@@ -37,13 +37,14 @@ llama_kv_win_params llama_kv_win_params_from(const llama_context_params & params
     p.n_sinks = params.kv_win_sinks;
     p.type_k  = params.type_k_win;
     p.type_v  = params.type_v_win;
-    if (const char * e = getenv("LLAMA_KV_WIN")) {
-        p.n_win = atoi(e);
+    const char * e_win = getenv("LLAMA_KV_WIN");
+    if (e_win != nullptr) {
+        p.n_win = atoi(e_win);
     }
     if (const char * e = getenv("LLAMA_KV_WIN_SINKS")) {
         p.n_sinks = std::max(0, atoi(e));
-        // sinks alone: an empty recent window
-        if (p.n_win < 0) {
+        // sinks alone: an empty recent window (an explicit LLAMA_KV_WIN=-1 keeps the ring off)
+        if (p.n_win < 0 && e_win == nullptr) {
             p.n_win = 0;
         }
     }
@@ -99,6 +100,15 @@ bool llama_kv_cache::win_init(const llama_kv_win_params & p) {
         why = "the cache shares the cells of another context";
     } else if (v_trans) {
         why = "flash attention is off (the V cache is transposed)";
+    } else if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        // the ring tensors get no split state of their own (they would be mirrored beside K/V split by head)
+        why = "the model is split by tensor across devices";
+    } else if (model.arch == LLM_ARCH_T5) {
+        // the two-source attention takes no KQ bias (T5 decoder self-attention adds its relative-position bias)
+        why = "the attention adds a relative-position bias";
+    } else if (model.arch == LLM_ARCH_QWEN4EXP && n_stream > 1) {
+        // the sparse attention's cell-to-slot table (set_input_win cells_in) holds one stream's cells
+        why = "the sparse attention reads one stream's ring slots and the cache has a stream per sequence";
     } else if (layers.empty()) {
         why = "no attention layer";
     } else if (!ggml_is_quantized(layers[0].k->type) && !(layers[0].v != nullptr && ggml_is_quantized(layers[0].v->type))) {

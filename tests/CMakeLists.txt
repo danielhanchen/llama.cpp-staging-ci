@@ -375,6 +375,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-rs-snap-qwen35 PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # the recent-window ring: sinks-only, its off switch beside LLAMA_KV_WIN_SINKS, a two-stream sparse attention cache
+    llama_build(test-kv-win-guards.cpp)
+    llama_test(
+        test-kv-win-guards
+        LABEL main
+        ARGS "${MODEL_DIR}/llama-dense.gguf" "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-kv-win-guards PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # -sm tensor (Meta(CPU, CPU)) with LLAMA_RS_REPLAY=1: the delta-net rollback keeps the snapshot rows and matches the CPU decode
     llama_build(test-rs-replay-meta.cpp)
     llama_test(

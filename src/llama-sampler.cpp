@@ -4650,6 +4650,11 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
 
 // see llama_sampler_graph_bound_one
 static bool llama_sampler_graph_bound_one(const struct llama_sampler * smpl) {
+    if (smpl != nullptr && smpl->iface == &llama_sampler_greedy_masked_i) {
+        // its mask is a pair of graph inputs when it has no buffer of its own (LLAMA_SAMPLER_MASK_PERSIST=0, or the allocation failed)
+        const auto * sctx = (const llama_sampler_greedy_masked *) smpl->ctx;
+        return !sctx->mask.empty() && sctx->mask_vals == nullptr;
+    }
     return smpl != nullptr && (smpl->iface == &llama_sampler_dist_i || smpl->iface == &llama_sampler_penalties_i ||
                               smpl->iface == &llama_sampler_logit_bias_i);
 }

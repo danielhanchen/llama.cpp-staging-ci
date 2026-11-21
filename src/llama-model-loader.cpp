@@ -1603,8 +1603,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     // LLAMA_REQUANT_HOST=1 (test only, without mmap): host tensors too
     static const bool rq_host = getenv("LLAMA_REQUANT_HOST") != nullptr && atoi(getenv("LLAMA_REQUANT_HOST")) != 0;
-    if (rq_cand && buft != nullptr && ggml_backend_buft_is_host(buft) && !(rq_host && !use_mmap)) {
-        // on the host: as in the file
+    // a device buffer type that wraps the mapped file (buffer_from_host_ptr on its default buffer type, e.g. Metal): the tensor
+    // takes the file's bytes in place (llama_model::load_tensors), so it cannot hold a converted copy and keeps the file's type
+    bool rq_mapped = false;
+    if (rq_cand && buft != nullptr && use_mmap && !ggml_backend_buft_is_host(buft)) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev != nullptr && buft == ggml_backend_dev_buffer_type(dev)) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            rq_mapped = props.caps.buffer_from_host_ptr;
+        }
+    }
+    if (rq_cand && buft != nullptr && (rq_mapped || (ggml_backend_buft_is_host(buft) && !(rq_host && !use_mmap)))) {
+        // on the host or in a mapped device buffer: as in the file
         t_meta = *cur;
         buft = buft_for_tensor(&t_meta);
     } else if (rq_cand && buft != nullptr) {

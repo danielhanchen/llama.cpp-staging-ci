@@ -128,6 +128,20 @@ static llama_kv_sel_procs llama_kv_sel_get_procs(ggml_backend_buffer_type_t buft
     return p;
 }
 
+static thread_local int g_kv_eager_depth = 0;
+
+static bool llama_kv_eager_active() {
+    return g_kv_eager_depth > 0;
+}
+
+llama_kv_eager_scope::llama_kv_eager_scope() {
+    ++g_kv_eager_depth;
+}
+
+llama_kv_eager_scope::~llama_kv_eager_scope() {
+    --g_kv_eager_depth;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -361,7 +375,7 @@ llama_kv_cache::llama_kv_cache(
 
     // LLAMA_KV_LAZY=1 reserves a device buffer's address range and backs only the cells in use (see lazy_ensure)
     // (unset = auto, see llama_kv_lazy_mode; read at every allocation, common sets the grant after the fit's measurements)
-    const bool kv_lazy = hparams.no_alloc ? llama_kv_lazy_measure_on() : llama_kv_lazy_alloc_on();
+    const bool kv_lazy = !llama_kv_eager_active() && (hparams.no_alloc ? llama_kv_lazy_measure_on() : llama_kv_lazy_alloc_on());
     // the cells backed at load
     const uint32_t lazy_n0 = [&]() {
         const char * e_init = getenv("LLAMA_KV_LAZY_INIT");
@@ -512,7 +526,8 @@ llama_kv_cache::llama_kv_cache(
                     if (!ok) {
                         // (the host chunks backed so far stay; the rest is device memory: a plain cache from here on)
                         LLAMA_LOG_WARN("%s: kv sel: host or device memory for the split K/V buffer failed, the rest is backed in device memory\n", __func__);
-                        if (sel_committed_fn == nullptr && !sp.commit(buf, 0, ggml_backend_buffer_get_size(buf))) {
+                        // checked for every buffer: an earlier buffer that engaged the split says nothing about this one
+                        if (!sp.commit(buf, 0, ggml_backend_buffer_get_size(buf))) {
                             throw std::runtime_error("failed to back the kv sel buffer");
                         }
                     } else {
@@ -2373,11 +2388,15 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 
     int32_t * data = (int32_t *) dst->data;
 
+    // the shift graph may cover only the backed prefix of a lazy cache (build_graph_shift): one entry per row of the view
+    const uint32_t n_rows = (uint32_t) (dst->ne[0]/n_stream);
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+        GGML_ASSERT(n_rows <= cells.size());
+        for (uint32_t i = 0; i < n_rows; ++i) {
+            data[s*n_rows + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
         }
     }
 }
@@ -3377,7 +3396,10 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+    // a lazy cache (one stream) backs only cells [0, lazy_cells): rows past them are not mapped and every cell there is empty
+    const uint32_t n_shift_rows = lazy_on() && n_stream == 1 ? std::max<uint32_t>(1, std::min(lazy_cells, get_size())) : get_size();
+
+    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) n_shift_rows*n_stream);
     ggml_set_input(inp->k_shift);
 
     inp->k_rot = build_input_k_rot(ctx);
@@ -3405,7 +3427,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                n_rot, n_head_kv, (int64_t) n_shift_rows*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
@@ -3827,6 +3849,18 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         // (the restored cells get ring slots from the blob, state_read_data, not from their positions)
+        // a lazy cache backs the restored cells first, with the MoE cache allowed to give memory back (apply_ubatch only
+        // checks them and aborts when they are not backed)
+        if (!lazy_bufs.empty() && !lazy_sim && !other) {
+            uint32_t mx = cells.used_max_p1();
+            for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+                mx = std::max<uint32_t>(mx, sinfo.idxs[0][ii] + 1);
+            }
+            if (!lazy_ensure(GGML_PAD(mx, 256), true)) {
+                LLAMA_LOG_ERROR("%s: lazy KV: no device memory for the %u cells of the state\n", __func__, mx);
+                return false;
+            }
+        }
         win_no_assign = true;
         apply_ubatch(sinfo, ubatch);
         win_no_assign = false;

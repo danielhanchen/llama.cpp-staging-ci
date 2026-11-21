@@ -1340,9 +1340,7 @@ llama_context::llama_context(
             place8_rel      = true;
             moe_cache->set_restore_soft(true);
             if (const char * el = getenv("LLAMA_MOE_PLACE8_LEND"); el != nullptr && atoi(el) != 0 && llama_mtp_draft_lend_on()) {
-                place8_lend = true;
-                std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
-                llama_place8_lend_tgts.push_back(this);
+                place8_lend = true; // registered at the end of the constructor (llama_place8_lend_tgts)
             }
             tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
             // (LLAMA_MOE_PLACE8_MID, set with it by the fit of a mid-size device): prompts keep their layer-major groups,
@@ -1958,6 +1956,12 @@ llama_context::llama_context(
         std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
         llama_mtp_ctxs.push_back(this);
     }
+    // a lending target too: a constructor that throws before here never runs the destructor that unregisters it, and the
+    // retry with a smaller MoE cache (common_init_from_params) would leave the drafter's restore reading the freed context
+    if (place8_lend) {
+        std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+        llama_place8_lend_tgts.push_back(this);
+    }
 }
 
 // the evictable weights a drafter lends exist only with mtp_borrow_io, which sets model_shared
@@ -1972,6 +1976,12 @@ void llama_context::small_plan_free(uint32_t i) {
     }
 }
 
+// the tensors of the largest commit graph: per cell and recurrent layer at most 11 for the delta-net replay and 6 for the conv
+// histories (rs_commit_build), with room to spare; at least the earlier fixed 16384, which many sequence slots outgrew
+static size_t rs_commit_max_nodes(const llama_memory_recurrent * mem, size_t n_cells) {
+    return std::max<size_t>(16384, n_cells * mem->s_l.size() * 20 + 64);
+}
+
 // the backend the commit graphs run on, and (one backend) a fallback allocation of the largest commit graph reserved at
 // load. T4, Qwen3.6 3-bit quant + MTP at a 4 GB tier, 32k: the device was full by the 2k request (CUDA graph instances
 // out of memory too) and the 2.05 MiB allocation of a new commit graph aborted the server in 8 of 8 launches. A commit now drops the
@@ -1981,7 +1991,7 @@ void llama_context::rs_replay_setup() {
     if (mem == nullptr || rs_mode != 0) {
         return;
     }
-    const size_t max_nodes = 16384;
+    const size_t max_nodes = rs_commit_max_nodes(mem, mem->size);
     const bool sched_only = getenv("LLAMA_RS_REPLAY_SCHED") != nullptr && atoi(getenv("LLAMA_RS_REPLAY_SCHED")) != 0;
     bool one = !sched_only;
     auto chk = [&](const ggml_tensor * t) {
@@ -2151,7 +2161,7 @@ void llama_context::rs_replay_commit(bool sync) {
         return;
     }
     const int64_t t0 = ggml_time_us();
-    const size_t max_nodes = 16384;
+    const size_t max_nodes = rs_commit_max_nodes(mem, mem->size);
     if (rs_mode == 0) {
         rs_replay_setup();
     }
@@ -2322,10 +2332,12 @@ void llama_context::rs_replay_commit(bool sync) {
         rs_graphs.clear();
         rs_ga_bytes = 0;
     }
-    ggml_init_params ip = { ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true };
+    // this commit's cells only (five key entries each)
+    const size_t max_nodes_g = rs_commit_max_nodes(mem, key.size()/5);
+    ggml_init_params ip = { ggml_tensor_overhead()*max_nodes_g + ggml_graph_overhead_custom(max_nodes_g, false), nullptr, true };
     ggml_context_ptr ctx_own { ggml_init(ip) };
     ggml_context * ctx = ctx_own.get();
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes_g, false);
     rs_commit_build(ctx, gf, /*worst =*/ false);
     if (ggml_graph_n_nodes(gf) > 0) {
         rs_graph e;
@@ -5302,22 +5314,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // a kept small graph built for these parameters goes back into the scheduler: only its allocation is redone (the same
     // graph allocates to the same addresses, so its CUDA graph is replayed as captured)
     auto small_swap_in = [&]() -> bool {
+        const gf_small_modes & km = gf_res_small_modes[i_small];
         if (n_small == 0 || gf == nullptr || !gf_res_small_built[i_small] || gf_res_small_epoch[i_small] != gf_res_epoch ||
-                moe_cache_seed_graph != moe_cache_seed || moe_cache_hybrid_graph != moe_cache_hybrid || moe_cache_devseed_graph != moe_cache_devseed ||
-                moe_inplace_graph != moe_inplace_ok ||
+                km.seed != moe_cache_seed || km.hybrid != moe_cache_hybrid || km.devseed != moe_cache_devseed ||
+                km.inplace != moe_inplace_ok ||
                 !res->can_reuse(gparams)) {
             // debug (LLAMA_GRAPH_SMALL_WHY=N): the first condition that refused the kept graph, for up to N refusals
             static int why_left = getenv("LLAMA_GRAPH_SMALL_WHY") ? atoi(getenv("LLAMA_GRAPH_SMALL_WHY")) : 0;
             if (n_small > 0 && gf != nullptr && why_left > 0) {
                 why_left--;
                 const char * why = !gf_res_small_built[i_small] ? "not built" : gf_res_small_epoch[i_small] != gf_res_epoch ? "epoch" :
-                    moe_cache_seed_graph != moe_cache_seed ? "seed mode" : moe_cache_hybrid_graph != moe_cache_hybrid ? "hybrid mode" :
-                    moe_cache_devseed_graph != moe_cache_devseed ? "devseed mode" : moe_inplace_graph != moe_inplace_ok ? "inplace" : "can_reuse";
+                    km.seed != moe_cache_seed ? "seed mode" : km.hybrid != moe_cache_hybrid ? "hybrid mode" :
+                    km.devseed != moe_cache_devseed ? "devseed mode" : km.inplace != moe_inplace_ok ? "inplace" : "can_reuse";
                 LLAMA_LOG_INFO("%s: kept graph for %u tokens (way %u) not reused: %s (epoch %llu / %llu)\n", __func__, n_small, i_small % GF_SMALL_WAYS,
                     why, (unsigned long long) gf_res_small_epoch[i_small], (unsigned long long) gf_res_epoch);
             }
             return false;
         }
+        // the graph now in the scheduler is this one: the reuse check of the next ubatch compares against its modes
+        moe_cache_seed_graph    = km.seed;
+        moe_cache_hybrid_graph  = km.hybrid;
+        moe_cache_devseed_graph = km.devseed;
+        moe_inplace_graph       = km.inplace;
         gf_res_prev_active = nullptr; // (not an invalidation of the kept small graphs)
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -5538,6 +5556,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         moe_cache_hybrid_graph = moe_cache_hybrid;
         // the seed plans are enabled in the op params of the graph, a reused graph keeps them (and may be replayed as captured)
         moe_cache_devseed_graph = moe_cache_devseed;
+        if (n_small > 0) {
+            gf_res_small_modes[i_small] = { moe_cache_seed, moe_cache_hybrid, moe_cache_devseed, moe_inplace_ok };
+        }
     }
 
     if (t_tr0) {
@@ -6454,7 +6475,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     for (bool more = true; more; ) {
         // the state before the ubatch that starts at the capture index (a layer-major group captures inside its graph)
         for (int s = 0; s < cap_max; ++s) {
-            if (cap[s].idx >= 0 && !cap[s].done && n_tokens_prev == cap[s].idx) {
+            if (cap[s].idx >= 0 && !cap[s].done && n_tokens_prev == cap[s].idx && cap_starts(s, mctx->get_ubatch())) {
                 cap_now(s, mctx->get_ubatch().pos[0] - 1);
             }
         }
@@ -7498,7 +7519,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         cap_k_group[c] = -1;
         if (cap[c].idx >= 0 && !cap[c].done) {
             for (size_t k = 1; k < group.size(); ++k) {
-                if (group[k].n_tokens_before == cap[c].idx) {
+                if (group[k].n_tokens_before == cap[c].idx && cap_starts(c, *group[k].ub)) {
                     cap_k_group[c] = (int) k;
                 }
             }
@@ -13574,11 +13595,25 @@ bool llama_context::cap_prepare(int s) {
             return false;
         }
         r.view = ggml_view_1d(C.ctx.get(), r.t, (int64_t) (r.size/ggml_type_size(r.t->type)), r.off);
+        // the copy paths of backends without a view-aware async copy (CPU, Metal, SYCL) read the view's own buffer
+        if (ggml_backend_view_init(r.view) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
         off += r.size;
     }
     C.cell    = (uint32_t) cell;
     C.regions = std::move(rg);
     return true;
+}
+
+// the ubatch about to run starts at the batch row of capture s, a row of its sequence: with several sequences in a batch the
+// equal split interleaves their rows, and the count of the rows run before it alone does not place the capture (the
+// snapshot would hold another number of the sequence's tokens than its label says)
+bool llama_context::cap_starts(int s, const llama_ubatch & ub) const {
+    if (ub.n_tokens == 0 || ub.data == nullptr || ub.data->batch_idxs.empty()) {
+        return true; // no row map: as before
+    }
+    return ub.data->batch_idxs[0] == cap[s].idx && ub.n_seq_id[0] >= 1 && ub.seq_id[0][0] == cap[s].seq;
 }
 
 void llama_context::cap_now(int s, llama_pos pos) {

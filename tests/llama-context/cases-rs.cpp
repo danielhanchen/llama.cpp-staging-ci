@@ -6,6 +6,7 @@
 #include "test-util.h"
 
 #include "common.h"
+#include "../../src/llama-ext.h" // llama_set_state_capture
 
 #include <algorithm>
 #include <array>
@@ -950,6 +951,62 @@ struct case_swa_prepare : ctx_test {
 };
 
 
+// a state capture asked at a batch index of a batch of two sequences: the equal split runs [A@0, B@0, A@1, B@1] first, so after
+// four rows the state of A already holds A@1, the row the capture at index 4 must come before. Such a capture is not taken (the
+// caller makes no checkpoint from it); a batch of one sequence still takes its capture with the position of the row before it
+struct case_capture_multi_seq : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "capture_multi_seq"; }
+    const char * description() const override {
+        return "a state capture in a batch of several sequences is not taken where the rows run before it are not the batch rows before its index";
+    }
+    std::string skip_reason(model_run & mr) const override {
+        if (arch_reserves_single_seq(mr.model)) {
+            return "multi-seq graphs";
+        }
+        return ctx_test::skip_reason(mr);
+    }
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        ctx_opts opts;
+        opts.n_ctx = 256; opts.n_batch = 64; opts.n_ubatch = 4; opts.n_seq_max = 2; opts.kv_unified = 1;
+        llama_context_ptr ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+        if (!llama_state_capture_supported(ctx.get())) {
+            return case_result::skip("no state capture in this context");
+        }
+        const auto run_one = [&](const int (&seqs)[5], const int (&poss)[5], bool & got, llama_pos & pm) {
+            llama_memory_clear(llama_get_memory(ctx.get()), true);
+            common_batch batch(ctx.get());
+            for (int i = 0; i < 5; ++i) {
+                batch.add(gen_token(n_vocab, seqs[i], poss[i]), poss[i], seqs[i], true);
+            }
+            CTX_REQUIRE(llama_set_state_capture(ctx.get(), 0, 4), "capture request refused");
+            CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "decode failed");
+            llama_synchronize(ctx.get());
+            pm  = -1;
+            got = llama_state_seq_captured_at(ctx.get(), 0, 4, &pm);
+            return case_result::pass();
+        };
+        bool got = false;
+        llama_pos pm = -1;
+        // A@0, B@0, B@1, B@2, A@1
+        if (auto r = run_one({ 0, 1, 1, 1, 0 }, { 0, 0, 1, 2, 1 }, got, pm); r.status != test_status::PASS) {
+            return r;
+        }
+        CTX_REQUIRE(!got || pm == 0, "the capture before row 4 holds A up to pos " + std::to_string(pm) + " instead of 0");
+        // one sequence: A@0 .. A@4, the capture before row 4 holds A up to pos 3
+        if (auto r = run_one({ 0, 0, 0, 0, 0 }, { 0, 1, 2, 3, 4 }, got, pm); r.status != test_status::PASS) {
+            return r;
+        }
+        CTX_REQUIRE(got && pm == 3, "the capture of a one-sequence batch was not taken at pos 3 (got " + std::to_string((int) got) +
+                ", pos " + std::to_string(pm) + ")");
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -960,6 +1017,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_k19_move>());
     cases.push_back(std::make_unique<case_k19_fuzz>());
     cases.push_back(std::make_unique<case_swa_prepare>());
+    cases.push_back(std::make_unique<case_capture_multi_seq>());
 
     return cases;
 }

@@ -4274,6 +4274,8 @@ struct llama_moe_cache::impl {
                 }
                 if (registered) {
                     mapped.emplace_back(unmap, key);
+                    // the pinned file pages stay in MemAvailable but are not reclaimable (llama_sysmem::available_reclaimable)
+                    file_pin_add(((r.second + page - 1) & ~(page - 1)) - (r.first & ~(page - 1)));
                 }
             }
             if (fail) {
@@ -10782,7 +10784,8 @@ struct llama_moe_cache::impl {
         for (int r = 0; r <= n_rep; ++r) {
             int32_t tmp[16];
             const int64_t t0 = ggml_time_us();
-            ggml_backend_tensor_get(g.state, tmp, 0, sizeof(tmp));
+            // a group of 1-2 slots (top-1 / top-2 MoE at a tiny budget) has a state smaller than the probe
+            ggml_backend_tensor_get(g.state, tmp, 0, std::min(sizeof(tmp), ggml_nbytes(g.state)));
             if (r > 0) {
                 trt.push_back(ggml_time_us() - t0);
             }
@@ -11098,7 +11101,11 @@ struct llama_moe_cache::impl {
         }
         cmt_ps_key   = cm_cal_key_eff(*gp, layers[gp->layers[0]]);
         cmt_ps_path  = cm_cal_path(dir, cmt_ps_key);
-        cmt_ps_tag   = llama_moe_tp::tag_of(slots, (int) layers.size(), (long long) max_batch);
+        static const bool margin_trust_env = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_MARGIN_TRUST");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        cmt_ps_tag   = llama_moe_tp::tag_of(slots, (int) layers.size(), (long long) max_batch, margin_trust_env);
         cmt_ps_state = 1;
         std::vector<llama_moe_tp::rec> r;
         if (llama_moe_tp::read(cmt_ps_path, cmt_ps_key, cmt_ps_tag, r)) {
@@ -12163,12 +12170,19 @@ struct llama_moe_cache::impl {
         }
         // the copies of an earlier graph may have used the slots kept free of copies for the host lookups (see place): the lookups read a little
         // past the end of a slot, they find cleared memory there
-        if (guard && g.lru.n_lent > 0) {
+        auto clear_guard = [&]() {
             ggml_backend_synchronize(devices[id].backend);
             for (ggml_tensor * bank : g.banks) {
                 ggml_backend_tensor_memset(bank, 0, (size_t) (g.n_slots - n_lend)*bank->nb[2], bank->nb[2]);
                 ggml_backend_tensor_memset(bank, 0, (size_t) g.n_slots*bank->nb[2], bank->nb[2]);
             }
+        };
+        // a growing lend whose RAM tier keeps a copy of the newly lent slots: the guard slot is one of them and may still hold an
+        // expert, so it is cleared only after the copy back below (cleared first, the tier would keep zeros as that expert)
+        const bool guard_after_shadow = guard && g.lru.n_lent > 0 && n_lend > g.lru.n_lent && host &&
+            (size_t) (&g - groups.data()) < host_group.size() && host_group[&g - groups.data()];
+        if (guard && g.lru.n_lent > 0 && !guard_after_shadow) {
+            clear_guard();
         }
         // a seed is planned and committed within one graph (see llama_context::graph_compute), none is open here
         // closing it anyway keeps its rollback snapshot from outliving the slots it describes
@@ -12190,6 +12204,9 @@ struct llama_moe_cache::impl {
                     }
                     shadow_slots(backend, g, evicted_tmp);
                 }
+            }
+            if (guard_after_shadow) {
+                clear_guard();
             }
             g.lru.set_lent(n_lend);
             LLAMA_LOG_INFO("%s: %s: MoE cache lends %d of %d slots (%.2f MiB) to the staging copies of large batches (LLAMA_MOE_CACHE_LEND=0 to disable)\n",
@@ -14756,7 +14773,8 @@ struct llama_moe_cache::impl {
             s.lru = g.lru;
             s.slot_maps.resize(g.layers.size());
             for (size_t j = 0; j < g.layers.size(); ++j) {
-                const int32_t * p = g.lru.slot_map[g.layers[j]];
+                // a group the budget left uncached keeps its layers but has no slot maps (its LRU was never initialized)
+                const int32_t * p = (size_t) g.layers[j] < g.lru.slot_map.size() ? g.lru.slot_map[g.layers[j]] : nullptr;
                 s.slot_maps[j].assign(p, p + (p != nullptr ? g.lru.n_expert : 0));
             }
             pw_get(g.map,    s.dev[0]);
@@ -14858,7 +14876,7 @@ struct llama_moe_cache::impl {
             }
             g.lru = s.lru;
             for (size_t j = 0; j < g.layers.size(); ++j) {
-                int32_t * p = g.lru.slot_map[g.layers[j]];
+                int32_t * p = (size_t) g.layers[j] < g.lru.slot_map.size() ? g.lru.slot_map[g.layers[j]] : nullptr;
                 if (p != nullptr && !s.slot_maps[j].empty()) {
                     memcpy(p, s.slot_maps[j].data(), s.slot_maps[j].size()*sizeof(int32_t));
                 }
@@ -14925,7 +14943,7 @@ struct llama_moe_cache::impl {
             mixb(hl, g.lru.scores.data(), g.lru.scores.size()*sizeof(int32_t));
             mixv(hl, g.lru.head); mixv(hl, g.lru.tail); mixv(hl, g.lru.w); mixv(hl, g.lru.n_lent); mixv(hl, g.lru.n_core);
             for (int32_t il : g.layers) {
-                if (g.lru.slot_map[il] != nullptr) {
+                if ((size_t) il < g.lru.slot_map.size() && g.lru.slot_map[il] != nullptr) {
                     mixb(hl, g.lru.slot_map[il], g.lru.n_expert*sizeof(int32_t));
                 }
             }
