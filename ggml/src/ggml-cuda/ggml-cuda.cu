@@ -2838,7 +2838,12 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 //  - only cc 1000..1099. Blackwell spans cc 1000/1100/1200 and only 1000 was measured.
 static bool ggml_cuda_mmf_loses_to_cublas(const ggml_tensor * src0, const ggml_tensor * src1,
         const int cc, const int64_t ne11) {
-    if (src0->type != GGML_TYPE_BF16 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < 1000 || cc >= 1100) {
+    // GGML_CUDA_BF16_CUBLAS=0: off, 1: also on every NVIDIA cc >= 1000 (cc 1100 / 1200 included), unset: cc 1000..1099
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_BF16_CUBLAS");
+        return e != nullptr ? atoi(e) : -1;
+    }();
+    if (mode == 0 || src0->type != GGML_TYPE_BF16 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < 1000 || (mode < 0 && cc >= 1100)) {
         return false;
     }
     // ne11 == 1 belongs to mmvf, which is faster than both mmf and cuBLAS there.
@@ -3134,7 +3139,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Require both operands contiguous. The folded channel stride becomes the GEMM leading
     // dimension, and a padded view could present ldb < K, which cuBLAS rejects, or a layout mmf
     // does not accept. Contiguity makes the promoted strides exactly the packed ones.
-    if (ne11 == 1 && src1->ne[2] > 1 && src1->ne[3] == 1
+    // GGML_CUDA_MUL_MAT_FOLD=0: off
+    static const bool fold_on = [] {
+        const char * e = getenv("GGML_CUDA_MUL_MAT_FOLD");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (fold_on && ne11 == 1 && src1->ne[2] > 1 && src1->ne[3] == 1
             && src0->ne[2] == 1 && src0->ne[3] == 1
             && dst->ne[1] == 1
             && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
