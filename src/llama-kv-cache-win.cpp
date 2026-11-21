@@ -103,6 +103,9 @@ bool llama_kv_cache::win_init(const llama_kv_win_params & p) {
     } else if (model.arch == LLM_ARCH_T5) {
         // the two-source attention takes no KQ bias (T5 decoder self-attention adds its relative-position bias)
         why = "the attention adds a relative-position bias";
+    } else if (model.arch == LLM_ARCH_QWEN4EXP && n_stream > 1) {
+        // the sparse attention's cell-to-slot table (set_input_win cells_in) holds one stream's cells
+        why = "the sparse attention reads one stream's ring slots and the cache has a stream per sequence";
     } else if (layers.empty()) {
         why = "no attention layer";
     } else if (!ggml_is_quantized(layers[0].k->type) && !(layers[0].v != nullptr && ggml_is_quantized(layers[0].v->type))) {
