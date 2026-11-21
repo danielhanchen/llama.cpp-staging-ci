@@ -130,7 +130,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-// k15-mm2 QSA maskless: the lists of flash_attn_mask_to_sparse_indices built from the selected cells themselves. A query row
+// QSA maskless: the lists of flash_attn_mask_to_sparse_indices built from the selected cells themselves. A query row
 // keeps cell c if a slot of its token selects c (idx < n_kv, a dead slot points at a dump row >= n_kv) and its causal mask is
 // finite there, which is the set of finite entries of the dense mask (-inf, 0 at the selected cells, + kq_mask). A bitmap over
 // the cells makes the lists ascending and duplicate free, so they equal the compacted ones element by element
@@ -348,14 +348,14 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
-    // (k19-tpp: a verify window wider than the reference picks as the reference window does, ggml_cuda_fattn_verify_ref_rows)
+    // (a verify window wider than the reference picks as the reference window does, ggml_cuda_fattn_verify_ref_rows)
     const int     ref_rows = ggml_cuda_fattn_verify_ref_rows(dst);
     const int64_t n_q      = ref_rows > 0 ? ref_rows : Q->ne[1];
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(n_q, 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
-    // k19-dsv4next diagnostic: GGML_CUDA_FATTN_SPARSE_MIN_KV=N replaces the K length threshold below (unset: the rule as is)
+    // diagnostic: GGML_CUDA_FATTN_SPARSE_MIN_KV=N replaces the K length threshold below (unset: the rule as is)
     static const int64_t min_kv_env = getenv("GGML_CUDA_FATTN_SPARSE_MIN_KV") ? atoll(getenv("GGML_CUDA_FATTN_SPARSE_MIN_KV")) : -1;
-    // k19-dsv4next: op_params[5] == 1 (set by the model on prompt attention whose rows see few of the K rows, DeepSeek-V4.1): the
+    // op_params[5] == 1 (set by the model on prompt attention whose rows see few of the K rows, DeepSeek-V4.1): the
     // gather from K >= 2 * n_kv_max per query, since every query tile of a prompt reads the whole K otherwise
     const bool    prefer   = dst->op_params[5] == 1;
     const int64_t min_kv = min_kv_env >= 0 ? min_kv_env : prefer ? 2*(int64_t) n_kv_max : std::max<int64_t>(4096, 2*n_gather);
@@ -367,7 +367,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
-// k19-g4cbuf: per device, the q8_0 in-place row limit common's fit asks for (0 = the default 16), see ggml_backend_cuda_set_fa_q8_inplace_rows
+// per device, the q8_0 in-place row limit common's fit asks for (0 = the default 16), see ggml_backend_cuda_set_fa_q8_inplace_rows
 static std::atomic<int> ggml_cuda_fattn_q8_inplace_rows[GGML_CUDA_MAX_DEVICES];
 
 void ggml_cuda_flash_attn_ext_set_q8_inplace_rows(const int device, const int rows) {
@@ -376,10 +376,10 @@ void ggml_cuda_flash_attn_ext_set_q8_inplace_rows(const int device, const int ro
     }
 }
 
-// k19-fattnq8: q8_0 K and V of a head size with a q8_0 instance (ggml_cuda_flash_attn_ext_mma_q8_may_use), on NVIDIA with Turing
+// q8_0 K and V of a head size with a q8_0 instance (ggml_cuda_flash_attn_ext_mma_q8_may_use), on NVIDIA with Turing
 // tensor cores, rows of whole blocks starting 4 byte aligned: the MMA kernel reads them in place. The same answer for the launch and for the
 // graph allocation (ggml_cuda_flash_attn_ext_get_alloc_size: no f16 copy behind the output). GGML_CUDA_FATTN_Q8_INPLACE=0: off
-// k19-fattnq4: likewise q4_0 K and / or V (q4_0 / q4_0, q4_0 / q8_0, q8_0 / q4_0), GGML_CUDA_FATTN_Q4_INPLACE=0: off (staged f16 copy
+// likewise q4_0 K and / or V (q4_0 / q4_0, q4_0 / q8_0, q8_0 / q4_0), GGML_CUDA_FATTN_Q4_INPLACE=0: off (staged f16 copy
 // as before). Up to GGML_CUDA_FATTN_Q4_INPLACE_MAX_ROWS query rows (default 16: verify windows; prompt ubatches stay staged).
 // The allocation answer (for_alloc) of a pair with q4_0 is in place only up to 16 rows, the configs that have a
 // q4_0 kernel (ggml_cuda_flash_attn_ext_mma_kvq_compiled); a launch of more rows in place leaves the reserved copy unused.
@@ -404,9 +404,9 @@ int ggml_cuda_flash_attn_ext_mma_kvq_inplace(const int device, const ggml_tensor
     }
     const bool has_q4 = K->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q4_0;
     const int64_t rows = dst->src[0]->ne[1];
-    // k19-g4cbuf: without GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS (read once) the limit is 16, or the device's fit rows where common's fit set
-    // them (ggml_backend_cuda_set_fa_q8_inplace_rows): a small device whose graphs are reserved at 31 tokens (k19-place8), so that
-    // reserve holds no f16 copy of the whole q8_0 K / V (G4 Qwen3.8-Flash-Next 12 GB / 262K: compute 561 -> 193 MiB, to the MoE cache)
+    // without GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS (read once) the limit is 16, or the device's fit rows where common's fit set
+    // them (ggml_backend_cuda_set_fa_q8_inplace_rows): a small device whose graphs are reserved at 31 tokens, so that
+    // reserve holds no f16 copy of the whole q8_0 K / V (RTX PRO 6000 Qwen3.8-Flash-Next 12 GB / 262K: compute 561 -> 193 MiB, to the MoE cache)
     const int64_t max_rows = max_rows_set >= 0 ? max_rows_set : std::max<int64_t>(16, ggml_cuda_fattn_q8_inplace_rows[device].load(std::memory_order_relaxed));
     if (has_q4 ? (!enabled_q4 || rows > (for_alloc ? std::min<int64_t>(max_rows_q4, 16) : max_rows_q4)) : (!enabled || rows > max_rows)) {
         return 0;
@@ -761,14 +761,14 @@ bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor
     return ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, true) != 0;
 }
 
-// k19-decmma: one-row decode over a q8_0 / q4_0 K and V cache with a GQA group of >= 4 query heads per KV head runs the in-place
+// one-row decode over a q8_0 / q4_0 K and V cache with a GQA group of >= 4 query heads per KV head runs the in-place
 // MMA kernel (f16 Q*K^T, the GQA group packed into the tile columns, ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2) instead of the
-// vector kernel, which leaves most of the memory bandwidth unused at long context (q4x q8_0 K / V decode at 8k / 30k / 120k: T4
-// +7 / +31 / +107%, L4 +2 / +12 / +46%, A100 +1 / +15 / +62%, G4 (sm_120) -1 / +7 / +30%).
+// vector kernel, which leaves most of the memory bandwidth unused at long context (a 4-bit MoE, q8_0 K / V decode at 8k / 30k / 120k: T4
+// +7 / +31 / +107%, L4 +2 / +12 / +46%, A100 +1 / +15 / +62%, RTX PRO 6000 (sm_120) -1 / +7 / +30%).
 // Taken on NVIDIA Turing+ for nodes the in-place kernels read (ggml_cuda_flash_attn_ext_mma_kvq_inplace: types, alignment), head size
 // 128 / 256 (K = V), the GQA layout the MMA kernel packs (mask, no ALiBi, KV padded to 256), no softcap, not two-source, not batch
 // invariant (that one-query node stays on the vector kernel, the reference of its verify windows), and a K length of at least
-// min_kv rows. min_kv: 12288 on compute capability 12.x, where the vector kernel still wins short contexts (G4 q8_0 K / V, 3 launches,
+// min_kv rows. min_kv: 12288 on compute capability 12.x, where the vector kernel still wins short contexts (RTX PRO 6000 q8_0 K / V, 3 launches,
 // spread <= 0.2%: 2k -0.4%, 8k -0.7%, 16k +2.4%, 30k +7.1%; crossover near 10k), 0 elsewhere (T4 / L4 / A100 already gain at 8k);
 // GGML_CUDA_FATTN_DEC_MMA_MIN_KV=N: N on every arch. No f16 copy is reserved for these nodes (in place), as for the vector kernel.
 // GGML_CUDA_FATTN_DEC_MMA=0: off (the vector kernel, as before)
@@ -820,7 +820,7 @@ static bool ggml_cuda_flash_attn_ext_dec_mma(const int device, const ggml_tensor
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// k19-fattnq4: a two-source node (ggml_flash_attn_ext_set_src2) is read in place when its body is (ggml_cuda_flash_attn_ext_mma_kvq_inplace:
+// a two-source node (ggml_flash_attn_ext_set_src2) is read in place when its body is (ggml_cuda_flash_attn_ext_mma_kvq_inplace:
 // q4_0 / q4_0 or q8_0 / q8_0, the row limits, alignment) and its ring is q8_0 / q8_0 with 4 byte aligned rows: the compiled
 // combinations (fattn-mma-f16.cuh). Returns code1 | code2 << 8 (type bits | 1), 0 = both staged to f16
 int ggml_cuda_flash_attn_ext_src2_codes(const int device, const ggml_tensor * dst, const bool for_alloc) {
@@ -842,7 +842,7 @@ int ggml_cuda_flash_attn_ext_src2_codes(const int device, const ggml_tensor * ds
     return code1 | (1 << 8);
 }
 
-// k19-fattnq4: a two-source node this backend can run: NVIDIA Turing+ (the MMA kernel), head sizes 64 / 128 / 256 (K = V) or the
+// a two-source node this backend can run: NVIDIA Turing+ (the MMA kernel), head sizes 64 / 128 / 256 (K = V) or the
 // MLA 576 / 512, no logit softcap, the second source of supported K / V types with whole 256-cell tiles, its mask F16 shaped like the
 // first's. GGML_CUDA_FATTN_SRC2=0: unsupported (the graph's generic form)
 static bool ggml_cuda_fattn_src2_supported(const int cc, const ggml_tensor * dst) {
@@ -1347,7 +1347,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // k19-fattnq4: a two-source node runs on the MMA kernel only
+    // a two-source node runs on the MMA kernel only
     if (dst->src[6] != nullptr) {
         if (!ggml_cuda_fattn_src2_supported(ggml_cuda_info().devices[device].cc, dst)) {
             return BEST_FATTN_KERNEL_NONE;
@@ -1364,7 +1364,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-        // k19-decmma: one-row decode over a quantized K / V cache with GQA >= 4 on the in-place MMA kernel
+        // one-row decode over a quantized K / V cache with GQA >= 4 on the in-place MMA kernel
         if (ggml_cuda_flash_attn_ext_dec_mma(device, dst, gqa_opt_applies)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
@@ -1379,7 +1379,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
-                // k19-kvsel: a node that asks for the selected-cell gather (op_params[5] == 1: its K / V cells partly in host memory,
+                // a node that asks for the selected-cell gather (op_params[5] == 1: its K / V cells partly in host memory,
                 // see qwen4exp build_attn_qsa) takes the sparse MMA kernel where it applies; the vector kernel walks every cell
                 const bool sparse_pref = dst->op_params[5] == 1 && gqa_opt_applies && gqa_ratio > 4 &&
                     ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(K->ne[0], V->ne[0], 1, 8) &&
@@ -1480,7 +1480,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = true;
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
-            // k19-fattnq8: no f16 copy when the kernel reads q8_0 K / V in place (k19-fattnq4: or q4_0)
+            // no f16 copy when the kernel reads q8_0 K / V in place (or q4_0)
             need_f16_K = dst->src[6] != nullptr ? ggml_cuda_flash_attn_ext_src2_codes(device, dst, true) == 0 :
                 ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, true) == 0;
             need_f16_V = need_f16_K;
@@ -1507,7 +1507,7 @@ thread_local ggml_cuda_fattn_probe *            ggml_cuda_fattn_probe_cur  = nul
 
 static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// k19-graph: a node with a KV length (ggml_flash_attn_ext_set_kv_len) is run as one of
+// a node with a KV length (ggml_flash_attn_ext_set_kv_len) is run as one of
 //   PAD:  the padded node as built, where its launch is the live node's (the sparse gather: its lists, split and blocks follow
 //         n_kv_max, not the cells, and the padding cells are -inf, never listed);
 //   DEV:  the live node's launch choices with the length read on the device (the dense stream-k MMA kernel, ggml_cuda_fattn_dev_len):
@@ -1591,7 +1591,7 @@ static ggml_cuda_fattn_kvl_plan ggml_cuda_fattn_kvl_get_plan(ggml_backend_cuda_c
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * M = dst->src[3];
     const int64_t n_kv = ggml_cuda_fattn_kv_len_host(dst);
-    // (k19-fattnq4: a two-source node takes the first source's live length as a constant)
+    // (a two-source node takes the first source's live length as a constant)
     if (!enabled || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) || dst->src[6] != nullptr) {
         plan.mode = GGML_CUDA_FATTN_KVL_LIVE;
         plan.sig  = (int64_t(GGML_CUDA_FATTN_KVL_LIVE) << 56) ^ n_kv;
@@ -1659,7 +1659,7 @@ int64_t ggml_cuda_flash_attn_ext_kv_len_sig(ggml_backend_cuda_context & ctx, con
     return ggml_cuda_fattn_kvl_get_plan(ctx, dst).sig;
 }
 
-// k19-kvsel host read counter (LLAMA_KV_SEL_STATS=1, a diagnostic: one extra kernel per attention node whose K / V buffer has host
+// host read counter (LLAMA_KV_SEL_STATS=1, a diagnostic: one extra kernel per attention node whose K / V buffer has host
 // chunks). Counters per device: [0] selected bytes on host chunks, [1] staged bytes on host chunks, [2] nodes, [3] nodes with host chunks
 static unsigned long long * ggml_cuda_kv_sel_ctr[GGML_CUDA_MAX_DEVICES] = {};
 static std::atomic<uint64_t> ggml_cuda_kv_sel_staged{0};
@@ -1771,7 +1771,7 @@ static void ggml_cuda_kv_sel_count(ggml_backend_cuda_context & ctx, const ggml_t
     CUDA_CHECK(cudaGetLastError());
 }
 
-// k19-kvsel staging (see ggml_cuda_kv_sel_stage): one warp per listed cell copies its K row, its V row and the mask values of the
+// staging (see ggml_cuda_kv_sel_stage): one warp per listed cell copies its K row, its V row and the mask values of the
 // tile's query rows, then points the list entry at the staging row (lane 0, after every lane has read the cell)
 template <typename T>
 static __global__ void kv_sel_stage_kernel(const char * __restrict__ K, const size_t nbk, const char * __restrict__ V, const size_t nbv,
@@ -1845,7 +1845,7 @@ void ggml_cuda_kv_sel_stats(uint64_t * out) {
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    // k19-kvsel: LLAMA_KV_SEL_STATS=1 counts the bytes this node reads from host chunks (a separate kernel, results unchanged)
+    // LLAMA_KV_SEL_STATS=1 counts the bytes this node reads from host chunks (a separate kernel, results unchanged)
     static const bool kv_sel_stats = ggml_cuda_kv_sel_stats_on();
     if (kv_sel_stats) {
         ggml_cuda_kv_sel_count(ctx, dst);
@@ -1867,11 +1867,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
-    // k15-fv: batch invariant node over several queries (speculative verify, the queries of one KV length): every query gets what
+    // batch invariant node over several queries (speculative verify, the queries of one KV length): every query gets what
     // the node of that query alone gets. The vector kernel at one column per block takes all of them in one launch with the KV
     // split of a single query; any other kernel runs once per query
     const ggml_tensor * Q = dst->src[0];
-    // (k19-fattnq4: not a two-source node, which takes the ordinary MMA launch below: correct, not split per query)
+    // (not a two-source node, which takes the ordinary MMA launch below: correct, not split per query)
     if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && Q->ne[1] > 1 && dst->src[6] == nullptr) {
         const ggml_tensor * mask = dst->src[3];
         ggml_tensor q1 = *Q;
@@ -1887,7 +1887,7 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
         d1.ne[2]  = 1;
         d1.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
         const best_fattn_kernel k1 = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), &d1);
-        // k15-lfm2, GGML_CUDA_FA_VERIFY_MMA=1 (opt-in): where the one query node runs the MMA kernel (Turing / Ampere: f16 KQ tiles,
+        // GGML_CUDA_FA_VERIFY_MMA=1 (opt-in): where the one query node runs the MMA kernel (Turing / Ampere: f16 KQ tiles,
         // f16 P, half2 VKQ), the verify node runs that kernel once for all its queries instead of once per query. Same kernel family
         // and number formats, only the tiling of the KV loop / softmax rescales and the KV split differ (equivalence
         // rule: reassociation); taken only when the batched node would pick the MMA kernel too
@@ -1905,7 +1905,7 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
         }
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
-        // k19-fixC: the per query launches need f16 K and V (another type stages a converted copy behind the output, which a
+        // the per query launches need f16 K and V (another type stages a converted copy behind the output, which a
         // launch writing one row of it would place over the rows after it). llama-graph splits the queries of one stream itself and
         // groups f16 K / V only, but a node of several streams (non-unified KV, -np N, a verify batch over 2+ sequences) with a
         // quantized cache reaches here whole: it takes the ordinary kernels below (correct, not bit-equal to a decode) instead of

@@ -3,7 +3,7 @@
 
 #include "common.cuh"
 
-// k19-ampmoe: multi-token MUL_MAT_ID (2..8 tokens of a speculative verify window) on int8 tensor cores for NVIDIA Ampere / Ada
+// multi-token MUL_MAT_ID (2..8 tokens of a speculative verify window) on int8 tensor cores for NVIDIA Ampere / Ada
 // (cc 8.0 / 8.6 / 8.7 / 8.9). The block of an expert's first (token-major) entry takes every entry of that expert as one MMA column
 // (a token picks an expert once, so <= 8 columns), decodes each weight block once into int8 m16n8k32 A fragments and multiplies it with
 // the q8_1 activations of all of them; the warps split K in 256-value units (their number follows K only). The integer dot products are

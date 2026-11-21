@@ -8,7 +8,7 @@
 #include "mmf.cuh"
 #include "convert.cuh"
 
-// k19-p1fuse: GGML_CUDA_MMVF_ONEBAR=0 restores the per-column barrier pair of the mul_mat_vec_f epilogue
+// GGML_CUDA_MMVF_ONEBAR=0 restores the per-column barrier pair of the mul_mat_vec_f epilogue
 static bool ggml_cuda_mmvf_one_bar() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_MMVF_ONEBAR");
@@ -17,7 +17,7 @@ static bool ggml_cuda_mmvf_one_bar() {
     return on;
 }
 
-// k15-mm2: is_multi = up to GGML_CUDA_MMVQ_MULTI_MAX matrices of one type and K over the same activation in one launch (alpha + beta of
+// is_multi = up to GGML_CUDA_MMVQ_MULTI_MAX matrices of one type and K over the same activation in one launch (alpha + beta of
 // a gated delta net layer, the router + the shared expert gate, ...): blocks [multi_block0[m], multi_block0[m + 1]) compute matrix m's
 // rows exactly as its own launch would (same block size, same loop, same reduction) into its contiguous output multi_dst[m]
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, bool is_multi = false>
@@ -143,7 +143,7 @@ static __global__ void mul_mat_vec_f(
     }
 
     if (block_size > warp_size) {
-        // k19-p1fuse one_bar: one zeroed partial slice of warp_size floats per column (nbytes_shared), else the one slice
+        // one_bar: one zeroed partial slice of warp_size floats per column (nbytes_shared), else the one slice
         const int nzero = one_bar ? ncols_dst*warp_size : warp_size;
         for (int i = tid; i < nzero; i += block_size) {
             buf_iw[i] = 0.0f;
@@ -345,7 +345,7 @@ static __global__ void mul_mat_vec_f(
 
     ggml_cuda_pdl_lc();
     if (block_size > warp_size && one_bar) {
-        // k19-p1fuse (GGML_CUDA_MMVF_ONEBAR=0: the per-column barrier pair below): every warp writes its partial of every column into that
+        // (GGML_CUDA_MMVF_ONEBAR=0: the per-column barrier pair below): every warp writes its partial of every column into that
         // column's slice, one barrier, then warp 0 reduces each slice. The values and the reduction order of each column are those of
         // the per-column loop, so the output is bitwise the same; 1 barrier instead of 2 * ncols_dst
 #pragma unroll
@@ -521,7 +521,7 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
-    // k19-p1fuse: ncols_dst partial slices for the one-barrier epilogue (has_fusion: ncols_dst == 1, so the gate slice follows at the
+    // ncols_dst partial slices for the one-barrier epilogue (has_fusion: ncols_dst == 1, so the gate slice follows at the
     // same offset either way)
     const bool one_bar = ggml_cuda_mmvf_one_bar();
     if (block_size_best > warp_size) {
@@ -705,7 +705,7 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
-// k15-mm2: split-K for F32 mat-vecs with few rows and a long K (Flash-Next: hc inject 10240 -> 4, ssm alpha / beta 2560 -> 48, the
+// split-K for F32 mat-vecs with few rows and a long K (Flash-Next: hc inject 10240 -> 4, ssm alpha / beta 2560 -> 48, the
 // shared expert gate 2560 -> 1), whose one-block-per-row grid leaves most SMs idle. Block (row, split) sums K range
 // [split*chunk, (split+1)*chunk) in f32 like the one-block kernel, writes its partial sums, and the last block of a row to arrive
 // (counted in cnt[row], which it resets) adds the partials in split order. Same f32 inputs and f32 accumulation, a different
@@ -713,7 +713,7 @@ static void mul_mat_vec_f_cuda(
 // It runs for K >= 4096 only: at K 2560 (48 rows, 1 row) the arrival count and the second pass cost what the split saves (B200,
 // Flash-Next decode, PDL off: hc inject 11.1 -> 4.2 us at 512 per block, ssm alpha / beta 4.6 -> 4.7, shared expert gate 4.3 -> 4.0).
 // GGML_CUDA_MMVF_SPLITK = K elements per block (default 512), 0 = off.
-// k15-mm2: the block size launch_mul_mat_vec_f_cuda picks for K = ncols
+// the block size launch_mul_mat_vec_f_cuda picks for K = ncols
 static int64_t mul_mat_vec_f_block_size(const int64_t ncols, const int device) {
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     int64_t block_size_best = warp_size;
@@ -733,7 +733,7 @@ static int64_t mul_mat_vec_f_block_size(const int64_t ncols, const int device) {
 }
 
 bool ggml_cuda_mul_mat_vec_f_multi_ok(const ggml_type type, const int64_t ncols, const int64_t ncols_dst, const int device) {
-    // k19-vrow2 / k19-vrow3: F32 at 5..8 columns in a verify window (GGML_CUDA_VERIFY_WIDE bit 1), where mmvf takes them (one launch)
+    // F32 at 5..8 columns in a verify window (GGML_CUDA_VERIFY_WIDE bit 1), where mmvf takes them (one launch)
     const int max_cols = ncols_dst <= 4 ? 4 : type == GGML_TYPE_F32 ? ggml_cuda_verify_wide_cols(ggml_cuda_info().devices[device].cc, 1) : 0;
     return (type == GGML_TYPE_F32 || type == GGML_TYPE_BF16) && ncols % 2 == 0 && ncols_dst >= 1 && ncols_dst <= std::min(max_cols, MMVF_MAX_BATCH_SIZE) &&
         ggml_cuda_info().devices[device].warp_size == 32 && mul_mat_vec_f_block_size(ncols, device) == 256;
@@ -900,7 +900,7 @@ static bool mul_mat_vec_f_splitk_try(ggml_backend_cuda_context & ctx, const floa
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-// k15-mm2: the split-K launch ggml_cuda_mul_mat would make for this dense F32 product (ggml_cuda_mul_mat_vec_f, no fusion), without
+// the split-K launch ggml_cuda_mul_mat would make for this dense F32 product (ggml_cuda_mul_mat_vec_f, no fusion), without
 // allocating; false if it would not take that launch (see the hyper-connection down + inject launch in mmvq.cu)
 bool ggml_cuda_mul_mat_vec_f_splitk_plan(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         ggml_tensor * dst, ggml_cuda_mmvf_splitk_args & a) {
@@ -1091,7 +1091,7 @@ bool ggml_cuda_verify_graph_active() {
     return ggml_cuda_verify_graph_tls;
 }
 
-// k19-vrow2 / k19-vrow3: GGML_CUDA_VERIFY_WIDE (a mask, default 7; 0 = off): what a verify window of 5..GGML_CUDA_VERIFY_WIDE_MAX
+// GGML_CUDA_VERIFY_WIDE (a mask, default 7; 0 = off): what a verify window of 5..GGML_CUDA_VERIFY_WIDE_MAX
 // (default 8) rows keeps from a window of 1..4 rows. 1: F32 weights stay on mmvf (and F32 products over one activation stay one mmvf multi
 // launch) instead of MMF (TF32 tensor cores) / cuBLAS; 2: dense mmvq products without fusion keep the 4 warps of 1..4 columns (the generic
 // table halves them from 5); 4: the same for the multi-matrix mmvq launches (Q / K / V, the gated delta net in-projections). mmvf's and
@@ -1100,8 +1100,8 @@ bool ggml_cuda_verify_graph_active() {
 // bytes of the same row in a 1..4-row window, and a deeper window costs the extra columns only. Not bit-identical to a 5..8-row window
 // without it (another f32 summation order than MMF / cuBLAS / 2-warp mmvq: KLD-gated); windows of 1..4 rows and
 // untagged graphs (prompt chunks) are not touched. NVIDIA Ampere and newer only, CUDA builds only: HIP / MUSA and older GPUs keep their
-// kernels. As any reassociation, it can flip a borderline MoE top-k route that then drifts (kvr2_tfc1 / k19-v5bug).
-// 8 (k19-ampere, opt-in: GGML_CUDA_VERIFY_WIDE=15): MUL_MAT_IDs of 5..8 tokens stay on the multi-token mmvq kernels where the Turing /
+// kernels. As any reassociation, it can flip a borderline MoE top-k route that then drifts.
+// 8 (opt-in: GGML_CUDA_VERIFY_WIDE=15): MUL_MAT_IDs of 5..8 tokens stay on the multi-token mmvq kernels where the Turing /
 // Ampere table sends them to MMQ (ggml_cuda_mmvq_mmid_max_batch; Ada / Blackwell already keep them, so nothing changes there)
 int ggml_cuda_verify_wide_cols(const int cc, const int bit) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -1150,7 +1150,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 if (ampere_mma_available(cc)) {
-                    if (ggml_cuda_verify_graph_tls && ne11 == 4) { // k19-tpp: a 4-row verify window as a 3-row one
+                    if (ggml_cuda_verify_graph_tls && ne11 == 4) { // a 4-row verify window as a 3-row one
                         static bool logged = false;
                         if (!logged) {
                             logged = true;
@@ -1159,7 +1159,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                         }
                         return true;
                     }
-                    // k19-vrow2 / k19-vrow3: 5..8 rows too (GGML_CUDA_VERIFY_WIDE bit 1)
+                    // 5..8 rows too (GGML_CUDA_VERIFY_WIDE bit 1)
                     return ne11 <= 3 || ne11 <= ggml_cuda_verify_wide_cols(cc, 1);
                 }
                 if (cc >= GGML_CUDA_CC_TURING) {
@@ -1209,7 +1209,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
-                // k15-mm2: GGML_CUDA_MMVF_BF16_MAX_N=N (opt-in, 0 = off): small BF16 weights at up to N columns take the vector kernel
+                // GGML_CUDA_MMVF_BF16_MAX_N=N (opt-in, 0 = off): small BF16 weights at up to N columns take the vector kernel
                 // (f32 activations and sums) instead of MMF (BF16 activations): more precise, not bit-identical (KLD-gated)
                 static const int bf16_max_n = getenv("GGML_CUDA_MMVF_BF16_MAX_N") ? atoi(getenv("GGML_CUDA_MMVF_BF16_MAX_N")) : 0;
                 if (src0_small && ne11 <= std::min(bf16_max_n, MMVF_MAX_BATCH_SIZE)) {

@@ -501,7 +501,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
             CUDA_CHECK(cudaSetDevice(physical_id));
             CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
         }
-        // k19-l4poly test knob GGML_CUDA_SCHEDULE=spin|yield|blocking: how a host thread waits for the device (default: the driver's
+        // Test knob GGML_CUDA_SCHEDULE=spin|yield|blocking: how a host thread waits for the device (default: the driver's
         // auto, which spins while there are fewer contexts than CPUs). On a small host whose MoE host team takes most CPUs, the
         // thread that waits for the graph competes with the team while it spins
         if (const char * e_sched = getenv("GGML_CUDA_SCHEDULE"); e_sched != nullptr && *e_sched != '\0') {
@@ -686,8 +686,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     size_t pool_used = 0;
     size_t pool_size = 0;
     size_t granularity;
-    std::vector<std::pair<CUdeviceptr, size_t>> mappings; // k17-small: also on CUDA, for trim()
-    size_t mark_size = SIZE_MAX;                           // k17-small: pool_size at mark(), SIZE_MAX: never marked (trim keeps all)
+    std::vector<std::pair<CUdeviceptr, size_t>> mappings; // also on CUDA, for trim()
+    size_t mark_size = SIZE_MAX;                           // pool_size at mark(), SIZE_MAX: never marked (trim keeps all)
 
     explicit ggml_cuda_pool_vmm(int device) :
         device(device),
@@ -814,7 +814,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         return ptr;
     }
 
-    // k17-small: unmap the trailing mappings that lie wholly above what is allocated (whole mappings: a range is unmapped as it was mapped)
+    // unmap the trailing mappings that lie wholly above what is allocated (whole mappings: a range is unmapped as it was mapped)
     void mark() override {
         mark_size = pool_size;
     }
@@ -952,7 +952,7 @@ struct ggml_backend_cuda_buffer_context {
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     CUmemGenericAllocationHandle vmm_handle = 0;
 #endif
-    // k17-small (lazy KV): a buffer whose address range is reserved whole and backed with device memory chunk by chunk on request
+    // lazy KV: a buffer whose address range is reserved whole and backed with device memory chunk by chunk on request
     // (ggml_backend_cuda_buffer_commit), so its tensors keep one base pointer (kernels and CUDA graphs see the same addresses) while only
     // the part in use takes memory. lazy_size = the reserved size; chunks = one physical allocation per granularity-aligned chunk
     bool   lazy      = false;
@@ -960,10 +960,10 @@ struct ggml_backend_cuda_buffer_context {
     size_t lazy_gran = 0;
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     std::vector<CUmemGenericAllocationHandle> chunks;   // 0 = not backed
-    // k19-t4small: a physical allocation may back a run of chunks (ggml_backend_cuda_buffer_commit_run): runs[i] = the number of chunks
+    // a physical allocation may back a run of chunks (ggml_backend_cuda_buffer_commit_run): runs[i] = the number of chunks
     // of the run that starts at chunk i (1 for a chunk backed alone), 0 inside a run or where nothing is backed; its chunks share a handle
     std::vector<uint32_t> runs;
-    // k19-kvsel: chunks backed by pinned host memory mapped into the same address range (ggml_backend_cuda_buffer_commit_host): kernels
+    // chunks backed by pinned host memory mapped into the same address range (ggml_backend_cuda_buffer_commit_host): kernels
     // read them over the bus at the same addresses. They are not device memory (not counted in ggml_cuda_own_bytes, not in committed).
     // chunk_host_dev: a device copy of chunk_host for the host read counter (LLAMA_KV_SEL_STATS), allocated once, refreshed on changes
     std::vector<uint8_t> chunk_host;
@@ -1192,7 +1192,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
         // only the backed chunks (a chunk is cleared when it is backed, see ggml_backend_cuda_buffer_commit)
         for (size_t i = 0; i < ctx->chunks.size(); ++i) {
             if (ctx->chunks[i] != 0) {
-                size_t j = i; // (k19-t4small: one memset per span of backed chunks)
+                size_t j = i; // (one memset per span of backed chunks)
                 while (j + 1 < ctx->chunks.size() && ctx->chunks[j + 1] != 0) {
                     j++;
                 }
@@ -1328,7 +1328,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     return &ggml_backend_cuda_buffer_types[device];
 }
 
-// k17-small (lazy KV): a CUDA buffer of `size` bytes whose address range is reserved but not backed (nullptr without VMM support or if the
+// lazy KV: a CUDA buffer of `size` bytes whose address range is reserved but not backed (nullptr without VMM support or if the
 // reservation fails). Its buffer type is the device's CUDA buffer type, so it is a CUDA buffer for every other purpose. Memory is backed
 // with ggml_backend_cuda_buffer_commit before a range is used; the backed bytes count as this process's own (GGML_CUDA_FAKE_FREE_MIB)
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_alloc_lazy(ggml_backend_buffer_type_t buft, size_t size) {
@@ -1429,7 +1429,7 @@ static bool ggml_backend_cuda_buffer_commit(ggml_backend_buffer_t buffer, size_t
 #endif
 }
 
-// k17-small (lazy KV step 2): give back the device memory of the chunks that lie wholly inside [offset, offset + size) of a lazy buffer
+// lazy KV step 2: give back the device memory of the chunks that lie wholly inside [offset, offset + size) of a lazy buffer
 // (the address range stays reserved, a later commit backs them again, cleared). Returns the bytes freed (0 for a buffer that is not lazy).
 // The caller makes sure nothing reads or writes that range any more (the device is synchronized here first)
 static size_t ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
@@ -1450,7 +1450,7 @@ static size_t ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, si
     CUDA_CHECK(cudaDeviceSynchronize());
     size_t freed = 0;
     for (size_t i = c0; i < c1; ++i) {
-        // (k19-t4small: a run is given back whole, so one that starts before c0 or ends after c1 stays backed)
+        // (a run is given back whole, so one that starts before c0 or ends after c1 stays backed)
         if (ctx->chunks[i] == 0 || ctx->runs[i] == 0 || i + ctx->runs[i] > c1) {
             continue;
         }
@@ -1482,7 +1482,7 @@ static size_t ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, si
 #endif
 }
 
-// k19-t4small: as ggml_backend_cuda_buffer_commit, but each span of chunks not backed yet inside [offset, offset + size) is backed by one
+// as ggml_backend_cuda_buffer_commit, but each span of chunks not backed yet inside [offset, offset + size) is backed by one
 // physical allocation (mapped, given access and cleared once): the MoE cache's decode extension backs and gives back hundreds of MiB per
 // request, which chunk by chunk took ~70 us per 2 MiB each way. A span the device cannot back whole is backed chunk by chunk
 static bool ggml_backend_cuda_buffer_commit_run(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
@@ -1578,7 +1578,7 @@ static size_t ggml_backend_cuda_buffer_committed(ggml_backend_buffer_t buffer) {
     return n;
 }
 
-// k19-kvsel: pinned host memory mapped into a lazy buffer's address range (CU_MEM_LOCATION_TYPE_HOST_NUMA physical allocations). The
+// pinned host memory mapped into a lazy buffer's address range (CU_MEM_LOCATION_TYPE_HOST_NUMA physical allocations). The
 // chunk granularity of a CUDA buffer type whose device can map host memory there, 0 if it cannot (no VMM, or a driver / device without
 // HOST_NUMA virtual memory management: CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, 141)
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -1796,7 +1796,7 @@ bool ggml_cuda_buffer_has_host_chunks(const ggml_backend_buffer * buf) {
 #endif
 }
 
-// k19-kvsel host read counter (LLAMA_KV_SEL_STATS): the host chunk map of the buffer holding `data` (fattn.cu); false if none
+// host read counter (LLAMA_KV_SEL_STATS): the host chunk map of the buffer holding `data` (fattn.cu); false if none
 bool ggml_cuda_buffer_host_chunks(const ggml_backend_buffer * buf, const char ** base, size_t * gran, const uint8_t ** map_dev,
         const uint8_t ** map_host, size_t * n) {
     if (buf == nullptr || !ggml_backend_buffer_is_cuda(const_cast<ggml_backend_buffer_t>(buf))) {
@@ -2155,8 +2155,8 @@ static void * ggml_cuda_host_malloc(size_t size) {
 // huge pages: anonymous memory aligned to 2 MiB, MADV_HUGEPAGE, then registered (portable, mapped) instead of cudaMallocHost, whose
 // pages are 4 KiB. The CPU reads each expert as long streams of rows; with 4 KiB pages every 4 KiB is a TLB entry and a stop of the
 // hardware prefetcher. Only the backing pages differ: the bytes, the device address (unified addressing) and every result are the
-// same. Opt-in (GGML_CUDA_HOST_THP=1; unset / 0 = cudaMallocHost): on a Colab G4 (48 vCPU EPYC 9B45, RTX PRO 6000) with Qwen3.8-Flash-Next
-// UD-IQ4_XS host batches were 3-7% shorter per expert row, but no tok/s cell moved beyond launch spread (48 / 32 / 16 GB, full card,
+// same. Opt-in (GGML_CUDA_HOST_THP=1; unset / 0 = cudaMallocHost): on a 48 vCPU EPYC 9B45 host with an RTX PRO 6000 with Qwen3.8-Flash-Next
+// IQ4_XS host batches were 3-7% shorter per expert row, but no tok/s cell moved beyond launch spread (48 / 32 / 16 GB, full card,
 // Qwen3.6-35B-A3B at 16 GB) and the device side beside a host batch grew. GGML_CUDA_HOST_THP_MIN_MB (default 256): buffers from that size
 // on. Linux only; any failure takes cudaMallocHost as before
 #if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -2348,7 +2348,7 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
-// k19-tcgemm: force_f32_out = F16 / BF16 inputs with FP32 accumulation and FP32 output (the dense prompt route below)
+// force_f32_out = F16 / BF16 inputs with FP32 accumulation and FP32 output (the dense prompt route below)
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const bool force_f32_out = false) {
@@ -2389,7 +2389,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
-    // k11: an F16 / BF16 copy of src1 shared with the next MUL_MAT of the graph (see ggml_cuda_src1_memo); only when src0 needs
+    // an F16 / BF16 copy of src1 shared with the next MUL_MAT of the graph (see ggml_cuda_src1_memo); only when src0 needs
     // no conversion, so that the shared copy is the first pool allocation of this product
     ggml_cuda_src1_memo & memo = ctx.src1_memo;
     const bool memo_ok = memo.top(dst) && compute_type != GGML_TYPE_F32 && src0->type == compute_type && src1->type == GGML_TYPE_F32 &&
@@ -2618,7 +2618,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = GGML_TYPE_F32;
     }
 
-    static const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE"); // k15-hostcut: read once
+    static const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE"); // read once
     if (env_c != nullptr) {
         std::string env_cpp = env_c;
         for (char & c : env_cpp) {
@@ -2676,7 +2676,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
-// k19-tcgemm: dense prompt products on tensor cores (see ggml_cuda_mul_mat). 0 = f32 accumulate (F16 in), 1 = k13 F16 accumulate, 2 = BF16 in
+// dense prompt products on tensor cores (see ggml_cuda_mul_mat). 0 = f32 accumulate (F16 in), 1 = F16 accumulate, 2 = BF16 in
 static int ggml_cuda_dense_tc_acc() {
     static const int acc = [] {
         const char * e = getenv("GGML_CUDA_DENSE_CUBLAS_ACC");
@@ -2710,7 +2710,7 @@ static bool ggml_cuda_dense_tc_route(const ggml_tensor * src0, const ggml_tensor
         return false;
     }
     if (ggml_cuda_dense_tc_acc() == 1) {
-        return true; // k13 behaviour: whatever ggml_cuda_mul_mat_cublas does for this product
+        return true; // previous behaviour: whatever ggml_cuda_mul_mat_cublas does for this product
     }
     if (ggml_cuda_dense_tc_acc() == 2 && !fast_bf16_hardware_available(cc)) {
         return false;
@@ -2936,7 +2936,7 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
-// k15-lfm2: the kernels of the flagged verify products. One INFO line per load (the first graph with verify products, see
+// the kernels of the flagged verify products. One INFO line per load (the first graph with verify products, see
 // ggml_cuda_verify_mmq_summary) counts them by kernel, so the engagement of GGML_CUDA_VERIFY_MMQ shows in any server log;
 // GGML_CUDA_VERIFY_MMQ_LOG=1 also names each product once per kernel and width
 struct ggml_cuda_verify_mmq_state {
@@ -3041,7 +3041,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // batch invariant (speculative verify batches): every column gets the bytes a single column (ne11 == 1) would get
     if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ne11 > 1) {
-        // k15-lfm2, GGML_CUDA_VERIFY_MMQ: a quantized dense verify product of up to 16 columns runs MMQ (int8 tensor cores) instead
+        // GGML_CUDA_VERIFY_MMQ: a quantized dense verify product of up to 16 columns runs MMQ (int8 tensor cores) instead
         // of the batched mmvq: the same q8_1 activations into the same int8 products with f32 accumulation, only the order of the f32
         // scale products and sums differs (equivalence rule). T4 at 8 rows the dp4a mmvq is compute-bound (2x one row).
         // Default on Turing (cc 7.5) only, where it was timed and passed the KLD gate; =1 on any device with
@@ -3051,14 +3051,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const char * e = getenv("GGML_CUDA_VERIFY_MMQ");
             return e != nullptr ? atoi(e) : -1;
         }();
-        // k15-pp: the Turing default is a reassociation, so the bit-exact verify (GGML_CUDA_VERIFY_REASSOC=0) leaves it off there: T4,
-        // Qwen3.6-35B-A3B UD-Q4_K_XL + MTP heads, LLAMA_MTP_EXACT=1 + VERIFY_REASSOC=0, the drafted text left the no-draft text at
+        // the Turing default is a reassociation, so the bit-exact verify (GGML_CUDA_VERIFY_REASSOC=0) leaves it off there: T4,
+        // Qwen3.6-35B-A3B at 4 bits + MTP heads, LLAMA_MTP_EXACT=1 + VERIFY_REASSOC=0, the drafted text left the no-draft text at
         // token 126 / 89 of 128 (chat / 8k), a near tie; GGML_CUDA_VERIFY_MMQ=1 still turns it on
         static const bool reassoc_ok = [] {
             const char * e = getenv("GGML_CUDA_VERIFY_REASSOC");
             return e == nullptr || atoi(e) != 0;
         }();
-        // k19-kqtc: the ported few-row MMQ (GGML_CUDA_MMQ_FEW, AUTO per architecture) takes the verify product where it applies, unless the verify is
+        // the ported few-row MMQ (GGML_CUDA_MMQ_FEW, AUTO per architecture) takes the verify product where it applies, unless the verify is
         // the bit-exact one (GGML_CUDA_VERIFY_REASSOC=0)
         if (reassoc_ok && ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
             ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
@@ -3122,7 +3122,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // k19-kqtc: the ported few-row MMQ (GGML_CUDA_MMQ_FEW, AUTO per architecture) before mmvq / MMQ
+    // the ported few-row MMQ (GGML_CUDA_MMQ_FEW, AUTO per architecture) before mmvq / MMQ
     if (ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
         ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
         return;
@@ -3131,10 +3131,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // k13-pp: GGML_CUDA_DENSE_CUBLAS_MIN=N (opt-in, 0 = off): quantized dense products of at least N columns are dequantized to FP16 and
+    // GGML_CUDA_DENSE_CUBLAS_MIN=N (opt-in, 0 = off): quantized dense products of at least N columns are dequantized to FP16 and
     // multiplied by cuBLAS instead of MMQ. Other rounding (KLD-gated)
-    // k19-tcgemm: the route dequantizes the weight into a pool scratch buffer (no second copy kept) and runs a tensor-core GEMM with FP32
-    // accumulation and FP32 output; GGML_CUDA_DENSE_CUBLAS_ACC=f16 restores the k13 FP16-accumulate path, =bf16 uses BF16 inputs
+    // the route dequantizes the weight into a pool scratch buffer (no second copy kept) and runs a tensor-core GEMM with FP32
+    // accumulation and FP32 output; GGML_CUDA_DENSE_CUBLAS_ACC=f16 restores the earlier FP16-accumulate path, =bf16 uses BF16 inputs
     if (ggml_cuda_dense_tc_route(src0, src1, dst, cc)) {
         ggml_cuda_mul_mat_dense_tc(ctx, src0, src1, dst);
         return;
@@ -3414,7 +3414,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 }
 
-// k15-fn debug (GGML_CUDA_GRAPH_NODE_STATS=3): the copy / gather nodes executed after the fusions, logged per captured graph
+// Debug (GGML_CUDA_GRAPH_NODE_STATS=3): the copy / gather nodes executed after the fusions, logged per captured graph
 static std::map<const void *, std::map<std::string, std::pair<int, size_t>>> ggml_cuda_exec_copy_ops;
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -3834,20 +3834,20 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-// k19-graph (proc "ggml_backend_fa_kv_len"): a padded flash attention node with a KV length computes the bits of the node of that
+// (proc "ggml_backend_fa_kv_len"): a padded flash attention node with a KV length computes the bits of the node of that
 // length, and its CUDA graph is replayed as the length changes where the launch allows it (see fattn.cu)
 static bool ggml_backend_cuda_fa_kv_len(void) {
     return true;
 }
 
-// k19-fattnq4 (proc "ggml_backend_fa_src2"): two-source flash attention (ggml_flash_attn_ext_set_src2) on the MMA kernel, NVIDIA Turing
+// (proc "ggml_backend_fa_src2"): two-source flash attention (ggml_flash_attn_ext_set_src2) on the MMA kernel, NVIDIA Turing
 // and newer; supports_op answers per node (fattn.cu ggml_cuda_fattn_src2_supported)
 static bool ggml_backend_cuda_fa_src2(void) {
     return true;
 }
 #endif
 
-// k15-fn: the host -> device uploads of n tensors (offset 0, whole size given) as one cudaMemcpyBatchAsync on the backend's stream, in
+// the host -> device uploads of n tensors (offset 0, whole size given) as one cudaMemcpyBatchAsync on the backend's stream, in
 // stream order like n cudaMemcpyAsync (the scheduler's graph inputs of a split: 21 per Flash-Next verify graph, issued back to back with
 // the GPU idle between them). Returns false (nothing queued) where the batch API is missing or refuses them: the caller copies one by one
 static bool ggml_backend_cuda_set_tensors_batch_async(ggml_backend_t backend, ggml_tensor * const * tensors, const void * const * data,
@@ -3986,7 +3986,7 @@ static size_t ggml_backend_cuda_graph_evict_since(ggml_backend_t backend, int64_
     return n;
 }
 
-// k15-pp: on = the next graph computations of this backend run without CUDA graph bookkeeping (computed once, never replayed)
+// on = the next graph computations of this backend run without CUDA graph bookkeeping (computed once, never replayed)
 static void ggml_backend_cuda_graph_skip_records(ggml_backend_t backend, bool on) {
 #ifdef USE_CUDA_GRAPH
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
@@ -4080,9 +4080,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     return true;
 }
 
-// k19-l4poly: blocking device waits, set by the MoE cache while its host team takes most of the CPUs (ggml_backend_cuda_set_wait_blocking,
+// blocking device waits, set by the MoE cache while its host team takes most of the CPUs (ggml_backend_cuda_set_wait_blocking,
 // LLAMA_MOE_SINGLE_WAIT_BLOCKING): the thread that waits for a graph sleeps on an event instead of spinning on a CPU the team needs.
-// Colab L4 (12 vCPUs) LFM2.5 4 GB chat with a host team of 10: 45.2 tok/s waiting by blocking sync, 41.9 spinning (team of 8: 42.0)
+// an L4 host (12 vCPUs), LFM2.5 4 GB chat with a host team of 10: 45.2 tok/s waiting by blocking sync, 41.9 spinning (team of 8: 42.0)
 static std::atomic<bool> g_cuda_wait_blocking{false};
 
 static void ggml_backend_cuda_set_wait_blocking(bool on) {
@@ -4150,7 +4150,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-// k15-fn (GGML_CUDA_GRAPH_KEY_SHAPE=0: the first node alone): the key adds the node count and the shapes of the first and last nodes, so
+// (GGML_CUDA_GRAPH_KEY_SHAPE=0: the first node alone): the key adds the node count and the shapes of the first and last nodes, so
 // graphs built in the same meta buffer (llama rebuilds every graph in one: the prompt tail, the verify, a 1-token decode) keep their own
 // entries, and a request's first verify finds the previous request's captured verify graph instead of warming up and capturing again.
 // Correctness does not depend on the key: an entry is reused only when every node property matches (ggml_cuda_graph_update_required)
@@ -4169,7 +4169,7 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
         mix((uint64_t) b->ne[d]);
     }
     if ((a->flags | b->flags) & GGML_TENSOR_FLAG_VERIFY) {
-        mix(0x7470705f76657269ULL); // k19-tpp: a verify-tagged graph never shares a key with an untagged one
+        mix(0x7470705f76657269ULL); // a verify-tagged graph never shares a key with an untagged one
     }
     return (const void *) (uintptr_t) h;
 }
@@ -4195,7 +4195,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         }
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
-        // k19-graph: the same graph, but the launch of a flash attention node follows its KV length, which is set with the inputs
+        // the same graph, but the launch of a flash attention node follows its KV length, which is set with the inputs
         bool fa_changed = false;
         for (const int i : graph->fa_kvl_nodes) {
             if (ggml_cuda_flash_attn_ext_kv_len_sig(*cuda_ctx, cgraph->nodes[i]) != graph->node_props[i].fa_sig) {
@@ -4217,12 +4217,12 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         graph->node_props.resize(cgraph->n_nodes);
     }
 
-    // k19-df2cost (GGML_CUDA_GRAPH_SKIP_IDLE=1, opt-in: no decode speed change measured on G4, the re-captures it removed were followed by
+    // (GGML_CUDA_GRAPH_SKIP_IDLE=1, opt-in: no decode speed change measured on RTX PRO 6000, the re-captures it removed were followed by
     // re-captures for real changes; default: compare every node as before): a node without GGML_TENSOR_FLAG_COMPUTE (a branch that
     // ggml_build_forward_select did not pick, e.g. the mixed-embedding input of a batch of tokens) is never launched (the evaluation skips
     // it) and no computed node reads it, so where the allocator put it and its sources does not change the captured graph: its addresses
     // are left out of the compare (its op, shape and flags stay in). Beside a MoE cache a verify window of another width moved such a
-    // node, so each change of width re-captured the 8000-node verify graph (G4 Flash-Next fn4 24 GB, DFlash2 with a confidence window:
+    // node, so each change of width re-captured the 8000-node verify graph (RTX PRO 6000 Flash-Next 4-bit 24 GB, DFlash2 with a confidence window:
     // 4-9 ms of host time per pass)
     static const bool skip_idle = getenv("GGML_CUDA_GRAPH_SKIP_IDLE") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_SKIP_IDLE")) != 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4249,7 +4249,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
-            // k15-fn: GGML_CUDA_GRAPH_WHY=N logs the first changed node of up to N re-captures (diagnostic)
+            // GGML_CUDA_GRAPH_WHY=N logs the first changed node of up to N re-captures (diagnostic)
             static int why_left = getenv("GGML_CUDA_GRAPH_WHY") ? atoi(getenv("GGML_CUDA_GRAPH_WHY")) : 0;
             if (!res && why_left > 0) {
                 why_left--;
@@ -4312,7 +4312,7 @@ static bool ggml_cuda_graph_drop_failed_instance(ggml_cuda_graph * graph, cudaEr
         (void)cudaGetLastError();
         graph->graph = nullptr;
     }
-    // k19-am17an: the chunks after the first go with it (none of them was launched: the chunks are launched after all instantiated)
+    // the chunks after the first go with it (none of them was launched: the chunks are launched after all instantiated)
     for (cudaGraphExec_t & e : graph->chunk_instances) {
         if (e != nullptr) {
             (void)cudaGraphExecDestroy(e);
@@ -4336,7 +4336,7 @@ static bool ggml_cuda_graph_drop_failed_instance(ggml_cuda_graph * graph, cudaEr
 }
 
 // returns false when the exec could not be instantiated again (see ggml_cuda_graph_drop_failed_instance): the caller runs eagerly
-// k19-am17an: one chunk of the graph, its exec and its newly captured graph (chunk 0: the graph's own graph / instance; the chunks after
+// one chunk of the graph, its exec and its newly captured graph (chunk 0: the graph's own graph / instance; the chunks after
 // it: chunk_graphs / chunk_instances)
 static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_t & instance, cudaGraph_t cgraph_chunk) {
     // GGML_CUDA_GRAPH_UPDATE_DEBUG=1 (debug): the error pending before the update and whether the exec handle is still valid, logged
@@ -4353,15 +4353,15 @@ static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_
     cudaError_t stat = cudaGraphExecUpdate(instance, cgraph_chunk, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
-    // k11: GGML_CUDA_GRAPH_UPDATE_FAULT=N (debug) makes every Nth update fail as if the device were out of memory
+    // GGML_CUDA_GRAPH_UPDATE_FAULT=N (debug) makes every Nth update fail as if the device were out of memory
     static const int update_fault = getenv("GGML_CUDA_GRAPH_UPDATE_FAULT") ? atoi(getenv("GGML_CUDA_GRAPH_UPDATE_FAULT")) : 0;
     static int64_t n_update = 0;
     if (update_fault > 0 && stat == cudaSuccess && ++n_update % update_fault == 0) {
         stat = cudaErrorMemoryAllocation;
     }
 
-    // k11 (GGML_CUDA_GRAPH_UPDATE_RETRY=0 restores the assert): an update can also fail with another error than an update failure, e.g.
-    // out of memory on a card other processes filled (seen on shared B200s with master, k10 and k11 builds alike). Such an error is not
+    // (GGML_CUDA_GRAPH_UPDATE_RETRY=0 restores the assert): an update can also fail with another error than an update failure, e.g.
+    // out of memory on a card other processes filled (seen on shared B200s with master and earlier builds alike). Such an error is not
     // sticky: it is cleared and the graph is instantiated again, as for an update failure. A sticky error (an earlier kernel fault)
     // fails the instantiation below with its own message
     static const bool update_retry = getenv("GGML_CUDA_GRAPH_UPDATE_RETRY") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_UPDATE_RETRY")) != 0;
@@ -4396,7 +4396,7 @@ static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
         if (update_error) {
-            // k16-race: after another error than an update failure (seen after a launch stalled for minutes on a crowded GPU: the
+            // after another error than an update failure (seen after a launch stalled for minutes on a crowded GPU: the
             // update returned invalid argument and so did this destroy, which aborted) the exec is destroyed at most once and a
             // failed destroy is not fatal: the handle is dropped and a new exec instantiated (GGML_CUDA_GRAPH_UPDATE_RETRY=0: assert)
             // GGML_CUDA_GRAPH_DESTROY_FAULT=1 (debug, with GGML_CUDA_GRAPH_UPDATE_FAULT): this destroy fails as seen live (the exec is leaked)
@@ -4417,7 +4417,7 @@ static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_
         }
         instance = nullptr;
         cudaError_t inst = cudaGraphInstantiate(&instance, cgraph_chunk, NULL, NULL, 0);
-        // k11: out of memory may pass once other processes free some; a few tries before the error is fatal
+        // out of memory may pass once other processes free some; a few tries before the error is fatal
         for (int k = 0; k < 20 && inst == cudaErrorMemoryAllocation && update_retry; ++k) {
             (void)cudaGetLastError();
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -4441,7 +4441,7 @@ static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_
 }
 
 // returns false when an exec could not be instantiated again (see ggml_cuda_graph_drop_failed_instance): the caller runs eagerly
-// k19-am17an: every chunk of a newly captured graph: the execs of the chunks it kept are updated, a chunk new to it is instantiated, the
+// every chunk of a newly captured graph: the execs of the chunks it kept are updated, a chunk new to it is instantiated, the
 // execs of chunks it no longer has (a shorter graph) are destroyed
 static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -4560,7 +4560,7 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
-// k15-fn: RMS_NORM -> MUL -> ROPE with a multi-section, non-vision rope (ggml_cuda_op_rms_norm_mul_mrope_fused): f32, the rope
+// RMS_NORM -> MUL -> ROPE with a multi-section, non-vision rope (ggml_cuda_op_rms_norm_mul_mrope_fused): f32, the rope
 // reads the mul output, the norm is the full-shape mul operand, the mul output is contiguous (the norm kernel writes it there)
 static bool ggml_cuda_should_fuse_rms_norm_mul_mrope(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * rope) {
     if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rope->op != GGML_OP_ROPE) {
@@ -4958,7 +4958,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     return true;
 }
 
-// k19-fusealias: a leaf (op NONE) source of a fused group was skipped by the overlap check below as if it were a weight. Leaves in the
+// a leaf (op NONE) source of a fused group was skipped by the overlap check below as if it were a weight. Leaves in the
 // compute buffer (the scheduler's copies of another backend's tensors, graph inputs) end their life at their last planned reader, and the
 // allocator may then place the fused output over them at a shift: the fused kernel writes rows while other blocks still read the leaf
 // (the fused mmvf + add and the fused MoE weighted reduction both raced so). A leaf in another buffer than dst (weights, caches) cannot
@@ -4983,7 +4983,7 @@ static bool ggml_cuda_fusion_leaf_may_alias(const ggml_tensor * dst, const ggml_
     return true;
 }
 
-// k19-fusealias: logs the first fused group refused for an input overlap (GGML_CUDA_FUSE_ALIAS_LOG=1: every distinct dst op / input name)
+// logs the first fused group refused for an input overlap (GGML_CUDA_FUSE_ALIAS_LOG=1: every distinct dst op / input name)
 static void ggml_cuda_fusion_leaf_alias_log(const ggml_tensor * dst, const ggml_tensor * src) {
     static const bool log_all = ggml_cuda_env_flag("GGML_CUDA_FUSE_ALIAS_LOG");
     static std::mutex mtx;
@@ -5220,7 +5220,7 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
-// k19-g4fuse: the overlapped verify of the MoE cache computes the hit experts and the fetched experts as two products and adds them
+// the overlapped verify of the MoE cache computes the hit experts and the fetched experts as two products and adds them
 // (ADD, every slot computed by exactly one side, the other side's rows 0), then the weighted reduction of the experts, then (Qwen3-Next
 // family) the ADD of the shared expert, whose gate ran beside the copies: three launches per MoE layer. One launch here: the reduction
 // kernel reads both products (their sum per element, as the ADD computes it, then the reduction's own order) and adds the following
@@ -5264,7 +5264,7 @@ static int ggml_cuda_try_fuse_moe_red_add2(ggml_backend_cuda_context * cuda_ctx,
     if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), n, ops.data(), outs, 1) || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, outs, 1)) {
         return 0;
     }
-    // k19-t4det: the kernel writes the token rows of dst while other blocks still read the expert rows of a and b (n_expert_used rows
+    // the kernel writes the token rows of dst while other blocks still read the expert rows of a and b (n_expert_used rows
     // per token), so dst must not overlap any input, also not one that the range check above skips: an input copy of the scheduler is
     // a leaf (op NONE) in the compute buffer, and the allocator may place dst over it once the ADD it fed was its last planned reader
     // (the hybrid path's host experts, ffn_moe_down_host: dst over them at a shift, the bytes then depended on the block order and
@@ -5308,7 +5308,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     const size_t num_unary = std::count(ops.begin(), ops.end(), GGML_OP_UNARY);
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
-    // k15-hostcut: every pattern below matches only through ggml_can_fuse / ggml_can_fuse_subgraph, which need node_idx to have the
+    // every pattern below matches only through ggml_can_fuse / ggml_can_fuse_subgraph, which need node_idx to have the
     // first op: test that first, before the pattern comparisons (about 30 calls per node in ggml_cuda_try_fuse).
     // GGML_CUDA_FUSE_PREFILTER=0: off
     static const bool prefilter = !getenv("GGML_CUDA_FUSE_PREFILTER") || atoi(getenv("GGML_CUDA_FUSE_PREFILTER")) != 0;
@@ -5628,7 +5628,7 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
             n_readers[cgraph->nodes[i]->src[1]->data]++;
         }
     }
-    // k15-hostcut: no mat-vec-size product (a prompt batch): no slot, and the producer scans below would find no target
+    // no mat-vec-size product (a prompt batch): no slot, and the producer scans below would find no target
     // (the same result without five passes over the graph). GGML_CUDA_Q8_1_PLAN_SCAN=1: scan anyway
     static const bool always_scan = ggml_cuda_env_flag("GGML_CUDA_Q8_1_PLAN_SCAN");
     if (n_readers.empty() && !always_scan) {
@@ -5664,7 +5664,7 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
         }
     }
     if (!producer_q8_1_disabled) {
-        // k15: the LFM2 short conv * c product (shortconv-fused.cu writes its q8_1 copy)
+        // the LFM2 short conv * c product (shortconv-fused.cu writes its q8_1 copy)
         for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
             const ggml_tensor * conv = cgraph->nodes[i];
             const ggml_tensor * mul  = cgraph->nodes[i + 1];
@@ -5681,9 +5681,9 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
             }
         }
     }
-    // k15-mm2: gated outputs (GLU, and the MUL of a fused SILU / SIGMOID / SOFTPLUS + MUL pair), unary.cu writes their q8_1 copy in the
+    // gated outputs (GLU, and the MUL of a fused SILU / SIGMOID / SOFTPLUS + MUL pair), unary.cu writes their q8_1 copy in the
     // rows of their reader, of any width (GGML_CUDA_GATED_Q8_1=0 turns this off)
-    // (GGML_CUDA_DISABLE_GLU_Q8_1=1, the switch of k15-fn 414e7c2d4a5 that this replaces, is an alias)
+    // (GGML_CUDA_DISABLE_GLU_Q8_1=1, the earlier switch 414e7c2d4a5 that this replaces, is an alias)
     static const bool gated_q8_1_disabled = [] {
         const char * e = getenv("GGML_CUDA_GATED_Q8_1");
         const char * d = getenv("GGML_CUDA_DISABLE_GLU_Q8_1");
@@ -5844,7 +5844,7 @@ static int ggml_cuda_try_fuse_ew_chain(ggml_backend_cuda_context * cuda_ctx, ggm
     // a mul_mat_vec_q reads the chain output: write its q8_1 copy in the same kernel
     void * q8_1_out = nullptr;
     ggml_cuda_q8_1_cache & cache = cuda_ctx->q8_1_cache;
-    // k15-mm2: also several rows whose length is a multiple of 32 but not of the q8_1 row padding (the hyper-connection up input at
+    // also several rows whose length is a multiple of 32 but not of the q8_1 row padding (the hyper-connection up input at
     // an MTP verify, 320 x 3), each q8_1 row padded with zeros as quantize_q8_1 pads it (GGML_CUDA_EW_Q8_1_ROWS=0: those rows not)
     static const bool rows_off = [] { const char * e = getenv("GGML_CUDA_EW_Q8_1_ROWS"); return e != nullptr && atoi(e) == 0; }();
     if (cache.active() && cuda_ctx->curr_stream_no == 0 && cache.norm_targets.count(last) &&
@@ -5931,9 +5931,9 @@ static int ggml_cuda_try_fuse_amax_rescale(ggml_backend_cuda_context * cuda_ctx,
     return id - i;
 }
 
-// k15-mm2: the next hyper-connection mix's grouped norm (RMS_NORM -> MUL, a q8_1 producer) reads the DSV4_HC_POST output of the
+// the next hyper-connection mix's grouped norm (RMS_NORM -> MUL, a q8_1 producer) reads the DSV4_HC_POST output of the
 // chain nodes [i, i + n_chain) + nodes[ip]: computed in one norm kernel (see below). Returns the number of extra nodes covered.
-    // k15-mm2: the next hyper-connection mix's grouped norm (RMS_NORM -> MUL, a q8_1 producer) reads this DSV4_HC_POST output: the
+    // the next hyper-connection mix's grouped norm (RMS_NORM -> MUL, a q8_1 producer) reads this DSV4_HC_POST output: the
     // norm kernel computes the post itself (stored to the post output as before) and writes the norm, its q8_1 copy, one launch
     // (GGML_CUDA_HC_POST_NORM=0: separate launches). Same expressions in the same order, so every output keeps its bytes.
 static int ggml_cuda_try_fuse_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, int n_chain, int ip) {
@@ -5950,7 +5950,7 @@ static int ggml_cuda_try_fuse_hc_post_norm(ggml_backend_cuda_context * cuda_ctx,
     }
     {
         // integration head (coordinator 10-26): opt-in (GGML_CUDA_HC_POST_NORM=1) as a free interim until the CUDA-graphs timing race fix
-        // lands (Flash-Next pinned f0 diverged in about 1 of 5 launches with it on, 0 of 14 off; G4 decode cost of off: inside 1% A/A)
+        // lands (Flash-Next pinned diverged in about 1 of 5 launches with it on, 0 of 14 off; RTX PRO 6000 decode cost of off: inside 1% A/A)
         static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_POST_NORM"); return e == nullptr || atoi(e) == 0; }();
         int irn = ip + 1;
         while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
@@ -6009,7 +6009,7 @@ static int ggml_cuda_try_fuse_hc_post_norm(ggml_backend_cuda_context * cuda_ctx,
 
 static void ggml_cuda_src1_memo_plan_norm(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i);
 
-// k19-fu2 F1: nodes i .. i + 3 = SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST (hc_combine of block i, prompt batch), then the grouped
+// Fusion F1: nodes i .. i + 3 = SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST (hc_combine of block i, prompt batch), then the grouped
 // RMS_NORM -> MUL of block i + 1's mix whose copy its products convert (rms_norm_mul_conv_f32, ggml_cuda_src1_memo): the post is computed
 // inside that norm kernel (ggml_cuda_op_hc_post_rms_norm_conv), one launch instead of dsv4_hc_post_f32 + rms_norm_mul_conv_f32. Same
 // expressions in the same order, so every output keeps its bytes. Returns the extra nodes covered (0 = not taken).
@@ -6165,7 +6165,7 @@ static int ggml_cuda_try_fuse_hc_post_chain(ggml_backend_cuda_context * cuda_ctx
 }
 
 // UNARY(gate) -> MUL(x, gate) where gate has one element per row of x: shared expert gates
-// returns the number of extra nodes covered (0 = no fusion): 1, or 2 with a following ADD of the product (k15-fn,
+// returns the number of extra nodes covered (0 = no fusion): 1, or 2 with a following ADD of the product (
 // GGML_CUDA_DISABLE_GATE_MUL_ADD_FUSION=1 turns that part off)
 static int ggml_cuda_try_fuse_unary_mul_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GATE_MUL_FUSION");
@@ -6246,13 +6246,13 @@ static bool ggml_cuda_try_fuse_add_unary_mul(ggml_backend_cuda_context * cuda_ct
 }
 
 // try and fuse nodes and return the number of nodes to skip
-// k11-decode: the experts of the MoE cache are read through a view of its expert bank, and that VIEW node sits between the gate and the up
-// product ({MUL_MAT_ID, VIEW, MUL_MAT_ID, GLU}), so the gate + up + GLU fusion below never matched them (k10: three launches per expert
+// the experts of the MoE cache are read through a view of its expert bank, and that VIEW node sits between the gate and the up
+// product ({MUL_MAT_ID, VIEW, MUL_MAT_ID, GLU}), so the gate + up + GLU fusion below never matched them (before: three launches per expert
 // FFN). The fused launch is the one the {MUL_MAT_ID, MUL_MAT_ID, GLU} pattern makes: mul_mat_vec_q with the gate in its fusion
 // arguments, whose up and gate sums are the sums of the unfused products and whose GLU is the GLU op's expression, so the output is
 // the bytes of the three launches (batch invariant verify included: the GLU node carries the flag). GGML_CUDA_MOE_CACHE_GLU_FUSE=1: on.
 static int ggml_cuda_try_fuse_moe_cache_glu(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    // off by default: G4 Flash-Next (Studio argv / no drafter) and Qwen3.6 MTP / LFM2.5 at 8 GB moved within the A/A spread
+    // off by default: RTX PRO 6000 Flash-Next (Studio argv / no drafter) and Qwen3.6 MTP / LFM2.5 at 8 GB moved within the A/A spread
     static const bool on = getenv("GGML_CUDA_MOE_CACHE_GLU_FUSE") != nullptr && atoi(getenv("GGML_CUDA_MOE_CACHE_GLU_FUSE")) != 0;
     if (!on || i + 3 >= cgraph->n_nodes || !cuda_ctx->stream_context().concurrent_events.empty()) {
         return 0;
@@ -6298,7 +6298,7 @@ static int ggml_cuda_try_fuse_moe_cache_glu(ggml_backend_cuda_context * cuda_ctx
     return 3;
 }
 
-// k15: ADD -> RMS_NORM -> MUL where a mul_mat_vec_q reads the MUL output (the q8_1 copy of ggml_cuda_q8_1_cache): the residual add
+// ADD -> RMS_NORM -> MUL where a mul_mat_vec_q reads the MUL output (the q8_1 copy of ggml_cuda_q8_1_cache): the residual add
 // is computed by the norm kernel (rms_norm_mul_q8_1_f32 with ra / rb), its output still written for its other users. LFM2.5 decode:
 // two residual adds per layer, 80 launches per token. Bit-identical to the unfused ops (same float add, same reduction order).
 // GGML_CUDA_ADD_RMS_FUSE=0: off
@@ -6391,7 +6391,7 @@ static bool ggml_cuda_glu_mmvq_src1_alias_ok(const ggml_cgraph * cgraph, int i) 
     return true;
 }
 
-// k15-mm: multi-matrix mul_mat_vec_q. Dense quantized products of one type and K over the same activation (Q/K/V of attention, the
+// multi-matrix mul_mat_vec_q. Dense quantized products of one type and K over the same activation (Q/K/V of attention, the
 // qkv + gate projections of a gated delta net layer, the shared expert's gate + up at several columns, ...) run as one launch that
 // quantizes the activation once and gives every matrix its own blocks (ggml_cuda_mul_mat_vec_q_multi): each output gets the bytes of
 // its own launch. The node order and the allocation are not changed: a later product of the group is computed early, at the first
@@ -6447,7 +6447,7 @@ static bool ggml_cuda_mmvq_multi_has_partner(const ggml_cgraph * cgraph, const i
     return false;
 }
 
-// k19-kqtc, GGML_CUDA_TURING_MULTI_MMQ (opt-in; unset / 0 = off, 1 = from 5 columns, N >= 2 = from N columns): on Turing (cc 7.5)
+// GGML_CUDA_TURING_MULTI_MMQ (opt-in; unset / 0 = off, 1 = from 5 columns, N >= 2 = from N columns): on Turing (cc 7.5)
 // a verify product of a multi-matrix group (gate / up, Q / K / V) of at least N columns stays a single product, so that the Turing
 // verify rule (GGML_CUDA_VERIFY_MMQ, default on there) runs it on MMQ like the single products, instead of the multi-matrix mmvq.
 // T4 micro-bench (Qwen3.8-27B gate + up, 5120 -> 2 x 17408, verify-flagged): Q4_K 5..8 columns 73 / 65 / 62 / 57%, Q5_K 71 / 68 / 62 /
@@ -6496,7 +6496,7 @@ static bool ggml_cuda_mmvq_multi_runtime_ok(const ggml_backend_cuda_context * ct
     if (ne11 > MMVQ_MAX_BATCH_SIZE) {
         return false;
     }
-    // k19-kqtc: a product the few-row MMQ takes in ggml_cuda_mul_mat stays a single product
+    // a product the few-row MMQ takes in ggml_cuda_mul_mat stays a single product
     if (ne11 > 1 && (!exact || ggml_cuda_verify_reassoc_ok()) && ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
         return false;
     }
@@ -6530,7 +6530,7 @@ static bool ggml_cuda_mmvq_multi_overlap(const ggml_tensor * a, const ggml_tenso
 
 // node i and the products after it that share its activation: one launch. Returns -1 if not taken, else the number of nodes right
 // after i that the launch covered (the others are in mmvq_done_early).
-// k15-mm2 QSA maskless. qwen4exp builds a dense selection mask per QSA layer (llama_model_qwen4exp::graph::build_qsa_sel):
+// QSA maskless. qwen4exp builds a dense selection mask per QSA layer (llama_model_qwen4exp::graph::build_qsa_sel):
 //   sel = add(view(set_rows(repeat(fill(-inf)), repeat(fill(0)), idx)), kq_mask)
 // and the sparse flash attention gather compacts its finite entries into index lists. The lists are the selected cells
 // (idx < n_kv, dead slots point at dump rows >= n_kv) where kq_mask is finite, so launch_fattn builds them from idx and kq_mask
@@ -6588,7 +6588,7 @@ static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, co
         if (fa->op != GGML_OP_FLASH_ATTN_EXT || (fa->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) || ggml_get_op_params_i32(fa, 4) <= 0) {
             continue;
         }
-        // k19-kvlong: the selection mask as one node (ggml_sel_mask, GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL). A decode / verify window gathers from
+        // the selection mask as one node (ggml_sel_mask, GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL). A decode / verify window gathers from
         // its idx and kq as from the chain's (the node is not run); a prompt runs the node, which builds the dense mask in one pass as
         // the rebuild below does, so it is not planned
         const ggml_tensor * sm = fa->src[3];
@@ -6656,7 +6656,7 @@ static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, co
         const int64_t n_kv   = kq->ne[0];
         const int64_t n_tok  = kq->ne[1]*kq->ne[3];
         // decode and verify windows: a dense kernel's pool copy of the mask stays small, and no mask scan (one stream).
-        // k19-fuse F6: a prompt batch never gathers, it gets the dense mask rebuilt in place by one launch instead of the fill /
+        // Fusion F6: a prompt batch never gathers, it gets the dense mask rebuilt in place by one launch instead of the fill /
         // repeat / set_rows / add chain (the same f16 values); GGML_CUDA_DISABLE_QSA_PROMPT_MASK=1 builds it in the graph
         static const bool prompt_off = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_PROMPT_MASK");
         const bool prompt = n_tok > GGML_CUDA_QSA_MASKLESS_MAX_TOKENS;
@@ -6738,7 +6738,7 @@ static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, g
     if (!ggml_cuda_mmvq_multi_candidate(node) || node->src[1]->ne[1] > MMVQ_MAX_BATCH_SIZE) {
         return -1;
     }
-    // k19-vcost: inside a side-stream branch the members are its own nodes only
+    // inside a side-stream branch the members are its own nodes only
     const int j_last = std::min(i + GGML_CUDA_MMVQ_MULTI_LOOKAHEAD, cuda_ctx->side_chain_active ? cuda_ctx->side_chain_last : INT_MAX);
     {
         bool any = false;
@@ -6813,7 +6813,7 @@ static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, g
     return run;
 }
 
-// k15-fn (GGML_CUDA_GDN_STATE_IN_PLACE=0 off): the gather of one recurrent-state row (build_rs, a GET_ROWS of the cache rows by the
+// (GGML_CUDA_GDN_STATE_IN_PLACE=0 off): the gather of one recurrent-state row (build_rs, a GET_ROWS of the cache rows by the
 // rollback-group ids) whose only reader is a gated_delta_net of one sequence is skipped, and the kernel reads that row from the cache
 // through the same ids: bitwise the same state, no 3 MiB copy per layer and step (Qwen3.8-Flash-Next: 36 GDN layers, 108 MiB per verify).
 // Not for the mma kernel (it reads a contiguous state), nor when the gathered rows have another reader
@@ -6876,7 +6876,7 @@ static bool ggml_cuda_try_gdn_state_in_place(ggml_backend_cuda_context * cuda_ct
     return true;
 }
 
-// k15-fn (GGML_CUDA_DISABLE_CONV_STATE_FUSION=1 off): the conv-state copy of a recurrent layer (qwen4exp build_conv_state_at: a CPY of
+// (GGML_CUDA_DISABLE_CONV_STATE_FUSION=1 off): the conv-state copy of a recurrent layer (qwen4exp build_conv_state_at: a CPY of
 // the last d_conv - 1 columns of the conv input into the recurrent cache) is deferred to the short convolution that reads the same input
 // a few nodes later, whose short-token kernel writes the same floats (ssm_conv_f32, see ssm_conv_state_copies): one launch per layer
 // fewer. Only when nothing between them touches the copy's destination or writes over the input, and the convolution's outputs do not
@@ -6920,10 +6920,10 @@ static void ggml_cuda_conv_state_flush(ggml_backend_cuda_context * cuda_ctx) {
     cuda_ctx->conv_state_pending.clear();
 }
 
-// k19-vrow3: how many graph nodes after a conv-input concat (and after each of its state copies) its short convolution is looked for. The
+// how many graph nodes after a conv-input concat (and after each of its state copies) its short convolution is looked for. The
 // state copies of a verify window are 3 nodes per rollback slot (tail view, slot view, copy), then the state gather before the
 // convolution: 24 nodes held 5 slots (a 5-row window); 7 slots (DFlash2 n_max 6, a 7-row window) put the convolution past 24 and the
-// concat ran (concat_non_cont, 0.25 ms per pass at 7 rows, G4 fn4). 48 holds the 8 slots of an 8-row window
+// concat ran (concat_non_cont, 0.25 ms per pass at 7 rows, RTX PRO 6000, 4-bit MoE). 48 holds the 8 slots of an 8-row window
 static constexpr int GGML_CUDA_CONV_CAT_LOOKAHEAD = 48;
 
 // GGML_CUDA_FUSION_TRACE=1: why a conv-input concat was not elided (refusal point, concat name)
@@ -7001,7 +7001,7 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
     return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 9);
 }
 
-// k15-fn (GGML_CUDA_DISABLE_CONV_CAT_FUSION=1 off): the CONCAT (dim 0) of a short convolution's state columns and its transposed new
+// (GGML_CUDA_DISABLE_CONV_CAT_FUSION=1 off): the CONCAT (dim 0) of a short convolution's state columns and its transposed new
 // tokens (qwen4exp build_conv_state_at) is not run in a decode / verify graph: the convolution reads both parts (ssm_conv_cat_f32), and
 // the conv-state copies deferred to it read the same registers. Only when every reader of the concat is that convolution or a copy of a
 // view of it (a copy that is not deferred makes the concat run first, ggml_cuda_conv_cat_materialize), nothing that runs before the
@@ -7080,7 +7080,7 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
     return true;
 }
 
-// k19-fuse F5 (GGML_CUDA_DISABLE_CONV_CAT_PROMPT=1 off): the same concat in a prompt batch (more new tokens than the short kernels
+// Fusion F5 (GGML_CUDA_DISABLE_CONV_CAT_PROMPT=1 off): the same concat in a prompt batch (more new tokens than the short kernels
 // take): the long-token convolution reads the state columns and the transposed new tokens itself (ssm_conv_long_token_f32 from_cat),
 // and the conv-state copies of the concat's tail, all inside the new-token part, run after it from that part (the same floats). The
 // copies move behind the convolution: one may write the very state row the convolution reads, nothing else between them may read or
@@ -7227,7 +7227,7 @@ static void ggml_cuda_conv_cat_materialize(ggml_backend_cuda_context * cuda_ctx,
     }
 }
 
-// k15-fn (GGML_CUDA_DISABLE_UNARY_SRC_CONT_FUSION=1 off): the CONT of a strided 3D f32 view (the attention output gate of qwen35 /
+// (GGML_CUDA_DISABLE_UNARY_SRC_CONT_FUSION=1 off): the CONT of a strided 3D f32 view (the attention output gate of qwen35 /
 // qwen35moe / qwen3next / qwen4exp: a view of every head's second half of Qcur_full, made contiguous) whose only reader is a UNARY
 // fused with the MUL after it (ggml_cuda_op_unary_mul): the fused kernel reads the view, the CONT does not run. Decode / verify rows
 // only (at most 8); nothing that runs up to the MUL may write over the view. Returns the UNARY index, -1: no match
@@ -7304,7 +7304,7 @@ static bool ggml_cuda_try_unary_src_cont_elide(ggml_backend_cuda_context * cuda_
     return true;
 }
 
-// k15-fn (GGML_CUDA_DISABLE_QSA_POOL_FUSION=1 off): a QSA layer's new pooled keys (qwen4exp build_qsa_sel): GET_ROWS of the kpool
+// (GGML_CUDA_DISABLE_QSA_POOL_FUSION=1 off): a QSA layer's new pooled keys (qwen4exp build_qsa_sel): GET_ROWS of the kpool
 // member keys -> CONT (member 0) -> kpool - 1 ADDs (members 1..) -> SCALE -> RMS_NORM -> MUL (weight row) -> RESHAPE -> ROPE (multi-section,
 // not vision) -> RESHAPE -> SET_ROWS (the pooled half of the cache rows), only views between them. Fills m with the chain (nullptr: no
 // match) and returns the SET_ROWS index. runtime: also the conditions on the data (alignment the unfused norm launch takes the float4
@@ -7496,7 +7496,7 @@ static int ggml_cuda_qsa_pool_match(const ggml_cgraph * cgraph, int i, ggml_cuda
     return j;
 }
 
-// k15-fn (GGML_CUDA_DISABLE_QSA_KEY_PACK_FUSION=1 off): a QSA layer's packed indexer key row (qwen4exp build_qsa_sel: FILL of the
+// (GGML_CUDA_DISABLE_QSA_KEY_PACK_FUSION=1 off): a QSA layer's packed indexer key row (qwen4exp build_qsa_sel: FILL of the
 // pooled half -> CONCAT (dim 0) of the raw key and it -> views -> SET_ROWS into the cache) as one kernel at the FILL that writes the
 // raw key and the fill value with set_rows' conversion (the concat only copies floats). Returns the SET_ROWS index, -1: no match
 struct ggml_cuda_qsa_key_pack {
@@ -7644,9 +7644,9 @@ static int ggml_cuda_try_fuse_qsa_pool(ggml_backend_cuda_context * cuda_ctx, con
     return j - i + 1;
 }
 
-// k15-fn: the readers of every tensor of one evaluation pass, built once per pass on first use: entries (node j, src k) with
+// the readers of every tensor of one evaluation pass, built once per pass on first use: entries (node j, src k) with
 // src[k] == t or src[k]->view_src == t, ascending (j, k) per t. The scan to the graph end per question cost ~6 scans of ~8000
-// nodes x GGML_MAX_SRC per delta-net layer per pass (host time of every eager / capture pass; G4 k15gi2 CPU samples)
+// nodes x GGML_MAX_SRC per delta-net layer per pass (host time of every eager / capture pass; RTX PRO 6000 CPU samples)
 static uint64_t ggml_cuda_eval_gen = 1;   // bumped at the start of every evaluation pass
 
 struct ggml_cuda_reader_index {
@@ -7686,7 +7686,7 @@ struct ggml_cuda_reader_index {
     }
 };
 
-// k15-fn: one reader (node j, src k) of t for ggml_cuda_sole_gdn_reader: 1 = skipped (a view of t), 0 = t's gated_delta_net, -1 = other
+// one reader (node j, src k) of t for ggml_cuda_sole_gdn_reader: 1 = skipped (a view of t), 0 = t's gated_delta_net, -1 = other
 static int ggml_cuda_gdn_reader_kind(const ggml_cgraph * cgraph, int j, int k, const ggml_tensor * t, int k_expected, int gdn) {
     const ggml_tensor * n = cgraph->nodes[j];
     const ggml_tensor * s = n->src[k];
@@ -7700,7 +7700,7 @@ static int ggml_cuda_gdn_reader_kind(const ggml_cgraph * cgraph, int j, int k, c
     return -1;
 }
 
-// k15-fn: the gated_delta_net (non-KDA, one sequence, not the mma kernel) that is the only reader of t (through views of t; its src[k] a
+// the gated_delta_net (non-KDA, one sequence, not the mma kernel) that is the only reader of t (through views of t; its src[k] a
 // contiguous whole view of t), or -1. GGML_CUDA_GDN_READER_INDEX=0: a scan of every node after i per call (the same answer)
 static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const ggml_tensor * t, int k_expected) {
     static const bool use_index = getenv("GGML_CUDA_GDN_READER_INDEX") == nullptr || atoi(getenv("GGML_CUDA_GDN_READER_INDEX")) != 0;
@@ -7747,7 +7747,7 @@ static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const gg
 
 static bool ggml_cuda_gdn_sigmoid_deferred(const ggml_cgraph * cgraph, int i);
 
-// k15-fn: no node between i and j writes over the bytes of t (the allocator may reuse them once their last planned reader ran); a beta
+// no node between i and j writes over the bytes of t (the allocator may reuse them once their last planned reader ran); a beta
 // sigmoid that its gated_delta_net applies itself (ggml_cuda_gdn_sigmoid_deferred) writes nothing
 static bool ggml_cuda_kept_until(const ggml_cgraph * cgraph, int i, int j, const ggml_tensor * t, bool skip_deferred = false) {
     for (int m = i + 1; m < j; ++m) {
@@ -7769,7 +7769,7 @@ static bool ggml_cuda_kept_until(const ggml_cgraph * cgraph, int i, int j, const
     return true;
 }
 
-// k15-fn: the beta sigmoid at node i is applied by the gated_delta_net that reads it (ggml_cuda_try_gdn_gates), so it is not run
+// the beta sigmoid at node i is applied by the gated_delta_net that reads it (ggml_cuda_try_gdn_gates), so it is not run
 static bool ggml_cuda_gdn_sigmoid_deferred(const ggml_cgraph * cgraph, int i) {
     static const bool enabled = getenv("GGML_CUDA_GDN_GATES") == nullptr || atoi(getenv("GGML_CUDA_GDN_GATES")) != 0;
     const ggml_tensor * node = cgraph->nodes[i];
@@ -7785,7 +7785,7 @@ static bool ggml_cuda_gdn_sigmoid_deferred(const ggml_cgraph * cgraph, int i) {
     return j >= 0 && ggml_cuda_kept_until(cgraph, i, j, raw);
 }
 
-// k15-fn (GGML_CUDA_GDN_GATES=0 off): the delta-net gates beta = sigmoid(b) and g = softplus(a + dt_bias) * A, each read only by a
+// (GGML_CUDA_GDN_GATES=0 off): the delta-net gates beta = sigmoid(b) and g = softplus(a + dt_bias) * A, each read only by a
 // gated_delta_net, are applied by that kernel to its raw inputs: two launches fewer per layer (Qwen3.8-Flash-Next: 72 per verify), the
 // same float operations, so bitwise. Returns the nodes covered (1 for the sigmoid, 3 for ADD -> SOFTPLUS -> MUL), 0 if not applicable
 static int ggml_cuda_try_gdn_gates(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
@@ -7846,7 +7846,7 @@ static int ggml_cuda_try_gdn_gates(ggml_backend_cuda_context * cuda_ctx, const g
 
 static bool ggml_cuda_side_mv_run(const ggml_tensor * node);
 
-// k15-mm2: the same for the F32 / BF16 vector kernel (ggml_cuda_mul_mat_vec_f_multi): products of one weight type and K over one
+// the same for the F32 / BF16 vector kernel (ggml_cuda_mul_mat_vec_f_multi): products of one weight type and K over one
 // activation, e.g. a gated delta net layer's alpha + beta, the router + the shared expert gate, the indexer q + k. Each output gets
 // the bytes of its own launch; the lookahead and the overlap rules are those of ggml_cuda_try_fuse_mmvq_multi. Products the side
 // stream runs (single column, ggml_cuda_side_mv_run) and K >= 4096 (the split-K launch) are left alone.
@@ -7867,7 +7867,7 @@ static bool ggml_cuda_mmvf_multi_candidate(const ggml_tensor * node) {
     return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && src0->op == GGML_OP_NONE && src0->view_src == nullptr &&
         ggml_is_contiguous(src0) && ggml_is_matrix(src0) && src0->ne[0] < 4096 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
         src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= 1 && src1->ne[1] <= MMVF_MAX_BATCH_SIZE && !ggml_is_empty(node) &&
-        ggml_is_contiguous(node) && !ggml_cuda_side_mv_run(node); // k19-vrow3: 5..8 columns only where ggml_cuda_mul_mat_vec_f_multi_ok takes them (GGML_CUDA_VERIFY_WIDE)
+        ggml_is_contiguous(node) && !ggml_cuda_side_mv_run(node); // 5..8 columns only where ggml_cuda_mul_mat_vec_f_multi_ok takes them (GGML_CUDA_VERIFY_WIDE)
 }
 
 // node goes to ggml_cuda_mul_mat_vec_f in ggml_cuda_mul_mat (same dispatch, see there)
@@ -7973,7 +7973,7 @@ static int ggml_cuda_try_fuse_mmvf_multi(ggml_backend_cuda_context * cuda_ctx, g
     return run;
 }
 
-// k15-fn (GGML_CUDA_DISABLE_QSA_IDX_FUSION=1 off): the QSA dead-slot index map of each layer, i32 -> f32 cast, (idx - dump) * live + dump,
+// (GGML_CUDA_DISABLE_QSA_IDX_FUSION=1 off): the QSA dead-slot index map of each layer, i32 -> f32 cast, (idx - dump) * live + dump,
 // f32 -> i32 cast (5 launches), as one kernel. The same float operations in the same order, rounded as the separate kernels round
 // them (explicit _rn intrinsics, no contraction into an FMA), and the casts as ggml_cuda_cast does them
 static __global__ void k_qsa_idx_select(const int32_t * __restrict__ idx, const float * __restrict__ dump, const float * __restrict__ live,
@@ -8005,8 +8005,8 @@ static __global__ void k_qsa_idx_select_staged(const int32_t * __restrict__ idx,
 }
 
 static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    // (before the overlap rule below the 8k / 16k md5 on G4 fn4 IQ4_XS 32 GB Studio varied from launch to launch: k15gd2_g4, k15ge_g4;
-    // with it stable and equal to the kill switch, k15gv_g4)
+    // (before the overlap rule below the 8k / 16k md5 on RTX PRO 6000 IQ4_XS 32 GB Studio varied from launch to launch;
+    // with it stable and equal to the kill switch)
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_IDX_FUSION");
     if (disabled || i + 4 >= cgraph->n_nodes) {
         return 0;
@@ -8042,7 +8042,7 @@ static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml
     // the allocator may place c2 in memory freed inside the chain (live after the mul, dump after the add): the separate kernels finish
     // reading it first, one grid would race with its other threads unless c2 starts exactly where the input does (element i of both
     // belongs to thread i). Then one block stages every result before writing any (decode / verify sizes), else no fusion.
-    // G4 fn4 32 GB: 8k md5 changed from launch to launch without this (k15gd2_g4, k15ge_g4); 8 of 12 layers overlap in the fn1 verify graph
+    // RTX PRO 6000 4-bit MoE 32 GB: 8k md5 changed from launch to launch without this; 8 of 12 layers overlap in the verify graph
     bool overlap = false;
     for (const ggml_tensor * in : { c1->src[0], sub->src[1], mul->src[1] }) {
         overlap = overlap || (in->data != c2->data && ggml_cuda_tensors_overlap(in, c2));
@@ -8064,7 +8064,7 @@ static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml
     return 4;
 }
 
-// k15-fn (GGML_CUDA_DISABLE_QSA_SEL_FUSION=1 off): the rest of a QSA layer's selection chain in the launch of its index map. From the
+// (GGML_CUDA_DISABLE_QSA_SEL_FUSION=1 off): the rest of a QSA layer's selection chain in the launch of its index map. From the
 // top-k pools to the i32 cell index of every slot (llama_model_qwen4exp::graph::build_qsa_sel):
 //   sel_idx = concat(get_rows(pools, top_k), tail)                                   member cells of the top pools, then the tail
 //   live    = concat(repeat(clamp(scale(get_rows(score, top_k)))), clamp(scale(cast(tail))))
@@ -8109,7 +8109,7 @@ static __global__ void k_qsa_sel_chain(const ggml_backend_cuda_context::qsa_sel_
     }
 }
 
-// k15-fn (GGML_CUDA_QSA_SEL_GRID=0: the staged single block always): the output overlaps no input (the keep-alive table keeps them
+// (GGML_CUDA_QSA_SEL_GRID=0: the staged single block always): the output overlaps no input (the keep-alive table keeps them
 // apart), so each thread writes its own element: one thread per element over a grid instead of one block looping over all of them
 static __global__ void k_qsa_sel_chain_grid(const ggml_backend_cuda_context::qsa_sel_args a, int32_t * __restrict__ dst, const int n) {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
@@ -8322,7 +8322,7 @@ static void ggml_cuda_qsa_sel_launch(ggml_backend_cuda_context * cuda_ctx, const
     CUDA_CHECK(cudaGetLastError());
 }
 
-// k15-fn (GGML_CUDA_DISABLE_SET_ROWS_PAIR=1 off): a SET_ROWS whose next compute node is another SET_ROWS of the same types (the K and
+// (GGML_CUDA_DISABLE_SET_ROWS_PAIR=1 off): a SET_ROWS whose next compute node is another SET_ROWS of the same types (the K and
 // V cache stores of an attention layer, the two index-cache stores of a QSA layer) runs with it in one launch. Neither reads or writes
 // the tensor the other writes (different view roots), so the order between them does not matter. Returns the extra nodes covered.
 static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
@@ -8369,7 +8369,7 @@ static int ggml_cuda_try_fuse_set_rows_pair(ggml_backend_cuda_context * cuda_ctx
     return j - i;
 }
 
-// k15-mm2: SCALE / SILU chain (each node read only by the next) -> MUL_MAT whose src1 is the chain end, a short-K dense Q8_0
+// SCALE / SILU chain (each node read only by the next) -> MUL_MAT whose src1 is the chain end, a short-K dense Q8_0
 // product of 1..4 columns (the hyper-connection up projection behind silu(scale(down))): the product's blocks apply the chain and
 // quantize its output themselves (ggml_cuda_mul_mat_vec_q_ew), one launch in place of the chain kernel, quantize_q8_1 and
 // mul_mat_vec_q, with the same bytes. Opt-in, GGML_CUDA_MMVQ_EW=1. Returns the number of extra nodes covered.
@@ -8451,10 +8451,10 @@ static bool ggml_cuda_mmvf_dispatch_ok(const ggml_backend_cuda_context * ctx, co
     return ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11);
 }
 
-// k15-mm2: the hyper-connection down projection (Q8_0) and inject product (F32, K = hc*n_embd -> hc rows, split-K) of one mix read the
+// the hyper-connection down projection (Q8_0) and inject product (F32, K = hc*n_embd -> hc rows, split-K) of one mix read the
 // same activation and are adjacent once the side-stream planner moved the inject behind its activation: one launch for both
 // (ggml_cuda_mul_mat_vec_q_inject, same bytes). Node i and the next compute node j; the inject then does not use the side stream.
-// Opt-in, GGML_CUDA_HC_INJECT_DOWN=1: break-even on G4 (k15mm2g4k fn4 32 GB: 128.9 / 115.6 tok/s chat / 8k vs 129.1 / 115.4 off) and
+// Opt-in, GGML_CUDA_HC_INJECT_DOWN=1: break-even on RTX PRO 6000 (4-bit MoE 32 GB: 128.9 / 115.6 tok/s chat / 8k vs 129.1 / 115.4 off) and
 // B200 (-0.4% / -0.1% per decode), inside the noise; it gives up the inject's side-stream overlap for one launch fewer per mix.
 static bool ggml_cuda_hc_inject_down_match(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i, int & j_out,
         ggml_tensor ** q_out, ggml_tensor ** f_out, ggml_cuda_mmvf_splitk_args * inj) {
@@ -8521,7 +8521,7 @@ static int ggml_cuda_try_fuse_hc_inject_down(ggml_backend_cuda_context * cuda_ct
     return j - i;
 }
 
-// k15-mm2: the hyper-connection up projection (Q8_0, gate) and the gated DSV4_HC_PRE reading it (the next compute node): one launch
+// the hyper-connection up projection (Q8_0, gate) and the gated DSV4_HC_PRE reading it (the next compute node): one launch
 // that writes the gate, the mixed stream and its q8_1 copy (ggml_cuda_mul_mat_vec_q_hc_pre, same bytes). Opt-in, GGML_CUDA_HC_UP_PRE=1:
 // slower on B200 at the Flash-Next verify (10.1 us vs 5.4 + 2.3 us for the two launches; the group arrival and the epilogue after the
 // last block of a group cost more than the launch saves).
@@ -8591,7 +8591,7 @@ static int ggml_cuda_try_fuse_hc_up_pre(ggml_backend_cuda_context * cuda_ctx, gg
     return j - i;
 }
 
-// k15-hostcut: consecutive CPY nodes (views between them skipped) with the same shapes and strides that take the generic F32 -> F32
+// consecutive CPY nodes (views between them skipped) with the same shapes and strides that take the generic F32 -> F32
 // element kernel, in one launch (ggml_cuda_cpy_multi): the delta-net conv-state snapshots, n_rs_seq + 1 per layer. No copy may read
 // or overlap what another one writes. Returns the nodes to skip, 0 if not taken
 static int ggml_cuda_try_fuse_cpy_multi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -8641,7 +8641,7 @@ static int ggml_cuda_try_fuse_cpy_multi(ggml_backend_cuda_context * cuda_ctx, gg
     return last - i;
 }
 
-// k19: the next node after j that is not a view / no-op (at most 4 of them skipped), or n_nodes
+// the next node after j that is not a view / no-op (at most 4 of them skipped), or n_nodes
 static int ggml_cuda_k19_next_compute(const ggml_cgraph * cgraph, int j) {
     for (int k = 0; k < 5; ++k) {
         if (++j >= cgraph->n_nodes) {
@@ -8654,7 +8654,7 @@ static int ggml_cuda_k19_next_compute(const ggml_cgraph * cgraph, int j) {
     return cgraph->n_nodes;
 }
 
-// k19: the nodes in (first, last) that are not in idxs are views / no-ops of none of the idxs nodes
+// the nodes in (first, last) that are not in idxs are views / no-ops of none of the idxs nodes
 static bool ggml_cuda_k19_views_between_ok(const ggml_cgraph * cgraph, int first, int last, const int * idxs, int n_idx) {
     for (int j = first + 1; j < last; ++j) {
         bool member = false;
@@ -8680,7 +8680,7 @@ static bool ggml_cuda_k19_views_between_ok(const ggml_cgraph * cgraph, int first
 
 static void ggml_cuda_src1_memo_plan_products(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int j0, const ggml_tensor * mul);
 
-// k19-fu2 F2: the fused gated delta net output norm (RMS_NORM -> MUL -> SIGMOID(z) -> MUL, node ic = the gated product) of a prompt
+// Fusion F2: the fused gated delta net output norm (RMS_NORM -> MUL -> SIGMOID(z) -> MUL, node ic = the gated product) of a prompt
 // batch whose out projection converts it to q8_1 MMQ rows with D4 scales: the norm kernel writes that copy too
 // (ggml_cuda_op_rms_norm_mul_sigmoid_gate_mmq, ggml_cuda_src1_memo), so the product does not quantize it. Same bytes.
 // GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ=1 turns it off; GGML_CUDA_GATED_NORM_MMQ_LOG=1 logs each fused launch (tests).
@@ -8716,7 +8716,7 @@ static bool ggml_cuda_try_gated_norm_mmq(ggml_backend_cuda_context * cuda_ctx, c
     return false;
 }
 
-// k19-fu2 F3: SWIGLU (split gate / up, the routed experts' activation) -> MUL_MAT_ID (the down product) on the MMQ path, prompt batches:
+// Fusion F3: SWIGLU (split gate / up, the routed experts' activation) -> MUL_MAT_ID (the down product) on the MMQ path, prompt batches:
 // the product's gathered quantize computes the SWIGLU itself (swiglu_quantize_mmq_q8_1: the same values and the same q8_1 bytes, the
 // rows placed by the inverse expert map, which sorts the rows as the forward map does), so the SWIGLU kernel, its f32 output and its
 // re-read do not run. Returns the extra nodes covered (0 = not taken). GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID=1 turns it off;
@@ -8809,7 +8809,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // k11-decode: LFM2 short-conv window (b * x into the conv window) and conv * c, small batches (GGML_CUDA_SHORTCONV_FUSE=0: off)
+    // LFM2 short-conv window (b * x into the conv window) and conv * c, small batches (GGML_CUDA_SHORTCONV_FUSE=0: off)
     if (node->op == GGML_OP_MUL) {
         if (const int n = ggml_cuda_try_fuse_shortconv_window(*cuda_ctx, cgraph, i)) {
             return n;
@@ -9044,9 +9044,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         n_fuse++;
 
-        // k19-fusealias: the fused chain reads every input while it writes the last node's output, element by element; an output the
+        // the fused chain reads every input while it writes the last node's output, element by element; an output the
         // allocator placed over an input at a shift (a dead input of an earlier node of the chain: the shared-expert product under the
-        // residual l_out of a MoE layer, q4x T4) is overwritten before other threads read it. Exact in-place (same address and layout)
+        // residual l_out of a MoE layer, 4-bit T4) is overwritten before other threads read it. Exact in-place (same address and layout)
         // is fine. GGML_CUDA_FUSE_ALIAS_STRICT=0: fused anyway
         if (n_fuse > 1 && ggml_cuda_fusion_alias_strict()) {
             const ggml_tensor * last = cgraph->nodes[i + n_fuse - 1];
@@ -9582,7 +9582,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     {
-        // k15-fn: the multi-section rope after a q / k norm (qwen4exp attention + indexer q), in the norm kernel
+        // the multi-section rope after a q / k norm (qwen4exp attention + indexer q), in the norm kernel
         // (GGML_CUDA_DISABLE_NORM_MROPE_FUSION=1 turns it off)
         static const bool mrope_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_NORM_MROPE_FUSION");
         if (!mrope_disabled && node->op == GGML_OP_RMS_NORM &&
@@ -9611,11 +9611,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
-    // k19 (GGML_CUDA_DISABLE_GATED_NORM_Q8=1 off): the gated delta net output norm, RMS_NORM -> MUL (weight) -> UNARY SIGMOID (z) ->
+    // (GGML_CUDA_DISABLE_GATED_NORM_Q8=1 off): the gated delta net output norm, RMS_NORM -> MUL (weight) -> UNARY SIGMOID (z) ->
     // MUL, in one kernel that also writes the q8_1 copy the out projection reads (ggml_cuda_op_rms_norm_mul_sigmoid_gate); before, the
     // norm * weight kernel and the sigmoid * product kernel (with the q8_1 copy). Bitwise the two kernels. View nodes may sit between
     // the four (z's reshape comes right before the sigmoid), as long as they view none of the fused nodes
-    // k19-p1fuse (GGML_CUDA_GATED_NORM_SILU=0 off): also the silu gate of qwen35 / qwen35moe (build_norm_gated), op_silu(z) * g as the
+    // (GGML_CUDA_GATED_NORM_SILU=0 off): also the silu gate of qwen35 / qwen35moe (build_norm_gated), op_silu(z) * g as the
     // unfused unary_mul kernel computes it: the same kernels with the gate expression a template parameter
     static const bool k19_gated_norm_off = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GATED_NORM_Q8");
     if (node->op == GGML_OP_RMS_NORM && !k19_gated_norm_off) {
@@ -9677,7 +9677,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // k19 (GGML_CUDA_DISABLE_L2_NORM_PAIR=1 off): two RMS_NORM -> SCALE pairs of one shape and stride (the gated delta net's q and k L2
+    // (GGML_CUDA_DISABLE_L2_NORM_PAIR=1 off): two RMS_NORM -> SCALE pairs of one shape and stride (the gated delta net's q and k L2
     // norm, build_gdn_l2_norm; the k view node between them) in one launch, bitwise the two launches; neither pair may read or write what
     // the other writes
     static const bool k19_l2_pair_off = ggml_cuda_env_flag("GGML_CUDA_DISABLE_L2_NORM_PAIR");
@@ -9797,7 +9797,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // k15-hostcut: the recurrent state clear and the gather after it (build_rs at a new sequence), see getrows.cuh
+    // the recurrent state clear and the gather after it (build_rs at a new sequence), see getrows.cuh
     if (node->op == GGML_OP_SCALE && cuda_ctx->stream_context().concurrent_events.empty()) {
         int j = i + 1;
         while (j < cgraph->n_nodes && (ggml_cuda_is_view_or_noop(cgraph->nodes[j]) || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
@@ -9842,7 +9842,7 @@ static bool ggml_cuda_side_mv_candidate(const ggml_tensor * node) {
         src1->ne[2] == 1 && src1->ne[3] == 1 && node->type == GGML_TYPE_F32;
 }
 
-// k15-mm2: products of at most 4 rows also at up to GGML_CUDA_SIDE_MV_COLS columns (default 4: the MTP verify windows; 1 = single
+// products of at most 4 rows also at up to GGML_CUDA_SIDE_MV_COLS columns (default 4: the MTP verify windows; 1 = single
 // column only, as before), so a verify's hyper-connection inject and shared expert gate run beside the products after them instead
 // of before them. Wider weights (alpha / beta) keep their multi-matrix launch at several columns. Same kernels, same values.
 static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
@@ -9861,7 +9861,7 @@ static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
     // at several columns only long-K ones (the hc inject, K = 10240): a short-K tiny product (the shared expert gate, K = 2560) joins
     // the multi-matrix launch of its neighbour instead (the router: one launch fewer), GGML_CUDA_SIDE_MV_COLS_MIN_K (default 4096)
     static const int64_t min_k = getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K") ? atoll(getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K")) : 4096;
-    // k19-vrow3: in a verify window of 5..8 rows whose F32 products stay on mmvf (GGML_CUDA_VERIFY_WIDE bit 1) as in a 4-row one (not
+    // in a verify window of 5..8 rows whose F32 products stay on mmvf (GGML_CUDA_VERIFY_WIDE bit 1) as in a 4-row one (not
     // with GGML_CUDA_SIDE_MV_COLS set)
     static const bool cols_env = getenv("GGML_CUDA_SIDE_MV_COLS") != nullptr;
     const int wide_cols = !cols_env && node->src[0]->type == GGML_TYPE_F32 && ncols > max_cols ?
@@ -9895,7 +9895,7 @@ static bool ggml_cuda_side_mv_use(const std::unordered_map<const ggml_tensor *, 
     return true;
 }
 
-// k11: see ggml_cuda_src1_memo. Called before node i runs: drop a held copy that node i does not read, and note whether
+// see ggml_cuda_src1_memo. Called before node i runs: drop a held copy that node i does not read, and note whether
 // node i should keep its converted src1 for the next compute node.
 static bool ggml_cuda_src1_memo_begin(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i, bool allowed) {
     static const bool disabled = getenv("GGML_CUDA_SRC1_MEMO") != nullptr && atoi(getenv("GGML_CUDA_SRC1_MEMO")) == 0;
@@ -9928,7 +9928,7 @@ static void ggml_cuda_src1_memo_end(ggml_backend_cuda_context * ctx) {
     memo.share_next = false;
 }
 
-// k11: a fused RMS_NORM + MUL at node i whose output the next matrix products convert (prompt batches): reserve the copy the
+// a fused RMS_NORM + MUL at node i whose output the next matrix products convert (prompt batches): reserve the copy the
 // first converting product would make and let the norm kernel write it (rms_norm_mul_conv_f32), see ggml_cuda_src1_memo.
 // The products only use it when their own key matches, so a wrong guess here costs the extra writes, not correctness.
 // GGML_CUDA_NORM_CONV=0 turns this part off.
@@ -9985,7 +9985,7 @@ static void ggml_cuda_src1_memo_plan_products(ggml_backend_cuda_context * ctx, c
         size_t  nbytes = 0;
         if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_NVFP4 && src0->type != GGML_TYPE_MXFP4 &&
                 ne11 > MMVQ_MAX_BATCH_SIZE && ggml_cuda_should_use_mmq(src0->type, cc, ne11, 0) &&
-                !ggml_cuda_dense_tc_route(src0, src1, node, cc)) { // k19-tcgemm: that product converts src1 itself
+                !ggml_cuda_dense_tc_route(src0, src1, node, cc)) { // that product converts src1 itself
             const mmq_q8_1_ds_layout layout = mmq_get_q8_1_ds_layout(src0->type);
             if (layout != MMQ_Q8_1_DS_LAYOUT_D4 && layout != MMQ_Q8_1_DS_LAYOUT_DS4) {
                 continue;
@@ -10023,7 +10023,7 @@ static void ggml_cuda_src1_memo_plan_products(ggml_backend_cuda_context * ctx, c
 }
 
 #ifdef USE_CUDA_GRAPH
-// k19-am17an: port of an upstream llama.cpp change by Aman Gupta (am17an), MIT: a captured ggml graph
+// Port of an upstream llama.cpp change by Aman Gupta (am17an), MIT: a captured ggml graph
 // becomes a series of CUDA graphs of about GGML_CUDA_GRAPH_CHUNK_SIZE ggml nodes each (default 512, upstream's), launched one after the
 // other on the same stream, so the GPU starts on the first chunk while the next ones are still being launched (the launch cost of a CUDA
 // graph grows with its size). The same kernels in the same order on one stream: the results do not change.
@@ -10045,7 +10045,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     bool graph_evaluated_or_captured = false;
 
 #ifdef USE_CUDA_GRAPH
-    // k19-am17an: the chunks of this capture before its last one (see ggml_cuda_graph_chunk_size)
+    // the chunks of this capture before its last one (see ggml_cuda_graph_chunk_size)
     const int  chunk_size = ggml_cuda_graph_chunk_size();
     const bool chunking   = use_cuda_graph && cuda_graph_update_required && chunk_size > 0;
     std::vector<cudaGraph_t> chunks_captured;
@@ -10186,7 +10186,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx->side_mv_fork, cudaEventDisableTiming));
                 }
             }
-            // k19-vcost: side-stream branches of this graph (see ggml_cuda_side_chain_plan): first node index -> { last node index, reader index }
+            // side-stream branches of this graph (see ggml_cuda_side_chain_plan): first node index -> { last node index, reader index }
             std::unordered_map<int, std::pair<int, int>> side_chain_at;
             if (!cuda_ctx->side_chain.empty() && stream_ctx.concurrent_events.empty() && use_cuda_graph && cuda_graph_update_required &&
                     cuda_ctx->side_mv_nodes != nullptr && cgraph->n_nodes > 0 && cgraph->nodes >= cuda_ctx->side_mv_nodes &&
@@ -10231,7 +10231,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             };
 
-            cuda_ctx->mmid_route.invalidate(); // k19-p5mmq: maps of another graph (or an earlier run of this one) are not reused
+            cuda_ctx->mmid_route.invalidate(); // maps of another graph (or an earlier run of this one) are not reused
             cuda_ctx->mmvq_done_early.clear();
             cuda_ctx->gdn_state_in_place.clear();
             cuda_ctx->gdn_gates_in.clear();
@@ -10240,7 +10240,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->conv_cat_prompt.clear();
             cuda_ctx->conv_cat_prompt_cpys.clear();
             cuda_ctx->unary_cont_elided.clear();
-            ++ggml_cuda_eval_gen;   // k15-fn: per-pass caches (ggml_cuda_reader_index) are rebuilt on first use
+            ++ggml_cuda_eval_gen;   // per-pass caches (ggml_cuda_reader_index) are rebuilt on first use
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
             ggml_cuda_qsa_sel_plan(cuda_ctx, cgraph);
 #ifdef USE_CUDA_GRAPH
@@ -10248,11 +10248,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif // USE_CUDA_GRAPH
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                // k19-p5mmq: a node writing over the ids of the kept MoE routing maps drops them (the maps' ids are only read by the
+                // a node writing over the ids of the kept MoE routing maps drops them (the maps' ids are only read by the
                 // products in the graphs built here; a group fused into an earlier node is not checked)
                 cuda_ctx->mmid_route.check_node(node);
 #ifdef USE_CUDA_GRAPH
-                // k19-am17an: the next chunk starts here (fused nodes are skipped together, so a cut never splits a fusion), only with no
+                // the next chunk starts here (fused nodes are skipped together, so a cut never splits a fusion), only with no
                 // work open on another stream (see ggml_cuda_graph_chunk_size)
                 if (chunking && i >= chunk_end && !is_concurrent_event_active && !cuda_ctx->side_chain_active && side_mv_pending.empty() &&
                         !cuda_ctx->moe_join_pending && cuda_ctx->curr_stream_no == 0) {
@@ -10495,7 +10495,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
-                bool fused_multi = false; // k15-mm: a multi-matrix mul_mat_vec_q launch took node i (and maybe nodes after it)
+                bool fused_multi = false; // a multi-matrix mul_mat_vec_q launch took node i (and maybe nodes after it)
                 if (nodes_to_skip == 0 && node->op == GGML_OP_MUL_MAT && !is_concurrent_event_active) {
                     int run = ggml_cuda_try_fuse_mmvq_multi(cuda_ctx, cgraph, i);
                     if (run < 0) {
@@ -10608,7 +10608,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
             }
-            // k19-am17an: the chunks of the previous capture go, the first chunk of this one is graph->graph, the others follow it
+            // the chunks of the previous capture go, the first chunk of this one is graph->graph, the others follow it
             for (cudaGraph_t g : graph->chunk_graphs) {
                 if (g != nullptr) {
                     CUDA_CHECK(cudaGraphDestroy(g));
@@ -10635,7 +10635,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
             chunks_captured.clear();
             graph_evaluated_or_captured = true; // CUDA graph has been captured
-            // k15-fn debug (GGML_CUDA_GRAPH_CAPTURE_LOG=1): every capture, with the launches of the key's previous exec
+            // Debug (GGML_CUDA_GRAPH_CAPTURE_LOG=1): every capture, with the launches of the key's previous exec
             static const bool cap_log = getenv("GGML_CUDA_GRAPH_CAPTURE_LOG") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_CAPTURE_LOG")) != 0;
             static int64_t n_captures = 0;
             ++n_captures;
@@ -10644,7 +10644,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     graph_key, cgraph->n_nodes, (long long) graph->n_launch_since_capture);
             }
             graph->n_launch_since_capture = 0;
-            // k15-fn debug (GGML_CUDA_GRAPH_NODE_STATS=1): the node types of each captured graph (a host<->device memcpy node makes the
+            // Debug (GGML_CUDA_GRAPH_NODE_STATS=1): the node types of each captured graph (a host<->device memcpy node makes the
             // launch cost grow with the node count: B200 2000 kernels 5.7 us, with memcpy nodes 102 us)
             static const bool node_stats = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) != 0;
             if (node_stats) {
@@ -10731,12 +10731,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         {
-            // k15-fn debug (GGML_CUDA_HOST_TIMING=N): the host time of the launch call alone, graphs of over 1000 ggml nodes apart
+            // Debug (GGML_CUDA_HOST_TIMING=N): the host time of the launch call alone, graphs of over 1000 ggml nodes apart
             static const int lt_every = getenv("GGML_CUDA_HOST_TIMING") ? atoi(getenv("GGML_CUDA_HOST_TIMING")) : 0;
             static int64_t lt_n[2] = { 0, 0 }, lt_t[2] = { 0, 0 }, lt_nodes[2] = { 0, 0 };
             const int64_t lt0 = lt_every > 0 ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
-            // k19-am17an: the chunks after the first, in order on the same stream
+            // the chunks after the first, in order on the same stream
             for (cudaGraphExec_t chunk : graph->chunk_instances) {
                 CUDA_CHECK(cudaGraphLaunch(chunk, cuda_ctx->stream()));
             }
@@ -10776,7 +10776,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
-// k15-fn debug (GGML_CUDA_HOST_TIMING=N): host time of the graph_compute phases, a summary every N calls with at least 64 nodes
+// Debug (GGML_CUDA_HOST_TIMING=N): host time of the graph_compute phases, a summary every N calls with at least 64 nodes
 struct ggml_cuda_host_timing {
     int every = 0;
     int64_t n = 0, t_check = 0, t_eval = 0, n_graph = 0, n_nodes = 0;
@@ -10786,7 +10786,7 @@ static ggml_cuda_host_timing & ggml_cuda_host_timing_get() { static ggml_cuda_ho
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    const ggml_cuda_verify_graph_scope verify_scope(cgraph); // k19-tpp
+    const ggml_cuda_verify_graph_scope verify_scope(cgraph); // tags the verify graphs of this pass
     ggml_cuda_host_timing & ht = ggml_cuda_host_timing_get();
     const bool ht_on = ht.every > 0 && cgraph->n_nodes >= 64;
     const int64_t ht0 = ht_on ? ggml_time_us() : 0;
@@ -10834,7 +10834,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
-                // k15-fn (GGML_CUDA_GRAPH_DIRECT_RECAPTURE=0: always warm up again): a key whose exec ran at least twice since its capture
+                // (GGML_CUDA_GRAPH_DIRECT_RECAPTURE=0: always warm up again): a key whose exec ran at least twice since its capture
                 // (a stable graph) and whose properties changed (a rebuilt graph: new request, other KV size) is captured again at once,
                 // without the eager warm-up pass; a graph that changes every call never gets there and warms up as before
                 static const bool direct = getenv("GGML_CUDA_GRAPH_DIRECT_RECAPTURE") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_DIRECT_RECAPTURE")) != 0;
@@ -10872,7 +10872,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
-        // k15-fn debug: the copies of this capture only (k19-host: only with the stats on, GGML_CUDA_GRAPH_NODE_STATS >= 3, the only writer
+        // the copies of this capture only (here: only with the stats on, GGML_CUDA_GRAPH_NODE_STATS >= 3, the only writer
         // of the map: an unlocked global map lookup on every capture raced with a capture of another context on another thread)
         static const bool exec_stats_cap = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 3;
         if (exec_stats_cap) {
@@ -10991,7 +10991,7 @@ static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     }
 }
 
-// k19-vcost: side-stream branches of several nodes. A shared expert in a MoE layer (Qwen3.8-Flash-Next, Qwen3.5 / 3.6 MoE, ...) is a
+// side-stream branches of several nodes. A shared expert in a MoE layer (Qwen3.8-Flash-Next, Qwen3.5 / 3.6 MoE, ...) is a
 // product pair of the layer's FFN input x (gate, up), their GLU and the down product of it, read only by the combine at the end of the
 // layer. Its four launches (~10 us per layer at 5..8 rows on an RTX PRO 6000) ran after the router, the top-k and the routed experts,
 // while the router's tiny products and the top-k leave most SMs idle. The branch is moved right after x's producer (before the
@@ -11137,7 +11137,7 @@ static void ggml_cuda_side_chain_plan(ggml_backend_cuda_context * cuda_ctx, ggml
     }
 }
 
-// k16-race: see ggml_backend_cuda_graph_optimize. Returns the last node the fused kernel writes (nullptr: no match) and the inputs it reads
+// see ggml_backend_cuda_graph_optimize. Returns the last node the fused kernel writes (nullptr: no match) and the inputs it reads
 static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int i, std::vector<ggml_tensor *> & inputs) {
     static const bool all_alias = ggml_cuda_env_flag("GGML_CUDA_FUSED_ALIAS");
     if (all_alias) {
@@ -11220,9 +11220,9 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
         }
     }
 
-    // QSA dead-slot index map CPY(i32 -> f32) -> SUB -> MUL -> ADD -> CPY(f32 -> i32) in one kernel (ggml_cuda_try_fuse_qsa_idx, k15-fn):
-    // the index input, dump and live. G4 fn4 32 GB: the map's output landed in memory freed inside the chain at an offset, the 8k md5
-    // varied (k15-fn stages the overlapping case in one block; with the inputs kept alive it does not occur). GGML_CUDA_QSA_IDX_ALIAS=1
+    // QSA dead-slot index map CPY(i32 -> f32) -> SUB -> MUL -> ADD -> CPY(f32 -> i32) in one kernel (ggml_cuda_try_fuse_qsa_idx):
+    // the index input, dump and live. RTX PRO 6000 4-bit MoE 32 GB: the map's output landed in memory freed inside the chain at an offset, the 8k md5
+    // varied (the fusion stages the overlapping case in one block; with the inputs kept alive it does not occur). GGML_CUDA_QSA_IDX_ALIAS=1
     static const bool qsa_alias = ggml_cuda_env_flag("GGML_CUDA_QSA_IDX_ALIAS");
     if (!qsa_alias && n0->op == GGML_OP_CPY && n0->type == GGML_TYPE_F32 && n0->src[0] != nullptr && n0->src[0]->type == GGML_TYPE_I32 &&
             i + 4 < cgraph->n_nodes) {
@@ -11237,10 +11237,10 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
         }
     }
 
-    // SILU / SIGMOID / SOFTPLUS + MUL in one kernel (ggml_cuda_op_unary_mul, also the gated q8_1 producer of k15-mm2): thread i writes
+    // SILU / SIGMOID / SOFTPLUS + MUL in one kernel (ggml_cuda_op_unary_mul, also the gated q8_1 producer): thread i writes
     // product element r*n + c and reads input element r*o + c. The allocator does put the product on the unary input (Qwen3.6 /
     // Flash-Next attn_gated), safe for contiguous rows (each thread reads what it writes), not for a strided input whose elements
-    // other threads still read: such inputs only (none in the current models, so their placement is unchanged). Same rule as k15-mm2
+    // other threads still read: such inputs only (none in the current models, so their placement is unchanged). Same rule as the gated q8_1 producer
     // 35b80a4d1dc. GGML_CUDA_UNARY_MUL_ALIAS=1
     static const bool um_alias = ggml_cuda_env_flag("GGML_CUDA_UNARY_MUL_ALIAS");
     if (!um_alias && n0->op == GGML_OP_UNARY && i + 1 < cgraph->n_nodes) {
@@ -11263,7 +11263,7 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
         }
     }
 
-    // QSA selection chain in one staged block at its index node (ggml_cuda_qsa_sel_plan, k15-fn): the chain's inputs (top_k, pool
+    // QSA selection chain in one staged block at its index node (ggml_cuda_qsa_sel_plan): the chain's inputs (top_k, pool
     // members, tail cells, scores) stay allocated until the index node is, so no node that still runs between the chain's first skipped
     // reader and the index node is placed over them (the plan then never has to refuse a chain for it). GGML_CUDA_QSA_SEL_ALIAS=1
     static const bool qsa_sel_alias = ggml_cuda_env_flag("GGML_CUDA_QSA_SEL_ALIAS");
@@ -11279,7 +11279,7 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
     }
 
     // short convolution (+ bias ADD) + SILU in one launch, which also writes the deferred conv-state copies (ggml_cuda_op_ssm_conv,
-    // ggml_cuda_try_conv_state_defer, k15-fn): the conv input and the weights stay off the SILU output (the allocator could place it in
+    // ggml_cuda_try_conv_state_defer): the conv input and the weights stay off the SILU output (the allocator could place it in
     // the input freed after the convolution: the fused kernel reads the input while it writes). GGML_CUDA_CONV_STATE_ALIAS=1
     static const bool conv_alias = ggml_cuda_env_flag("GGML_CUDA_CONV_STATE_ALIAS");
     if (!conv_alias && n0->op == GGML_OP_SSM_CONV && i + 1 < cgraph->n_nodes) {
@@ -11299,7 +11299,7 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
         }
     }
 
-    // QSA pooled keys in one launch (ggml_cuda_try_fuse_qsa_pool, k15-fn): the member ids, the norm weight, the rope positions and
+    // QSA pooled keys in one launch (ggml_cuda_try_fuse_qsa_pool): the member ids, the norm weight, the rope positions and
     // factors and the scatter rows stay allocated until the scatter is (the kernel writes only the cache). GGML_CUDA_QSA_POOL_ALIAS=1
     static const bool pool_alias = ggml_cuda_env_flag("GGML_CUDA_QSA_POOL_ALIAS");
     if (!pool_alias && n0->op == GGML_OP_GET_ROWS) {
@@ -11314,7 +11314,7 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
         }
     }
 
-    // QSA packed indexer key row in one kernel at its FILL (ggml_cuda_try_fuse_qsa_key_pack, k15-fn): the raw key and the rows stay
+    // QSA packed indexer key row in one kernel at its FILL (ggml_cuda_try_fuse_qsa_key_pack): the raw key and the rows stay
     // allocated until the scatter is. GGML_CUDA_QSA_KEY_PACK_ALIAS=1
     static const bool pack_alias = ggml_cuda_env_flag("GGML_CUDA_QSA_KEY_PACK_ALIAS");
     if (!pack_alias && n0->op == GGML_OP_FILL) {
@@ -11325,7 +11325,7 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
         }
     }
 
-    // CONT of a strided view read by its fused UNARY + MUL instead (ggml_cuda_try_unary_src_cont_elide, k15-fn): the view (and so the
+    // CONT of a strided view read by its fused UNARY + MUL instead (ggml_cuda_try_unary_src_cont_elide): the view (and so the
     // tensor it views) stays allocated until the MUL is. GGML_CUDA_UNARY_SRC_CONT_ALIAS=1
     static const bool cont_alias = ggml_cuda_env_flag("GGML_CUDA_UNARY_SRC_CONT_ALIAS");
     if (!cont_alias && n0->op == GGML_OP_CONT) {
@@ -11336,7 +11336,7 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
         }
     }
 
-    // conv-input CONCAT read by its short convolution instead of run (ggml_cuda_try_conv_cat_elide, k15-fn): the state columns and the
+    // conv-input CONCAT read by its short convolution instead of run (ggml_cuda_try_conv_cat_elide): the state columns and the
     // new tokens stay allocated until the convolution's last output is, so no node between them, nor the convolution's output, is
     // placed over them (the runtime check then never has to refuse it). GGML_CUDA_CONV_CAT_ALIAS=1
     static const bool cat_alias = ggml_cuda_env_flag("GGML_CUDA_CONV_CAT_ALIAS");
@@ -11379,7 +11379,7 @@ static void ggml_cuda_fused_keep_inputs(ggml_cgraph * cgraph, ggml_backend_graph
 }
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
-    const ggml_cuda_verify_graph_scope verify_scope(cgraph); // k19-tpp
+    const ggml_cuda_verify_graph_scope verify_scope(cgraph); // tags the verify graphs of this pass
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     const bool disable_fusion = ggml_cuda_fusion_disabled();
@@ -11501,7 +11501,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     }
 
-    // k16-race: fused kernels whose outputs must not land on the inputs they read. Each matcher below follows the op pattern its
+    // fused kernels whose outputs must not land on the inputs they read. Each matcher below follows the op pattern its
     // fusion takes (ggml_cuda_try_fuse_*) and names the tensors the fused kernel reads and the last node it writes; graph_optimize keeps
     // those inputs alive until that node is allocated, so the allocator places no output (also none in place) over them. The separate
     // kernels each finish reading before the next writes; a fused kernel writes while it (or the kernels around it, with PDL) still
@@ -11880,7 +11880,7 @@ static std::unordered_map<void *, ggml_cuda_host_mapping> & ggml_cuda_host_mappi
     return m;
 }
 
-// k19-ptres: the same mappings ordered by address (start -> end, they never overlap), so ggml_cuda_host_is_mapped is a search, not a
+// the same mappings ordered by address (start -> end, they never overlap), so ggml_cuda_host_is_mapped is a search, not a
 // scan: an MoE cache core registers the expert buffers as ~11k runs, and every host region of a batched expert copy is looked up
 static std::map<uintptr_t, uintptr_t> & ggml_cuda_host_mapping_index() {
     static std::map<uintptr_t, uintptr_t> m;
@@ -12038,7 +12038,7 @@ static void * ggml_cuda_host_map_range(int device, void * ptr, size_t size, void
     return ptr;
 }
 
-// k16: page-locks [ptr, ptr + size) (page-aligned outward) for DMA copies only: read-only and NOT mapped into the device address space, so
+// page-locks [ptr, ptr + size) (page-aligned outward) for DMA copies only: read-only and NOT mapped into the device address space, so
 // the device keeps no page tables for it (the mapped registration of ggml_cuda_host_map_range cost 10-18 MiB of VRAM for 7-9 GiB).
 // Returns the key to release with ggml_backend_cuda_host_unpin, nullptr if the host or the driver refuses (e.g. no read-only registration)
 static void * ggml_backend_cuda_host_pin_range(void * ptr, size_t size) {
@@ -12116,7 +12116,7 @@ struct ggml_backend_cuda_device_context {
 };
 
 // maps host memory into the address space of the device dev (see ggml_cuda_host_map)
-// single-graph MoE mailbox (k11, see ggml-moe-mailbox.h): mapped host memory the device writes and reads, and its device control block
+// single-graph MoE mailbox (see ggml-moe-mailbox.h): mapped host memory the device writes and reads, and its device control block
 // (CUDA only, as its proc address: MUSA has no cudaHostAlloc / cudaHostAllocMapped, HIP has no mailbox kernels)
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static void * ggml_backend_cuda_moe_mailbox_alloc(void * dev, size_t size, void ** mbox_dev, void ** ctl_dev) {
@@ -12811,7 +12811,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MOE_CACHE_LOOKUP:
             return ggml_cuda_moe_cache_lookup_supported(op);
         case GGML_OP_KQ_MASK:
-            if (ggml_get_op_params_i32(op, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL) { // k19-kvlong: ggml_sel_mask
+            if (ggml_get_op_params_i32(op, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL) { // ggml_sel_mask
                 return op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F16 &&
                     ggml_is_contiguous(op->src[1]) && op->src[0]->nb[0] == sizeof(int32_t);
             }
@@ -13220,7 +13220,7 @@ static size_t ggml_backend_cuda_moe_fetch_overlap_min_bytes(ggml_backend_dev_t d
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// k17-small: the compute capability of a CUDA device as major*100 + minor*10 (e.g. 750 for a T4), -1 if dev is not a CUDA device
+// the compute capability of a CUDA device as major*100 + minor*10 (e.g. 750 for a T4), -1 if dev is not a CUDA device
 static int ggml_backend_cuda_dev_compute_capability(ggml_backend_dev_t dev) {
     if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
         return -1;
@@ -13230,7 +13230,7 @@ static int ggml_backend_cuda_dev_compute_capability(ggml_backend_dev_t dev) {
     return cc >= GGML_CUDA_CC_OFFSET_MTHREADS ? -1 : cc;   // NVIDIA only (AMD / Moore Threads carry an offset)
 }
 
-// k19-fitplain: whether a CUDA device drives a display: 1 no display (headless), 0 a display or a display watchdog, -1 unknown.
+// whether a CUDA device drives a display: 1 no display (headless), 0 a display or a display watchdog, -1 unknown.
 // 0 where the device has a kernel run time limit (cudaDevAttrKernelExecTimeout: set by the display watchdog, X / a compositor on
 // Linux, every WDDM device on Windows) or where NVML reports a display initialized on the device (nvmlDeviceGetDisplayActive: an X
 // server / compositor / framebuffer holding screen memory). 1 only where neither holds and NVML answered (Linux), or for a TCC device
@@ -13255,7 +13255,7 @@ static int ggml_cuda_nvml_display(const char * pci_bus_id, int & active, int & m
         void * h = nullptr;
         if (f_by_pci(pci_bus_id, &h) == 0 && f_active(h, &active) == 0) {
             // NVML_FEATURE_DISABLED = 0. Display mode (a connector enabled) is logged only: datacenter boards report it enabled with
-            // no display (Colab L4: mode 1, display active 0, no run time limit)
+            // no display (L4: mode 1, display active 0, no run time limit)
             if (f_mode(h, &mode) != 0) {
                 mode = -1;
             }
@@ -13315,7 +13315,7 @@ static int ggml_backend_cuda_dev_headless(ggml_backend_dev_t dev) {
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// k17-small (release-split): mark / trim every memory pool of a CUDA backend (see ggml_cuda_pool::mark / trim); trim synchronizes the
+// release-split: mark / trim every memory pool of a CUDA backend (see ggml_cuda_pool::mark / trim); trim synchronizes the
 // device first and returns the bytes given back. Other backends: nothing (0)
 static size_t ggml_backend_cuda_pool_mark_trim(ggml_backend_t backend, bool trim) {
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
@@ -13327,10 +13327,10 @@ static size_t ggml_backend_cuda_pool_mark_trim(ggml_backend_t backend, bool trim
         CUDA_CHECK(cudaDeviceSynchronize());
     }
     if (!trim) {
-        // the streams a later call may need are created now, while the device has memory for them: G4 4 GB q3m 16k release-split,
+        // the streams a later call may need are created now, while the device has memory for them: RTX PRO 6000 4 GB 3-bit 16k release-split,
         // a prompt checkpoint (state_get_async) inside the released window failed in cudaStreamCreateWithFlags.
-        // k19-tierfix-fit: best effort, as their only purpose is to come before that call: a device already full leaves the rest to be
-        // created where they are used (G4 capped at 8 GB, Qwen3.8-Flash-Next UD-IQ4_XS with the route tail skip off: the CUDA_CHECK
+        // best effort, as their only purpose is to come before that call: a device already full leaves the rest to be
+        // created where they are used (RTX PRO 6000 capped at 8 GB, Qwen3.8-Flash-Next IQ4_XS with the route tail skip off: the CUDA_CHECK
         // here aborted the first 8k prompt, while the release itself needs none of these streams)
         for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
             if (ctx->streams[ctx->device][s] != nullptr) {
@@ -13468,7 +13468,7 @@ static bool ggml_backend_cuda_buffer_restore(ggml_backend_buffer_t buffer) {
 #endif
 }
 
-// k19-int3fix2: whether the few-row MMQ (GGML_CUDA_MMQ_FEW, its AUTO table and env included) would take a dense product of src0 type /
+// whether the few-row MMQ (GGML_CUDA_MMQ_FEW, its AUTO table and env included) would take a dense product of src0 type /
 // ne00 x ne01 over ncols contiguous F32 columns on this device (tests: test-backend-ops VROW_INV compares such verify rows only with the
 // lever off, see test_vrow_inv). Exposed as the "ggml_backend_cuda_mmq_few_takes" proc address
 static bool ggml_backend_cuda_mmq_few_takes(ggml_backend_dev_t dev, enum ggml_type type, int64_t ne00, int64_t ne01, int64_t ncols) {
@@ -13491,7 +13491,7 @@ static bool ggml_backend_cuda_mmq_few_takes(ggml_backend_dev_t dev, enum ggml_ty
     return ggml_cuda_should_use_mmq_few(&src0, &src1, ggml_cuda_info().devices[device].cc);
 }
 
-// k19-g4cbuf: flash attention reads a q8_0 K / V of this device in place up to `rows` query rows (at most 32; 0 = the default 16;
+// flash attention reads a q8_0 K / V of this device in place up to `rows` query rows (at most 32; 0 = the default 16;
 // GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS overrides): set by common's fit for a small device's decode-sized graphs. Exposed as the
 // "ggml_backend_cuda_set_fa_q8_inplace_rows" proc address
 static void ggml_backend_cuda_set_fa_q8_inplace_rows(ggml_backend_dev_t dev, int rows) {
@@ -13623,11 +13623,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_set_tensors_batch_async;
     }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // k19-graph: flash attention reads its KV length (ggml_flash_attn_ext_set_kv_len) at the bits of the unpadded node (fattn.cu)
+    // flash attention reads its KV length (ggml_flash_attn_ext_set_kv_len) at the bits of the unpadded node (fattn.cu)
     if (strcmp(name, "ggml_backend_fa_kv_len") == 0) {
         return (void *)ggml_backend_cuda_fa_kv_len;
     }
-    // k19-fattnq4: two-source flash attention (see ggml_backend_cuda_fa_src2)
+    // two-source flash attention (see ggml_backend_cuda_fa_src2)
     if (strcmp(name, "ggml_backend_fa_src2") == 0) {
         static const bool enabled = getenv("GGML_CUDA_FATTN_SRC2") == nullptr || atoi(getenv("GGML_CUDA_FATTN_SRC2")) != 0;
         return enabled ? (void *)ggml_backend_cuda_fa_src2 : nullptr;
@@ -13717,7 +13717,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
-// k19-q38t (mmvq.cu): applies GGML_CUDA_MMVQ_GRID_SMEM=0 to the device
+// (mmvq.cu): applies GGML_CUDA_MMVQ_GRID_SMEM=0 to the device
 void ggml_cuda_mmvq_grid_init(int device);
 
 ggml_backend_t ggml_backend_cuda_init(int device) {
@@ -13726,7 +13726,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         return nullptr;
     }
 
-    ggml_cuda_mmvq_grid_init(device); // k19-q38t: GGML_CUDA_MMVQ_GRID_SMEM (mmvq.cu)
+    ggml_cuda_mmvq_grid_init(device); // GGML_CUDA_MMVQ_GRID_SMEM (mmvq.cu)
 
     ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
     if (ctx == nullptr) {

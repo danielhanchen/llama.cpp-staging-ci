@@ -21,7 +21,7 @@ static __device__ __forceinline__ bool kq_mask_keep(const int32_t * c, const int
     }
 }
 
-// k19-kvwin (ggml_kq_mask_win): win_mode 1 = without the window cells that have a ring copy (flags), 2 = the ring's window cells only
+// (ggml_kq_mask_win): win_mode 1 = without the window cells that have a ring copy (flags), 2 = the ring's window cells only
 template <typename T>
 static __global__ void kq_mask_kernel(const int32_t * __restrict__ cells, const int32_t * __restrict__ toks, T * __restrict__ dst,
         const int64_t n_kv, const int64_t n_tps, const size_t nb1, const size_t nb3,
@@ -50,7 +50,7 @@ static __global__ void kq_mask_kernel(const int32_t * __restrict__ cells, const 
     }
 }
 
-// k19-kvlong: GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL (ggml_sel_mask). Every cell kq - INFINITY, then the selected cells kq + 0 (one stream, in order),
+// GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL (ggml_sel_mask). Every cell kq - INFINITY, then the selected cells kq + 0 (one stream, in order),
 // each rounded as the f16 add of the chain add(view(set_rows(fill(-inf), fill(0), idx)), kq) it replaces
 static __global__ void sel_mask_fill_kernel(const half * __restrict__ kq, half * __restrict__ dst, const int64_t n_kv,
         const size_t nb1_kq, const size_t nb1_dst) {

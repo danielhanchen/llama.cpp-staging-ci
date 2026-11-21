@@ -60,7 +60,7 @@ static __device__ __forceinline__ int32_t moe_cache_id(const int32_t * ids, cons
     return (uint32_t) e < (uint32_t) n_expert ? e : 0;
 }
 
-// k15-fn: ids with strided rows (s1 elements apart, s1 = ne0 when contiguous), e.g. the view of the router's argsort
+// ids with strided rows (s1 elements apart, s1 = ne0 when contiguous), e.g. the view of the router's argsort
 static __device__ __forceinline__ int32_t moe_cache_id(const int32_t * ids, const int i, const int n_expert, const int ne0, const int s1) {
     const int32_t e = ids[s1 == ne0 ? i : (i / ne0)*s1 + i % ne0];
     return (uint32_t) e < (uint32_t) n_expert ? e : 0;
@@ -93,7 +93,7 @@ static __device__ __forceinline__ void moe_cache_add_u64(int32_t * p, const unsi
     p[1] = (int32_t) (uint32_t) (x >> 32);
 }
 
-// k19-g4pref cross-layer prefetch (ggml_moe_cache_prefetch, op mode 8). A prefetch runs the assign below as a plain lookup of predicted
+// cross-layer prefetch (ggml_moe_cache_prefetch, op mode 8). A prefetch runs the assign below as a plain lookup of predicted
 // ids (is_pf): it admits them like a lookup but writes no use counters, scores or lookup statistics, at most max_fill experts (0: all).
 // The real lookups and assigns of a group with prefetches count what came of them. mark [n_slots]: MOE_PF_MAGIC while a slot holds an
 // expert a prefetch admitted that no lookup has hit since; ev [n_layer*n_expert]: MOE_PF_MAGIC while an expert a prefetch evicted has
@@ -207,7 +207,7 @@ static __global__ void moe_cache_assign(
     int32_t * fill_s = fill_e + n_ids;
     int32_t * cnt    = counts != nullptr ? counts + (int64_t) il*n_expert : nullptr;
     int32_t * sc     = scores != nullptr ? scores + (int64_t) il*n_expert : nullptr;
-    // k19-q4xcache (ggml_moe_cache_assign_lookup_counts): an assign that stands in for the plain lookup (every miss fetched) leaves the
+    // (ggml_moe_cache_assign_lookup_counts): an assign that stands in for the plain lookup (every miss fetched) leaves the
     // use counters as the lookup does, so the host / fetch ranking of later hybrid batches is the same as without it
     int32_t * cnt_w  = lookup_counts ? nullptr : cnt;
 
@@ -284,7 +284,7 @@ static __global__ void moe_cache_assign(
     // hits: set the reference bit and pin the slot for this lookup
     int n_hit = 0;
     int n_skp = 0;
-    int n_useful = 0; // k19-g4pref counters (pf.mark / pf.ev set)
+    int n_useful = 0; // counters (pf.mark / pf.ev set)
     int n_wasted = 0;
     int n_evmiss = 0;
     for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
@@ -360,7 +360,7 @@ static __global__ void moe_cache_assign(
         take_e = victim + n_ids;
         const int64_t acc = (int64_t) (uint32_t) stat[2] + (int64_t) fetch_q*n_miss;
         n_take = max((int) (acc >> 16), min(n_miss, n_slots - state[6]));
-        // k19-hostrow (LLAMA_MOE_HYBRID_WIDE): a window whose experts may outnumber the slots admits at most the slots this lookup does
+        // (LLAMA_MOE_HYBRID_WIDE): a window whose experts may outnumber the slots admits at most the slots this lookup does
         // not pin (its hits); the rest go to the host. Never binds while the distinct ids fit the slots (every earlier caller)
         int n_pin = n_hit;
         for (int off = MOE_CACHE_LANES/2; off > 0; off >>= 1) {
@@ -401,7 +401,7 @@ static __global__ void moe_cache_assign(
         }
     }
 
-    // k19-g4pref: a prefetch admits at most max_fill of its missing experts (the first ones in the order of the ids: rank-major)
+    // a prefetch admits at most max_fill of its missing experts (the first ones in the order of the ids: rank-major)
     if (pf.is_pf && pf.max_fill > 0 && n_take > pf.max_fill) {
         for (int j = pf.max_fill + lane; j < n_take; j += MOE_CACHE_LANES) {
             row[take_e[j]] = -1;
@@ -415,7 +415,7 @@ static __global__ void moe_cache_assign(
 
     // victims: CLOCK sweep, 32 slots at a time, the slots used by this lookup are skipped
     // there are enough unpinned slots because the number of distinct ids is at most the number of slots
-    // k19-ptres core (ggml_moe_cache_set_core, lo > 0): the victims come from slots [lo, n_slots) only, ns of them; lo = 0: as before
+    // core (ggml_moe_cache_set_core, lo > 0): the victims come from slots [lo, n_slots) only, ns of them; lo = 0: as before
     const int ns = n_slots - lo;
     int h = state[0];
     if (lo > 0 && (h < lo || h >= n_slots)) {
@@ -479,7 +479,7 @@ static __global__ void moe_cache_assign(
         }
         h = h + far + 1 < n_slots ? h + far + 1 : h + far + 1 - ns;
 
-        // k19-ramevict admission margin (hybrid, LLAMA_MOE_CACHE_ADMIT_MARGIN): a missing expert replaces a resident only if its decayed
+        // admission margin (hybrid, LLAMA_MOE_CACHE_ADMIT_MARGIN): a missing expert replaces a resident only if its decayed
         // count beats the victim's by the margin (score > victim*margin_q/65536 + w*margin_add_q/65536); empty slots always admit. The
         // victims were taken in rising score order, the candidates go in falling score order (ties by expert id), so the admitted ones
         // are a prefix of both; the rest go to the host as the experts the fetch share leaves out (the victims keep their experts).
@@ -640,7 +640,7 @@ static __global__ void moe_cache_assign(
             slots[i] = row[moe_cache_id(ids, i, n_expert, ne0, ids_s1)];
         }
         if (counts != nullptr) {
-            // after the copy list: the experts left to the host; k19-l4c deferred admission (ggml_moe_cache_set_defer): every expert that
+            // after the copy list: the experts left to the host; deferred admission (ggml_moe_cache_set_defer): every expert that
             // was not cached before this lookup (the hit slots row), the admitted ones too, which the copies make hits for later batches
             const bool to_host = defer ? fill_s[2*n_ids + i] < 0 : slots[i] < 0;
             fill_s[n_ids + i] = to_host && !skip ? moe_cache_id(ids, i, n_expert, ne0, ids_s1) : -1;
@@ -810,7 +810,7 @@ static __global__ void moe_cache_seed_plan(
         s_new   = 0;
     }
     __syncthreads();
-    // k19-ptres core (lo > 0): the victims come from slots [lo, n_victim) only
+    // core (lo > 0): the victims come from slots [lo, n_victim) only
     if (n_seed == 0 || n_victim <= lo) {
         if (t == 0) {
             out[0] = 0;
@@ -961,7 +961,7 @@ static __global__ void moe_cache_seed_fill(const int32_t * __restrict__ plan, co
     }
 }
 
-#define MOE_PF_MAX_IDS 256 // k19-g4pref: predicted ids per prefetch (see moe_pf_run)
+#define MOE_PF_MAX_IDS 256 // predicted ids per prefetch (see moe_pf_run)
 
 bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
     const int mode    = ggml_get_op_params_i32(op, 10);
@@ -1043,7 +1043,7 @@ static void moe_cache_fetch_launch(cudaStream_t stream, const ggml_tensor * dst,
     CUDA_CHECK(cudaGetLastError());
 }
 
-// k19-g4pref: the n_top experts with the largest logits of each token (ties: the lower expert id, NaN read as -inf), rank-major:
+// the n_top experts with the largest logits of each token (ties: the lower expert id, NaN read as -inf), rank-major:
 // ids[r*n_tokens + t] is the expert of rank r of token t, so the assign meets every token's first choices before any second one
 #define MOE_PF_THREADS 256
 static __global__ void moe_pf_topn(const float * __restrict__ logits, const int n_expert, const int n_top, const int n_tokens,
@@ -1358,7 +1358,7 @@ static void moe_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     p.pending = true;
 }
 
-// single-graph host misses (k11, see ggml_moe_mailbox_publish): flags of the mapped mailbox at system scope
+// single-graph host misses (see ggml_moe_mailbox_publish): flags of the mapped mailbox at system scope
 #if defined(MOE_MAILBOX_OK)
 static __device__ __forceinline__ uint32_t moe_mailbox_load_acquire(const uint32_t * p) {
     uint32_t v;
@@ -1386,7 +1386,7 @@ static __device__ __forceinline__ uint64_t moe_mailbox_ns() {
     return t;
 }
 
-// k19-overlap GGML_MOE_MAILBOX_TIMING=1 (diagnostic, off by default): the publish notes the device time and the merge adds the device
+// GGML_MOE_MAILBOX_TIMING=1 (diagnostic, off by default): the publish notes the device time and the merge adds the device
 // work beside the host and its wait to ggml_moe_mailbox_hdr::tm, which llama_moe_cache reports per layer at exit
 static int ggml_moe_mailbox_timing() {
     static const int on = [] {
@@ -1450,7 +1450,7 @@ static __global__ void moe_mailbox_publish(const int32_t * hid, const int n_ids,
 }
 
 // one block per row [n_embd] of dev: rows on the host wait for the host and add its result
-// k18 (GGML_MOE_MAILBOX_FAST, default on; =0 restores the loop below): with no timeout (what llama_moe_cache passes) only completed is
+// (GGML_MOE_MAILBOX_FAST, default on; =0 restores the loop below): with no timeout (what llama_moe_cache passes) only completed is
 // polled, error every 16th poll and no sleep, so a wait costs one mapped read per poll instead of four plus 100 ns; the host rows are
 // read 16 bytes at a time (a quarter of the mapped reads). The same sums of the same values, in the same order per element.
 static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, const int n_embd, const char * mbox, const int n_used,
@@ -1491,7 +1491,7 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
                     }
                     __nanosleep(100);
                 }
-                // k19-overlap GGML_MOE_MAILBOX_TIMING: the block of the batch's first host row adds this batch to the sums
+                // GGML_MOE_MAILBOX_TIMING: the block of the batch's first host row adds this batch to the sums
                 bool first = timing != 0 && s == 1;
                 for (int r = 0; first && r < row; ++r) {
                     first = hid[r] < 0;
@@ -1587,7 +1587,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
 #endif
 
     if (mode == 8) {
-        moe_pf_run(ctx, dst); // k19-g4pref, see ggml_moe_cache_prefetch
+        moe_pf_run(ctx, dst); // see ggml_moe_cache_prefetch
         return;
     }
     if (mode != 3) {
@@ -1655,7 +1655,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             return;
         }
         if (ggml_get_op_params_i32(dst, 12) == 2) {
-            // k19-l4c deferred admission (ggml_moe_cache_set_defer): the host computes the admitted experts of this batch, the copies only
+            // deferred admission (ggml_moe_cache_set_defer): the host computes the admitted experts of this batch, the copies only
             // fill their slots for later batches. They run on the side stream without a join in the graph: the end of the graph waits
             // for them (moe_join_pending, see ggml_backend_cuda_graph_compute). The assign result is a graph tensor whose memory the
             // nodes after this one may reuse, so the copy list is first copied to a buffer of the context, one entry per layer (the
@@ -1748,7 +1748,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
     GGML_ASSERT(scores == nullptr || (ggml_is_contiguous(scores) && ggml_nelements(scores) == ggml_nelements(map) && grow > 65536 && grow <= 2*65536));
 
     GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ggml_is_contiguous(dst));
-    const int ids_s1 = (int) (ids->nb[1]/sizeof(int32_t)); // k15-fn: rows of ids may be strided
+    const int ids_s1 = (int) (ids->nb[1]/sizeof(int32_t)); // rows of ids may be strided
 
     if (n_ids == 0) {
         return; // for example the last layer of a ubatch without outputs
@@ -1767,7 +1767,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
 #endif // defined(GGML_USE_HIP)
     }
 
-    // k19-ramevict: LLAMA_MOE_CACHE_ADMIT_MARGIN=M (e.g. 1.25; unset / 0 = off) and LLAMA_MOE_CACHE_ADMIT_ADD=A (share of one use's weight,
+    // LLAMA_MOE_CACHE_ADMIT_MARGIN=M (e.g. 1.25; unset / 0 = off) and LLAMA_MOE_CACHE_ADMIT_ADD=A (share of one use's weight,
     // default 0): the admission margin of the hybrid assign with decayed counts (see moe_cache_assign)
     static const int admit_margin_q = [] {
         const char * e = getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN");

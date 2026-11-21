@@ -320,11 +320,11 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-// k19-ampere (GGML_CUDA_VERIFY_WIDE bit 8): the Turing / Ampere table sends some MUL_MAT_IDs of 7..8 tokens to MMQ (IQ3_S from 7: the
+// (GGML_CUDA_VERIFY_WIDE bit 8): the Turing / Ampere table sends some MUL_MAT_IDs of 7..8 tokens to MMQ (IQ3_S from 7: the
 // Flash-Next gate / up of a DFlash2 n_max 6 window). Inside a verify-tagged graph those columns keep the multi-token mmvq kernels a
 // 2..6-row window and every Ada / Blackwell window runs (mul_mat_vec_q_moe_vl for the fused IQ3_S gate / up). Not bit-identical to the
 // MMQ launch it replaces (another f32 summation order: reassociation, KLD-gated)
-// k19-ampmoe: also 8 where the int8 tensor-core MoE kernel (mmvq-moetc.cuh) takes the type inside a verify window
+// also 8 where the int8 tensor-core MoE kernel (mmvq-moetc.cuh) takes the type inside a verify window
 int ggml_cuda_mmvq_mmid_max_batch(ggml_type type, int cc) {
     const int table = get_mmvq_mmid_max_batch(type, cc);
     if (table >= MMVQ_MAX_BATCH_SIZE) {
@@ -335,10 +335,10 @@ int ggml_cuda_mmvq_mmid_max_batch(ggml_type type, int cc) {
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 
-// k19-a80verify (GGML_CUDA_VERIFY_DENSE_MMQ_SM80="min[:mask]", opt-in: unset / 0 = off, "5" = Q6_K from 5 columns): on cc 8.0 (A100 / A30) a dense quantized product
+// (GGML_CUDA_VERIFY_DENSE_MMQ_SM80="min[:mask]", opt-in: unset / 0 = off, "5" = Q6_K from 5 columns): on cc 8.0 (A100 / A30) a dense quantized product
 // of min..8 columns inside a verify-tagged graph runs MMQ (int8 tensor cores) instead of the batched mmvq, for the types of the mask
-// (1 Q6_K, 2 Q8_0, 4 the other K / legacy quants MMQ takes). The A100 mmvq pays every further column of these products in full (Colab
-// A100 80 GB, Qwen3.8-Flash-Next fn4n full card, node trace of a 7-row DFlash2 verify: the 8192-row Q6_K in-projections 87.5 us at 7
+// (1 Q6_K, 2 Q8_0, 4 the other K / legacy quants MMQ takes). The A100 mmvq pays every further column of these products in full (an
+// A100 80 GB, Qwen3.8-Flash-Next at 4 bits, full card, node trace of a 7-row DFlash2 verify: the 8192-row Q6_K in-projections 87.5 us at 7
 // columns vs 47.4 at 3, the dense mat-vecs 1.36 ms of the 2.9 ms each verify row costs). MUL_MAT_IDs keep their
 // rule (ggml_cuda_mmvq_mmid_max_batch); 1..min-1 columns, prompt chunks (untagged graphs) and the exact (batch invariant) verify keep
 // mmvq. Not bit-identical to the mmvq launch it replaces (another f32 order of the same int8 dot products: reassociation, KLD-gated).
@@ -381,7 +381,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (ggml_cuda_verify_dense_mmq_sm80(type, cc, ne11)) {
         return false;
     }
-    // k19-vrow3: a verify window of 5..8 rows keeps mmvq where the tables below send K-quants to MMQ (Blackwell: Q6_K at 8, the lm head
+    // a verify window of 5..8 rows keeps mmvq where the tables below send K-quants to MMQ (Blackwell: Q6_K at 8, the lm head
     // of a DFlash2 n_max 7 window), so its rows keep the sums of a 1..4-row window (GGML_CUDA_VERIFY_WIDE bit 2)
     if (ne11 >= 5 && ne11 <= ggml_cuda_verify_wide_cols(cc, 2)) {
         return true;
@@ -685,15 +685,15 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-// k19-q38t: the IQ3_S / IQ3_XXS grid tables (2 / 1 KiB) in shared memory for the dense mul_mat_vec_q. Each lane looks up 8 grid
+// the IQ3_S / IQ3_XXS grid tables (2 / 1 KiB) in shared memory for the dense mul_mat_vec_q. Each lane looks up 8 grid
 // entries per 32 weights at random indices; from the global table a warp's lookup touches ~14 of the 16 cache lines of iq3s_grid
 // (one L1 wavefront each), from shared memory it costs the bank conflicts of 32 random words (~3-4). On a T4 a 1-column IQ3_S
-// product ran at ~104 GB/s against ~258 GB/s for IQ4_XS (k19-mmvqcols micro-bench), i.e. bound by these lookups. The table
+// product ran at ~104 GB/s against ~258 GB/s for IQ4_XS (micro-bench), i.e. bound by these lookups. The table
 // values, the int arithmetic and the float expressions are those of vec_dot_iq3_s_q8_1 / vec_dot_iq3_xxs_q8_1 (vecdotq.cuh),
 // only the table the entries come from differs, so every output keeps its bytes. GGML_CUDA_MMVQ_GRID_SMEM=0: the global tables
 // (set per device in ggml_backend_cuda_init, ggml_cuda_mmvq_grid_init).
-// k19-small1115: unset = per-arch default: the global tables on compute capability 8.0 (A100: the shared-memory copy measured
-// 0.5-1.4% slower there, q38s no-draft / MTP decode), shared memory on every other arch. GGML_CUDA_MMVQ_GRID_SMEM=1 = shared memory
+// unset = per-arch default: the global tables on compute capability 8.0 (A100: the shared-memory copy measured
+// 0.5-1.4% slower there, Qwen3.8 no-draft / MTP decode), shared memory on every other arch. GGML_CUDA_MMVQ_GRID_SMEM=1 = shared memory
 // on every arch (the previous default), =0 = global tables on every arch. Either table holds the same entries: bytes are unchanged.
 static __device__ int mmvq_grid_smem_off = 0;
 
@@ -701,7 +701,7 @@ void ggml_cuda_mmvq_grid_init(int device);
 
 void ggml_cuda_mmvq_grid_init(int device) {
     const char * e = getenv("GGML_CUDA_MMVQ_GRID_SMEM");
-    const bool arch_off = ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_AMPERE; // k19-small1115: sm_80 default
+    const bool arch_off = ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_AMPERE; // sm_80 default
     if (e != nullptr ? atoi(e) == 0 : arch_off) {
         const int off = 1;
         ggml_cuda_set_device(device);
@@ -793,11 +793,11 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_grid(const uint32_t
     return d * sumi;
 }
 
-// k19-dsv4p (GGML_CUDA_MMVQ_IQ_TAB): IQ1_S / IQ2_XXS single column mat-vec with the codebook in shared memory. Each vec_dot of these
+// (GGML_CUDA_MMVQ_IQ_TAB): IQ1_S / IQ2_XXS single column mat-vec with the codebook in shared memory. Each vec_dot of these
 // types gathers 4 codebook entries at random indices; from global memory (L1) a warp-wide gather of 32 random entries of the 8 KB
 // IQ1_S grid touches ~25 cache lines and is replayed per line, from shared memory it costs a few bank conflicts. The entries and the
 // integer / float arithmetic are those of vec_dot_iq1_s_q8_1 / vec_dot_iq2_xxs_q8_1, so every sum keeps its bytes.
-// k19-iqsmem: also IQ2_XS (iq2xs_grid, 4 KiB) and IQ2_S (iq2s_grid, 8 KiB), under their own switch GGML_CUDA_MMVQ_IQ2_TAB
+// also IQ2_XS (iq2xs_grid, 4 KiB) and IQ2_S (iq2s_grid, 8 KiB), under their own switch GGML_CUDA_MMVQ_IQ2_TAB
 // (mul_mat_vec_q_tab_launch); vec_dot_iq2_xs_q8_1_tab / vec_dot_iq2_s_q8_1_tab are vec_dot_iq2_xs_q8_1 / vec_dot_iq2_s_q8_1 with the
 // entries read from the shared copy (same 64-bit entries, same int / float expressions in the same order)
 static constexpr __host__ __device__ bool mmvq_tab_type(ggml_type type) {
@@ -963,8 +963,8 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_tab(
     return d * sumi;
 }
 
-// the vec_dot of the kernel: with c_tab the shared memory codebook variant of an mmvq_tab_type (k19-dsv4p), the IQ3_S / IQ3_XXS
-// grid through grid (k19-q38t: shared memory, or the global table under GGML_CUDA_MMVQ_GRID_SMEM=0), else vec_dot_q_cuda
+// the vec_dot of the kernel: with c_tab the shared memory codebook variant of an mmvq_tab_type, the IQ3_S / IQ3_XXS
+// grid through grid (shared memory, or the global table under GGML_CUDA_MMVQ_GRID_SMEM=0), else vec_dot_q_cuda
 template <ggml_type type, bool c_tab>
 static __device__ __forceinline__ float mmvq_vec_dot(const void * tab, const uint32_t * grid,
         const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int kbx, const int kqs) {
@@ -999,8 +999,8 @@ static __device__ __forceinline__ float mmvq_vec_dot(const void * tab, const uin
 // rows of one of them exactly as that matrix's own launch would (same warps, rows per block and reduction)
 // c_unroll > 1: the K loop unrolled c_unroll times, so that a thread has the weight loads of several iterations in flight (few rows,
 // long K: the grid covers few SMs and waits on memory latency); every thread adds its blocks in the same order, so the bytes are the same
-// c_tab: the codebook of an mmvq_tab_type in shared memory (k19-dsv4p, mmvq_vec_dot)
-// c_wpr (k19-q4xt): every warp of the block is a block of its own (one warp, c_rpb rows): warp w takes rows
+// c_tab: the codebook of an mmvq_tab_type in shared memory (mmvq_vec_dot)
+// c_wpr: every warp of the block is a block of its own (one warp, c_rpb rows): warp w takes rows
 // c_rpb*(c_wpr*blockIdx.x + w), no shared memory reduction (c_nwarps = c_wpr warps per block, single column only)
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int c_nwarps = 0, int n_multi = 0, int c_rpb = 0, int c_unroll = 1, bool c_ewq = false, bool c_tab = false, int c_wpr = 0>
 __launch_bounds__((c_nwarps > 0 ? c_nwarps : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
@@ -1035,7 +1035,7 @@ static __global__ void mul_mat_vec_q(
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps_red*warp_size / qi;
 
-    // k19-dsv4p: the codebook into shared memory (constant data: before the PDL wait, every thread of the block passes here)
+    // the codebook into shared memory (constant data: before the PDL wait, every thread of the block passes here)
     constexpr bool use_tab = c_tab && mmvq_tab_type(type);
     [[maybe_unused]] const void * tab = nullptr;
     if constexpr (use_tab) {
@@ -1088,19 +1088,19 @@ static __global__ void mul_mat_vec_q(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     ggml_cuda_pdl_sync();
     sample_dst = blockIdx.z;
-    // k11-decode: a single column MUL_MAT_ID launch over several tokens (batch invariant verify) takes the tokens as samples:
+    // a single column MUL_MAT_ID launch over several tokens (batch invariant verify) takes the tokens as samples:
     // token z reads the experts of its ids row (one sample, z = 0: as before)
     if (ncols_dst == 1 && ids) {
         ids += sample_dst*ids_stride;
     }
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
-    // k19-exactdet: the rows of dst, the bound of a partial last row block (rows_per_cuda_block > 1: small K, rows not a multiple of the
+    // the rows of dst, the bound of a partial last row block (rows_per_cuda_block > 1: small K, rows not a multiple of the
     // rows per block). Dense: the column stride. MUL_MAT_ID at one column: the slot stride (stride_col_dst is the token stride there, so
     // the last block of a slot wrote its rows past the expert into the next slot's first rows, which that slot's block also writes: the
     // bytes depended on which block wrote last, and the last slot of the last token wrote past dst)
     const uint32_t nrows_dst = ncols_dst == 1 && ids && !shared_expert ? stride_channel_dst : stride_col_dst;
-    // k19-ikfix: the last row a partial last row block reads. Its rows past nrows_dst read the last row again instead of the bytes after
+    // the last row a partial last row block reads. Its rows past nrows_dst read the last row again instead of the bytes after
     // the matrix (past the end of the weight buffer for the last matrix: an out-of-bounds read); their sums are not stored (the row guard
     // below), the rows that are stored read what they read before, so every output keeps its bytes
     const int i_last = rows_per_cuda_block == 1 ? 0 : max(0, min(rows_per_cuda_block, (int) nrows_dst - row0) - 1);
@@ -1191,7 +1191,7 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
-    // k15-mm2 (c_ewq, see ggml_cuda_mul_mat_vec_q_ew): src1 is the F32 input of a SCALE / SILU chain; the block applies the chain
+    // (c_ewq, see ggml_cuda_mul_mat_vec_q_ew): src1 is the F32 input of a SCALE / SILU chain; the block applies the chain
     // and quantizes the result into shared memory, with the expressions of the chain kernels (ew_chain_apply, scale_f32,
     // unary_op_kernel) and of quantize_q8_1 (one value per lane, the same 32-lane reductions), so y holds the bytes the
     // unfused chain + quantize_q8_1 would have written
@@ -1224,7 +1224,7 @@ static __global__ void mul_mat_vec_q(
         vy = y_ew;
     }
 
-    // k19-q38t: grid table in shared memory (see mmvq_grid_smem_off)
+    // grid table in shared memory (see mmvq_grid_smem_off)
     constexpr int grid_n = mmvq_grid_smem_n(type);
     __shared__ uint32_t grid_sm[grid_n > 0 ? grid_n : 1];
     const uint32_t * grid = grid_sm;
@@ -1433,7 +1433,7 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-// k19-moebw: c_unroll > 1 runs c_unroll K iterations of a lane per pass of its loop (the later ones guarded), so their weight and
+// c_unroll > 1 runs c_unroll K iterations of a lane per pass of its loop (the later ones guarded), so their weight and
 // activation loads are in flight together; a lane still adds its blocks in the same order, so every sum keeps its bytes
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false, int c_unroll = 1>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
@@ -1513,7 +1513,7 @@ static __global__ void mul_mat_vec_q_moe(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
-    // k19-ikfix: rows past nrows_x of a partial last row block read the last row (not the bytes after the expert); their sums are not stored
+    // rows past nrows_x of a partial last row block read the last row (not the bytes after the expert); their sums are not stored
     const int i_last = c_rows_per_block == 1 ? 0 : max(0, min(c_rows_per_block, (int) nrows_x - row0) - 1);
 
     // partial sum for each thread
@@ -1623,7 +1623,7 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
-// k19-vrow: the weight operand of one vec_dot_q_cuda call of a MoE row, decoded once and applied to every token of the expert's group
+// the weight operand of one vec_dot_q_cuda call of a MoE row, decoded once and applied to every token of the expert's group
 // (mul_mat_vec_q_moe_group). apply(y) is the type's vec_dot_q_cuda(vx, y, kbx, kqs) with the weight side precomputed: the same int8
 // dot products into the same int sum and the same float products in the same order, so a token's value is bitwise its own call's.
 // Types without a specialisation keep the call itself (c_dec false, or no decode below)
@@ -1666,7 +1666,7 @@ struct mmvq_moe_wdec<GGML_TYPE_IQ3_S, true> {
                 iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
                 iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
-            // k19-moebw: the signs as in vec_dot_iq3_s_q8_1 (0x01 per negative byte, -g = (g ^ 0xFF) + 1 without a carry)
+            // the signs as in vec_dot_iq3_s_q8_1 (0x01 per negative byte, -g = (g ^ 0xFF) + 1 without a carry)
             const int sb0 = ((signs_packed_8[l0/2] & 0x0F) * 0x00204081) & 0x01010101;
             const int sb1 = ((signs_packed_8[l0/2] >>   4) * 0x00204081) & 0x01010101;
 
@@ -1724,7 +1724,7 @@ struct mmvq_moe_wdec<GGML_TYPE_IQ4_NL, true> {
     }
 };
 
-// k19-vrow: mul_mat_vec_q_moe with the (token, slot) entries grouped by expert. A verify window of T tokens x k slots names fewer
+// mul_mat_vec_q_moe with the (token, slot) entries grouped by expert. A verify window of T tokens x k slots names fewer
 // distinct experts than entries (Flash-Next: ~1.9 x k for T = 3); mul_mat_vec_q_moe gives each entry a warp of its own, which reads and
 // decodes the expert's rows again for every token that chose it. Here the warp of the first entry of an expert (token-major order)
 // takes every entry of that expert, decodes each weight block once and applies it to all of them; the other entries' warps leave.
@@ -1733,7 +1733,7 @@ struct mmvq_moe_wdec<GGML_TYPE_IQ4_NL, true> {
 // Grid: (ceil(nrows_x / (c_rpw*c_nwarps)), nchannels_dst (slots), ncols_dst (tokens)); block (warp_size, c_nwarps), warp y owns c_rpw
 // rows and takes c_group entries of its expert per pass over K (more: further passes over K, the weights then come from L1 / L2).
 // NVIDIA only (ballots on a 32 lane warp); no shared expert
-// k19-moebw: c_unroll > 1 as in mul_mat_vec_q_moe (c_unroll K iterations per pass, the same order of every lane's sums)
+// c_unroll > 1 as in mul_mat_vec_q_moe (c_unroll K iterations per pass, the same order of every lane's sums)
 template <ggml_type type, int c_rpw, int c_nwarps, int c_group, bool c_dec, bool has_fusion, int c_unroll = 1>
 __launch_bounds__(c_nwarps*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe_group(
@@ -1994,13 +1994,13 @@ static __global__ void mul_mat_vec_q_moe_group(
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// k19-moebw: the multi-token routed-expert mat-vec with the weight rows of a warp fetched as whole 16 byte chunks into shared memory
+// the multi-token routed-expert mat-vec with the weight rows of a warp fetched as whole 16 byte chunks into shared memory
 // before any of them is used, then the K loop of mul_mat_vec_q_moe on that copy: lane l takes the K blocks l / (qi / vdr) +
 // n * vdr * 32 / qi with kqs = vdr * (l % (qi / vdr)), sums them in that order, then warp_reduce_sum and the moe epilogue: the same
 // vec_dot_q_cuda calls on the same bytes, so every output is bitwise mul_mat_vec_q_moe's (and mul_mat_vec_q_moe_group's). As in
 // mul_mat_vec_q_moe_group, a warp takes every entry (token, slot) that chose its expert, so an expert's rows are read from DRAM once.
 // Turing has no cp.async: 16 byte loads through registers. On Turing (T4) the multi-token kernels run at ~20% of the DRAM peak and
-// this one is 20-35% faster at 2..8 tokens; on Blackwell (G4) it is slower than the K-unrolled mul_mat_vec_q_moe
+// this one is 20-35% faster at 2..8 tokens; on Blackwell (RTX PRO 6000) it is slower than the K-unrolled mul_mat_vec_q_moe
 // Grid: (ceil(nrows_x / (rpw * nwarps)), slots, tokens); block (32, nwarps); warp y owns rows [row0, row0 + rpw).
 template <ggml_type type, bool has_fusion>
 __launch_bounds__(8*WARP_SIZE)
@@ -2229,7 +2229,7 @@ static __global__ void mul_mat_vec_q_moe_bw(
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// k19-moegrp: the multi-token routed-expert mat-vec with c_tpr threads per row and the entries of an expert c_g at a time, bitwise
+// the multi-token routed-expert mat-vec with c_tpr threads per row and the entries of an expert c_g at a time, bitwise
 // mul_mat_vec_q_moe. That kernel gives a row a warp: lane l (a "virtual lane" here) sums vec_dot_q_cuda over the K blocks
 // l / (qi / vdr) + n * vdr * 32 / qi (kqs = vdr * (l % (qi / vdr))) in that order, then warp_reduce_sum adds lane l ^ o to lane l for
 // o = 16, 8, 4, 2, 1. Here thread t of a row computes the sums of the virtual lanes t + c_tpr * m (m < 32 / c_tpr) in the same order,
@@ -2238,7 +2238,7 @@ static __global__ void mul_mat_vec_q_moe_bw(
 // Each weight operand is decoded once for the c_g entries (mmvq_moe_wdec), a warp holds 32 / c_tpr rows, and as in
 // mul_mat_vec_q_moe_group the block of an expert's first entry (token-major) takes every entry of that expert, the others leave.
 // Grid: (nrows_x / (32 / c_tpr * c_nwarps), slots, tokens); block (32, c_nwarps). NVIDIA only; no shared expert.
-// On G4 it is faster than mul_mat_vec_q_moe_group / mul_mat_vec_q_moe_bw for the IQ3_S gate / up only (mul_mat_vec_q_moe_vl_launch)
+// On the RTX PRO 6000 it is faster than mul_mat_vec_q_moe_group / mul_mat_vec_q_moe_bw for the IQ3_S gate / up only (mul_mat_vec_q_moe_vl_launch)
 template <ggml_type type, int c_tpr, int c_g, int c_nwarps, bool has_fusion>
 __launch_bounds__(c_nwarps*32, 1)
 static __global__ void mul_mat_vec_q_moe_vl(
@@ -2469,7 +2469,7 @@ static constexpr bool mul_mat_vec_q_multi_type(const ggml_type type) {
 }
 
 
-// k15-mm: whether a dense launch of nrows rows (over all channels / samples) of K = ncols_x unrolls its K loop (c_unroll = 8): few
+// whether a dense launch of nrows rows (over all channels / samples) of K = ncols_x unrolls its K loop (c_unroll = 8): few
 // rows and at least two K iterations per thread, where the latency of the weight loads, not the bandwidth, sets the time
 // (GGML_CUDA_MMVQ_UNROLL=0 turns it off)
 template <ggml_type type>
@@ -2542,7 +2542,7 @@ static void mul_mat_vec_q_switch_fusion(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
 
-// k19-moebw: the types whose mul_mat_vec_q_moe has K-unrolled instances (the routed experts of the models we ship)
+// the types whose mul_mat_vec_q_moe has K-unrolled instances (the routed experts of the models we ship)
 static constexpr bool mmvq_moe_unroll_type(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ3_S:
@@ -2558,7 +2558,7 @@ static constexpr bool mmvq_moe_unroll_type(const ggml_type type) {
     }
 }
 
-// k19-ampere, GGML_CUDA_MOE_AMPERE (default 1; 0 = the Blackwell-tuned shapes there too): on sm_80 (A100; measured there only, sm_86 /
+// GGML_CUDA_MOE_AMPERE (default 1; 0 = the Blackwell-tuned shapes there too): on sm_80 (A100; measured there only, sm_86 /
 // sm_87 keep the old rules) the multi-token MoE mat-vecs pick other shapes of the same kernels, every one bitwise the kernel it replaces
 // (test-moe-bw-exact on A100: rpb8_g0 / bw1 / vl16_4 0 floats differ). A100 microbench (test-moe-bw-exact --bench, Flash-Next shapes,
 // 128 experts, P 0.55; us per layer vs the old rule): IQ4_NL down at 5..8 tokens 8 rows per warp block 0.86 / 0.84 / 0.88 / 0.83;
@@ -2580,10 +2580,10 @@ static void mmvq_moe_ampere_log(const char * what, const ggml_type type, const i
     });
 }
 
-// k19-moebw, GGML_CUDA_MOE_UNROLL (default 4; 0 or 1 = off): a multi-token MUL_MAT_ID (verify window) lane runs up to this many of its
+// GGML_CUDA_MOE_UNROLL (default 4; 0 or 1 = off): a multi-token MUL_MAT_ID (verify window) lane runs up to this many of its
 // K iterations per pass (2 or 4), so their loads are in flight together instead of one iteration's at a time; the warps of the MoE
 // kernels are few and short (one row pair per token, 1..4 iterations of K), so they wait on L1TEX / L2 / DRAM latency (Nsight Compute
-// on G4: 40-78% of the stalls). A lane adds its K blocks in the same order, so every output keeps its bytes. 1 for a K of one iteration
+// on the RTX PRO 6000: 40-78% of the stalls). A lane adds its K blocks in the same order, so every output keeps its bytes. 1 for a K of one iteration
 template <ggml_type type>
 static int mmvq_moe_unroll(const int ncols_x, const int warp_size) {
     static const int env = [] {
@@ -2639,9 +2639,9 @@ static void mul_mat_vec_q_moe_launch(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
 
-    // k19-moebw, GGML_CUDA_MOE_RPB (unset = auto, 2 = off, 4 / 8 = always): the rows a warp takes; 4 = fewer and longer blocks (a row's
+    // GGML_CUDA_MOE_RPB (unset = auto, 2 = off, 4 / 8 = always): the rows a warp takes; 4 = fewer and longer blocks (a row's
     // sum is its own: the same lanes, K order and reduction). Auto: 4 for a product without a fused gate whose K is 1..2 iterations of a
-    // lane at 2..4 tokens (the blocks of 2..4 warps of the down projections are too short there: G4 Flash-Next IQ4_NL down 0.71 / 0.86 /
+    // lane at 2..4 tokens (the blocks of 2..4 warps of the down projections are too short there: Flash-Next on the RTX PRO 6000 IQ4_NL down 0.71 / 0.86 /
     // 0.94x the time at 2 / 3 / 4 tokens, Qwen3.6 Q5_K down 0.74 / 0.87 / 0.96x, Q6_K 0.85 / 0.94 / 1.00x; Q8_0 / Q5_K with 3 iterations
     // and every fused gate / up: no gain or slower), else 2. Rows a multiple of 4, no shared expert
     static const int rpb_env = [] {
@@ -2657,7 +2657,7 @@ static void mul_mat_vec_q_moe_launch(
             const int bpi   = vdr * warp_size / qi;
             const int iters = (ncols_x / qk + bpi - 1) / bpi;
             rpb_moe = !has_fusion && iters <= 2 && ncols_dst >= 2 && ncols_dst <= 4 ? 4 : 2;
-            // k19-ampere: sm_80, 5..8 tokens: 8 rows per warp block
+            // sm_80, 5..8 tokens: 8 rows per warp block
             const int cc_rpb = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             if (!has_fusion && iters <= 2 && ncols_dst >= 5 && ncols_dst <= 8 && mmvq_moe_ampere(cc_rpb) && nrows_x % 8 == 0 &&
                     fusion.shared_up == nullptr) {
@@ -2687,7 +2687,7 @@ static void mul_mat_vec_q_moe_launch(
         }
     }
 
-    // k19-moebw: the K iterations a lane runs per pass of its loop (mul_mat_vec_q_moe c_unroll, mmvq_moe_unroll)
+    // the K iterations a lane runs per pass of its loop (mul_mat_vec_q_moe c_unroll, mmvq_moe_unroll)
     const int unroll = mmvq_moe_unroll<type>(ncols_x, warp_size);
 #define MMVQ_MOE_LAUNCH(FUS, UNR) \
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, FUS, UNR>, launch_params, \
@@ -2715,9 +2715,9 @@ static void mul_mat_vec_q_moe_launch(
 #undef MMVQ_MOE_LAUNCH
 }
 
-// k19-vrow: GGML_CUDA_MMVQ_MOE_GROUP (default 1; 0 = mul_mat_vec_q_moe everywhere): a bit mask of the multi-token IQ3_S / IQ4_NL
+// GGML_CUDA_MMVQ_MOE_GROUP (default 1; 0 = mul_mat_vec_q_moe everywhere): a bit mask of the multi-token IQ3_S / IQ4_NL
 // MUL_MAT_IDs that run mul_mat_vec_q_moe_group instead, bitwise the same values: 1 = with a fused gate (gate / up + GLU), 2 = the
-// others (down). Flash-Next shapes on G4, random weights, real-like routing (1.85x top-k distinct experts at 3 tokens), us per layer
+// others (down). Flash-Next shapes on the RTX PRO 6000, random weights, real-like routing (1.85x top-k distinct experts at 3 tokens), us per layer
 // of gate / up + down 3 tokens 49.6 -> 47.0, 5 tokens 69.9 -> 66.2, 6 tokens 82.9 -> 76.5 with
 // bit 1 and the shape below; the grouped down is slower at every shape (its base kernel is 40 registers, all lanes busy on L2 hits),
 // and without shared experts across tokens the grouped gate / up is 2-4% slower.
@@ -2766,7 +2766,7 @@ static void mul_mat_vec_q_moe_group_launch_cfg(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    // k19-moebw, GGML_CUDA_MMVQ_MOE_GROUP_UNROLL (default 3; 0 or 1 = off): the fused gate / up runs up to 3 K iterations per pass
+    // GGML_CUDA_MMVQ_MOE_GROUP_UNROLL (default 3; 0 or 1 = off): the fused gate / up runs up to 3 K iterations per pass
     // (IQ3_S at K 2560: all 3 of a lane's), the same order of its sums
     static const int unroll_env = [] {
         const char * e = getenv("GGML_CUDA_MMVQ_MOE_GROUP_UNROLL");
@@ -2863,13 +2863,13 @@ static bool mul_mat_vec_q_moe_group_launch(
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// k19-moebw, GGML_CUDA_MOE_BW (unset = auto, 0 = off, 1 = on wherever it can run): multi-token MUL_MAT_IDs (2..8 tokens) of IQ3_S /
+// GGML_CUDA_MOE_BW (unset = auto, 0 = off, 1 = on wherever it can run): multi-token MUL_MAT_IDs (2..8 tokens) of IQ3_S /
 // IQ4_NL / IQ4_XS / Q4_K / Q5_K / Q6_K / Q8_0 experts run mul_mat_vec_q_moe_bw, bitwise the same values; NVIDIA Turing and newer (not
 // GB10), no shared expert in the launch, at most 128 (token, slot) entries. Auto: Ampere and newer, the IQ3_S gate / up with a fused
-// gate at 6..8 tokens, where the grouped kernel's per-pass decode costs more than the copy (G4 Flash-Next: 0.976 / 0.950 / 0.933x the
+// gate at 6..8 tokens, where the grouped kernel's per-pass decode costs more than the copy (Flash-Next on the RTX PRO 6000: 0.976 / 0.950 / 0.933x the
 // time of mul_mat_vec_q_moe_group at 6 / 7 / 8 tokens, slower below 5 and for every other type there; mul_mat_vec_q_moe_vl takes
 // that product first unless GGML_CUDA_MOE_VL=0). Not on Turing: on a T4 the
-// kernel is 0.6-0.85x the time of the ones it replaces at 3..8 tokens, but Qwen3.6 UD-Q4_K_XL at 12 GB decodes 1.8% slower with it.
+// kernel is 0.6-0.85x the time of the ones it replaces at 3..8 tokens, but Qwen3.6 at 4 bits (12 GB) decodes 1.8% slower with it.
 // GGML_CUDA_MOE_BW_CFG=rpw,nwarps,bytes picks the shape (0 = auto: rows per warp up to `bytes` (4096) of weights, 4 warps)
 static bool mmvq_moe_bw_on(const int cc, const ggml_type type, const bool fused, const int ntok, bool * ampere_rule = nullptr) {
     static const int env = [] {
@@ -2879,7 +2879,7 @@ static bool mmvq_moe_bw_on(const int cc, const ggml_type type, const bool fused,
     if (env >= 0) {
         return env != 0;
     }
-    // k19-ampere: sm_80 also the IQ3_S gate or up without a fused gate at 5..8 tokens and the fused gate / up at 2
+    // sm_80 also the IQ3_S gate or up without a fused gate at 5..8 tokens and the fused gate / up at 2
     if (mmvq_moe_ampere(cc) && type == GGML_TYPE_IQ3_S && ((!fused && ntok >= 5) || (fused && ntok == 2))) {
         if (ampere_rule) {
             *ampere_rule = true;
@@ -2987,10 +2987,10 @@ static bool mul_mat_vec_q_moe_bw_launch(
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// k19-moegrp, GGML_CUDA_MOE_VL (unset = auto, 0 = off, "tpr,g" = c_tpr threads per row and c_g entries per decode wherever it can
+// GGML_CUDA_MOE_VL (unset = auto, 0 = off, "tpr,g" = c_tpr threads per row and c_g entries per decode wherever it can
 // run): multi-token MUL_MAT_IDs of IQ3_S experts with a fused gate (the Flash-Next gate / up) run mul_mat_vec_q_moe_vl, bitwise the
 // same values; NVIDIA Turing and newer (not GB10), no shared expert, at most 128 entries. Auto: Ampere and newer at 3..8 tokens,
-// 16 threads per row, 2 entries per decode up to 5 tokens and 4 above (G4 Flash-Next, the time of the grouped / staged kernels it
+// 16 threads per row, 2 entries per decode up to 5 tokens and 4 above (Flash-Next on the RTX PRO 6000, the time of the grouped / staged kernels it
 // replaces: 0.92 / 0.90 / 0.88 / 0.90 / 0.90 / 0.91 at 3..8 tokens). The IQ4_NL / Q8_0 downs and the IQ4_XS gate / up measured slower
 // with it at every width (1.04-1.25x), so it has no instances for them
 struct mmvq_moe_vl_cfg {
@@ -3017,7 +3017,7 @@ static mmvq_moe_vl_cfg mmvq_moe_vl_config(const ggml_type type, const bool fused
     if (cc >= GGML_CUDA_CC_AMPERE && type == GGML_TYPE_IQ3_S && fused && ntok >= 3) {
         c.tpr = 16;
         c.g   = ntok <= 5 ? 2 : 4;
-        // k19-ampere: sm_80, 4 entries per decode from 3 tokens
+        // sm_80, 4 entries per decode from 3 tokens
         if (ntok <= 5 && mmvq_moe_ampere(cc)) {
             c.g = 4;
             mmvq_moe_ampere_log("4 entries per decode", type, ntok);
@@ -3154,27 +3154,27 @@ static int mul_mat_vec_q_nwarps_1(const int ncols_x, const bool has_ids, const i
     return calc_nwarps(type, 1, table_id, small_k, halve_iters);
 }
 
-// k19-mmvqcols: more rows per block for a dense 2..8 column launch (speculative verify windows) of the types whose lanes each read one
+// more rows per block for a dense 2..8 column launch (speculative verify windows) of the types whose lanes each read one
 // q8_1 block per 32 weights (IQ3_S, IQ2_XXS, Q3_K): a warp's 32-bit activation load then spans 9 cache lines, the per-column cost of these
 // launches is L1 wavefronts, and the rows of a block share those loads. Rows alone keep every row's sum (the K split and the reduction are
 // per row): bitwise the launch they replace, also on the exact (batch invariant) verify path. Rows per arch from the benches:
-// Turing 8 at 2..8 columns (Kaggle T4); Ampere cc 8.0 4 at 2..8 (Colab A100: 8 lost up to 35%, register
-// pressure); Ada cc 8.9 4 from IQ2_XXS 4, Q3_K 5, IQ3_S 7 columns (Colab L4: below that within +-5%); other archs unchanged until measured.
+// Turing 8 at 2..8 columns (T4); Ampere cc 8.0 4 at 2..8 (A100: 8 lost up to 35%, register
+// pressure); Ada cc 8.9 4 from IQ2_XXS 4, Q3_K 5, IQ3_S 7 columns (L4: below that within +-5%); other archs unchanged until measured.
 // GGML_CUDA_MMVQ_COLS_CFG: unset / AUTO = that table, 0 = off, R4 / R8 = those rows for every listed type, width and NVIDIA table.
 // Returns the rows (0: not taken)
-// k19-q38next: the same lever for the K-quant / IQ4_XS products of a dense model's verify windows (Qwen3.8-27B UD-Q4_K_XL: Q5_K / IQ4_XS
+// the same lever for the K-quant / IQ4_XS products of a dense model's verify windows (Qwen3.8-27B at 4 bits: Q5_K / IQ4_XS
 // / Q4_K / Q6_K, 85% of an L4 MTP pass at 5 rows, each 1.5-1.9x its 1-row launch). Their lanes read 16 bytes of a q8_1 block per load, 8
 // such groups per warp load (~5 cache lines), 6 loads per 16 weights per column: the activation loads of a 5-column launch are ~3x its
 // weight loads in L1 wavefronts, and the rows of a block share them. Rows only: bitwise the launch it replaces (plain, verify-wide,
 // multi-matrix and exact launches). GENERIC table only (Turing sends these widths to MMQ). GGML_CUDA_MMVQ_KQ_ROWS: unset / AUTO = the
 // per-arch table (mmvq_kq_rows_auto), 0 = off, R4 = 4 rows at every 2..8 column width (8 rows lost to register pressure on Ampere / Ada
-// for the IQ types, k19-mmvqcols, and are not compiled for these types); GGML_CUDA_MMVQ_KQ_COLS_MIN (default 2)
+// for the IQ types above, and are not compiled for these types); GGML_CUDA_MMVQ_KQ_COLS_MIN (default 2)
 static constexpr bool mmvq_kq_type(const ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS;
 }
-// AUTO: Ada (cc 8.9) 4 rows at 2..8 columns for all four types: Colab L4, Qwen3.8-27B UD-Q4_K_XL + MTP drafter (5-row verify windows),
+// AUTO: Ada (cc 8.9) 4 rows at 2..8 columns for all four types: L4, Qwen3.8-27B at 4 bits + MTP drafter (5-row verify windows),
 // 3 interleaved launches, chat 34.3 -> 39.5 tok/s, 8k 30.4 -> 35.1 (+15%), text unchanged (default and exact verify). Ampere cc 8.0
-// stays off: on a Colab A100 the 4-row launch of Q4_K / Q5_K / Q6_K at 5 columns ran 1-16% slower (test-mmvqcols-exact --bench, register
+// stays off: on a A100 the 4-row launch of Q4_K / Q5_K / Q6_K at 5 columns ran 1-16% slower (test-mmvqcols-exact --bench, register
 // pressure). Other archs off until measured
 static int mmvq_kq_rows_auto(const ggml_type type, const int ncols_dst, const int cc) {
     GGML_UNUSED(type); GGML_UNUSED(ncols_dst);
@@ -3250,7 +3250,7 @@ static void mul_mat_vec_q_launch_nwarps(
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const int nchannels_dst, const int nsamples_dst, const int warp_size, cudaStream_t stream) {
     static_assert(c_nwarps > 0, "c_nwarps");
-    // k19-mmvqcols: the rows lever for the exact / verify-wide launches (mmvq_cols_rows)
+    // the rows lever for the exact / verify-wide launches (mmvq_cols_rows)
     if constexpr (mmvq_cols_type(type) && c_ncols_dst > 1) {
         const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
         const int r = mmvq_cols_rows(type, c_ncols_dst, table_id);
@@ -3351,7 +3351,7 @@ static int mul_mat_vec_q_exact_batched(
 
 
 
-// k15-mm: rows per block of a 2..8 column launch, by the shape (a row's sum does not depend on it, so every output keeps its bytes):
+// rows per block of a 2..8 column launch, by the shape (a row's sum does not depend on it, so every output keeps its bytes):
 //  - few K blocks per row (the hyper-connection up projection, K = 320): most thread groups have no block, so a block takes as many
 //    rows as it has warps, as the single column small-K launch does (GGML_CUDA_MMVQ_BATCH_SMALL_K=0 turns this off);
 //  - few rows (the hyper-connection down projection, 320 rows of K = 10240): one row per block, so that the grid covers every SM
@@ -3385,7 +3385,7 @@ static int mul_mat_vec_q_batch_rpb(const int ncols_x, const int nrows_x, const i
     return 0;
 }
 
-// k19-vrow3: whether the default launch of ncols_dst columns already gives a row the sums of the 4-warp launch of 1..4 columns: when its
+// whether the default launch of ncols_dst columns already gives a row the sums of the 4-warp launch of 1..4 columns: when its
 // warps cover the K blocks of a row in one pass, lane t of both takes K block t / (qi / vdr) and nothing else, and the 4-warp reduction
 // only adds the +0.0 of its idle warps (the hyper-connection up projection, K = 320: 10 Q8_0 blocks, 16 per pass with 2 warps). The
 // default launch then stays (it is faster there); the values are the same up to the sign of a row sum that is exactly zero
@@ -3397,7 +3397,7 @@ static bool mul_mat_vec_q_wide_same_as_default(const int ncols_x, const int ncol
     return ncols_x / qk <= vdr * calc_nwarps(type, ncols_dst, table_id) * warp_size / qi;
 }
 
-// k19-vrow2 / k19-vrow3: a dense 5..8 column launch of a multi-matrix type (no fusion, no ids) as the 4-column launch makes it, only wider: 4 warps,
+// a dense 5..8 column launch of a multi-matrix type (no fusion, no ids) as the 4-column launch makes it, only wider: 4 warps,
 // the rows per block and K unroll mul_mat_vec_q_batch_rpb / mul_mat_vec_q_unroll pick for 4 columns. A row's sum depends on the warps
 // and the unroll (the K split and order), not on the rows per block. false: not this type / table (the caller falls back)
 template <ggml_type type>
@@ -3424,7 +3424,7 @@ static bool mul_mat_vec_q_verify_wide(
         }
               int  rpb    = mul_mat_vec_q_batch_rpb<type>(ncols_x, nrows_x, 4, cc, warp_size, table_id);
         const bool unroll = mul_mat_vec_q_unroll<type>(ncols_x, (int64_t) nrows_x*nchannels_dst*nsamples_dst, 4, table_id, warp_size);
-        // k19-q38next: the K-quant rows lever (mmvq_kq_rows) where the 4-column rule keeps the default rows and the K loop rolled
+        // the K-quant rows lever (mmvq_kq_rows) where the 4-column rule keeps the default rows and the K loop rolled
         const int  kqr    = rpb == 0 && !unroll ? mmvq_kq_rows(type, ncols_dst, table_id) : 0;
         if (kqr == 4 && nrows_x % kqr == 0) {
             rpb = kqr;
@@ -3457,17 +3457,17 @@ static bool mul_mat_vec_q_verify_wide(
     }
 }
 
-// k19-dsv4p: the single column launch of an mmvq_tab_type with the codebook in shared memory (mul_mat_vec_q c_tab). The warps and the
+// the single column launch of an mmvq_tab_type with the codebook in shared memory (mul_mat_vec_q c_tab). The warps and the
 // K split are those of the launch it replaces, so each row's sum keeps its bytes; the rows per block (which do not change a row's sum)
 // are the small-K rows (= warps) for a small K, GGML_CUDA_MMVQ_TURING_IDS_ROWS (default 2; 1 / 4) for a MUL_MAT_ID launch, which also
-// shares the shared-memory load between more rows, and k16-turing's 2 rows (turing_2rows) or the table's rows for a dense launch.
-// GGML_CUDA_MMVQ_IQ_TAB: 1 (default) = sm_75 binaries on the TURING table (as k16-turing), 0 = off (the launches as before),
+// shares the shared-memory load between more rows, and the Turing 2 rows (turing_2rows) or the table's rows for a dense launch.
+// GGML_CUDA_MMVQ_IQ_TAB: 1 (default) = sm_75 binaries on the TURING table (as the Turing 2-row launch), 0 = off (the launches as before),
 // 2 = every NVIDIA table (a byte check elsewhere, not a tuned setting). No shared-expert fusion, unrolled or wider (halve_iters) launch.
-// k19-iqsmem:
+// Also:
 //  - IQ2_XS / IQ2_S take the same launch under GGML_CUDA_MMVQ_IQ2_TAB (same values 0 / 1 / 2, default 1); a dense launch takes
-//    GGML_CUDA_MMVQ_IQ2_TAB_ROWS rows per block (2 = k16-turing's, default; 4 / 8: the 4 / 8 KiB table load shared by more rows).
-//  - IQ3_S / IQ3_XXS single token MUL_MAT_ID (MoE experts): the grid kernel (k19-q38t, grid in shared memory unless
-//    GGML_CUDA_MMVQ_GRID_SMEM=0) with GGML_CUDA_MMVQ_GRID_IDS rows per block instead of one: unset = 4 (k19-q4xt; 2 before) on sm_75 binaries on the TURING
+//    GGML_CUDA_MMVQ_IQ2_TAB_ROWS rows per block (2 = the Turing default; 4 / 8: the 4 / 8 KiB table load shared by more rows).
+//  - IQ3_S / IQ3_XXS single token MUL_MAT_ID (MoE experts): the grid kernel (grid in shared memory unless
+//    GGML_CUDA_MMVQ_GRID_SMEM=0) with GGML_CUDA_MMVQ_GRID_IDS rows per block instead of one: unset = 4 (2 before) on sm_75 binaries on the TURING
 //    table, off elsewhere; 0 / 1 = off (one row per block, as before); 2 / 4 / 8 = that many rows on every NVIDIA table. A Qwen3.6-35B-A3B
 //    expert row (K 2048) is 8 IQ3_XXS blocks, which half of a block's 4 warps cover; the 1 KiB grid copy is then larger than the row.
 //    Same 4 warps and K split as the one-row launch: bitwise the same outputs.
@@ -3529,7 +3529,7 @@ static bool mul_mat_vec_q_tab_launch(
             if (ids == nullptr || small_k || grid_ids_env == 0 || (grid_ids_env < 0 && !sm75)) {
                 return false;
             }
-            // k19-q4xt: the sm_75 default 4 rows (was 2): q36x on a Kaggle T4, 3 launches, md5 equal, full card chat / 8k +2.3% / +3.3%
+            // the sm_75 default 4 rows (was 2): Qwen3.6 on a T4, 3 launches, md5 equal, full card chat / 8k +2.3% / +3.3%
             // (A/A +0.3% / +0.4%), 12 GB +0.5% / +1.0%, 8 GB +0.3% / +0.4% (inside the A/A there); 8 rows below 4 in 5 of 6 cells
             rpb_force = grid_ids_env > 0 ? grid_ids_env : 4;
         } else {
@@ -3555,7 +3555,7 @@ static bool mul_mat_vec_q_tab_launch(
         if (rpb > 1 && nrows_x % rpb != 0) {   // a block reads the weights of all its rows
             return false;
         }
-        // k19-iqsmem (GGML_CUDA_MMVQ_GRID_IDS_WARPS, default 1; 0 = always 4): an IQ3 MUL_MAT_ID row whose K blocks 2 warps cover in one
+        // (GGML_CUDA_MMVQ_GRID_IDS_WARPS, default 1; 0 = always 4): an IQ3 MUL_MAT_ID row whose K blocks 2 warps cover in one
         // pass (K <= 2048 for IQ3_XXS / IQ3_S: Qwen3.6-35B-A3B's experts) runs with 2 warps. Lane t of both launches then takes K block
         // t / (qi / vdr) and nothing else, and the 4-warp launch only adds the +0.0 of its idle warps (every partial sum starts at +0.0,
         // so none is -0.0 and x + 0.0 == x): bitwise the same row sums from half the threads
@@ -3620,7 +3620,7 @@ static bool mul_mat_vec_q_tab_launch(
                 grid_type ? "iqsmem" : mmvq_tab_iq2_type(type) ? "iqsmem" : "dsv4p", grid_type ? "grid (MUL_MAT_ID rows)" : "codebook",
                 ggml_type_name(type), rpb, ids != nullptr, (int) small_k);
         }
-        // k19-iqsmem: one INFO line per process at the first launch of a new path (engagement, independent of the log switch)
+        // one INFO line per process at the first launch of a new path (engagement, independent of the log switch)
         if constexpr (grid_type || mmvq_tab_iq2_type(type)) {
             static bool engaged = false;
             if (!engaged) {
@@ -3633,7 +3633,7 @@ static bool mul_mat_vec_q_tab_launch(
     }
 }
 
-// k19-q4xt: single token MUL_MAT_ID whose expert rows are short enough that one warp covers a row's K blocks in one pass (the K-quant
+// single token MUL_MAT_ID whose expert rows are short enough that one warp covers a row's K blocks in one pass (the K-quant
 // / Q4_0 / Q5_0 / IQ4 experts of a Qwen3.6-35B-A3B down projection: K 512 = 2 Q5_K blocks, 16 lanes each). The launch it replaces runs
 // 2 (Turing K-quants) or 4 warps per block and only warp 0 has K blocks: the other warps add +0.0 partials (none is -0.0: every partial
 // starts at +0.0) and the block's row count is the resident-block limit's. Here every warp is a block of its own (mul_mat_vec_q c_wpr):
@@ -3759,7 +3759,7 @@ static bool mul_mat_vec_q_wpr_launch(
     }
 }
 
-// k19-ampmoe: set while the batch invariant MUL_MAT_ID columns run (mul_mat_vec_q_switch_ncols_dst), so they never reach mmvq-moetc
+// set while the batch invariant MUL_MAT_ID columns run (mul_mat_vec_q_switch_ncols_dst), so they never reach mmvq-moetc
 static thread_local bool mmvq_moetc_blocked = false;
 
 template <ggml_type type>
@@ -3775,7 +3775,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
 
-    // k15-fv, GGML_CUDA_MMVQ_MOE_ONE=1 (opt-in, changes the single token MUL_MAT_ID sums): one token MUL_MAT_ID runs the multi-token MoE
+    // GGML_CUDA_MMVQ_MOE_ONE=1 (opt-in, changes the single token MUL_MAT_ID sums): one token MUL_MAT_ID runs the multi-token MoE
     // kernel too. That kernel gives each token one warp of its own over the whole K loop, so a token's sums do not depend on the other
     // tokens of the launch: a batch invariant verify batch is then that one launch (in chunks of the kernel's batch limit), no longer
     // one single token launch per token
@@ -3784,7 +3784,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return e != nullptr && atoi(e) != 0;
     }();
     const bool moe_path = moe_one && ids != nullptr && nsamples_x == 1 && nsamples_dst == 1;
-    // k15-fv, GGML_CUDA_VERIFY_REASSOC (default 1; 0 = the bit-exact per-token verify below): a batch invariant verify batch runs the
+    // GGML_CUDA_VERIFY_REASSOC (default 1; 0 = the bit-exact per-token verify below): a batch invariant verify batch runs the
     // ordinary multi-column kernels (MUL_MAT_ID: mul_mat_vec_q_moe; dense without fusion: the batched mmvq). Every row then reads the same
     // q8_1 activations into the same int8 dot products with f32 accumulation as its single token launch, only the order of the f32
     // sums differs (equivalence rule); the dispatcher still never routes these nodes to MMQ / cuBLAS
@@ -3796,7 +3796,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                                 fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr;
     const bool reassoc_path = exact && reassoc && ncols_dst > 1 && (ids != nullptr ? nsamples_x == 1 && nsamples_dst == 1 : !has_fusion_any);
     if ((moe_path || (reassoc_path && ids != nullptr)) && ncols_dst > 1) {
-        // k19-ampmoe: the batch invariant columns below never take the tensor-core MoE kernel (mmvq-moetc.cuh), whatever its mode
+        // the batch invariant columns below never take the tensor-core MoE kernel (mmvq-moetc.cuh), whatever its mode
         struct moetc_guard { bool prev; moetc_guard() : prev(mmvq_moetc_blocked) { mmvq_moetc_blocked = true; } ~moetc_guard() { mmvq_moetc_blocked = prev; } } moetc_g;
         const int cc_m  = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const int max_b = get_mmvq_mmid_max_batch(type, cc_m);
@@ -3825,7 +3825,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, false);
         };
-        // k11-decode: MUL_MAT_ID without a shared expert or biases: one launch of the single token kernel, the tokens as samples (grid z),
+        // MUL_MAT_ID without a shared expert or biases: one launch of the single token kernel, the tokens as samples (grid z),
         // so every block computes what it computes in the token's own launch (GGML_CUDA_MMVQ_EXACT_IDS_MERGE=0: one launch per token)
         static const bool ids_merge = [] {
             const char * e = getenv("GGML_CUDA_MMVQ_EXACT_IDS_MERGE");
@@ -3873,7 +3873,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // rc == 0: the batched launch below
     }
 
-    // k19-vrow2 / k19-vrow3 (GGML_CUDA_VERIFY_WIDE bit 2, see ggml_cuda_verify_wide_cols): a dense product without fusion over 5..8 columns of a
+    // (GGML_CUDA_VERIFY_WIDE bit 2, see ggml_cuda_verify_wide_cols): a dense product without fusion over 5..8 columns of a
     // verify window keeps the 4 warps of 1..4 columns, so its K split is the 3-row window's: the multi-matrix types with the 4-column
     // launch's rows per block and K unroll (mul_mat_vec_q_verify_wide), the others through the batch invariant 4-warp launch
     if (!exact && ids == nullptr && ncols_dst >= 5 &&
@@ -3971,7 +3971,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     };
 
     if (has_ids && (ncols_dst > 1 || moe_path)) {
-        // k19-ampmoe (GGML_CUDA_MOE_TC, mmvq-moetc.cuh): 2..8 tokens of a verify window on int8 tensor cores (NVIDIA Ampere / Ada); not on
+        // (GGML_CUDA_MOE_TC, mmvq-moetc.cuh): 2..8 tokens of a verify window on int8 tensor cores (NVIDIA Ampere / Ada); not on
         // the batch invariant path (exact, or the reassociating chunks above)
         if (!exact && !mmvq_moetc_blocked && ncols_dst > 1 && nsamples_x == 1 && nsamples_dst == 1 &&
                 ggml_cuda_moe_tc_ok(type, ncols_x, ncols_dst, cc, fusion) &&
@@ -3979,7 +3979,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stride_channel_x, stride_channel_y, stride_channel_dst, nchannels_y, nchannels_dst, ncols_dst, ids_stride, stream)) {
             return;
         }
-        // k19-moegrp (GGML_CUDA_MOE_VL): the same values, c_tpr threads per row, an expert's entries c_g per weight decode
+        // (GGML_CUDA_MOE_VL): the same values, c_tpr threads per row, an expert's entries c_g per weight decode
         if (ncols_dst > 1 && nsamples_x == 1 && nsamples_dst == 1 && mul_mat_vec_q_moe_vl_launch<type>(
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
                 stride_row_x, stride_col_y, stride_col_dst,
@@ -3987,7 +3987,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 ncols_dst, ids_stride, nchannels_dst, cc, warp_size, stream)) {
             return;
         }
-        // k19-moebw (Turing by default, GGML_CUDA_MOE_BW): the same values from each warp's weight rows staged in shared memory
+        // (Turing by default, GGML_CUDA_MOE_BW): the same values from each warp's weight rows staged in shared memory
         if (ncols_dst > 1 && nsamples_x == 1 && nsamples_dst == 1 && mul_mat_vec_q_moe_bw_launch<type>(
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
                 stride_row_x, stride_col_y, stride_col_dst,
@@ -3995,7 +3995,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 ncols_dst, ids_stride, nchannels_dst, cc, warp_size, stream)) {
             return;
         }
-        // k19-vrow: the same values, each expert's rows read once for all the tokens that chose it
+        // the same values, each expert's rows read once for all the tokens that chose it
         if (ncols_dst > 1 && mul_mat_vec_q_moe_group_launch<type>(
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
                 stride_row_x, stride_col_y, stride_col_dst,
@@ -4003,7 +4003,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 ncols_dst, ids_stride, warp_size, nchannels_dst, stream)) {
             return;
         }
-        // k19-ampere: more tokens than this device's mul_mat_vec_q_moe instances take (their __launch_bounds__ follow the per-architecture
+        // more tokens than this device's mul_mat_vec_q_moe instances take (their __launch_bounds__ follow the per-architecture
         // table: a verify window kept on mmvq by ggml_cuda_mmvq_mmid_max_batch) run in chunks of that size; each warp owns one token, so
         // every column keeps its bytes
         const int moe_max = get_mmvq_mmid_max_batch(type, cc);
@@ -4031,10 +4031,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return;
     }
 
-    // k15-mm: few rows of a long K: the K loop unrolled (mul_mat_vec_q_unroll)
+    // few rows of a long K: the K loop unrolled (mul_mat_vec_q_unroll)
     const bool unroll = !has_ids && mul_mat_vec_q_unroll<type>(ncols_x, (int64_t) nrows_x*nchannels_dst*nsamples_dst, ncols_dst, table_id, warp_size);
 
-    // k19-mmvqcols: the rows lever (mmvq_cols_rows) for a dense 2..8 column launch without ids or fusion
+    // the rows lever (mmvq_cols_rows) for a dense 2..8 column launch without ids or fusion
     const auto cols_cfg_launch = [&](auto nc_tag) -> bool {
         constexpr int c_ncols_dst = decltype(nc_tag)::value;
         if constexpr (!mmvq_cols_type(type)) {
@@ -4068,7 +4068,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         }
     };
 
-    // k15-mm: a 2..8 column dense launch with other rows per block (mul_mat_vec_q_batch_rpb); false = the default launch
+    // a 2..8 column dense launch with other rows per block (mul_mat_vec_q_batch_rpb); false = the default launch
     const auto batch_rpb_launch = [&](auto nc_tag) -> bool {
         constexpr int c_ncols_dst = decltype(nc_tag)::value;
         if constexpr (!mul_mat_vec_q_multi_type(type)) {
@@ -4127,7 +4127,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream, unroll);
             };
 
-            // k16-turing (GGML_CUDA_MMVQ_TURING_2ROWS, default on): on sm_75 a single column launch takes 2 rows per block, which shares
+            // (GGML_CUDA_MMVQ_TURING_2ROWS, default on): on sm_75 a single column launch takes 2 rows per block, which shares
             // the q8_1 loads of the activation between the rows and adds weight loads in flight. A row's sum does not depend on the rows
             // per block (the K split and the reduction are per row), so the output keeps its bytes. sm_75 binaries only (the TURING table
             // also covers Volta, where it did not gain), not Q3_K, not the small-K / unrolled / MoE (ids) / shared-expert launches, and
@@ -4142,14 +4142,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 calc_rows_per_block(type, 1, table_id) == 1 &&
                 ((turing_2rows_env == 1 && table_id == MMVQ_PARAMETERS_TURING && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
                  (turing_2rows_env == 2 && (table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GENERIC)));
-            // k19-dsv4p: IQ1_S / IQ2_XXS with the codebook in shared memory (mul_mat_vec_q_tab_launch); false = the launches below
+            // IQ1_S / IQ2_XXS with the codebook in shared memory (mul_mat_vec_q_tab_launch); false = the launches below
             if (mul_mat_vec_q_tab_launch<type>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, stride_row_x, stride_col_y,
                     stride_col_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst, ids_stride,
                     should_use_small_k(c_ncols_dst), unroll || should_halve_iters(), turing_2rows, cc, table_id, warp_size, stream)) {
                 break;
             }
-            // k19-q4xt: short expert rows, every warp its own rows (mul_mat_vec_q_wpr_launch); false = the launches below
+            // short expert rows, every warp its own rows (mul_mat_vec_q_wpr_launch); false = the launches below
             if (mul_mat_vec_q_wpr_launch<type>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, stride_row_x, stride_col_y,
                     stride_col_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst, ids_stride,
@@ -4267,10 +4267,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
     }
 }
 
-// k15-mm: n_multi dense matrices of one type and one K that read the same activation, in one launch (see ggml_cuda_mul_mat_vec_q_multi).
+// n_multi dense matrices of one type and one K that read the same activation, in one launch (see ggml_cuda_mul_mat_vec_q_multi).
 // The launch configuration is the one each matrix's own (non batch invariant, or batch invariant with the K split of one column) launch
 // takes; it depends only on the type, K and the number of columns, so every output gets the bytes of that launch.
-// c_nwarps > 0: that many warps (k19-vrow3: 4 for a 5..8 column verify window, as mul_mat_vec_q_verify_wide)
+// c_nwarps > 0: that many warps (4 for a 5..8 column verify window, as mul_mat_vec_q_verify_wide)
 template <ggml_type type, int c_ncols_dst, int n_multi, bool c_small_k = false, bool c_halve_iters = false, int c_rpb = 0, int c_unroll = 1,
           int c_nwarps = 0>
 static void mul_mat_vec_q_multi_launch(
@@ -4319,7 +4319,7 @@ static void mul_mat_vec_q_multi_switch_ncols(
     }
     GGML_UNUSED(rows_min);
     const bool unroll = mul_mat_vec_q_unroll<type>(ncols_x, total_rows, ncols_dst, table_id, warp_size);
-    // k19-q38next: the K-quant rows lever (mmvq_kq_rows) for the Q / K / V and gate / up launches of 2..8 columns: rows only, so every
+    // the K-quant rows lever (mmvq_kq_rows) for the Q / K / V and gate / up launches of 2..8 columns: rows only, so every
     // matrix keeps the bytes of its own launch; only where the rule above keeps the default rows, the K loop rolled and every matrix's
     // rows divide evenly (a block reads all its rows)
     const auto kq_rows = [&](const int nc, const int r0, const bool unr) {
@@ -4341,7 +4341,7 @@ static void mul_mat_vec_q_multi_switch_ncols(
 #define MMVQ_MULTI_L(NC, RPB, UNR) mul_mat_vec_q_multi_launch<type, NC, n_multi, false, false, RPB, UNR>(fusion, nrows, vy, ncols_x, stride_row_x, stride_col_y, warp_size, table_id, stream)
 #define MMVQ_MULTI(NC) (brpb == 1 ? (unroll ? MMVQ_MULTI_L(NC, 1, 8) : MMVQ_MULTI_L(NC, 1, 1)) : brpb == 4 ? MMVQ_MULTI_L(NC, 4, 1) : \
                         unroll ? MMVQ_MULTI_L(NC, 0, 8) : MMVQ_MULTI_L(NC, 0, 1))
-    // k19-vrow3 (GGML_CUDA_VERIFY_WIDE bit 4, see ggml_cuda_verify_wide_cols): 5..8 columns of a verify window keep the 4 warps of 1..4
+    // (GGML_CUDA_VERIFY_WIDE bit 4, see ggml_cuda_verify_wide_cols): 5..8 columns of a verify window keep the 4 warps of 1..4
     // columns, with the rows per block and K unroll of the 4-column launch (a row's sum depends on the warps only), so the Q / K / V and
     // gated delta net in-projections of a deep window get the bytes of a 1..4-row window's, as mul_mat_vec_q_verify_wide for single products
     if (ncols_dst >= 5 && table_id == MMVQ_PARAMETERS_GENERIC && calc_nwarps(type, 4, table_id) == 4 &&
@@ -4616,7 +4616,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
-    // k19-ampere: engagement line (once) of a verify MUL_MAT_ID kept here past the per-architecture table (GGML_CUDA_VERIFY_WIDE bit 8)
+    // engagement line (once) of a verify MUL_MAT_ID kept here past the per-architecture table (GGML_CUDA_VERIFY_WIDE bit 8)
     if (ids && dst->ne[2] > 1 && !(dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) &&
             dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         static std::once_flag once;
@@ -4826,7 +4826,7 @@ void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, const int n,
     GGML_ASSERT(ok);
 }
 
-// k15-mm2: a short-K dense Q8_0 product of 1..4 columns whose F32 src1 is the output of a SCALE / SILU chain (the hyper-connection
+// a short-K dense Q8_0 product of 1..4 columns whose F32 src1 is the output of a SCALE / SILU chain (the hyper-connection
 // up projection, K = 320, behind silu(scale(down))): one launch in place of the chain kernel, quantize_q8_1 and mul_mat_vec_q.
 // Only where the unfused mul_mat_vec_q runs 4 warps (generic and Turing tables, 1..4 columns, batch invariant or not): a row's sum
 // depends on the warps only (rows per block and unrolling do not change it), so every output keeps its bytes.
@@ -4926,7 +4926,7 @@ void ggml_cuda_op_mul_mat_vec_q(
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
 
-// k15-mm2: the hyper-connection mat-vecs of qwen4exp (Flash-Next) next to their neighbours, in one launch each. A Q8_0 row's sum
+// the hyper-connection mat-vecs of qwen4exp (Flash-Next) next to their neighbours, in one launch each. A Q8_0 row's sum
 // depends only on the warps of its block (4 here, as the unfused launch has on the generic and Turing tables at 1..4 columns, also
 // batch invariant, where a column is computed with the warps of a single column launch), not on the rows per block: the kernels
 // below compute every Q8_0 row with the 4-warp K split and reduction of mul_mat_vec_q, so each output keeps its bytes.

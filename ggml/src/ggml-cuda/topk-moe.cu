@@ -439,7 +439,7 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     const int n_experts = logits->ne[0];
     const int n_rows    = logits->ne[1];
 
-    // k19-dsv4: GGML_CUDA_TOPK_MOE_LOG=1 logs every fused launch (test-topk384-exact counts them: a silent fallback fails it)
+    // GGML_CUDA_TOPK_MOE_LOG=1 logs every fused launch (test-topk384-exact counts them: a silent fallback fails it)
     static const bool log_launch = [] {
         const char * e = getenv("GGML_CUDA_TOPK_MOE_LOG");
         return e != nullptr && atoi(e) != 0;
@@ -493,7 +493,7 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
     if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 384 && n_expert != 576) {
         return false;
     }
-    // k19-dsv4: GGML_CUDA_TOPK_MOE_384=0 keeps 384-expert routing (DeepSeek-V4.1) on the unfused path (GGML_CUDA_DISABLE_FUSION=1 turns
+    // GGML_CUDA_TOPK_MOE_384=0 keeps 384-expert routing (DeepSeek-V4.1) on the unfused path (GGML_CUDA_DISABLE_FUSION=1 turns
     // off every fusion)
     static const bool fuse_384 = [] {
         const char * e = getenv("GGML_CUDA_TOPK_MOE_384");

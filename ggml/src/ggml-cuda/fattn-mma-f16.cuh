@@ -389,7 +389,7 @@ static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV,
     return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
 }
 
-// k19-fattnq8 / k19-fattnq4: the in-place code q8_kv of the MMA kernel. 0: f16 K / V (or a staged f16 copy). Else the low 2 bits are
+// the in-place code q8_kv of the MMA kernel. 0: f16 K / V (or a staged f16 copy). Else the low 2 bits are
 // the load mode (1: synchronous loads converting on the way, 2: the raw rows through the cp.async pipeline, converted in shared
 // memory), bit 2 set: K is q4_0 (else q8_0), bit 3 set: V is q4_0 (else q8_0). 1 / 2 are q8_0 K and V as before
 static constexpr __host__ __device__ int  fattn_kvq_mode(const int q8_kv) { return q8_kv & 3; }
@@ -426,7 +426,7 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_i8_compil
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
         const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse, const int q8_kv = 0) {
 #ifdef CP_ASYNC_AVAILABLE
-    // k19-fattnq8: q8_0 K / V (q8_kv 1) loaded synchronously, converted on the way into shared memory; q8_kv 2: the raw q8_0 rows
+    // q8_0 K / V (q8_kv 1) loaded synchronously, converted on the way into shared memory; q8_kv 2: the raw q8_0 rows
     // through the cp.async pipeline of the f16 kernel, converted in shared memory (see flash_attn_ext_q8_load_raw)
     const int nstages_target = ncols2 >= 2 && fattn_kvq_mode(q8_kv) != 1 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
     // sparse gather is not implemented for multi-stage loading
@@ -543,14 +543,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     }
 }
 
-// k19-fattnq8: a K / V tile read from a q8_0 cache in place (or from its raw rows in shared memory, q8_kv 2). KV points at the first
+// a K / V tile read from a q8_0 cache in place (or from its raw rows in shared memory, q8_kv 2). KV points at the first
 // q8_0 block of the head's row, stride_KV is the row stride in bytes, D2 the half2 per row (the whole head: q8_0 tiles are never split
 // along D). Each thread takes a pair of blocks (68 bytes = 17 aligned 32 bit words: rows start 4 byte aligned) and writes their 64
 // values as 8 chunks of 16 bytes into the f16 tile, in the swizzled layout of flash_attn_ext_f16_load_tile (zeros for skipped rows).
 // The value is f16(q) * d in one f16 multiply, the staging conversion's (convert.cu dequantize_block_q8_0_f16: __hmul2 of exact f16
 // operands, rounded once): f16(q) is built exactly as (1024 + (q ^ 0x80)) - 1152, so the tile holds the bits the f16 kernel reads
 // from the staged copy.
-// k19-fattnq4 (is_q4): the same for a q4_0 cache. A pair of q4_0 blocks is 36 bytes = 9 aligned 32 bit words (d of block 0 in the
+// (is_q4): the same for a q4_0 cache. A pair of q4_0 blocks is 36 bytes = 9 aligned 32 bit words (d of block 0 in the
 // low half of w[0], its 16 quant bytes at bytes 2..17; d of block 1 in the high half of w[4], its quants in w[5..8]); value j < 16 of a
 // block is the low nibble of quant byte j, value j + 16 its high nibble. f16(n - 8) is built exactly as (1024 + n) - 1032 and the value
 // is fma(f16(n - 8), d, +0): the exact product rounded once, as the staging conversion (convert.cu dequantize_block_q4_0: d*n - 8*d in
@@ -692,9 +692,9 @@ static __device__ __forceinline__ void flash_attn_ext_q8_load_tile(
     }
 }
 
-// k19-fattnq8 (q8_kv 2): the raw q8_0 rows of a K / V tile (nbatch_fa rows of D2/16 blocks, 16 byte aligned: D 256) into shared
+// (q8_kv 2): the raw q8_0 rows of a K / V tile (nbatch_fa rows of D2/16 blocks, 16 byte aligned: D 256) into shared
 // memory with cp.async, 16 bytes per copy, rows packed at their size; flash_attn_ext_q8_load_tile converts them into the f16 tile.
-// (k19-fattnq4: row_bytes is the size of a row of the type, q8_0 or q4_0)
+// (row_bytes is the size of a row of the type, q8_0 or q4_0)
 template<int nwarps, int nbatch_fa, int row_bytes>
 static __device__ __forceinline__ void flash_attn_ext_q8_load_raw(
         const char * const __restrict__ KV, char * const __restrict__ raw, const int stride_KV, const int k_VKQ_0) {
@@ -1783,7 +1783,7 @@ template<int DKQ, int ncols> struct mma_tile_sizes {
 };
 #endif // defined(TURING_MMA_AVAILABLE)
 
-// k19-fattnq4: the KV loop of flash_attn_ext_f16_process_tile over KV tiles kb0_start .. kb0_stop - 1 of one source (K / V / mask of
+// the KV loop of flash_attn_ext_f16_process_tile over KV tiles kb0_start .. kb0_stop - 1 of one source (K / V / mask of
 // ne11 cells, in-place code q8_kv), with the softmax state (KQ_max, KQ_rowsum, VKQ_C) carried in and out: a two-source node runs it
 // once per source, so its cells are processed exactly as those of one source of the concatenated cells (raw rows packed at the row
 // size of this source's type; the raw buffers of the shared memory layout fit the larger of the two)
@@ -1926,7 +1926,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int zt_gqa,
         const int kb0_start,
         const int kb0_stop,
-        // k19-fattnq4: the second source of a two-source node (q8_kv2 >= 0, see ggml_cuda_fattn_dev_len), its first tile is it1
+        // the second source of a two-source node (q8_kv2 >= 0, see ggml_cuda_fattn_dev_len), its first tile is it1
         const half2  * const __restrict__ K2_h2,
         const half2  * const __restrict__ V2_h2,
         const half   * const __restrict__ mask2_h,
@@ -1977,8 +1977,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr bool raw_kv = fattn_kvq_mode(q8_kv) == 2;
     half2 * tile_V    =           nstages > 1 && !raw_kv ? tile_K + nbatch_fa * stride_tile_K : tile_K;
     half  * tile_mask = (half *) (nstages > 1 && !raw_kv ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
-    // k19-fattnq8 (q8_kv 2): one f16 tile (K, then V), the raw q8_0 (k19-fattnq4: or q4_0) rows of K and V behind it, the mask behind them
-    // (k19-fattnq4: a two-source node's sources share the mode; the raw rows are laid out at the larger row of the two)
+    // (q8_kv 2): one f16 tile (K, then V), the raw q8_0 (or q4_0) rows of K and V behind it, the mask behind them
+    // (a two-source node's sources share the mode; the raw rows are laid out at the larger row of the two)
     constexpr int q8_kv2_l  = q8_kv2 < 0 ? q8_kv : q8_kv2;
     static_assert(fattn_kvq_mode(q8_kv2_l) == fattn_kvq_mode(q8_kv), "the sources of a two-source node share the load mode");
     constexpr int raw_row_K1 = fattn_kvq_row_bytes(DKQ, fattn_kvq_k4(q8_kv)), raw_row_K2 = fattn_kvq_row_bytes(DKQ, fattn_kvq_k4(q8_kv2_l));
@@ -2191,7 +2191,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     __syncthreads();
     }
 
-    // k19-fattnq4: a two-source node (q8_kv2 >= 0): tiles 0 .. it1 - 1 from the first source, it1 .. from the second
+    // a two-source node (q8_kv2 >= 0): tiles 0 .. it1 - 1 from the first source, it1 .. from the second
     if constexpr (q8_kv2 < 0) {
         flash_attn_ext_f16_kv_loop
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, q8_kv,
@@ -2637,24 +2637,24 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
            (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8);
 }
 
-// k19-fattnq8: head sizes with a q8_0 kernel (the tiles of these hold whole rows: nbatch_K2 = DKQ/2, nbatch_V2 = DV/2 in every config)
-// (k19-fattnq4: and head size 64, for q8_0 and q4_0)
+// head sizes with a q8_0 kernel (the tiles of these hold whole rows: nbatch_K2 = DKQ/2, nbatch_V2 = DV/2 in every config)
+// (and head size 64, for q8_0 and q4_0)
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_q8_may_use(
         const int DKQ, const int DV, const bool use_logit_softcap, const bool V_is_K_view) {
     return DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256) && !use_logit_softcap && !V_is_K_view;
 }
 
-// k19-fattnq4: the K / V type bits (fattn_kvq_k4 / fattn_kvq_v4) of the in-place kernels compiled for a tile config: q8_0 K / V at
-// every config (k19-fattnq8), the pairs with a q4_0 K or V only where ncols1 <= 16 (at most 16 query rows: the configs a verify window
+// the K / V type bits (fattn_kvq_k4 / fattn_kvq_v4) of the in-place kernels compiled for a tile config: q8_0 K / V at
+// every config, the pairs with a q4_0 K or V only where ncols1 <= 16 (at most 16 query rows: the configs a verify window
 // can pick, ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1; wider ones never take the in-place path by default)
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_kvq_compiled(const int ncols1, const int kvq_types) {
     return kvq_types == 0 || ncols1 <= 16;
 }
 
-// k19-fattnq8: q8_kv != 0: K and V are q8_0 (the cache itself, read in place, see flash_attn_ext_q8_load_tile), 1 = synchronous
+// q8_kv != 0: K and V are q8_0 (the cache itself, read in place, see flash_attn_ext_q8_load_tile), 1 = synchronous
 // tile loads, 2 = the raw rows through the cp.async pipeline (16 byte aligned rows, f16 kernel with 2 stages, no sparse gather);
 // nb11 / nb21 are then the byte strides of the q8_0 rows
-// k19-fattnq4: q8_kv2 >= 0: a two-source node (ggml_flash_attn_ext_set_src2), the second source (dev_len.K2 / V2 / mask2, in-place code
+// q8_kv2 >= 0: a two-source node (ggml_flash_attn_ext_set_src2), the second source (dev_len.K2 / V2 / mask2, in-place code
 // q8_kv2, the load mode of q8_kv) continues the KV tiles of the first at tile dev_len.it1
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse, int q8_kv, int q8_kv2 = -1>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
@@ -2772,7 +2772,7 @@ static __global__ void flash_attn_ext_f16(
 
     const int stride_V = V_is_K_view ? stride_K : (fattn_kvq_v_raw(q8_kv) ? nb21 : nb21 / sizeof(half2));
 
-    // k19-graph: a padded node with its live KV length on the device (see ggml_cuda_fattn_dev_len): the loop bound and the stream-k
+    // a padded node with its live KV length on the device (see ggml_cuda_fattn_dev_len): the loop bound and the stream-k
     // blocks of the launch at that length; the blocks past them exit. The launched grid (gridDim.x) still lays out the fixup buffer
     int ne11_live = ne11;
     int nblocks   = gridDim.x;
@@ -2785,7 +2785,7 @@ static __global__ void flash_attn_ext_f16(
         }
     }
 
-    // k19-fattnq4: a two-source node loops over the tiles of both sources (no device length, host-checked)
+    // a two-source node loops over the tiles of both sources (no device length, host-checked)
     const int iter_k     = q8_kv2 >= 0 ? dev_len.it1 + dev_len.n_kv2 / nbatch_fa : (ne11_live + (nbatch_fa - 1)) / nbatch_fa;
     const int stride_K2    = q8_kv2 > 0 ? dev_len.nb11_2 : dev_len.nb11_2 / int(sizeof(half2));
     const int stride_V2    = V_is_K_view ? stride_K2 : (q8_kv2 > 0 ? dev_len.nb21_2 : dev_len.nb21_2 / int(sizeof(half2)));
@@ -2916,12 +2916,12 @@ static __global__ void flash_attn_ext_f16(
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
-// k19-fattnq8: the MMA kernel reads this node's q8_0 K / V in place (no staged f16 copy); fattn.cu
+// the MMA kernel reads this node's q8_0 K / V in place (no staged f16 copy); fattn.cu
 bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor * dst);
-// k19-fattnq4: 0 = staged, else the in-place code (mode bits 1, K / V type bits fattn_kvq_k4 / fattn_kvq_v4) for q8_0 / q4_0 K and V;
+// 0 = staged, else the in-place code (mode bits 1, K / V type bits fattn_kvq_k4 / fattn_kvq_v4) for q8_0 / q4_0 K and V;
 // for_alloc: the answer for the graph allocation (the f16 copy is reserved unless every launch of the node reads in place); fattn.cu
 int ggml_cuda_flash_attn_ext_mma_kvq_inplace(const int device, const ggml_tensor * dst, const bool for_alloc);
-// k19-fattnq4: a two-source node's in-place codes: 0 = both sources staged to f16, else code1 | code2 << 8 (fattn.cu)
+// a two-source node's in-place codes: 0 = both sources staged to f16, else code1 | code2 << 8 (fattn.cu)
 int ggml_cuda_flash_attn_ext_src2_codes(const int device, const ggml_tensor * dst, const bool for_alloc);
 // the MMA kernel computes this node's Q*K^T in INT8 over its q8_0 K cache (GGML_CUDA_FATTN_I8); fattn.cu
 bool ggml_cuda_flash_attn_ext_mma_i8(const int device, const ggml_tensor * dst);
@@ -2970,7 +2970,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
-    // k19-p2qsa: the shared memory whose occupancy the sparse launch keeps (0: its own), see GGML_CUDA_FA_SPARSE_SMEM_FIX below
+    // the shared memory whose occupancy the sparse launch keeps (0: its own), see GGML_CUDA_FA_SPARSE_SMEM_FIX below
     size_t sparse_occ_nbytes = 0;
 
     float logit_softcap;
@@ -2998,7 +2998,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                     shared_memory_limit_raised[id] = true;
                 }
 
-                // k19-p2qsa: the sparse kernel loads K / V in one stage (device ggml_cuda_fattn_mma_get_nstages), but the size above is the
+                // the sparse kernel loads K / V in one stage (device ggml_cuda_fattn_mma_get_nstages), but the size above is the
                 // two-stage one. GGML_CUDA_FA_SPARSE_SMEM_FIX (default 1): launch it with the one-stage size, its occupancy (so the stream-k
                 // split) still that of the two-stage size, so every output is bitwise the same; 2: the occupancy of the one-stage size too
                 // (more blocks per SM where shared memory bound them: another KV split, rounding-level); 0: as before
@@ -3060,7 +3060,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const bool async_kv_preload = nstages == 2 && !use_sparse;
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // k19-fattnq4: a two-source node (ggml_flash_attn_ext_set_src2: a q4_0 body and a q8_0 recent-window ring). One
+    // a two-source node (ggml_flash_attn_ext_set_src2: a q4_0 body and a q8_0 recent-window ring). One
     // kernel loops over the KV tiles of both sources with one online softmax, so it computes what the same kernel computes over the
     // concatenated cells (same tiles, stream-k split and fixup). In place where both sources are q4_0 / q8_0 pairs of a compiled
     // combination (body q4_0 / q4_0 or q8_0 / q8_0, ring q8_0 / q8_0) and the rows allow it (ggml_cuda_flash_attn_ext_src2_codes), else
@@ -3125,13 +3125,13 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // k19-fattnq8: q8_0 K / V read in place by a q8_kv instance of the same kernel instead of converting the whole K and V to f16
+    // q8_0 K / V read in place by a q8_kv instance of the same kernel instead of converting the whole K and V to f16
     // first: q8_kv 2 where the f16 kernel pipelines its loads (cp.async, 2 stages; head size 256, 16 byte aligned rows, not sparse):
     // the raw q8_0 rows through the same pipeline and converted to one f16 tile in shared memory; else q8_kv 1: synchronous loads that
     // convert on the way. Both write the f16 values of the staging conversion. The launch geometry (stream-k blocks, fixup) is the f16
     // kernel's: its occupancy at its shared memory, so the KV split, and with the same f16 tiles every MMA and sum, is the staged
     // launch's. GGML_CUDA_FATTN_Q8_INPLACE=0: staged as before
-    // k19-fattnq4: the same for q4_0 K and / or V (q4_0 / q4_0, q4_0 / q8_0, q8_0 / q4_0), kvq = the type bits of the code. Kernels with a
+    // the same for q4_0 K and / or V (q4_0 / q4_0, q4_0 / q8_0, q8_0 / q4_0), kvq = the type bits of the code. Kernels with a
     // q4_0 side exist for ncols1 <= 16 (ggml_cuda_flash_attn_ext_mma_kvq_compiled); a wider config (GGML_CUDA_FATTN_Q4_INPLACE_MAX_ROWS
     // raised above 16) runs staged, the graph reserved the f16 copy for it (ggml_cuda_flash_attn_ext_get_alloc_size)
     if constexpr (ggml_cuda_flash_attn_ext_mma_q8_may_use(DKQ, DV, false, V_is_K_view)) {
@@ -3284,7 +3284,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     if (sparse_occ_nbytes) {
-        // k19-p2qsa: the launch geometry of the two-stage size (GGML_CUDA_FA_SPARSE_SMEM_FIX=1)
+        // the launch geometry of the two-stage size (GGML_CUDA_FA_SPARSE_SMEM_FIX=1)
         launch_fattn<DV, ncols1, ncols2>
             (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, warp_size_host, async_kv_preload,
              nullptr, 1, 1, false, fattn_kernel, sparse_occ_nbytes);

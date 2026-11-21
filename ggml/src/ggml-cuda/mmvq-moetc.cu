@@ -15,7 +15,7 @@
 #include <string>
 #include <type_traits>
 
-// k19-ampmoe (see mmvq-moetc.cuh). One launch:
+// (see mmvq-moetc.cuh). One launch:
 // - grid (16*RW-row tiles, slots, tokens), block 4 warps = KW (split K) x RW (16-row groups). The block of entry (token, slot) leaves
 //   unless it is the first entry (token-major) of its expert; then it takes the expert's entries as columns c = 0..ncols-1;
 // - warp (kw, rw) runs the 256-value units kw, kw + KW, ... of its 16 rows (fused: + the 16 gate rows): per unit a cp.async ring stage
@@ -657,8 +657,8 @@ static __global__ void mul_mat_vec_q_moe_tc(const moetc_args args) {
 
 struct moetc_cfg {
     int  mode  = 1;    // 0 off, 1 verify windows, 2 every 2..8-token MUL_MAT_ID
-    // bit per moetc_type_bit. Default Q4_K / Q5_K / Q6_K: srv_kld long48 q4x (A100) inside the -fa off band on every statistic. The
-    // Flash-Next types (IQ4_XS / IQ4_NL / Q5_0 / Q8_0 / IQ3_XXS / IQ2_S) are opt-in (GGML_CUDA_MOE_TC_TYPES=all or a list): fn4n
+    // bit per moetc_type_bit. Default Q4_K / Q5_K / Q6_K: a long 48-prompt KLD run of a 4-bit MoE (A100) inside the -fa off band on every statistic. The
+    // Flash-Next types (IQ4_XS / IQ4_NL / Q5_0 / Q8_0 / IQ3_XXS / IQ2_S) are opt-in (GGML_CUDA_MOE_TC_TYPES=all or a list): Flash-Next at 4 bits
     // full card long48 KLD mean / p99 / max inside the band, top-1 97.58% vs 97.70 / 98.14% for the two band samples (-fa off,
     // GGML_CUDA_VERIFY_WIDE=0), 0.12 pp below
     int  types = 0x7;
@@ -726,10 +726,10 @@ static int moetc_min_tokens(const ggml_type type, const int cc, const int env_mi
     }
     // index: Q4_K Q5_K Q6_K IQ4_XS Q8_0 IQ4_NL Q5_0 IQ3_XXS IQ2_S
     // A100 40 (amp_ka2 / amp_ka3, two VMs): Q4_K gate / up 1.06-1.08x at 2..3 tokens, 1.2-1.4x at 4..8; Q5_K / Q6_K / Q8_0 / IQ4_NL
-    // downs ~1.0-1.2x at 3, 1.5-2.2x at 5..8; IQ4_XS / Q5_0 from 4, IQ3_XXS / IQ2_S from 5 (q4x MTP chat / 8k +3.2 / +2.9% e2e, KLD
+    // downs ~1.0-1.2x at 3, 1.5-2.2x at 5..8; IQ4_XS / Q5_0 from 4, IQ3_XXS / IQ2_S from 5 (4-bit MoE + MTP chat / 8k +3.2 / +2.9% e2e, KLD
     // inside the -fa off band). L4 (amp_kl2, at its DRAM roof): only the expert dedup pays; taken where the microbench gains >= 1.1x
-    // (5..8-token windows). With Q4_K from 4 (amp_l1) the per-pass time of q4x MTP fell 1-5% but the changed verify text drafted fewer
-    // tokens per pass at 8k (2.56 vs 2.84), -5% tok/s: q4x MTP windows (3..4 rows) stay on mmvq there
+    // (5..8-token windows). With Q4_K from 4 the per-pass time of the 4-bit MoE + MTP fell 1-5% but the changed verify text drafted fewer
+    // tokens per pass at 8k (2.56 vs 2.84), -5% tok/s; its MTP windows (3..4 rows) stay on mmvq there
     static const int sm80[9] = { 2, 3, 3, 4, 3, 3, 4, 5, 5 };
     static const int sm89[9] = { 7, 7, 8, 7, 9, 5, 5, 5, 5 };
     int i = 0;

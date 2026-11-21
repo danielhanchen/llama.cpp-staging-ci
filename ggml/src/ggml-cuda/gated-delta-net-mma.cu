@@ -384,7 +384,7 @@ template <int C, int V, int BLOCKS = 1> bool init(int device) {
 
 enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head };
 
-// k19-p1fuse: the shape / device / switch part of select_gdn_mma_path, without the kernel set-up (init): false = the AR kernel for
+// the shape / device / switch part of select_gdn_mma_path, without the kernel set-up (init): false = the AR kernel for
 // sure. ggml_cuda_gdn_mma_candidate exports it for the fusion matchers (ggml_cuda_gated_delta_net_may_use_mma)
 static bool gdn_mma_candidate(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
@@ -400,7 +400,7 @@ static bool gdn_mma_candidate(int device, const ggml_cuda_gdn_mma_args & a) {
     return false;
 #else
     // Enable only architectures benchmarked for this schedule. MMA support alone does not imply a speedup.
-    // k15-mm2: B200 (cc 1000) added: prefill 512 / 2048 tokens with 16 key heads (Qwen3.6-35B-A3B, Flash-Next / Qwen3.6-27B) 1.6-3.3x
+    // B200 (cc 1000) added: prefill 512 / 2048 tokens with 16 key heads (Qwen3.6-35B-A3B, Flash-Next / Qwen3.6-27B) 1.6-3.3x
     // faster than the per-token kernel (test-backend-ops perf), Qwen3.6-35B-A3B pp2048 kernel time 149 -> 119 ms.
     // GGML_CUDA_GDN_MMA_B200=0 is the kill switch of that addition (the list as before it). GGML_CUDA_GDN_MMA=0 never takes the
     // chunked kernel, =1 takes it on every NVIDIA GPU with Ampere MMA (measurements only).

@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-// k19-kvsel: K/V cache chunks backed by pinned host memory inside a CUDA lazy buffer (see ggml_backend_cuda_buffer_commit_host)
+// K/V cache chunks backed by pinned host memory inside a CUDA lazy buffer (see ggml_backend_cuda_buffer_commit_host)
 
 // the host chunk map of a lazy buffer with host chunks and a device copy of its map (LLAMA_KV_SEL_STATS); false otherwise
 bool ggml_cuda_buffer_host_chunks(const ggml_backend_buffer * buf, const char ** base, size_t * gran, const uint8_t ** map_dev,

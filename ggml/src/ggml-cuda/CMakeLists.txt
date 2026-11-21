@@ -175,7 +175,7 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
     endif()
 
-    # k19-fitplain: NVML is opened at run time (dlopen) to tell a headless device from one driving a display
+    # NVML is opened at run time (dlopen) to tell a headless device from one driving a display
     target_link_libraries(ggml-cuda PRIVATE ${CMAKE_DL_LIBS})
 
     if (GGML_CUDA_NO_VMM)

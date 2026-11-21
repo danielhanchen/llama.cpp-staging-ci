@@ -69,7 +69,7 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
 
-// k19-fu2 F3: SWIGLU(gate, up) (split, F32) quantized for the MUL_MAT_ID that reads it, rows scattered to their compact rows through the
+// SWIGLU(gate, up) (split, F32) quantized for the MUL_MAT_ID that reads it, rows scattered to their compact rows through the
 // inverse map (source row = token*n_expert_used + slot -> compact row, -1 = skipped), see swiglu_quantize_mmq_q8_1
 void swiglu_quantize_mmq_q8_1_cuda(
         const float * gate, const float * up, const int32_t * ids_inv, void * vy, ggml_type type_src0,

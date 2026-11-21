@@ -1,6 +1,6 @@
 #include "moe-weighted-reduction.cuh"
 
-// k19-g4fuse: two_src = the experts are the sum of two products (experts + experts2, the ADD of the MoE cache's overlapped verify: hits
+// two_src = the experts are the sum of two products (experts + experts2, the ADD of the MoE cache's overlapped verify: hits
 // and fetched experts, each slot computed by one of them), extra = an addend of the result (the ADD that follows the reduction). Both
 // as the separate nodes compute them: (a + b) per element first, the reduction's own order, then sum + extra (float addition commutes)
 template <bool two_src, bool with_extra>

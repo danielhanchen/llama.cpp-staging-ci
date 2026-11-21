@@ -768,7 +768,7 @@ static double ggml_cuda_ar_time_decode(ggml_cuda_ar_pipeline * p, bool p2p, floa
 
 // Auto mode: P2P only when it is measurably faster than host staging for a decode-sized
 // AllReduce on this machine (median of 3 trials each, P2P must win by >= 3%). On 2x T4
-// over a PCIe host bridge (Kaggle) P2P measured no decode gain.
+// over a PCIe host bridge (a T4 x2 host) P2P measured no decode gain.
 static bool ggml_cuda_ar_p2p_faster(ggml_cuda_ar_pipeline * p, double * us_p2p, double * us_host) {
     const int count = 8192; // 32 KiB of F32: a decode-sized hidden state
     float * buf[2] = {};

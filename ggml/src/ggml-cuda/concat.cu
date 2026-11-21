@@ -143,7 +143,7 @@ static bool concat_transposed_enabled() {
     return enabled;
 }
 
-// k19-q4xt (GGML_CUDA_CONCAT_TRANSPOSED_MIN, default 2; 32 = as before): the fewest src1 columns (tokens) the tile kernel takes. A
+// (GGML_CUDA_CONCAT_TRANSPOSED_MIN, default 2; 32 = as before): the fewest src1 columns (tokens) the tile kernel takes. A
 // speculative verify window (2..8 tokens) of a GDN layer concatenated its conv state through the generic kernel: one 256-thread block
 // per channel (8192 for Qwen3.6-35B-A3B) for 6 values each, ~40 us per layer on a T4, ~1.2 ms per 3-token verify pass. The tile
 // kernel masks the tokens past ne10 (its loops already guard token < ne10); a pure copy either way, so the bytes are the same.

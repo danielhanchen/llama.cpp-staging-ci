@@ -1,4 +1,4 @@
-// k19-kqtc: few-row MMQ ported from upstream llama.cpp (the llama.cpp authors, MIT), routing in ggml-cuda.cu behind GGML_CUDA_MMQ_FEW.
+// few-row MMQ ported from upstream llama.cpp (the llama.cpp authors, MIT), routing in ggml-cuda.cu behind GGML_CUDA_MMQ_FEW.
 #include "mmq-few.cuh"
 #include "cp-async.cuh"
 #include "mma.cuh"
@@ -21,7 +21,7 @@ bool ggml_cuda_verify_reassoc_ok() {
 // NVIDIA only: the kernel uses the NVIDIA int8 MMA fragment layout and cp.async.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-// k19-kqtc: helpers that upstream keeps in common.cuh / cp-async.cuh / quantize.cuh, kept in this file in the fork so the port
+// helpers that upstream keeps in common.cuh / cp-async.cuh / quantize.cuh, kept in this file in the fork so the port
 // recompiles only this file (those headers are included by every CUDA object)
 static __device__ __forceinline__ void ggml_cuda_prefetch_l2(const void * p) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -78,8 +78,8 @@ static constexpr int MMQ_FEW_MAX_NCG = 3;  // max. number of column groups
 static constexpr int MMQ_FEW_NROWS   = 16; // src0 rows of one MMA tile
 static constexpr int MMQ_FEW_NWARPS  = 4;
 
-// k19-kqtc: GGML_CUDA_MMQ_FEW: unset = AUTO (the per-architecture table in ggml_cuda_mmq_few_auto_min_ncols: A100 / A30 and Ada
-// measured, off elsewhere, also on cc 12.0 since k19-int3fix), 0 = off, 1 = the upstream per-type minimum columns (ggml_cuda_mmq_few_min_ncols) on every Ampere+ device,
+// GGML_CUDA_MMQ_FEW: unset = AUTO (the per-architecture table in ggml_cuda_mmq_few_auto_min_ncols: A100 / A30 and Ada
+// measured, off elsewhere, also on cc 12.0 since a later fix), 0 = off, 1 = the upstream per-type minimum columns (ggml_cuda_mmq_few_min_ncols) on every Ampere+ device,
 // N >= 2 = from N columns for every type it decodes; GGML_CUDA_MMQ_FEW_MAX (default 8, the verify widths) = the most columns taken
 // (upstream: 24; wider products keep MMQ)
 struct mmq_few_env_t { int mode; int max_cols; };
@@ -938,12 +938,12 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
     }
 }
 
-// k19-kqtc AUTO table (min columns, 0 = off), from Qwen3.8-27B UD-Q4_K_XL + MTP verify passes:
-// - cc 8.0 (A100 / A30): K-quants from 2 columns (micro-bench 5 columns: Q4_K 53%, Q5_K 57% of the batched mmvq; q38d MTP +41% chat,
-//   +39% 8k on an A100 40 GB), Q6_K / IQ4_XS from 3, Q8_0 from 5 (from 2 it moved q4x's Q8_0 verify text: -5% chat by acceptance);
-// - cc 8.9 (Ada, L4): the upstream table (L4 q38d +8.5% chat, +5.4% 8k);
-// - cc 12.0 (RTX PRO 6000 / RTX 50xx): off (k19-int3fix; GGML_CUDA_MMQ_FEW=1 = the upstream table). The table gained G4 q38d +2.1% chat
-//   (flat 8k) but cost Flash-Next, whose dense products are K 2560 Q6_K / Q8_0 / IQ4_XS: G4 full card MTP chat 338.3 -> 325.1 tok/s at
+// AUTO table (min columns, 0 = off), from Qwen3.8-27B at 4 bits + MTP verify passes:
+// - cc 8.0 (A100 / A30): K-quants from 2 columns (micro-bench 5 columns: Q4_K 53%, Q5_K 57% of the batched mmvq; Qwen3.8 dense MTP +41% chat,
+//   +39% 8k on an A100 40 GB), Q6_K / IQ4_XS from 3, Q8_0 from 5 (from 2 it moved a 4-bit MoE's Q8_0 verify text: -5% chat by acceptance);
+// - cc 8.9 (Ada, L4): the upstream table (L4 Qwen3.8 dense +8.5% chat, +5.4% 8k);
+// - cc 12.0 (RTX PRO 6000 / RTX 50xx): off (GGML_CUDA_MMQ_FEW=1 = the upstream table). The table gained the Qwen3.8 dense +2.1% chat
+//   (flat 8k) but cost Flash-Next, whose dense products are K 2560 Q6_K / Q8_0 / IQ4_XS: full card MTP chat 338.3 -> 325.1 tok/s at
 //   the same text, MTP 8k 278.9 -> 251.2 (other text, +8.7% passes), DFlash2 48 GB chat 255.4 -> 248.8, and its verify rows broke the
 //   row invariance of test-backend-ops VROW_INV (22 of 96);
 // - other devices: off (not measured); GGML_CUDA_MMQ_FEW=1 / N turns it on.
@@ -993,7 +993,7 @@ bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * 
     return ggml_cuda_is_aligned(src0, x_alignment) && ggml_cuda_is_aligned(src1, 16);
 }
 
-// k19-kqtc: the src1 quantization of the few-row MMQ (upstream quantize.cu)
+// the src1 quantization of the few-row MMQ (upstream quantize.cu)
 // Each thread quantizes 4 values of one column, see quantize.cuh for the layout.
 template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_few_q8_1(

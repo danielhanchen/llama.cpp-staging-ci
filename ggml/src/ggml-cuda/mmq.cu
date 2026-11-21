@@ -129,14 +129,14 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     // Q4 only for the FP4 types on Blackwell
     GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
     const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
-    // k19-gfix-fp4act: an unset prec keeps Q8_1 activations; the native W4A4 path only on request (GGML_CUDA_MMQ_PREC=q4 or a graph Q4)
+    // an unset prec keeps Q8_1 activations; the native W4A4 path only on request (GGML_CUDA_MMQ_PREC=q4 or a graph Q4)
     if (prec != GGML_PREC_Q4 || !can_use_q4) {
         return GGML_PREC_Q8;
     }
     return GGML_PREC_Q4;
 }
 
-// k19-p5mmq: GGML_CUDA_MMID_MEMO_DOWN=0: every MoE MMQ product builds its routing maps (see ggml_cuda_mmid_route_memo)
+// GGML_CUDA_MMID_MEMO_DOWN=0: every MoE MMQ product builds its routing maps (see ggml_cuda_mmid_route_memo)
 static bool ggml_cuda_mmid_memo_down_enabled() {
     static const bool on = getenv("GGML_CUDA_MMID_MEMO_DOWN") == nullptr || atoi(getenv("GGML_CUDA_MMID_MEMO_DOWN")) != 0;
     return on;
@@ -234,7 +234,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t n_expert_used = ids->ne[0];
 
         // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-        // k15-lfm2: op param 2 of a MUL_MAT_ID that reads a MoE cache bank in place (llama-moe-cache in-place prompts) = the number of
+        // op param 2 of a MUL_MAT_ID that reads a MoE cache bank in place (llama-moe-cache in-place prompts) = the number of
         // experts its ids can name (the layer's experts, not the bank's slots): the average is over those (GGML_CUDA_MMQ_ID_ACTIVE=0: off)
         static const bool active_hint = [] { const char * e = getenv("GGML_CUDA_MMQ_ID_ACTIVE"); return e == nullptr || atoi(e) != 0; }();
         const int32_t n_active_hint = active_hint ? ggml_get_op_params_i32(dst, 2) : 0;
@@ -271,7 +271,7 @@ void ggml_cuda_mul_mat_q(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
 
-        // k11: the q8_1 copy of src1 shared with the next MUL_MAT of the graph (see ggml_cuda_src1_memo)
+        // the q8_1 copy of src1 shared with the next MUL_MAT of the graph (see ggml_cuda_src1_memo)
         ggml_cuda_src1_memo & memo = ctx.src1_memo;
         const char * memo_q8_1 = nullptr;
         bool memo_quantized = false;
@@ -351,7 +351,7 @@ void ggml_cuda_mul_mat_q(
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
-    // k19-fu2 F3: src1 is a SWIGLU this product computes in its quantize (ggml_cuda_mmq_id_swiglu_ok), scattered by the inverse map
+    // src1 is a SWIGLU this product computes in its quantize (ggml_cuda_mmq_id_swiglu_ok), scattered by the inverse map
     const bool swiglu_src1 = ctx.mmq_swiglu_src1 != nullptr && ctx.mmq_swiglu_src1 == src1;
     GGML_ASSERT(!swiglu_src1 || (!use_native_fp4 && ne11 == n_expert_used));
 
@@ -361,7 +361,7 @@ void ggml_cuda_mul_mat_q(
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
 
-    // k11: the expert maps and the q8_1 copy of src1 shared with the next MUL_MAT_ID of the graph that reads the same src1 with
+    // the expert maps and the q8_1 copy of src1 shared with the next MUL_MAT_ID of the graph that reads the same src1 with
     // the same ids (gate and up), see ggml_cuda_src1_memo
     ggml_cuda_src1_memo & memo = ctx.src1_memo;
     const int64_t memo_key[ggml_cuda_src1_memo::n_key] = {
@@ -385,7 +385,7 @@ void ggml_cuda_mul_mat_q(
     }
     char * memo_base = (memo_hit || memo_hold) ? (char *) memo.ptr : nullptr;
 
-    // k19-p5mmq: the routing maps with the inverse map (gate / up with one row per token, the fused-SwiGLU down) depend only on the ids
+    // the routing maps with the inverse map (gate / up with one row per token, the fused-SwiGLU down) depend only on the ids
     // and their shape: kept in ctx.mmid_route by the product that builds them for the next ones with the same ids (see
     // ggml_cuda_mmid_route_memo). Same integers, so the same bytes
     const bool write_inverse = dedup_bcast || swiglu_src1;
@@ -518,14 +518,14 @@ void ggml_cuda_mul_mat_q(
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, J_best,
-        // k15-mm2: a product over a bank of MoE cache slots (op param 2 = the experts its ids can name, set by the graph for in-place
+        // a product over a bank of MoE cache slots (op param 2 = the experts its ids can name, set by the graph for in-place
         // prompt products) gives no tile to the empty slots. GGML_CUDA_MMQ_SKIP_EMPTY=0: off, 2: every compact MoE tiling (tests)
         ggml_cuda_mmq_skip_empty_mode() == 2 || (ggml_cuda_mmq_skip_empty_mode() == 1 && ggml_get_op_params_i32(dst, 2) > 0)};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 
-// k19-fu2 F3: whether the MMQ id path of dst (a MUL_MAT_ID with src0, src1 = glu, ids) can compute glu (SWIGLU of two F32 tensors) in
+// whether the MMQ id path of dst (a MUL_MAT_ID with src0, src1 = glu, ids) can compute glu (SWIGLU of two F32 tensors) in
 // its gathered quantize (swiglu_quantize_mmq_q8_1): q8_1 activations (not the native FP4 path), one row of glu per (token, slot), float4
 // loads of the gate / up rows. The caller checks that the product takes the MMQ path.
 bool ggml_cuda_mmq_id_swiglu_ok(const ggml_tensor * src0, const ggml_tensor * glu, const ggml_tensor * ids, const ggml_tensor * dst, int cc) {

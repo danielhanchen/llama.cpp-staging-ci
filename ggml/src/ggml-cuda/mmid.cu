@@ -350,7 +350,7 @@ static __global__ void mm_ids_scatter(
         int rank = 0;
         int cnt  = 0;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-        // k19-p5mmq: the lanes holding the same expert in one warp match instead of 32 shuffles (GGML_CUDA_MMID_MATCH_ANY=0: the
+        // the lanes holding the same expert in one warp match instead of 32 shuffles (GGML_CUDA_MMID_MATCH_ANY=0: the
         // shuffles). The same rank and count, so the same maps
         if (match_any) {
             const unsigned int same = __match_any_sync(0xFFFFFFFF, expert_used);
@@ -399,7 +399,7 @@ static __global__ void mm_ids_scatter(
     }
 }
 
-// k19-p5mmq: GGML_CUDA_MMID_MATCH_ANY=0 ranks the scatter's lanes by 32 shuffles as before (sm >= 70 only; same maps either way)
+// GGML_CUDA_MMID_MATCH_ANY=0 ranks the scatter's lanes by 32 shuffles as before (sm >= 70 only; same maps either way)
 static bool mm_ids_match_any() {
     static const bool on = getenv("GGML_CUDA_MMID_MATCH_ANY") == nullptr || atoi(getenv("GGML_CUDA_MMID_MATCH_ANY")) != 0;
     return on;
