@@ -37,13 +37,14 @@ llama_kv_win_params llama_kv_win_params_from(const llama_context_params & params
     p.n_sinks = params.kv_win_sinks;
     p.type_k  = params.type_k_win;
     p.type_v  = params.type_v_win;
-    if (const char * e = getenv("LLAMA_KV_WIN")) {
-        p.n_win = atoi(e);
+    const char * e_win = getenv("LLAMA_KV_WIN");
+    if (e_win != nullptr) {
+        p.n_win = atoi(e_win);
     }
     if (const char * e = getenv("LLAMA_KV_WIN_SINKS")) {
         p.n_sinks = std::max(0, atoi(e));
-        // sinks alone: an empty recent window
-        if (p.n_win < 0) {
+        // sinks alone: an empty recent window (an explicit LLAMA_KV_WIN=-1 keeps the ring off)
+        if (p.n_win < 0 && e_win == nullptr) {
             p.n_win = 0;
         }
     }
