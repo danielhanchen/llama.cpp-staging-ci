@@ -214,7 +214,7 @@ struct server_task {
 
     server_task() = default;
 
-    // k15-hostcut: when the HTTP thread made the task (us, ggml_time_us), so the prompt time of its slot starts there and covers what the
+    // when the HTTP thread made the task (us, ggml_time_us), so the prompt time of its slot starts there and covers what the
     // server loop did before it took the task (an idle prompt-cache save it waited for, an idle re-reserve of the prompt graph); 0 for a
     // task that waited for a free slot (its prompt time starts when a slot takes it)
     int64_t t_posted_us = 0;
@@ -656,7 +656,7 @@ struct server_prompt {
 };
 
 struct server_prompt_data {
-    // k11: pooled buffers without a zero-fill (common_state_buf_take / _recycle / _prefault)
+    // pooled buffers without a zero-fill (common_state_buf_take / _recycle / _prefault)
     common_state_buf main;
     common_state_buf drft;
 
@@ -693,13 +693,13 @@ struct server_prompt_cache {
     // optional SSD tier: evicted states are written there, and load() looks there after the RAM cache (not owned)
     server_prompt_ssd * ssd = nullptr;
 
-    // k11: the entry whose state is still being copied by an asynchronous save (server_slot::prompt_save), and how to wait for it
+    // the entry whose state is still being copied by an asynchronous save (server_slot::prompt_save), and how to wait for it
     const server_prompt_cache_state * inflight = nullptr;
     std::function<void()>             wait_reads;
-    // k15-idlewait: the drop of an entry still being saved may be deferred (drop_newest); the server sets it for a single slot only
+    // the drop of an entry still being saved may be deferred (drop_newest); the server sets it for a single slot only
     bool                              drop_defer_ok = false;
 
-    // k15-idlewait (LLAMA_PCS_CKPT_COPY_ASYNC): the next alloc() copies the checkpoints the slot drops on clone_thread (set by
+    // LLAMA_PCS_CKPT_COPY_ASYNC: the next alloc() copies the checkpoints the slot drops on clone_thread (set by
     // server_slot::prompt_save at a request); wait_inflight / wait_clone join it
     bool        clone_async_next = false;
     std::thread clone_thread;
@@ -721,7 +721,7 @@ struct server_prompt_cache {
         }
     }
 
-    // k15-idlewait: an entry dropped while its asynchronous save was still copying (drop_newest) waits here for the copy, its buffers
+    // an entry dropped while its asynchronous save was still copying (drop_newest) waits here for the copy, its buffers
     // go back to the pool at the next wait_inflight (the server calls it after the next decode, which joins the save)
     std::list<server_prompt_cache_state> dropped_inflight;
     void recycle_dropped();
@@ -729,11 +729,11 @@ struct server_prompt_cache {
     // remove the oldest state, handing it to the SSD tier if there is one
     void evict_front();
 
-    // k15-ttft (LLAMA_PCS_IDLE_SAVE): remove the newest entry holding exactly these tokens (a save made at idle that the next request did
+    // LLAMA_PCS_IDLE_SAVE: remove the newest entry holding exactly these tokens (a save made at idle that the next request did
     // not need: the slot was kept by prompt similarity); true if one was removed
     bool drop_newest(const server_tokens & tokens);
 
-    // k15-idlewait (LLAMA_PCS_IDLE_LEND): the checkpoints an idle save moved into the newest entry holding exactly these tokens go back
+    // LLAMA_PCS_IDLE_LEND: the checkpoints an idle save moved into the newest entry holding exactly these tokens go back
     // to the slot (dst), all of them when the entry is about to be dropped (keep_entry false), else a copy of those up to pos keep_max
     // (the ones the slot's next prompt keeps); true if the entry was found
     // entry_copies: all of them go back and the entry keeps a copy of each (what it held with LLAMA_PCS_IDLE_LEND=0)
@@ -750,7 +750,7 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    // take_from (k15-ttft, optional): the checkpoint list of the slot being saved; its checkpoints with pos_max > keep_max are moved
+    // take_from (optional): the checkpoint list of the slot being saved; its checkpoints with pos_max > keep_max are moved
     // into the entry instead of copied (the caller knows the slot drops them), the others are copied as before
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft,
                                       std::list<common_prompt_checkpoint> * take_from = nullptr, llama_pos keep_max = -1);

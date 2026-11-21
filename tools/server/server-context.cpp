@@ -71,7 +71,7 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
-// k19-tpp: bytes of a GGUF file and its splits (NAME-0000k-of-0000n.gguf), 0 if unknown
+// bytes of a GGUF file and its splits (NAME-0000k-of-0000n.gguf), 0 if unknown
 static uint64_t tpp_gguf_bytes(const std::string & path) {
     std::error_code ec;
     if (path.empty()) {
@@ -98,7 +98,7 @@ static uint64_t tpp_gguf_bytes(const std::string & path) {
     return ec ? 0 : (uint64_t) b;
 }
 
-// k19-fnmtp2: true if a file lives on a memory file system (tmpfs / ramfs on Linux): its pages are host memory that MemAvailable does
+// true if a file lives on a memory file system (tmpfs / ramfs on Linux): its pages are host memory that MemAvailable does
 // not count as available, so a model staged there is resident though the available memory reads lower than its size
 static bool tpp_file_in_ram_fs(const std::string & path) {
 #if defined(__linux__)
@@ -113,8 +113,8 @@ static bool tpp_file_in_ram_fs(const std::string & path) {
 #endif
 }
 
-// k19-bigverify: bytes of the GGUF's per-layer token embedding table (per_layer_token_embd.weight), an input-layer GET_ROWS table that
-// the loader keeps in host memory whatever the device split (Qwen3.8-Flash-Next UD-IQ4_XS: 26.8 GiB of its 87.2 GiB). 0 if absent or
+// bytes of the GGUF's per-layer token embedding table (per_layer_token_embd.weight), an input-layer GET_ROWS table that
+// the loader keeps in host memory whatever the device split (Qwen3.8-Flash-Next at 4 bits: 26.8 GiB of its 87.2 GiB). 0 if absent or
 // unreadable (the caller then counts the whole file, as before)
 static uint64_t tpp_host_input_bytes(const std::string & path) {
     if (path.empty()) {
@@ -149,21 +149,21 @@ static uint64_t tpp_host_input_bytes(const std::string & path) {
     return sum;
 }
 
-// k19-vwidth (LLAMA_SPEC_PREWARM=N: widths 1..N, opt-in): a target with a drafter and no MoE cache decodes, at load, a
+// (LLAMA_SPEC_PREWARM=N: widths 1..N, opt-in): a target with a drafter and no MoE cache decodes, at load, a
 // dummy prompt of LLAMA_SPEC_PREWARM_POS (640) tokens, then windows of every width 1..N, LLAMA_SPEC_PREWARM_REPS (10) times each,
 // appended after it (a 1-row decode as a plain decode, wider ones as verify windows, as the server runs them), then forgets them: each
 // width's kept graph (llama_context gf_res_small) is built and its CUDA graph warmed up, captured and launched at least 8 times in the
-// KV bucket of a short request. The prompt matters: graphs built on an empty memory take other branches (no pooled keys: G4 fn4
+// KV bucket of a short request. The prompt matters: graphs built on an empty memory take other branches (no pooled keys: RTX PRO 6000 Flash-Next
 // 7570 vs 7613 nodes) and a request could not reuse them. 8 launches keep a CUDA graph through idle time (ggml-cuda evicts the
 // others after 10 s, GGML_CUDA_GRAPH_KEEP) and let a new KV bucket re-capture it directly (GGML_CUDA_GRAPH_DIRECT_RECAPTURE, no eager
 // pass). A width a request uses for the first time (a confidence rule's, or a draft the n_predict limit cut at the end of a request)
-// then replays a captured graph instead of an eager pass plus a capture (~15-20 ms each on G4 Flash-Next). The memory is cleared
+// then replays a captured graph instead of an eager pass plus a capture (~15-20 ms each on RTX PRO 6000 Flash-Next). The memory is cleared
 // after; no value of a later request depends on these decodes
-// k19-fullcost: on by default on a GPU target (widths 1..8; LLAMA_SPEC_PREWARM=N up to 8, =0 off; ~2.6 s of load time on G4 Flash-Next
-// with DFlash2: 7 widths x 3 sampler chains x 9 decodes). Before k19-fullcost the idle re-reserve of the pp graph (restore_pp_plan)
-// invalidated every kept graph at each request's start, so no prewarmed graph was ever used (vw_t2a / vw_t4: on = off within noise);
-// with the kept graphs surviving it (and one KV bucket for chat and 8k, LLAMA_KV_BUCKET_DEV_STEP_MIN) a request replays them: G4 fn4 full
-// card (fc_r3, 2 launches): DFlash2 n6 chat 329.1 -> 343.1, the width rule over every width (LLAMA_DFLASH_EV) chat 325.2 -> 372.5, 8k
+// on by default on a GPU target (widths 1..8; LLAMA_SPEC_PREWARM=N up to 8, =0 off; ~2.6 s of load time on RTX PRO 6000 Flash-Next
+// with DFlash2: 7 widths x 3 sampler chains x 9 decodes). Before this change the idle re-reserve of the pp graph (restore_pp_plan)
+// invalidated every kept graph at each request's start, so no prewarmed graph was ever used (on = off within noise);
+// with the kept graphs surviving it (and one KV bucket for chat and 8k, LLAMA_KV_BUCKET_DEV_STEP_MIN) a request replays them: RTX PRO 6000 Flash-Next full
+// card (2 launches): DFlash2 n6 chat 329.1 -> 343.1, the width rule over every width (LLAMA_DFLASH_EV) chat 325.2 -> 372.5, 8k
 // 266.4 -> 292.7 tok/s, same text
 // (widths up to the outputs the context takes per sequence, the server's widest window)
 // (the graphs carry the slot's device sampler: each chain of `chains` is swapped in for its own windows, raw logits off as for a request
@@ -177,27 +177,27 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     }
     static const int reps  = getenv("LLAMA_SPEC_PREWARM_REPS") ? std::max(2, atoi(getenv("LLAMA_SPEC_PREWARM_REPS"))) : 9;
     static const int n_pre = getenv("LLAMA_SPEC_PREWARM_POS")  ? std::max(0, atoi(getenv("LLAMA_SPEC_PREWARM_POS")))  : 640;
-    // k19-fullcost (LLAMA_SPEC_PREWARM_CACHED=1, opt-in): beside a MoE cache too; LLAMA_SPEC_PREWARM_WIDTHS="1,3,7" prewarms only those
+    // (LLAMA_SPEC_PREWARM_CACHED=1, opt-in): beside a MoE cache too; LLAMA_SPEC_PREWARM_WIDTHS="1,3,7" prewarms only those
     // widths (default 1..w_max). LLAMA_SPEC_PREWARM_MEM=1 logs the device's free memory after each width (the graph memory per width)
-    // (k19-bigverify: unset, on beside a cache that holds most of the experts, llama_moe_cache_wide_graphs; =0 off there too)
-    // k19-g4cap (opt-in, LLAMA_SPEC_PREWARM_CACHED_FRAC=f, e.g. 0.3; unset / 0 = only the wide-graph rule, as before): also beside a cache
+    // (unset, on beside a cache that holds most of the experts, llama_moe_cache_wide_graphs; =0 off there too)
+    // (opt-in, LLAMA_SPEC_PREWARM_CACHED_FRAC=f, e.g. 0.3; unset / 0 = only the wide-graph rule, as before): also beside a cache
     // that holds at least f of its host expert bytes, where the widest window is at least LLAMA_SPEC_PREWARM_CACHED_MIN_W (5) rows (DFlash2:
     // MTP's 1..3-row graphs are captured by the first request's own short windows). Only the prewarm: the device KV buckets keep their
-    // 2048-cell step there. Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS at a 32 GB cap (41.4% cached): the warm-up request leaves the 4..7-row
+    // 2048-cell step there. RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits at a 32 GB cap (41.4% cached): the warm-up request leaves the 4..7-row
     // verify widths to be built and captured inside the next one (36-129 ms per width); prewarmed, with the CPU-miss windows paused (below),
     // DFlash2 n6 chat 203.1 -> 224.1 tok/s (same text), 8k 172.7 -> 190.3 (other text: the prewarm moves the cached experts, so the
     // host-computed ones; srv_kld long48 inside the -fa off band), 3 launches on one VM with the CPU-miss calibration pinned for both
     // builds. At 16 GB (15.5% cached) keep it off: level with the pause, -24% without it. Opt-in because the 8k text changes (exact in chat)
-    // k19-prewexact: with the cache taken back after the windows (exact, below) the text is that of no prewarm in chat and 8k: same VM,
-    // CPU-miss calibration pinned, 3 launches (px_c32): chat 213.1 (int3) / 209.8 (FRAC unset) -> 231.5 tok/s, 8k 180.5 / 180.5 -> 179.9,
+    // with the cache taken back after the windows (exact, below) the text is that of no prewarm in chat and 8k: same VM,
+    // CPU-miss calibration pinned, 3 launches: chat 213.1 (previous default) / 209.8 (FRAC unset) -> 231.5 tok/s, 8k 180.5 / 180.5 -> 179.9,
     // md5 equal in every launch; the 8k gain of the prewarm without the restore (195.8) came with its other text. 24 GB (27.1% cached)
     // is under 0.3, so no prewarm there
-    // (k19-prewexact: on by default at 0.3 now that the prewarm is exact, LLAMA_SPEC_PREWARM_CACHED_FRAC=0 off)
+    // (on by default at 0.3 now that the prewarm is exact, LLAMA_SPEC_PREWARM_CACHED_FRAC=0 off)
     static const double cached_frac_min = getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC") != nullptr ?
         atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.3;
     static const int cached_min_w = getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W") != nullptr ?
         atoi(getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W")) : 5;
-    llama_moe_cache_fingerprint(ctx, "prewarm point"); // k19-prewexact diagnostic (LLAMA_MOE_CACHE_FP_LOG=1)
+    llama_moe_cache_fingerprint(ctx, "prewarm point"); // diagnostic (LLAMA_MOE_CACHE_FP_LOG=1)
     const double cache_frac = llama_moe_cache_frac(ctx);
     const bool wide_graphs  = llama_moe_cache_wide_graphs(ctx);
     const bool band_ok      = !wide_graphs && cached_frac_min > 0.0 && cache_frac >= cached_frac_min && w_max >= cached_min_w;
@@ -225,11 +225,11 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         sum_w += w;
     }
     const int n_chain = std::max<int>(1, (int) chains.size());
-    // k19-p2qsa / k19-int3fix: the QSA form of the prewarmed decode / verify graphs. LLAMA_SPEC_PREWARM_ALLFIT unset = the all-fit form
-    // beside a MoE cache (the host tiers, where the first request building its all-fit widths costs: G4 Flash-Next 48 GB DFlash2 chat 281.0
+    // the QSA form of the prewarmed decode / verify graphs. LLAMA_SPEC_PREWARM_ALLFIT unset = the all-fit form
+    // beside a MoE cache (the host tiers, where the first request building its all-fit widths costs: RTX PRO 6000 Flash-Next 48 GB DFlash2 chat 281.0
     // tok/s with the all-fit prewarm vs 253.9 with the scored one, base without all-fit 265.8) and the scored form without one (full card:
-    // chat 391.6 vs 382.8, 8k 236.1 vs 232.0: a request past 512 pools then replays them); 0 = scored only (k19-p2qsa 7f298b321bd), 1 =
-    // all-fit only, 2 = both when the model selects QSA pools (twice the graphs: out of device memory at G4 48 GB without the floor below,
+    // chat 391.6 vs 382.8, 8k 236.1 vs 232.0: a request past 512 pools then replays them); 0 = scored only (commit 7f298b321bd), 1 =
+    // all-fit only, 2 = both when the model selects QSA pools (twice the graphs: out of device memory at RTX PRO 6000 48 GB without the floor below,
     // 245.2 tok/s with it)
     static const int pw_env  = getenv("LLAMA_SPEC_PREWARM_ALLFIT") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_ALLFIT")) : -1;
     const int  pw_mode  = pw_env >= 0 ? pw_env : (llama_moe_cache_active(ctx) ? 1 : 0);
@@ -275,25 +275,25 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         }
         pos += n;
     };
-    // k19-tokcost: the dummy windows (one repeated token) must not feed the MoE cache's CPU-miss rule: one such miss-rate window
-    // (0.7%) turned the host path off for the next request (fn4 24 GB, fc_r13: P_CUM 0.5 chat 153 vs 184 tok/s; 16 GB prewarm -20%).
-    // k19-g4cap: LLAMA_SPEC_PREWARM_CM_PAUSE unset = paused beside a cache under the wide-graph share (llama_moe_cache_wide_graphs), where
-    // the host path carries the decode (G4 Flash-Next 32 GB: 8k 172.7 -> 193.8 tok/s and chat TTFT 0.26 -> 0.22 s with the pause; 16 GB
+    // the dummy windows (one repeated token) must not feed the MoE cache's CPU-miss rule: one such miss-rate window
+    // (0.7%) turned the host path off for the next request (Flash-Next 24 GB: P_CUM 0.5 chat 153 vs 184 tok/s; 16 GB prewarm -20%).
+    // LLAMA_SPEC_PREWARM_CM_PAUSE unset = paused beside a cache under the wide-graph share (llama_moe_cache_wide_graphs), where
+    // the host path carries the decode (RTX PRO 6000 Flash-Next 32 GB: 8k 172.7 -> 193.8 tok/s and chat TTFT 0.26 -> 0.22 s with the pause; 16 GB
     // forced prewarm chat 125.8 -> 162.8). Over the share the prewarm keeps counting, as before: there the windows it feeds turn the host
-    // path off, which a timing trial confirms (G4 48 GB, 14.7 vs 16.6 ms per small batch), and the pause would move the warm phase and
-    // the trial into the first request (gc_ab1 48 GB DFlash2 chat 269.8 -> 246.1). =1 always, =0 never
-    // k19-prewexact: beside a MoE cache the dummy windows also move what the cache holds (the 640-token prompt seeds it, every window
-    // admits and evicts by the clock), so the next requests compute other experts on the host: G4 Flash-Next 32 GB with the band prewarm
+    // path off, which a timing trial confirms (RTX PRO 6000 48 GB, 14.7 vs 16.6 ms per small batch), and the pause would move the warm phase and
+    // the trial into the first request (48 GB DFlash2 chat 269.8 -> 246.1). =1 always, =0 never
+    // beside a MoE cache the dummy windows also move what the cache holds (the 640-token prompt seeds it, every window
+    // admits and evicts by the clock), so the next requests compute other experts on the host: RTX PRO 6000 Flash-Next 32 GB with the band prewarm
     // gave chat the same text but 8k another one (832d4d83 vs 6974c3ad). Exact: the cache's state is snapshotted before the windows and
     // taken back after them (the experts of the slots that changed are copied back into the banks, slots / clock / device counters /
     // seed and refill bookkeeping restored) and its rules are quiet meanwhile (no CPU-miss window, timing trial, overlap rule or trial
     // moves), so the first request sees the cache it would have seen without the prewarm and only the captured graphs remain
-    // (G4 Flash-Next 32 GB: 337 slots get their expert back, 795 MiB, per launch; the state fingerprints at every request begin equal
-    // those of a launch without the prewarm, LLAMA_MOE_CACHE_FP_LOG=1). Not the default for the wide-graph prewarm (>= 60% cached, G4
+    // (RTX PRO 6000 Flash-Next 32 GB: 337 slots get their expert back, 795 MiB, per launch; the state fingerprints at every request begin equal
+    // those of a launch without the prewarm, LLAMA_MOE_CACHE_FP_LOG=1). Not the default for the wide-graph prewarm (>= 60% cached, RTX PRO 6000
     // 48 GB): there its windows end the CPU-miss warm phase and timing trial before the first request, and exact moves them into it
-    // (px_ab48b DFlash2 chat 261.7 -> 245.0 tok/s); the 48 GB 8k text varies per launch with or without a prewarm (the timing trial).
+    // (DFlash2 chat 261.7 -> 245.0 tok/s); the 48 GB 8k text varies per launch with or without a prewarm (the timing trial).
     // LLAMA_SPEC_PREWARM_EXACT unset = exact for the band prewarm (a cache under the wide-graph share), 1 = also over it, 0 = never (the
-    // k19-tokcost pause below then)
+    // the token-cost pause below then)
     const char * e_ex  = getenv("LLAMA_SPEC_PREWARM_EXACT");
     const int    ex_env = e_ex != nullptr ? atoi(e_ex) : -1;
     const bool   exact  = llama_moe_cache_active(ctx) && (ex_env > 0 || (ex_env < 0 && !wide_graphs)) &&
@@ -303,8 +303,8 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     if (cm_pause) {
         llama_moe_cache_stats_pause(ctx, true);
     }
-    // k19-p2qsa: the prewarmed graphs in the scored QSA form (LLAMA_QSA_ALLFIT), the kept graphs a request past 512 pools replays: an all-fit
-    // prewarm left only all-fit graphs, so the first verify / decode of such a request rebuilt every width inside its decode (G4 Flash-Next
+    // the prewarmed graphs in the scored QSA form (LLAMA_QSA_ALLFIT), the kept graphs a request past 512 pools replays: an all-fit
+    // prewarm left only all-fit graphs, so the first verify / decode of such a request rebuilt every width inside its decode (RTX PRO 6000 Flash-Next
     // full card, MTP 8k after chat: 4 builds, -2.9%). The first short request builds its all-fit graphs beside them instead (its own ways),
     // a one-time cost per width. LLAMA_SPEC_PREWARM_ALLFIT=1: prewarm the all-fit form instead
     // the first (or only) form is the scored one unless LLAMA_SPEC_PREWARM_ALLFIT=1; with both forms each chain prewarms its scored widths,
@@ -317,7 +317,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         }
     };
     pw_pause(pw_mode != 1);
-    // k19-int3fix: every captured verify graph keeps device memory the fit does not count (A100 80 GB with 48 GB free, Flash-Next + DFlash2
+    // every captured verify graph keeps device memory the fit does not count (A100 80 GB with 48 GB free, Flash-Next + DFlash2
     // MoE cache: 22-66 MiB per graph, 3 chains x 7 widths took 828 -> 64 MiB free on ec9072e9789 and -> 2 MiB with the few-row MMQ, whose
     // first request then died in a pool alloc). LLAMA_SPEC_PREWARM_MIN_FREE_MIB (default 512, 0 = no floor): no further width is
     // prewarmed below that much free device memory; the widths left out are captured when a request first needs them
@@ -394,7 +394,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
             n_ok, n_pre, reps, (int) chains.size(), (ggml_time_us() - t0)/1000.0);
 }
 
-// k19-l4reg: see server_slot::get_n_draft_max (default on, LLAMA_SPEC_END_FULL_WINDOW=0: the draft is cut to the tokens left as before)
+// see server_slot::get_n_draft_max (default on, LLAMA_SPEC_END_FULL_WINDOW=0: the draft is cut to the tokens left as before)
 static bool spec_end_full_window() {
     static const bool v = [] {
         const char * e = getenv("LLAMA_SPEC_END_FULL_WINDOW");
@@ -406,7 +406,7 @@ static bool spec_end_full_window() {
     return v;
 }
 
-// k19-q4xaccept: a request with penalties (Studio sends presence 1.5 for every Qwen3.5 / 3.6 / 3.8 request; the server's window is
+// a request with penalties (Studio sends presence 1.5 for every Qwen3.5 / 3.6 / 3.8 request; the server's window is
 // the last 64 tokens) drafts the argmax of the draft's candidates AFTER those penalties (window = the target's last tokens plus the
 // ones drafted before them), the token the target most likely emits; before, the draft's raw argmax was often a token the penalty had
 // just pushed down (a word of the last 64 tokens), which the target then rejected. Drafts only: the verify is unchanged (greedy:
@@ -425,9 +425,9 @@ static bool spec_replay_reverify() {
     return v;
 }
 
-// k19-sharednoise: drafts take the target's shared noise when the target draws with it (LLAMA_SHARED_NOISE=1);
+// drafts take the target's shared noise when the target draws with it (LLAMA_SHARED_NOISE=1);
 // LLAMA_SHARED_NOISE_DRAFT=0: they do not (the target's draws stay counter-based)
-// k19-small1115 (LLAMA_SPEC_TPP_ACTIVE, default on; 0 = off): the MTP window rules of a --parallel 1 server on a --parallel N one,
+// (LLAMA_SPEC_TPP_ACTIVE, default on; 0 = off): the MTP window rules of a --parallel 1 server on a --parallel N one,
 // decided per round from the active slots (load_model, update_slots)
 static bool spec_tpp_active_on() {
     static const bool on = [] {
@@ -445,12 +445,12 @@ static bool spec_sn_draft_on() {
     return v;
 }
 
-// k19-host30k (LLAMA_STATE_ASYNC_EXT=0: off): the prompt-cache save of a long prompt (larger than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB, or than
-// the staging at a request) was synchronous on the server thread: G4 Qwen3.8-Flash-Next UD-IQ4_XS, the 642 MiB save of a 16k prompt
+// (LLAMA_STATE_ASYNC_EXT=0: off): the prompt-cache save of a long prompt (larger than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB, or than
+// the staging at a request) was synchronous on the server thread: RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits, the 642 MiB save of a 16k prompt
 // took 175-360 ms of the next (30k) request's TTFT at 24 / 32 GB (a MoE cache: saved at the request) and ~140 ms at full card (saved at
 // idle, which the request sent right after the response waits for). The contexts pin at load the staging a whole-sequence save needs at
 // most (llama_state_seq_async_ext_reserve), and the save then reads its rows asynchronously: the same bytes into the entry. Pinned on a
-// thread while the slot generated instead (k19hx_g4), the pinning cost the decode 5-17% (cudaMallocHost beside the decode)
+// thread while the slot generated instead, the pinning cost the decode 5-17% (cudaMallocHost beside the decode)
 static bool server_state_async_ext() {
     static const bool v = getenv("LLAMA_STATE_ASYNC_EXT") == nullptr || atoi(getenv("LLAMA_STATE_ASYNC_EXT")) != 0;
     return v;
@@ -537,7 +537,7 @@ enum slot_state {
 
 struct server_slot; // forward declaration
 
-// k19-handoff (diagnostic, LLAMA_PASS_TIMING=1): host wall time between the steps of a speculative pass of one generating slot,
+// (diagnostic, LLAMA_PASS_TIMING=1): host wall time between the steps of a speculative pass of one generating slot,
 // averaged per request (printed with the timings): draft call, the host work up to the target's decode call, the decode call, its
 // wait, the drafter's pass over the verify rows, the accept, the accepted tokens' handling and the loop back to the next draft
 struct server_pass_timer {
@@ -620,7 +620,7 @@ struct server_pass_timer {
         dg.t_launch = dg.t_wait = dg.t_walk = dg.n_draft = 0;
     }
 };
-// k19-handoff: the server yields its task queue to a worker while a decode runs; ending a yield waits for that worker to wake and
+// the server yields its task queue to a worker while a decode runs; ending a yield waits for that worker to wake and
 // stop (two thread hand-offs), which a short speculative pass pays three times (draft, verify, the drafter's pass over the rows).
 // LLAMA_SERVER_YIELD_SMALL=0: work of at most 32 tokens runs without the yield (queued tasks then wait for the end of the pass);
 // default 1 = always yield, as before
@@ -792,7 +792,7 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
-    // k19-host (LLAMA_MTP_PROMPT_BG): joins the drafter's prompt pass running on a worker before the slot touches the draft context
+    // (LLAMA_MTP_PROMPT_BG): joins the drafter's prompt pass running on a worker before the slot touches the draft context
     std::function<void()> spec_bg_join;
     void spec_bg_wait() const {
         if (spec_bg_join) {
@@ -813,17 +813,17 @@ struct server_slot {
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
-    // k19-sharednoise: the key and the mirrored chain of the target's shared-noise draws, read by the drafter
+    // the key and the mirrored chain of the target's shared-noise draws, read by the drafter
     common_shared_noise_draft spec_sn;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
-    std::vector<completion_token_output> spec_probs; // k13: n_probs of the accepted tokens, read from their verify rows before any rollback
+    std::vector<completion_token_output> spec_probs; // n_probs of the accepted tokens, read from their verify rows before any rollback
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
-    // k19-rollback: the speculative checkpoint of the target is the host copy of its recurrent rows (llama_rs_snap_save), not spec_ckpt's data
+    // the speculative checkpoint of the target is the host copy of its recurrent rows (llama_rs_snap_save), not spec_ckpt's data
     bool spec_rs_snap = false;
 
-    // k9-draft: speculation cost governor (common/spec-governor.h); gov_step: what the current step is for it
+    // speculation cost governor (common/spec-governor.h); gov_step: what the current step is for it
     // (0 = not governed, 1 = plain because the governor held drafting back, 2 = a draft is verified, 3 = drafting gave no draft)
     common_spec_governor gov;
     int64_t gov_t_last = 0;
@@ -868,12 +868,12 @@ struct server_slot {
 
     server_prompt prompt;
 
-    // ckpt_keep_max >= -1 (k15-ttft): the caller knows the next prompt of this slot drops every checkpoint with pos_max above it, so
+    // ckpt_keep_max >= -1: the caller knows the next prompt of this slot drops every checkpoint with pos_max above it, so
     // those are moved into the cache entry instead of copied (opt-in, LLAMA_PCS_MOVE_CKPT=1), or copied on a thread (at_request, default)
-    // k15-ttft: the slot's prompt is in the prompt cache already, saved while the server was idle (LLAMA_PCS_IDLE_SAVE)
+    // the slot's prompt is in the prompt cache already, saved while the server was idle (LLAMA_PCS_IDLE_SAVE)
     bool prompt_saved_idle = false;
     bool prompt_saved_idle_new = false; // ... into a new entry (not one the cache held already)
-    // k15-idlewait: that save moved the slot's checkpoints into the entry instead of copying them (they come back at the next request)
+    // that save moved the slot's checkpoints into the entry instead of copying them (they come back at the next request)
     bool ckpt_lent = false;
 
     bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false, bool lend_ckpt = false,
@@ -882,7 +882,7 @@ struct server_slot {
         if (prompt.tokens.size() == 0) {
             return false;
         }
-        // k15-idlewait: an idle save of the only slot moves the checkpoints into the entry (no copy on the server loop: G4 q4x, 63 MiB for
+        // an idle save of the only slot moves the checkpoints into the entry (no copy on the server loop: RTX PRO 6000 4-bit MoE, 63 MiB for
         // the 640-token warm prompt); ckpt_return gives them back at the next request (server_context_impl::get_available_slot)
         std::list<common_prompt_checkpoint> lent;
         if (lend_ckpt) {
@@ -901,14 +901,14 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        // opt-in (LLAMA_PCS_MOVE_CKPT=1): local q4x spilled multi-turn (mt_local, k15r36) ended +900 MiB RssAnon with the move on
+        // opt-in (LLAMA_PCS_MOVE_CKPT=1): local 4-bit MoE spilled multi-turn ended +900 MiB RssAnon with the move on
         static const bool move_ckpt = getenv("LLAMA_PCS_MOVE_CKPT") != nullptr && atoi(getenv("LLAMA_PCS_MOVE_CKPT")) != 0;
         const bool mv = move_ckpt && ckpt_keep_max >= -1;
-        // k15-idlewait (LLAMA_PCS_CKPT_COPY_ASYNC=0: copied here, as before): at a request save the checkpoints the next prompt erases
+        // (LLAMA_PCS_CKPT_COPY_ASYNC=0: copied here, as before): at a request save the checkpoints the next prompt erases
         // are copied on a thread of the prompt cache into pooled buffers (the same buffers and copies as before, the originals go back
         // to the pool once copied, as the prompt's erase would have put them); the entry waits for it like a state save in flight.
-        // G4 q4x 12 GB chat: the copies of 2 checkpoints (125.6 MiB) were ~20 ms of the request.
-        // k17: default on again (LLAMA_PCS_CKPT_COPY_ASYNC=0: off). Its +577 MiB end-of-run RssAnon (T4 LFM2.5 multi-turn) was the state
+        // RTX PRO 6000 4-bit MoE 12 GB chat: the copies of 2 checkpoints (125.6 MiB) were ~20 ms of the request.
+        // default on again (LLAMA_PCS_CKPT_COPY_ASYNC=0: off). Its +577 MiB end-of-run RssAnon (T4 LFM2.5 multi-turn) was the state
         // pool: oversized pooled buffers held by small checkpoints and refills racing the originals (common_state_buf_pending_add,
         // LLAMA_STATE_POOL_SMALL_FRESH, LLAMA_STATE_POOL_REL); with those the run ends below the copies in place
         static const bool copy_async = getenv("LLAMA_PCS_CKPT_COPY_ASYNC") == nullptr || atoi(getenv("LLAMA_PCS_CKPT_COPY_ASYNC")) != 0;
@@ -927,23 +927,23 @@ struct server_slot {
             ckpt_lent = true;
         }
 
-        // k11 (LLAMA_PROMPT_SAVE_ASYNC=1, opt-in: on G4 it took 5 ms off the chat TTFT but the copies then delay the prompt's first
+        // (LLAMA_PROMPT_SAVE_ASYNC=1, opt-in: on RTX PRO 6000 it took 5 ms off the chat TTFT but the copies then delay the prompt's first
         // ubatch, Qwen3.6 MTP 32 GB pp -35% chat .. -3% 2k with md5 unchanged): the device copies are queued in stream order before the next decode, the host
         // copy into the cache entry runs on the context's state worker; the cache waits for it before it reads, erases or evicts
         // the entry (server_prompt_cache::wait_inflight). Larger states than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB (512) are saved as before.
         static const bool async_on = getenv("LLAMA_PROMPT_SAVE_ASYNC") != nullptr && atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC")) != 0;
         static const size_t async_max = (size_t) (getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB"))) : 512) << 20;
         llama_state_seq_flags fl = (async_on || force_async) && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
-        // k15-idlewait (LLAMA_PCS_REQ_SAVE_ASYNC=0: synchronous, as before): a save made at the request (where no idle save ran: a spilled
+        // (LLAMA_PCS_REQ_SAVE_ASYNC=0: synchronous, as before): a save made at the request (where no idle save ran: a spilled
         // tier, a MoE cache) reads the state rows into the pinned staging buffers the context already holds (the checkpoint saves reserve
-        // them) and the state worker copies them into the entry while the prompt runs; the next memory op waits for the reads only. G4
-        // q4x 12 GB chat: the synchronous reads into the fresh entry (77 MiB, 82 calls with a sync each) were most of the 40 ms the request
+        // them) and the state worker copies them into the entry while the prompt runs; the next memory op waits for the reads only. RTX PRO 6000
+        // 4-bit MoE 12 GB chat: the synchronous reads into the fresh entry (77 MiB, 82 calls with a sync each) were most of the 40 ms the request
         // waited before its prompt. Only where the staging holds the save already (LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW): no new pinned memory
         static const bool req_async = getenv("LLAMA_PCS_REQ_SAVE_ASYNC") == nullptr || atoi(getenv("LLAMA_PCS_REQ_SAVE_ASYNC")) != 0;
         if (fl == LLAMA_STATE_SEQ_FLAGS_NONE && req_async && at_request && (cur_size <= async_max || server_state_async_ext())) {
             fl = LLAMA_STATE_SEQ_FLAGS_ASYNC | LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW;
         }
-        // k19-host30k: a save larger than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB, at a request or at idle, is asynchronous where the staging
+        // a save larger than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB, at a request or at idle, is asynchronous where the staging
         // the context pinned beforehand (server_state_async_ext) holds it, its rows past the staging synchronous as before
         if (fl == LLAMA_STATE_SEQ_FLAGS_NONE && force_async && server_state_async_ext()) {
             fl = LLAMA_STATE_SEQ_FLAGS_ASYNC | LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW;
@@ -962,12 +962,12 @@ struct server_slot {
         return true;
     }
 
-    // k15-ttft: the RAM prompt-cache save of this slot (state + a clone of each checkpoint) writes into fresh host memory when the
+    // the RAM prompt-cache save of this slot (state + a clone of each checkpoint) writes into fresh host memory when the
     // buffer pool holds nothing large enough, and faulting those pages in made most of the save (local B200, Qwen3.6-35B-A3B MTP,
     // 640-token prompt: 77 MiB state + 2 x 62 MiB checkpoints, 80-290 ms against 8-16 ms into resident buffers). Once the prompt is
     // processed (and again when the slot goes idle) the prefault worker is asked for resident pool buffers of the sizes the next save
     // needs, so it runs while the slot generates or waits. Same copies into other buffers: the saved bytes are unchanged.
-    // Opt-in (LLAMA_PCS_PREFAULT_NEXT=1): the prepared buffers stay resident while the slot idles (G4 q4x 32 GB: +113 MiB RSS), and
+    // Opt-in (LLAMA_PCS_PREFAULT_NEXT=1): the prepared buffers stay resident while the slot idles (RTX PRO 6000 4-bit MoE 32 GB: +113 MiB RSS), and
     // the 2 MiB pages of common_state_thp_alloc take most of the fault cost without holding memory
     void prefault_next_save() const {
         static const bool on = getenv("LLAMA_PCS_PREFAULT_NEXT") != nullptr && atoi(getenv("LLAMA_PCS_PREFAULT_NEXT")) != 0;
@@ -1019,7 +1019,7 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
-    // k15-fn: the device greedy chain of this slot (set in the context while greedy requests run, see launch_slot_with_task)
+    // the device greedy chain of this slot (set in the context while greedy requests run, see launch_slot_with_task)
     llama_sampler_ptr smpl_dev;
     llama_sampler_ptr smpl_dev_m; // the same with the EOG tokens excluded (ignore_eos requests), swapped in for them
     llama_sampler_ptr smpl_dev_k; // a device top-k (dev_topk_k candidates) for sampled requests the host chain can finish from them
@@ -1194,7 +1194,7 @@ struct server_slot {
         return !!spec && !spec_off_req;
     }
 
-    int32_t n_spec_pen = 0; // k19-q4xaccept: passes drafted with the request's penalties (this request)
+    int32_t n_spec_pen = 0; // passes drafted with the request's penalties (this request)
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
     bool use_spec_rejection() const {
@@ -1222,9 +1222,9 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
-        // k19-l4reg (LLAMA_SPEC_END_FULL_WINDOW=0: off): near the n_predict limit the draft is no longer cut to the tokens left, so the
+        // (LLAMA_SPEC_END_FULL_WINDOW=0: off): near the n_predict limit the draft is no longer cut to the tokens left, so the
         // last pass of a request runs the width every other pass ran instead of a new one (process_token stops at the limit and drops
-        // the rest). A width a request never ran before builds its graph at that pass: Colab L4 12 GB Qwen3.8-Flash-Next UD-IQ4_XS MTP,
+        // the rest). A width a request never ran before builds its graph at that pass: L4 12 GB Qwen3.8-Flash-Next at 4 bits MTP,
         // the 1-row decode a text left for its last token took 0.86-1.30 s against 30 ms for a 3-row verify window
         if (n_remaining() > 0 && n_remaining() - 1 < n_draft_max) {
             if (!spec_end_full_window()) {
@@ -1239,7 +1239,7 @@ struct server_slot {
             }
         }
 
-        // k17-strict: batch invariant verify under a MoE cache: the window (the sampled token + the drafts) stays within the tokens
+        // batch invariant verify under a MoE cache: the window (the sampled token + the drafts) stays within the tokens
         // whose experts the cache serves on the device, as the single token decodes it must equal (llama_verify_device_max_tokens);
         // a larger window would run its experts on the CPU from host weights. LLAMA_SPEC_EXACT_DEVICE_CAP=0: off
         if (const int32_t cap = llama_verify_device_max_tokens(ctx_tgt); cap > 0 && n_draft_max > cap - 1) {
@@ -1405,7 +1405,7 @@ struct server_slot {
 
     void print_timings() const {
         {
-            // k19-hostgap: engagement of the task-queue yield's fast end (LLAMA_SERVER_YIELD_FAST=0: off), counts since start
+            // engagement of the task-queue yield's fast end (LLAMA_SERVER_YIELD_FAST=0: off), counts since start
             int64_t n_fast = 0, n_total = 0;
             server_queue_yield_counts(n_fast, n_total);
             SLT_INF(*this, "%" PRId64 " of %" PRId64 " task-queue yields ended without waiting for the worker (LLAMA_SERVER_YIELD_FAST=0 off)\n",
@@ -1419,7 +1419,7 @@ struct server_slot {
             srv_pass_timer().reset();
         }
         {
-            // k19-gramdev: device top-k rows of a grammar / reasoning budget request
+            // device top-k rows of a grammar / reasoning budget request
             const auto ds = common_sampler_get_dev_stats(smpl.get());
             if (ds.n_rows > 0) {
                 SLT_INF(*this, "device top-k grammar: %" PRId64 " rows, %" PRId64 " rejected, %" PRId64 " fallback, %" PRId64 " forced, %" PRId64 " full rows\n",
@@ -1708,9 +1708,9 @@ public:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
-    bool device_greedy_ok = false; // k15-fn: greedy requests sample on the device (see launch_slot_with_task)
+    bool device_greedy_ok = false; // greedy requests sample on the device (see launch_slot_with_task)
     std::vector<llama_token> dev_greedy_mask; // the EOG tokens (ignore_eos), ascending: the mask of the slots' masked device chain
-    int32_t dev_topk_k = 0; // k15-fn: the candidates of the device top-k chain (0: off, LLAMA_SERVER_DEVICE_TOPK=0)
+    int32_t dev_topk_k = 0; // the candidates of the device top-k chain (0: off, LLAMA_SERVER_DEVICE_TOPK=0)
 
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
@@ -1788,14 +1788,14 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-    // k15-lfm2: spill mode 3 pinned the small batches (llama_moe_pin_small); a request that cannot draft (a prompt of long_prompt+ tokens
+    // spill mode 3 pinned the small batches (llama_moe_pin_small); a request that cannot draft (a prompt of long_prompt+ tokens
     // whose shortest repeat is longer than any match) lifts the pin for its decode and the next request restores it before its prompt
     bool spill_pinned     = false;
     bool spill_pin_lifted = false;
 
     common_speculative_ptr spec;
 
-    // k19-host (LLAMA_MTP_PROMPT_BG=0 off): the MTP drafter's pass over a prompt batch runs on a worker beside the target's next decode when
+    // (LLAMA_MTP_PROMPT_BG=0 off): the MTP drafter's pass over a prompt batch runs on a worker beside the target's next decode when
     // that decode is the slot's last few prompt tokens (the [n-4] [4] split of a long prompt: the [4] waits for its experts over PCIe while
     // the drafter computes). The worker runs the same process_rows calls on the same rows in the same order, then the draft-context steps
     // the main thread queued for it (the checkpoint's draft part, the draft's seq_rm), so the draft's KV, drafts and text are those of
@@ -1809,18 +1809,18 @@ private:
         bool                               live    = false; // main thread: a worker is running
         bool                               hold    = false; // main thread: the next update_slots continues the slot's prompt beside it
         bool                               group   = false; // main thread: beside the next prompt batch of any size (the target holds)
-        bool                               free_hold = false; // main thread: the target's free-only hold is set (k19-q4x262)
+        bool                               free_hold = false; // main thread: the target's free-only hold is set
         bool                               fail    = false; // main thread: a pass the target's hold joined failed (reported at the next join)
-        int                                slot_id = -1;    // main thread: the slot whose prompt batch the pass computes (k19-studio-np4)
+        int                                slot_id = -1;    // main thread: the slot whose prompt batch the pass computes
         std::atomic<bool>                  ok      { true };
         int64_t                            t_launch = 0;
     } spec_bg;
 
     static constexpr int32_t spec_bg_tail_max = 64; // the next target decode it may run beside: at most this many tokens
 
-    // k19-q4x262 (LLAMA_MTP_PROMPT_BG_FREE_HOLD=0 off): a pass launched beside the tail decode (not group mode) sets the target's
+    // (LLAMA_MTP_PROMPT_BG_FREE_HOLD=0 off): a pass launched beside the tail decode (not group mode) sets the target's
     // free-only hold (llama_set_nextn_hold_free). Without it, a tail decode that took the MoE cache banks back after a released prompt
-    // freed the drafter's compute buffers and graph results while the pass computed in them (G4 q4x 12 GB ctx 262144 MTP, 8192-token
+    // freed the drafter's compute buffers and graph results while the pass computed in them (RTX PRO 6000 4-bit MoE 12 GB ctx 262144 MTP, 8192-token
     // prompt: the server died silently at the first decode, base and head alike)
     static bool spec_bg_free_hold_on() {
         static const bool v = getenv("LLAMA_MTP_PROMPT_BG_FREE_HOLD") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG_FREE_HOLD")) != 0;
@@ -1870,7 +1870,7 @@ private:
         return true;
     }
 
-    // k19-host (LLAMA_MTP_PROMPT_BG_GROUP): the target context's next-n hold (llama_set_nextn_hold), on the server thread inside the target's
+    // (LLAMA_MTP_PROMPT_BG_GROUP): the target context's next-n hold (llama_set_nextn_hold), on the server thread inside the target's
     // decode, before it writes / frees the rows the pass reads or frees the drafter's compute buffers
     static void spec_bg_hold_cb(void * ud) {
         auto * self = (server_context_impl *) ud;
@@ -1908,9 +1908,9 @@ private:
         return spec_bg.ok.load();
     }
 
-    // k19-studio-np4 (LLAMA_MTP_PROMPT_BG_MULTI=0 off): the slot whose prompt the drafter's background pass may accompany: the only
+    // (LLAMA_MTP_PROMPT_BG_MULTI=0 off): the slot whose prompt the drafter's background pass may accompany: the only
     // slot (-np 1), or with several slots the only one that is processing (the others idle: Studio's -np 4 with one user). Before, the
-    // pass ran on a worker only at -np 1; at -np 4 each 8192-token group of a long prompt waited for its drafter pass in line (G4 Flash-Next
+    // pass ran on a worker only at -np 1; at -np 4 each 8192-token group of a long prompt waited for its drafter pass in line (RTX PRO 6000 Flash-Next
     // + Q8_0 MTP 16 GB, 30k: 93-117 ms per group, TTFT 6.356 vs 6.162 s at -np 1). Every other slot that starts work joins the worker
     // first (pre_decode, and the slot's prompt_load / prompt_save / prompt_clear / release), as the draft context is shared
     server_slot * spec_bg_slot() {
@@ -1977,12 +1977,12 @@ private:
     std::unique_ptr<server_prompt_ssd>   prompt_ssd; // SSD tier of the prompt cache (--cache-ssd-dir)
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
-    // k11 (LLAMA_LM_CKPT_MERGE): absolute batch indices where the server would have ended a prompt batch for the checkpoint
+    // (LLAMA_LM_CKPT_MERGE): absolute batch indices where the server would have ended a prompt batch for the checkpoint
     // 4 + n_ubatch tokens before the end; the batch goes on, its ubatches still end there (llama_set_ubatch_breaks), so a
     // layer-major prompt reads the host experts once for both (the checkpoint itself is not made)
     std::vector<int32_t> lm_breaks;
-    // k15-pp: the checkpoint at the first merged break, taken inside the decode (llama_set_state_capture): slot, its token count there
-    // k15-pp2: up to two (the far and the near checkpoint of one prompt batch)
+    // the checkpoint at the first merged break, taken inside the decode (llama_set_state_capture): slot, its token count there
+    // up to two (the far and the near checkpoint of one prompt batch)
     struct lm_cap_req_t {
         int     slot;
         int64_t n_tokens;
@@ -2013,10 +2013,10 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
-    int32_t spec_active_cap = 0; // k19-small1115: drafts per window while another slot is active (0: no cut; load_model)
-    bool    spec_g4t_raised = false; // k19-g4tail: the rule raised the MTP windows to n_def drafts (load_model)
+    int32_t spec_active_cap = 0; // drafts per window while another slot is active (0: no cut; load_model)
+    bool    spec_g4t_raised = false; // the rule raised the MTP windows to n_def drafts (load_model)
     bool    spec_chat_deep  = false; // the MTP windows of the chat bucket draft deeper (load_model)
-    int32_t spec_g4t_cap    = 0;     // k19-g4tail2: drafts per window when the placed MoE cache is outside the band (0: no cut)
+    int32_t spec_g4t_cap    = 0;     // drafts per window when the placed MoE cache is outside the band (0: no cut)
 
     int64_t t_last_load_progress_ms = 0;
 
@@ -2103,10 +2103,10 @@ private:
 
         const bool is_resume = sleeping;
 
-        // k11-decode: n-gram drafting on by default where nothing else drafts (server-spec-auto.h, LLAMA_SPEC_AUTO=0: off)
+        // n-gram drafting on by default where nothing else drafts (server-spec-auto.h, LLAMA_SPEC_AUTO=0: off)
         server_spec_auto_apply(params);
 
-        // k19-tpp (LLAMA_SPEC_TPP=0: off): an MTP drafter at 2 drafts (Studio's --spec-draft-n-max 2, greedy, no p-min) keeps those 2 and
+        // (LLAMA_SPEC_TPP=0: off): an MTP drafter at 2 drafts (Studio's --spec-draft-n-max 2, greedy, no p-min) keeps those 2 and
         // adds a 3rd where the measured tokens per ms of a 4-row verify beat the 3-row one (common_spec_mtp_cost::tpp_more / tpp_keep).
         // Verify rows of 3 and 4 tokens run the same kernels (LLAMA_SPEC_TPP_VERIFY), so the greedy text stays that of 2 drafts
         {
@@ -2118,12 +2118,12 @@ private:
             }) == 1 && std::find(sp.types.begin(), sp.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != sp.types.end();
             // by default only where every GPU is NVIDIA Ampere or newer (compute capability >= 8.0): there a 4-row verify row runs the
             // kernels of a 3-row one (mmvq keeps its 4 warps up to 4 columns, F32 weights stay on mmvf under the verify tag). Turing's
-            // mmvq table halves the q6_K warps at 4 columns, so a T4 window's head rows sum in another order (Kaggle T4 q4x + MTP heads:
+            // mmvq table halves the q6_K warps at 4 columns, so a T4 window's head rows sum in another order (T4 4-bit MoE + MTP heads:
             // +3% decode, but chat text varied launch to launch); AMD and other GPUs report no capability. LLAMA_SPEC_TPP=1 forces it on
-            // k19-small1115 (LLAMA_SPEC_TPP_ACTIVE, default on; 0 = only with --parallel 1, as before): with --parallel N the windows
+            // (LLAMA_SPEC_TPP_ACTIVE, default on; 0 = only with --parallel 1, as before): with --parallel N the windows
             // are decided per round from the active slots: a lone request drafts as on a --parallel 1 server (the wider windows below),
             // and while another slot is active every window is cut to the floor of 2 drafts (update_slots), the windows of a
-            // --parallel N server without them. Colab A100 40 GB Qwen3.6-35B-A3B UD-Q3_K_XL in-file MTP n2 (ks_a1): one request on
+            // --parallel N server without them. A100 40 GB Qwen3.6-35B-A3B at 3 bits in-file MTP n2: one request on
             // --parallel 4 decoded 324.3 tok/s vs 342.6 on --parallel 1, the same text
             const bool mtp_shape = mtp_only && sp.draft.n_max == 2 && sp.draft.n_min == 0 && sp.draft.p_min <= 0.0f && !sp.draft.probabilistic &&
                 (params.n_parallel == 1 || spec_tpp_active_on());
@@ -2160,7 +2160,7 @@ private:
             const bool dev_ok = n_gpu > 0 && cc_min >= 800;
             // The restricted DFlash2 draft head beside a MoE cache that holds most of the experts (LLAMA_DFLASH_DRAFT_VOCAB_WIDE, see
             // llama_context and the fit) is on where every GPU the fit uses has compute capability 12.0, the only cards it is measured on:
-            // Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS + DFlash2 n6, 48 GB, 3 launches: chat 281.2 -> 285.8 tok/s (+1.6%), the same text.
+            // RTX PRO 6000, Qwen3.8-Flash-Next at 4 bits + DFlash2 n6, 48 GB, 3 launches: chat 281.2 -> 285.8 tok/s (+1.6%), the same text.
             // An explicit LLAMA_DFLASH_DRAFT_VOCAB_WIDE keeps its value
             if (getenv("LLAMA_DFLASH_DRAFT_VOCAB_WIDE") == nullptr && sp.has_dft() && !gpus.empty()) {
                 bool all_120 = true;
@@ -2174,7 +2174,7 @@ private:
                 }
             }
             // no wider window where the experts will not all fit on the devices: there the fit runs an MoE cache, whose residency a
-            // wider window moves, and sizing the outputs for 4 rows instead of 3 already takes from the cache (G4 fn4 16 GB, ktp_g4e: MoE
+            // wider window moves, and sizing the outputs for 4 rows instead of 3 already takes from the cache (RTX PRO 6000 Flash-Next 16 GB, ktp_g4e: MoE
             // cache 5528 vs 5538 MiB, text != base, 0.94-0.96 of base at 16k / 30k). Decided before the fit, from the GGUF bytes (target
             // and drafter + 1.5 GiB) against the devices' free memory; the speculative side also turns the window off if a cache runs
             // anyway. LLAMA_SPEC_TPP_CACHED=1: on there too
@@ -2194,10 +2194,10 @@ private:
                 }
             }
             dev_free += igpu_free;
-            // k19-bigverify (opt-in, LLAMA_SPEC_TPP_NEED_PLE=0): without tensor overrides the per-layer embedding table never takes device
-            // memory, so it can be left out of the need. Colab A100 80 GB, Qwen3.8-Flash-Next UD-IQ4_XS + MTP drafter: need 94815 MiB with
+            // (opt-in, LLAMA_SPEC_TPP_NEED_PLE=0): without tensor overrides the per-layer embedding table never takes device
+            // memory, so it can be left out of the need. A100 80 GB, Qwen3.8-Flash-Next at 4 bits + MTP drafter: need 94815 MiB with
             // its 26.8 GiB table against 80725 MiB free keeps the windows at 2 drafts although the fit places every expert on the card and
-            // runs no MoE cache. Left out (bv_abh), k19-tpp + k19-depth's 4-draft windows there: chat 156.1 -> 159.7 tok/s (+2.3%) but 8k
+            // runs no MoE cache. Left out, the rule above + the earlier rule's 4-draft windows there: chat 156.1 -> 159.7 tok/s (+2.3%) but 8k
             // 148.2 -> 120.6 (-18.6%: each verify row costs ~2.9 ms on that card, 4.06 / 3.05 tokens per pass at 25.5 / 25.3 ms). So the
             // default (unset / 1) still counts the whole file until the deep windows are priced per device
             const uint64_t tgt_bytes = mtp_shape ? tpp_gguf_bytes(params.model.path) : 0;
@@ -2218,8 +2218,8 @@ private:
                 const char * x = getenv("LLAMA_MTP_EXACT");
                 return x != nullptr && atoi(x) != 0;
             }();
-            // Only where the routed experts fit in host RAM: where they do not (Colab L4, 52 GB of RAM for the 57.6 GB of experts of fn4n)
-            // the cache's misses are read from the disk and each verify row costs ~27% of a pass (fm_l1: 4 drafts -5% chat), so the windows
+            // Only where the routed experts fit in host RAM: where they do not (L4, 52 GB of RAM for the 57.6 GB of experts of Flash-Next)
+            // the cache's misses are read from the disk and each verify row costs ~27% of a pass (4 drafts -5% chat), so the windows
             // stay at 2 there. LLAMA_SPEC_DEPTH_CACHED_DISK=1: on there too; LLAMA_SPEC_DEPTH_CACHED_RAM_MIB=N: N MiB of RAM instead of
             // MemAvailable (test hook)
             const uint64_t ram_avail = [] {
@@ -2232,16 +2232,16 @@ private:
             }();
             const char * dc_env = getenv("LLAMA_SPEC_DEPTH_CACHED");
             int depth_cached = dc_env != nullptr ? atoi(dc_env) : 0;
-            // k19-fnmtp2: the default where a verify row beside the cache is cheap (LLAMA_SPEC_DEPTH_CACHED unset; =0: 2 drafts, =N: N).
+            // the default where a verify row beside the cache is cheap (LLAMA_SPEC_DEPTH_CACHED unset; =0: 2 drafts, =N: N).
             // An MTP drafter of its own (-md) at Studio's shape drafts LLAMA_SPEC_DEPTH_CACHED_N (4) per window below LLAMA_SPEC_DEPTH_POS
             // when (a) the cache is expected to hold at least LLAMA_SPEC_DEPTH_CACHED_SHARE (0.30) of the routed experts, estimated before
             // the fit as 1 - (device need without the host-only per-layer embedding table - free) / expert bytes, and (b) the whole target
             // GGUF is held in host memory (on a memory file system, or its bytes within the available memory), so the rows' expert misses
-            // and per-layer embedding rows come from RAM, not the disk. G4 RTX PRO 6000 96 GB, Qwen3.8-Flash-Next UD-IQ4_XS from RAM + its
+            // and per-layer embedding rows come from RAM, not the disk. RTX PRO 6000 RTX PRO 6000 96 GB, Qwen3.8-Flash-Next at 4 bits from RAM + its
             // MTP drafter, Studio argv, 3 launches, this rule against its kill switch: 48 GB (cache 67%) chat
             // +10.1% / 8k +18.0%, 32 GB (41%) +10.0% / +3.0%; at 16 GB (14%: rule off) 4 drafts measured chat +7.8% (12.8% launch spread) /
-            // 8k -6.7%. A verify row there costs 2.2-2.5 ms of a 12.6-13.0 ms pass at 48 / 32 GB, ~3.5 ms of 15.2 at 16 GB. Colab A100 80 GB
-            // at 48 GB chat +17.7% / 8k +1.6%. The A100 40 GB VM of round 1 (93.7 GB model, 83 GB of RAM: rows read from the disk) stays at 2
+            // 8k -6.7%. A verify row there costs 2.2-2.5 ms of a 12.6-13.0 ms pass at 48 / 32 GB, ~3.5 ms of 15.2 at 16 GB. A100 80 GB
+            // at 48 GB chat +17.7% / 8k +1.6%. The A100 40 GB VM of the first run (93.7 GB model, 83 GB of RAM: rows read from the disk) stays at 2
             // (decided before the cache share bands below: where these deeper windows are the default, those bands leave the
             // windows to this rule, see share_deep)
             const bool deep_try = dc_env == nullptr && mtp_shape && cache_expected && sp.has_dft() && !exact_mtp && !host_experts &&
@@ -2262,14 +2262,14 @@ private:
             const bool in_ram_fs = deep_try && tpp_file_in_ram_fs(params.model.path);
             const bool resident  = in_ram_fs || (tgt_bytes > 0 && ram_avail > 0 && tgt_bytes <= ram_avail);
             // (short_b == 0: every routed expert is expected on the devices and the need only reads high from the drafter and margin,
-            // k19-bigverify's A100 80 GB full card, where 4 drafts measured 8k -18.6%: not this rule's tier)
+            // the earlier rule's A100 80 GB full card, where 4 drafts measured 8k -18.6%: not this rule's tier)
             const bool def_on    = deep_try && exp_b > 0 && short_b > 0 && deep_share >= deep_share_min && resident;
-            // k19-g4tail (LLAMA_MOE_G4TAIL=0: off, the int3 rule above alone): a cache expected to hold LLAMA_MOE_G4TAIL_LO .. _HI (0.07 ..
-            // 0.17, the estimate; G4 16 GB reads 10.8% here, 14.4% once placed) of the routed experts, on compute capability 12.0 cards
+            // (LLAMA_MOE_G4TAIL=0: off, the rule above alone): a cache expected to hold LLAMA_MOE_G4TAIL_LO .. _HI (0.07 ..
+            // 0.17, the estimate; RTX PRO 6000 16 GB reads 10.8% here, 14.4% once placed) of the routed experts, on compute capability 12.0 cards
             // only, with the target in RAM: the windows draft n_def (4) too, and the MoE cache's cross-layer prefetch is on in its band
             // (LLAMA_MOE_PREFETCH_AUTO=2 for llama_moe_cache: top 10 predicted experts, at most 1 copied per layer, generation and verify
-            // windows only, where the placed cache holds 10-20%). With the route tail skip off (int3 c5d7c3bc40d) every rank 7-9 miss is a
-            // host expert or a copy; the two together, Colab G4 Flash-Next UD-IQ4_XS MTP n2 16 GB, 3 launches on two VMs: chat +8.3 / +9.0%
+            // windows only, where the placed cache holds 10-20%). With the route tail skip off (commit c5d7c3bc40d) every rank 7-9 miss is a
+            // host expert or a copy; the two together, RTX PRO 6000 Flash-Next at 4 bits MTP n2 16 GB, 3 launches on two VMs: chat +8.3 / +9.0%
             // (held-out text +9.5%), 8k +8.0 / +10.8% (held-out -1.3%); long48 KLD inside the -fa off band on all 8 statistics.
             // An explicit LLAMA_SPEC_DEPTH_CACHED / LLAMA_MOE_PREFETCH / LLAMA_MOE_PREFETCH_AUTO keeps its value
             const bool g4tail_on = [] {
@@ -2278,8 +2278,8 @@ private:
             }();
             const double g4t_lo = getenv("LLAMA_MOE_G4TAIL_LO") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_LO")) : 0.07;
             const double g4t_hi = getenv("LLAMA_MOE_G4TAIL_HI") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_HI")) : 0.17;
-            // k19-g4tail2: not above LLAMA_FIT_LONGCTX_MIN_CTX (32768, where --fit's long-context ladder takes over; n_ctx 0 = the
-            // trained context counts as above): there the deeper windows changed the fit itself. G4 16 GB ctx 262144: priced at 4
+            // not above LLAMA_FIT_LONGCTX_MIN_CTX (32768, where --fit's long-context ladder takes over; n_ctx 0 = the
+            // trained context counts as above): there the deeper windows changed the fit itself. RTX PRO 6000 16 GB ctx 262144: priced at 4
             // drafts the requantized drafter was left out, and the placement moved (49 layers, n_ubatch 2048, cache 6233 MiB against
             // 50 layers, n_ubatch 512, 3915 MiB with the rule off): decode chat / 8k 87.4 / 82.3 tok/s against 133.0 / 125.2. Above the
             // bound the rule sets nothing, as LLAMA_MOE_G4TAIL=0
@@ -2294,7 +2294,7 @@ private:
             // Between the two rules (from LLAMA_MOE_G4TAIL_HI, 0.17, up to LLAMA_SPEC_DEPTH_CACHED_SHARE, 0.30) the windows stayed at 2
             // drafts on compute capability 12.0 cards. There the deep windows' rule applies too, under the same conditions as the band
             // below it (target in RAM, n_ctx not above LLAMA_FIT_LONGCTX_MIN_CTX), drafting LLAMA_SPEC_DEPTH_MID_N (default 3) per
-            // window; no prefetch and no host-path change (both stay as at the rule's floor). Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS +
+            // window; no prefetch and no host-path change (both stay as at the rule's floor). RTX PRO 6000, Qwen3.8-Flash-Next at 4 bits +
             // its MTP drafter, Studio argv, 24 GB (25.0% expected), 3 launches: 3 drafts chat 185.7 -> 194.8 tok/s, 8k 163.0 -> 174.8;
             // 4 drafts chat 191.5, 8k 155.5 (each extra verify row misses more experts at this share). LLAMA_SPEC_DEPTH_MID=0,
             // LLAMA_MOE_G4TAIL=0 or an explicit LLAMA_SPEC_DEPTH_CACHED_SHARE: off
@@ -2310,8 +2310,8 @@ private:
                 exp_b > 0 && short_b > 0 && resident && deep_share >= g4t_hi && deep_share < deep_share_min && g4t_ctx_ok &&
                 n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
             // The same 3-draft windows just above that floor, up to LLAMA_SPEC_DEPTH_MID_HI (0.33; 0: the deep windows' own depth from
-            // the floor): there a 4th verify row still misses enough experts that the narrower window pays. Colab G4, Qwen3.8-Flash-Next
-            // UD-IQ4_XS + its MTP drafter, Studio argv, 3 launches on three texts each, 3 against 4 drafts: 27 GB (30.4% expected) chat
+            // the floor): there a 4th verify row still misses enough experts that the narrower window pays. RTX PRO 6000, Qwen3.8-Flash-Next
+            // at 4 bits + its MTP drafter, Studio argv, 3 launches on three texts each, 3 against 4 drafts: 27 GB (30.4% expected) chat
             // +2..+8%, 8k -3..+14%; 28 GB (32.1%) chat +1..+8%, 8k +2..+38%; from 29 GB (33.9%) on 4 drafts win chat on every text
             // (29 / 30 / 32 / 36 GB)
             const double mid_hi = [] {
@@ -2320,9 +2320,9 @@ private:
             }();
             const bool def_mid_hi = def_on && mid_on && g4tail_on && getenv("LLAMA_SPEC_DEPTH_CACHED_SHARE") == nullptr &&
                 getenv("LLAMA_SPEC_DEPTH_CACHED_N") == nullptr && deep_share < mid_hi && g4t_ctx_ok && n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
-            // k19-sharegate (LLAMA_SPEC_TPP_SHAREGATE=0: off, the blanket rule above): a cache expected to hold nearly every routed
+            // (LLAMA_SPEC_TPP_SHAREGATE=0: off, the blanket rule above): a cache expected to hold nearly every routed
             // expert (estimated share = 1 - (need - free) / expert bytes, at least LLAMA_SPEC_TPP_CACHED_SHARE, default 0.85) keeps the
-            // priced 3-draft windows, as LLAMA_SPEC_TPP_CACHED=1. The rule above came from fn4 at a 9-14% share; at ~92% (q4x on a 24 GB
+            // priced 3-draft windows, as LLAMA_SPEC_TPP_CACHED=1. The rule above came from Flash-Next at a 9-14% share; at ~92% (4-bit MoE on a 24 GB
             // L4) a 4th verify row misses few experts. Not for experts placed on the host by hand, not with LLAMA_MTP_EXACT=1, only
             // where the routed experts fit in host RAM (misses not read from the disk)
             const char * sg = getenv("LLAMA_SPEC_TPP_SHAREGATE");
@@ -2339,12 +2339,12 @@ private:
             const double share_est = share_exp > 0 ? 1.0 - (double) share_short/(double) share_exp : 0.0;
             const uint64_t share_ram = share_exp > 0 ? llama_available_memory() : 0;
             const bool share_hi = share_exp > 0 && share_est >= share_min && (share_ram == 0 || share_exp <= share_ram);
-            // k19-q4cap (LLAMA_SPEC_TPP_CACHED_LOW=0 off): from LLAMA_SPEC_TPP_CACHED_SHARE_LOW (0.30) of the routed experts up to the
+            // (LLAMA_SPEC_TPP_CACHED_LOW=0 off): from LLAMA_SPEC_TPP_CACHED_SHARE_LOW (0.30) of the routed experts up to the
             // share above, the 3rd draft only in the windows of the chat bucket (KV positions below 1536, LLAMA_SPEC_TPP_CTX_EXTRA
-            // "1,0,0,0,0" unless given): longer contexts keep 2 drafts. Qwen3.6-35B-A3B UD-Q4_K_XL + MTP (3 launches, priced
-            // windows at every position): chat G4 @16 (61%) +8.8%, L4 16 GB (61%) +6.3%, L4 12 GB (39%) +9.6%, L4 8 GB (17%) 0%; 8k
-            // 0..+2.2% (G4 @16 with the larger cache -2.7%), 30k -8.5% (L4 12 GB): so the priced 3rd draft stays off past the chat bucket.
-            // Qwen3.8 Flash-Next UD-IQ4_XS at a 9-14% share (where the blanket rule above was measured) stays below it. Same output class (MTP verify), KLD inside the -fa off band (L4 12 GB)
+            // "1,0,0,0,0" unless given): longer contexts keep 2 drafts. Qwen3.6-35B-A3B at 4 bits + MTP (3 launches, priced
+            // windows at every position): chat RTX PRO 6000 @16 (61%) +8.8%, L4 16 GB (61%) +6.3%, L4 12 GB (39%) +9.6%, L4 8 GB (17%) 0%; 8k
+            // 0..+2.2% (RTX PRO 6000 @16 with the larger cache -2.7%), 30k -8.5% (L4 12 GB): so the priced 3rd draft stays off past the chat bucket.
+            // Qwen3.8 Flash-Next at 4 bits at a 9-14% share (where the blanket rule above was measured) stays below it. Same output class (MTP verify), KLD inside the -fa off band (L4 12 GB)
             const char * lo_e = getenv("LLAMA_SPEC_TPP_CACHED_LOW");
             const double share_lo = [] {
                 const char * s = getenv("LLAMA_SPEC_TPP_CACHED_SHARE_LOW");
@@ -2352,14 +2352,14 @@ private:
             }();
             // Neither band below caps an MTP drafter of its own (-md) where the deeper windows above are its default (def_on / g4t): their
             // estimate counts the host-only per-layer embedding table as device need and reads far below the cache's real share there.
-            // Colab G4 48 GB, Qwen3.8-Flash-Next UD-IQ4_XS + its MTP drafter: 20% read against 67.7% held, so the chat band set 3-draft
+            // RTX PRO 6000 48 GB, Qwen3.8-Flash-Next at 4 bits + its MTP drafter: 20% read against 67.7% held, so the chat band set 3-draft
             // windows in place of 6 / 4 (chat 262.2 -> 235.2 tok/s, 8k 220.8 -> 211.3). Built-in MTP heads (no -md) never take the deep
             // windows and keep both bands
             const bool share_deep = def_on || g4t || def_mid;
             const bool share_low = !share_hi && !share_deep && share_exp > 0 && (lo_e == nullptr || atoi(lo_e) != 0) && share_est >= share_lo &&
                 share_lo < share_min && (share_ram == 0 || share_exp <= share_ram);
             // LLAMA_SPEC_TPP_CACHED_SHARE_CHAT (default 0.15, 0 = off): from that share up to the band above, the 3rd draft in the chat
-            // bucket only (the longer buckets keep 2 drafts). L4 capped at 8 GB (17%), Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, three VMs, 10
+            // bucket only (the longer buckets keep 2 drafts). L4 capped at 8 GB (17%), Qwen3.6-35B-A3B at 4 bits + MTP, three VMs, 10
             // interleaved launches per arm: chat +2.9% (2.69 -> 3.28 tokens per pass), 8k level; the 8k bucket's 3rd draft did not pay there
             const double share_chat_lo = [] {
                 const char * s = getenv("LLAMA_SPEC_TPP_CACHED_SHARE_CHAT");
@@ -2380,7 +2380,7 @@ private:
             const bool share_ok = share_hi || share_low || share_chat;
             // LLAMA_SPEC_TPP_CACHED_LOW_MID (default 1, =0 off): in that band the windows of the 6144..12288 bucket take the 3rd draft
             // too. Their 4-row windows carry the verify tag (3-row kernels); beside a cache holding most experts the extra row adds few
-            // misses while a pass carries ~0.6 more tokens. L4 capped at 16 GB (61%), Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, 8k prompt, 3
+            // misses while a pass carries ~0.6 more tokens. L4 capped at 16 GB (61%), Qwen3.6-35B-A3B at 4 bits + MTP, 8k prompt, 3
             // interleaved launches: decode 96.9 -> 110.0 tok/s (2.59 -> 3.24 tokens per pass), same text there; on other cards the cache
             // residency can differ and change the text within the -fa off KLD band; chat, 16k and 30k use other buckets
             static const bool low_mid = getenv("LLAMA_SPEC_TPP_CACHED_LOW_MID") == nullptr || atoi(getenv("LLAMA_SPEC_TPP_CACHED_LOW_MID")) != 0;
@@ -2407,13 +2407,13 @@ private:
             const bool fits_all = (ce != nullptr && atoi(ce) != 0) || !cache_expected;
             // LLAMA_SPEC_TPP=1 forces past the device rule, not the MoE cache rule
             const bool on = (e != nullptr ? atoi(e) != 0 : dev_ok) && fits_all;
-            // k19-fnmtp (LLAMA_SPEC_DEPTH_CACHED=N drafts, N = 3..8; 0: off; unset: the k19-fnmtp2 default below): beside a MoE cache an MTP drafter of its own
-            // (-md) drafts N in every window below LLAMA_SPEC_DEPTH_POS (12288), the windows from there are k19-tpp's priced ones (2, a 3rd
+            // (LLAMA_SPEC_DEPTH_CACHED=N drafts, N = 3..8; 0: off; unset: the default below): beside a MoE cache an MTP drafter of its own
+            // (-md) drafts N in every window below LLAMA_SPEC_DEPTH_POS (12288), the windows from there are the earlier rule's priced ones (2, a 3rd
             // where it pays at the cache's cost ratio). The 4-row windows then get the verify tag (LLAMA_SPEC_VERIFY4_CACHED=1 is set unless
             // given), so they run the 3-row kernels instead of cuBLAS. Not with LLAMA_MTP_EXACT=1 (beside a cache the exact text follows the
             // window where the CPU-miss host path runs): there the windows stay at 2.
-            // Not on by itself because the deeper window does not pay on every measured cached tier (Colab A100 40 GB
-            // Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk, 3 launches, with the PLE table read in part): 3 drafts full card chat +3.4% /
+            // Not on by itself because the deeper window does not pay on every measured cached tier (A100 40 GB
+            // Qwen3.8-Flash-Next at 4 bits from the VM disk, 3 launches, with the PLE table read in part): 3 drafts full card chat +3.4% /
             // 8k -3.8%, 16 GB chat -6% / 8k +7.6%; 4 drafts full card +1.8% / +6.8%, 16 GB -16% / -14%. A verify row costs ~10 ms there
             // (PLE rows read from the disk and expert misses copied at ~10 GB/s), against 3.4 -> 4.0 tokens per pass
             if (deep_try && !on) {
@@ -2430,7 +2430,7 @@ private:
                 // Where the cache is expected to hold most of the routed experts (at least LLAMA_SPEC_HOSTPATH_OFF_SHARE, default 0.60;
                 // 0: off) on compute capability 12.0 cards, the CPU-miss host path stays off (as LLAMA_MOE_CPU_MISS=0): the few misses of
                 // the deep verify windows are fetched instead of computed on the host. There the host path ran inside the decode call
-                // (6-7 ms of host time in an 18 ms pass) and its trial in the first chat request. Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS +
+                // (6-7 ms of host time in an 18 ms pass) and its trial in the first chat request. RTX PRO 6000, Qwen3.8-Flash-Next at 4 bits +
                 // its MTP drafter, Studio argv, 48 GB (67.7% expected), two VMs x 2 launches: chat 231.9 -> 249.9 tok/s (+7.8%, 17.5 -> 16.3
                 // ms per pass), chat TTFT 0.184 -> 0.150 s, 8k level (210.6 / 210.9), the same text. At 32 GB (39%) the host path is
                 // needed (-15% without it), at 16 GB (11%) more so (-43%). An explicit LLAMA_MOE_CPU_MISS keeps its value
@@ -2446,8 +2446,8 @@ private:
                         100.0*deep_share, hp_share);
                 }
                 // In the same band the MTP drafter's restricted head keeps 32768 rows instead of 65536: each draft step's lm head is
-                // the largest kernel of the step there, and the deep windows draft 4-6 steps per pass. Colab G4, Qwen3.8-Flash-Next
-                // UD-IQ4_XS + its MTP drafter, Studio argv, 48 GB, 2 launches: 8k 210.4 -> 215.7 tok/s (+2.5%, 16.22 -> 16.04 ms per
+                // the largest kernel of the step there, and the deep windows draft 4-6 steps per pass. RTX PRO 6000, Qwen3.8-Flash-Next
+                // at 4 bits + its MTP drafter, Studio argv, 48 GB, 2 launches: 8k 210.4 -> 215.7 tok/s (+2.5%, 16.22 -> 16.04 ms per
                 // pass at 3.46 tokens), chat level (256.3 / 256.6), the same text. LLAMA_SPEC_MTP_VOCAB_WIDE=0: off; an explicit
                 // LLAMA_MTP_DRAFT_VOCAB keeps its value
                 const bool mtp_vocab_wide = [] {
@@ -2485,7 +2485,7 @@ private:
             // where the deep windows are on and a verify row is cheap: the full card and a cache expected to hold at least 60% of the
             // routed experts, compute capability 12.0 only. Longer contexts keep the deep windows' own depth (LLAMA_SPEC_DEPTH_MAIN_N for
             // the drafter), so an 8k request keeps its windows; the windows are sized for the deeper one. MoE targets only. A request
-            // below 1536 tokens has one verify width, one that crosses 1536 two. Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS + its MTP
+            // below 1536 tokens has one verify width, one that crosses 1536 two. RTX PRO 6000, Qwen3.8-Flash-Next at 4 bits + its MTP
             // drafter, 6 drafts in every window: 48 GB chat +2.5% (5.22 vs 4.06 tokens per pass), full card chat +1.7%, the same text;
             // at 16 GB chat -7% (not there)
             const int chat_n = [] {
@@ -2503,7 +2503,7 @@ private:
             };
             const uint64_t expert_bytes = mtp_shape && !on && cache_expected && depth_cached >= 3 ? common_moe_expert_bytes(params.model.path) : 0;
             const bool ram_fits = ram_avail == 0 || expert_bytes <= ram_avail;
-            // (the device rule as k19-tpp's: NVIDIA Ampere or newer, LLAMA_SPEC_TPP=1 forces past it, =0 turns this off too)
+            // (the device rule as the earlier rule's: NVIDIA Ampere or newer, LLAMA_SPEC_TPP=1 forces past it, =0 turns this off too)
             const bool deep_cached = mtp_shape && !on && cache_expected && sp.has_dft() && (e != nullptr ? atoi(e) != 0 : dev_ok) &&
                 depth_cached >= 3 && !exact_mtp && (ram_fits || disk_ok);
             if (mtp_shape && !on && cache_expected && sp.has_dft() && depth_cached >= 3 && !exact_mtp && !(ram_fits || disk_ok)) {
@@ -2512,9 +2512,9 @@ private:
                     expert_bytes/1048576.0, ram_avail/1048576.0);
             }
             if (deep_cached) {
-                // k19-g4tail2: under the g4tail rule --fit admits the drafter by the verify cost of the windows it had before the rule
+                // under the g4tail rule --fit admits the drafter by the verify cost of the windows it had before the rule
                 // (fit_n_max). The windows of n_def drafts then stand only where the placed cache takes the prefetch band (after
-                // common_init_from_params below), else they are cut back to 2. G4 16 GB ctx 262144 (r1): priced at 4 drafts the
+                // common_init_from_params below), else they are cut back to 2. RTX PRO 6000 16 GB ctx 262144 (r1): priced at 4 drafts the
                 // requantized drafter needed a cache of 4 tokens per layer, left 3.2 and was left out, decode without drafts 87.8 / 81.7
                 // tok/s chat / 8k against 132.7 / 123.8 with the rule off (LLAMA_MOE_G4TAIL_PLACED_GATE=0: priced at n_def, as before)
                 const char * pg = getenv("LLAMA_MOE_G4TAIL_PLACED_GATE");
@@ -2531,12 +2531,12 @@ private:
                     "window below position %s, 2 and a priced 3rd from there; 4-row verify windows tagged (LLAMA_SPEC_DEPTH_CACHED=0: 2 drafts)\n", need/1048576.0,
                     dev_free/1048576.0, sp.draft.n_max, getenv("LLAMA_SPEC_DEPTH_POS") != nullptr ? getenv("LLAMA_SPEC_DEPTH_POS") : "12288");
             } else if (mtp_shape && on) {
-                // k19-depth (LLAMA_SPEC_DEPTH=0: off, =1: also beside built-in MTP heads): with an MTP drafter of its own (-md), every window
+                // (LLAMA_SPEC_DEPTH=0: off, =1: also beside built-in MTP heads): with an MTP drafter of its own (-md), every window
                 // below position 12288 (LLAMA_SPEC_DEPTH_POS) drafts 4, the windows from there are the ones above (2, a 3rd where it pays).
-                // G4 Qwen3.8-Flash-Next fn4 full card: 4 drafts +6.8% chat / +10.9% 8k, -13% 30k against 2 + tpp.
+                // RTX PRO 6000 Qwen3.8-Flash-Next Flash-Next full card: 4 drafts +6.8% chat / +10.9% 8k, -13% 30k against 2 + tpp.
                 // Built-in heads (Qwen3.6) stay at the windows above: their extra verify row costs ~20% of a pass
                 const char * de = getenv("LLAMA_SPEC_DEPTH");
-                // (k19-sharegate: beside the cache the deep windows stay opt-in, LLAMA_SPEC_DEPTH=1)
+                // (beside the cache the deep windows stay opt-in, LLAMA_SPEC_DEPTH=1)
                 const bool deep = de != nullptr ? atoi(de) != 0 : sp.has_dft() && !share_ok;
                 sp.draft.n_floor = 2;
                 // (the chat bucket's deeper windows on a MoE target only: a dense one keeps 4)
@@ -2551,8 +2551,8 @@ private:
                 }
                 // With the deeper chat windows on the whole card (compute capability 12.0, MoE target, an MTP drafter of its own) the
                 // drafter's restricted head keeps 49152 rows instead of 65536: the head is the largest kernel of a draft step (99 of 331
-                // us there) and a chat window drafts 6 steps. Only the drafts change, the verify keeps the text. Colab G4, Qwen3.8-Flash-Next
-                // UD-IQ4_XS + its MTP drafter, Studio argv, whole card, two VMs x 3 launches: chat +1.7% / +2.1%, 8k +0.8% / +2.4%, the
+                // us there) and a chat window drafts 6 steps. Only the drafts change, the verify keeps the text. RTX PRO 6000, Qwen3.8-Flash-Next
+                // at 4 bits + its MTP drafter, Studio argv, whole card, two VMs x 3 launches: chat +1.7% / +2.1%, 8k +0.8% / +2.4%, the
                 // same tokens per pass (5.22 / 3.46) and text; 32768 rows lost tokens per pass in chat (5.22 -> 5.12).
                 // LLAMA_SPEC_MTP_VOCAB_FULL=0: 65536; an explicit LLAMA_MTP_DRAFT_VOCAB keeps its value
                 const bool vocab_full = [] {
@@ -2568,7 +2568,7 @@ private:
                     const char * a = getenv("LLAMA_SPEC_ADRAFT");
                     return a != nullptr && atoi(a) != 0;
                 }()) {
-                // k19-adraft (opt-in, LLAMA_SPEC_ADRAFT=1): where the windows stay at 2 drafts beside a MoE cache, a sampled request's window
+                // (opt-in, LLAMA_SPEC_ADRAFT=1): where the windows stay at 2 drafts beside a MoE cache, a sampled request's window
                 // holds up to LLAMA_SPEC_ADRAFT_MAX drafts (default 3), each past the 2nd kept while its draft probability is at least
                 // LLAMA_SPEC_ADRAFT_P (0.9; the drafter's confidence gate, a function of the text). =2: priced by expected tokens per ms
                 // instead; =3: one width per stretch of the request from the running share of drafts that held; =4: by position. Greedy requests keep 2 drafts. Sampled verify is sample-and-match with the target's chain and RNG, so only the
@@ -2592,7 +2592,7 @@ private:
                 SRV_INF("MTP stays at 2 drafts here (%d GPUs, lowest compute capability %d: not every GPU is NVIDIA Ampere or newer; "
                     "LLAMA_SPEC_TPP=1 forces the wider window)\n", n_gpu, n_gpu > 0 ? cc_min : -1);
             }
-            // k19-small1115: the windows above were widened past Studio's 2 drafts on a --parallel N server: cut back to 2 in the
+            // the windows above were widened past Studio's 2 drafts on a --parallel N server: cut back to 2 in the
             // rounds where another slot is active (update_slots)
             spec_active_cap = params.n_parallel > 1 && mtp_shape && sp.draft.n_max > 2 ? 2 : 0;
             if (spec_active_cap > 0) {
@@ -2716,7 +2716,7 @@ private:
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
 
-        // k19-g4tail2: the rule's windows of n_def drafts stand only where the placed MoE cache took its prefetch band (the cache
+        // the rule's windows of n_def drafts stand only where the placed MoE cache took its prefetch band (the cache
         // publishes LLAMA_MOE_G4TAIL_PLACED once placed). Its estimate before the fit leaves out the KV cache of n_ctx: at 262144 the
         // placed cache is smaller than at the measured 32768, and 4-draft windows beside a cache below the band were never measured
         // to pay. Outside the band: 2 drafts per window, as without the rule (LLAMA_MOE_G4TAIL_PLACED_GATE=0: keep the windows)
@@ -2751,7 +2751,7 @@ private:
                 ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
                 const char * rn = reg ? ggml_backend_reg_name(reg) : "";
-                // k19-igpu: an integrated GPU too (ggml-cuda reports prop.integrated as IGPU: Strix Halo gfx1151, Jetson, DGX Spark); the
+                // an integrated GPU too (ggml-cuda reports prop.integrated as IGPU: Strix Halo gfx1151, Jetson, DGX Spark); the
                 // argmax runs in the same graph on the same backend, nothing is sized from memory
                 const enum ggml_backend_dev_type dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
                 device_greedy_ok = dev && (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
@@ -2772,7 +2772,7 @@ private:
 
         // --fit placed the draft model on the CPU, where drafting is slower than none (see common_init_result)
         if (has_spec && params_base.speculative.draft.fit_off) {
-            // k19-rollback: or the n-gram suffix drafts --fit put in its place (common_fit_drop_ngram, LLAMA_SPEC_DROP_NGRAM)
+            // or the n-gram suffix drafts --fit put in its place (common_fit_drop_ngram, LLAMA_SPEC_DROP_NGRAM)
             const bool drop_ngram = params_base.speculative.ngram_suffix.drop_fallback;
             SRV_WRN("--fit: the draft model does not fit on the GPU beside the main model and its MoE cache, %s "
                 "(LLAMA_FIT_DRAFT_CPU=1 drafts on the CPU, LLAMA_FIT_DRAFT_LAST=0 restores the old placement)\n",
@@ -2803,20 +2803,20 @@ private:
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
-                // k15-small4: a draft that does not load or whose context does not allocate (device memory the fit could not see:
+                // a draft that does not load or whose context does not allocate (device memory the fit could not see:
                 // a draft it cannot measure on its own, memory another process took) is dropped and the server runs without speculative
                 // decoding, as --fit does when the draft does not fit; the main model and its context are already up.
                 // LLAMA_DRAFT_FAIL_HARD=1: exit, as before
                 const char * env_hard = getenv("LLAMA_DRAFT_FAIL_HARD");
                 const bool   hard     = env_hard != nullptr && atoi(env_hard) != 0;
                 bool         failed   = (has_draft && model_dft == nullptr) || ctx_dft == nullptr;
-                // k17-small: the draft is up, but device memory the fit did not price can leave the GPU too little for the CUDA pools of the
-                // first prompt (Kaggle T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, ctx 16384: the fit left 258 MiB, the MTP context's compute
+                // the draft is up, but device memory the fit did not price can leave the GPU too little for the CUDA pools of the
+                // first prompt (T4 4 GB, Qwen3.6-35B-A3B at 4 bits + MTP, ctx 16384: the fit left 258 MiB, the MTP context's compute
                 // buffer took 233 MiB against the 104 the fit measured and the main one grew 482 -> 514, 74.8 MiB were free after load and the
                 // first prompt aborted with "CUDA error: out of memory" in every launch). A device with less than LLAMA_DRAFT_MIN_FREE_MIB (192)
                 // free after the draft is created drops the draft as above; the main context stays as fitted. LLAMA_DRAFT_MIN_FREE_MIB=0: off
-                // The floor is 192 MiB on NVIDIA devices below compute capability 8.0 and off elsewhere: on G4 (RTX PRO 6000, cc 12.0) free
-                // memory after the draft does not predict the abort. q4x 4 GB 16k + MTP runs with 18.6 MiB free (decode 169 tok/s, dropping
+                // The floor is 192 MiB on NVIDIA devices below compute capability 8.0 and off elsewhere: on RTX PRO 6000 (RTX PRO 6000, cc 12.0) free
+                // memory after the draft does not predict the abort. 4-bit MoE 4 GB 16k + MTP runs with 18.6 MiB free (decode 169 tok/s, dropping
                 // the draft there costs 30%), while q3m 4 GB 32k + MTP aborts in its first prompt with 58.6 MiB free, the same as with the
                 // draft kept, so a floor there only loses speed. AMD, Moore Threads and other GPUs report no capability: off, as before.
                 // LLAMA_DRAFT_MIN_FREE_MIB=N sets one floor for every GPU, integrated ones included (ggml-cuda reports a device with
@@ -2837,8 +2837,8 @@ private:
                             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                             auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
                             const int cc = cc_fn != nullptr ? cc_fn(dev) : -1;
-                            // k17-small: off where the fit priced the drafter as it runs (LLAMA_FIT_MTP_PRICE=1, exported by common):
-                            // the floor stood in for that price and dropped drafts that fit (Colab T4 4 GB q4x 16k: 126.9 MiB free,
+                            // off where the fit priced the drafter as it runs (LLAMA_FIT_MTP_PRICE=1, exported by common):
+                            // the floor stood in for that price and dropped drafts that fit (T4 4 GB 4-bit MoE 16k: 126.9 MiB free,
                             // chat 38.9 -> 27.1 tok/s)
                             const char * e_pr = getenv("LLAMA_FIT_MTP_PRICE");
                             const bool priced = e_pr != nullptr && atoi(e_pr) != 0 && params_base.fit_params;
@@ -3014,14 +3014,14 @@ private:
             spec_init.reset();
         }
 
-        // k15-lfm2: a weak host (few threads, not faster than an upload) with most experts cached drops the CPU-miss rule, so the
+        // a weak host (few threads, not faster than an upload) with most experts cached drops the CPU-miss rule, so the
         // default drafts verify exactly (llama_moe_cpu_miss_drop_slow; LLAMA_MOE_CPU_MISS_DROP=0: off)
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
                 !llama_verify_exact_placement(ctx_tgt) && llama_moe_cpu_miss_drop_slow(ctx_tgt)) {
             SRV_INF("%s", "MoE cache: CPU misses off on this host (weak host, most experts cached): drafts verified exactly\n");
         }
 
-        // k13: default drafts where the host computes experts (server_spec_spill_mode) draft only from repeats of at least
+        // default drafts where the host computes experts (server_spec_spill_mode) draft only from repeats of at least
         // server_spec_spill_min_match tokens (short repeats cost a verify window of host experts for little)
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
                 !llama_verify_exact_placement(ctx_tgt) &&
@@ -3034,7 +3034,7 @@ private:
                 ns.n_min_match = mm;
                 ns.n_min_draft = std::max(ns.n_min_draft, mm);
             }
-            // k15-spec: long prompts draft from shorter repeats (server_spec_spill_min_match_long)
+            // long prompts draft from shorter repeats (server_spec_spill_min_match_long)
             ns.long_prompt      = server_spec_spill_long_prompt();
             ns.n_min_match_long = server_spec_spill_min_match_long(llama_moe_host_mode(ctx_tgt), ns.n_min_match,
                 server_spec_auto_arch(params_base.model.path));
@@ -3044,9 +3044,9 @@ private:
             }
         }
 
-        // k15-lfm2: LFM2.5 with drafts verified exactly (output unchanged by the window): prompts of 4096+ tokens take a short window of
-        // 2 drafts and the full window from a repeat of 6. Opt-in (LLAMA_SPEC_LFM_LONG_WIN=1): G4 32 GB +0.6% / +3.1% at 8k / 16k on the
-        // default build, but -3.7% / -1.6% with GGML_CUDA_MMVQ_MOE_ONE=1 (k15-fn's coming default)
+        // LFM2.5 with drafts verified exactly (output unchanged by the window): prompts of 4096+ tokens take a short window of
+        // 2 drafts and the full window from a repeat of 6. Opt-in (LLAMA_SPEC_LFM_LONG_WIN=1): RTX PRO 6000 32 GB +0.6% / +3.1% at 8k / 16k on the
+        // default build, but -3.7% / -1.6% with GGML_CUDA_MMVQ_MOE_ONE=1 (the earlier rule's coming default)
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
                 llama_verify_exact_placement(ctx_tgt) && server_spec_auto_arch(params_base.model.path) == "lfm2moe") {
             const char * e = getenv("LLAMA_SPEC_LFM_LONG_WIN");
@@ -3074,20 +3074,20 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
 
-        // k13: LLAMA_MOE_CPU_MISS_FROZEN=1 freezes the small batches of a MoE cache with CPU misses (see llama_moe_freeze_small) with or
+        // LLAMA_MOE_CPU_MISS_FROZEN=1 freezes the small batches of a MoE cache with CPU misses (see llama_moe_freeze_small) with or
         // without drafts; unset: only where it lets the default n-gram drafts verify exactly (below, LLAMA_SPEC_EXACT_FROZEN); 0: never
         const int moe_frozen_env = getenv("LLAMA_MOE_CPU_MISS_FROZEN") != nullptr ? atoi(getenv("LLAMA_MOE_CPU_MISS_FROZEN")) : -1;
         if (moe_frozen_env == 1 && llama_moe_freeze_small(ctx_tgt)) {
             SRV_INF("%s", "MoE cache: small batches frozen (LLAMA_MOE_CPU_MISS_FROZEN=1)\n");
         }
 
-        bool auto_verify_exact = false; // k19: the default n-gram drafts verify batch invariant (logged below)
+        bool auto_verify_exact = false; // the default n-gram drafts verify batch invariant (logged below)
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
-            // k11-decode: the default drafts are verified batch invariant, so greedy output stays that of plain decoding; where the
+            // the default drafts are verified batch invariant, so greedy output stays that of plain decoding; where the
             // placement cannot give single token bytes (host experts, a MoE cache) they stay off (LLAMA_SPEC_AUTO_EXACT=0 keeps them)
             if (params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact()) {
-                // k13: a MoE cache with CPU misses verifies exactly once its small batches are frozen
+                // a MoE cache with CPU misses verifies exactly once its small batches are frozen
                 if (!llama_verify_exact_placement(ctx_tgt) && moe_frozen_env != 0 && server_spec_exact_frozen() && llama_moe_freeze_small(ctx_tgt)) {
                     SRV_INF("%s", "MoE cache: small batches frozen so the default n-gram drafts verify exactly (LLAMA_SPEC_EXACT_FROZEN=1, "
                         "LLAMA_MOE_CPU_MISS_FROZEN=0: off)\n");
@@ -3100,19 +3100,19 @@ private:
                     llama_set_verify_exact(ctx_tgt, true);
                     auto_verify_exact = true;
                 } else if (spill == 2 && getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") == nullptr && llama_moe_freeze_small(ctx_tgt)) {
-                    // k13: frozen small batches, drafts verified batch invariant (exact against this frozen cache)
+                    // frozen small batches, drafts verified batch invariant (exact against this frozen cache)
                     llama_set_verify_exact(ctx_tgt, true);
                     auto_verify_exact = true;
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: small batches frozen, drafts verified exactly against them "
                         "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
                 } else if (spill == 3 && llama_moe_pin_small(ctx_tgt)) {
                     spill_pinned = true;
-                    // k13: small batches always take the host path (no timing trials), fetch share and admissions kept; drafts verified
+                    // small batches always take the host path (no timing trials), fetch share and admissions kept; drafts verified
                     // as ordinary batches: other greedy text, KLD-gated per model
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: small-batch host path pinned on, drafts verified as ordinary "
                         "batches (KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
                 } else if (spill == 1 || spill == 3) {
-                    // k13: drafts verified as ordinary batches with the host path: other greedy text, KLD-gated per model
+                    // drafts verified as ordinary batches with the host path: other greedy text, KLD-gated per model
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: drafts verified as ordinary batches with the host path "
                         "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
                 } else {
@@ -3127,7 +3127,7 @@ private:
             model_dft = nullptr;
         }
 
-        // k19: with the reassociated verify (GGML_CUDA_VERIFY_REASSOC, default on: verify rows differ from single token decodes by f32
+        // with the reassociated verify (GGML_CUDA_VERIFY_REASSOC, default on: verify rows differ from single token decodes by f32
         // summation order equivalence rule) and windows priced from measured round times, which tokens come from a verify
         // row depends on timing, so greedy output can differ between launches at near ties
         if (spec && auto_verify_exact) {
@@ -3143,7 +3143,7 @@ private:
             return false;
         }
 
-        // k19-np12c: the drafter's host copy at load where the prompt groups are expected to borrow its weights (LLAMA_MTP_DRAFT_LEND_EAGER=0 off)
+        // the drafter's host copy at load where the prompt groups are expected to borrow its weights (LLAMA_MTP_DRAFT_LEND_EAGER=0 off)
         if (ctx_dft != nullptr) {
             llama_mtp_draft_lend_warm(ctx_tgt);
         }
@@ -3179,7 +3179,7 @@ private:
             slot.reset();
         }
 
-        // k15-fn: every slot gets its device greedy chain once (setting a sampler reserves the graphs again): greedy requests take its
+        // every slot gets its device greedy chain once (setting a sampler reserves the graphs again): greedy requests take its
         // token and copy no logits, the others copy the raw logits as before (llama_set_sampler_raw_logits)
         if (device_greedy_ok) {
             // the EOG tokens an ignore_eos request excludes (their -inf bias): the masked chain, the larger graph, is set for the reserve and
@@ -3237,8 +3237,8 @@ private:
             SRV_INF("greedy requests are sampled on the device: %s (LLAMA_SERVER_DEVICE_GREEDY=0 to disable)\n", all ? "on" : "off");
         }
 
-        // k19-vwidth: every verify width's graph captured ahead (server_spec_prewarm), after the slots' device samplers are set: their
-        // nodes are part of the graphs (G4 Flash-Next: 7613 nodes with the greedy chain vs 7570 without), so each chain slot 0 can take
+        // every verify width's graph captured ahead (server_spec_prewarm), after the slots' device samplers are set: their
+        // nodes are part of the graphs (RTX PRO 6000 Flash-Next: 7613 nodes with the greedy chain vs 7570 without), so each chain slot 0 can take
         // for a request (greedy, masked greedy, top-k) gets its own windows
         // (a set LLAMA_SPEC_PREWARM also without a draft model, e.g. n-gram drafts in CPU tests)
         if (spec && (ctx_dft != nullptr || getenv("LLAMA_SPEC_PREWARM") != nullptr) && params_base.warmup && !slots.empty()) {
@@ -3256,7 +3256,7 @@ private:
                 chains, s0.smpl_dev.get(), true);
         }
 
-        // k19-fnttft: the load is over (target, drafter, warm-ups): read back the PLE table pages the page cache gave up since the
+        // the load is over (target, drafter, warm-ups): read back the PLE table pages the page cache gave up since the
         // load's part read, before the first request (llama_ple_topup; LLAMA_PLE_TOPUP=0 off)
         llama_ple_topup(ctx_tgt);
 
@@ -3312,7 +3312,7 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
             {
-                // k15-idlewait: the idle checkpoint lend and the deferred drop are for a single slot only
+                // the idle checkpoint lend and the deferred drop are for a single slot only
                 static const bool lend_env  = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
                 static const bool defer_env = getenv("LLAMA_PCS_DROP_DEFER") == nullptr || atoi(getenv("LLAMA_PCS_DROP_DEFER")) != 0;
                 prompt_cache->drop_defer_ok = params_base.n_parallel == 1;
@@ -3360,7 +3360,7 @@ private:
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
 
-        // k19-host30k: the staging a whole-sequence prompt-cache save needs at most, pinned now (server_state_async_ext)
+        // the staging a whole-sequence prompt-cache save needs at most, pinned now (server_state_async_ext)
         if (prompt_cache && server_state_async_ext()) {
             llama_state_seq_async_ext_reserve(ctx_tgt, 0);
             if (ctx_dft && ctx_dft != ctx_tgt) {
@@ -3412,11 +3412,11 @@ private:
         });
         queue_tasks.on_idle_work([this]() {
             spec_bg_join_or_abort();
-            // k19-l4fill: the RAM tier refills the slots it freed while the server idles (the reads stop at the next batch)
+            // the RAM tier refills the slots it freed while the server idles (the reads stop at the next batch)
             if (ctx_tgt) {
                 llama_moe_host_fill_idle(ctx_tgt);
             }
-            // k15-ttft: the prompt-cache save that the next request's slot selection makes (get_available_slot: the slot's prompt with its
+            // the prompt-cache save that the next request's slot selection makes (get_available_slot: the slot's prompt with its
             // checkpoints, 65 MiB for a short Qwen3.6 chat, 8-19 ms on a B200 ahead of the prompt) is made here instead, as the slot went
             // idle: the same entry, saved in the same order before the next request's load. LLAMA_PCS_IDLE_SAVE=0: at the request, as
             // before; 1: on this thread (a request sent right after the response waits for it); default 2: the host copy on the state
@@ -3424,7 +3424,7 @@ private:
             // checkpoint move (LLAMA_PCS_MOVE_CKPT, which needs the next prompt) applies only to saves still made at a request.
             static const int idle_save = getenv("LLAMA_PCS_IDLE_SAVE") ? atoi(getenv("LLAMA_PCS_IDLE_SAVE")) : 2;
             // only where every layer weight is in device memory and no MoE cache runs (llama_verify_exact_placement): at a spilled tier the
-            // save overlapped the next prompt's expert uploads (G4 q4x 12 GB chat back-to-back +11 ms TTFT) and held the entry on top
+            // save overlapped the next prompt's expert uploads (RTX PRO 6000 4-bit MoE 12 GB chat back-to-back +11 ms TTFT) and held the entry on top
             // of the cache's host buffers (+150 MiB VmHWM); there the save stays at the request
             const bool resident = ctx_tgt && llama_verify_exact_placement(ctx_tgt) && !llama_moe_cache_active(ctx_tgt) &&
                 (!ctx_dft || ctx_dft == ctx_tgt || (llama_verify_exact_placement(ctx_dft) && !llama_moe_cache_active(ctx_dft)));
@@ -3442,12 +3442,12 @@ private:
                             (prompt_cache->limit_tokens > 0 && prompt_cache->n_tokens() + slot.prompt.tokens.size() > prompt_cache->limit_tokens)) {
                             continue;
                         }
-                        // k17: default on again (LLAMA_PCS_IDLE_LEND=0: off). With the state pool fixes (LLAMA_STATE_POOL_SMALL_FRESH / _REL /
-                        // _PENDING) the resident G4 multi-turn run ends below the merged opt-in defaults: Qwen3.6 MTP 3991 vs 4959 MiB, LFM2.5
-                        // 1903 vs 2707 MiB, same text and VmHWM (the lend itself: +206 MiB on Qwen3.6, 3991 vs 3785; G4 q4x 32 GB chat -2 ms)
+                        // default on again (LLAMA_PCS_IDLE_LEND=0: off). With the state pool fixes (LLAMA_STATE_POOL_SMALL_FRESH / _REL /
+                        // _PENDING) the resident RTX PRO 6000 multi-turn run ends below the merged opt-in defaults: Qwen3.6 MTP 3991 vs 4959 MiB, LFM2.5
+                        // 1903 vs 2707 MiB, same text and VmHWM (the lend itself: +206 MiB on Qwen3.6, 3991 vs 3785; RTX PRO 6000 4-bit MoE 32 GB chat -2 ms)
                         static const bool lend_env = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
                         if (lend_env && params_base.n_parallel == 1) {
-                            common_state_ckpt_fit_enable(); // k17: lent checkpoints keep their buffers in the cache entry: fit them from now on
+                            common_state_ckpt_fit_enable(); // lent checkpoints keep their buffers in the cache entry: fit them from now on
                         }
                         slot.prompt_saved_idle_new = slot.prompt_save(*prompt_cache, -2, idle_save == 2, lend_env && params_base.n_parallel == 1);
                         if (slot.prompt_saved_idle_new) {
@@ -3457,7 +3457,7 @@ private:
                     }
                 }
             }
-            // k15-idlewait: the MoE cache re-calibration in this idle work stops (stays pending) once a task is queued
+            // the MoE cache re-calibration in this idle work stops (stays pending) once a task is queued
             auto idle_abort = [](void * q) { return static_cast<server_queue *>(q)->has_tasks(); };
             if (ctx_tgt) {
                 llama_set_idle_abort(ctx_tgt, idle_abort, &queue_tasks);
@@ -3685,9 +3685,9 @@ private:
         }
 
         if (ret) {
-            // k15-ttft: a save made at idle that the old order would not have made (the slot is kept: similarity, or a stateless task)
+            // a save made at idle that the old order would not have made (the slot is kept: similarity, or a stateless task)
             // is taken back, so the cache holds what it held before (LLAMA_PCS_IDLE_SAVE)
-            // k15-idlewait: the checkpoints the idle save lent to its entry come back first: all of them when the entry is dropped below,
+            // the checkpoints the idle save lent to its entry come back first: all of them when the entry is dropped below,
             // else a copy of the ones the next prompt keeps (past the common prefix the slot would erase them when the prompt starts)
             if (ret->ckpt_lent && prompt_cache) {
                 const bool keep_entry = update_cache && !task.is_stateless();
@@ -3788,7 +3788,7 @@ private:
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         slot.prompt_saved_idle = false;
         llama_moe_request_begin(ctx_tgt);
-        // k15-lfm2: the pin a request without drafts lifted is restored before the next prompt (see spill_pinned)
+        // the pin a request without drafts lifted is restored before the next prompt (see spill_pinned)
         if (spill_pin_lifted) {
             spill_pin_lifted = !llama_moe_pin_small_set(ctx_tgt, true);
         }
@@ -3890,9 +3890,9 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
-            // k15-fn: a greedy request (the argmax of the raw logits, common_sampler_device_greedy) takes the token of the slot's device greedy
+            // a greedy request (the argmax of the raw logits, common_sampler_device_greedy) takes the token of the slot's device greedy
             // chain when every device of the model is a CUDA / ROCm GPU (its argmax returns the lowest id on a tie, as the host greedy path),
-            // so the logits of the sampled rows (every verify row of speculative decoding) are not copied to the host: G4 Qwen3.8-Flash-Next
+            // so the logits of the sampled rows (every verify row of speculative decoding) are not copied to the host: RTX PRO 6000 Qwen3.8-Flash-Next
             // + MTP copied 1.08 MiB per token. Other requests copy the raw logits and sample on the host. LLAMA_SERVER_DEVICE_GREEDY=0 off
             // an ignore_eos request (every bias is the -inf of an EOG token) takes the masked chain of the slot
             // a sampled request whose chain can finish from the device top-k (common_sampler_device_topk) takes the slot's top-k chain:
@@ -3926,7 +3926,7 @@ private:
                 dev_greedy = dev_greedy && slot.smpl_dev_set;
                 dev_topk   = dev_topk && slot.smpl_dev_set;
                 llama_set_sampler_raw_logits(ctx_tgt, slot.id, !dev_greedy && !dev_topk);
-                // k19-gramdev: a grammar / reasoning budget request on the device top-k copies its raw rows too, for the positions the
+                // a grammar / reasoning budget request on the device top-k copies its raw rows too, for the positions the
                 // candidates cannot decide (common_sampler_device_topk)
                 llama_set_sampler_keep_logits(ctx_tgt, slot.id, dev_topk && common_sampler_device_topk_needs_raw(slot.smpl.get()));
                 common_sampler_set_device_token(slot.smpl.get(), dev_greedy);
@@ -4232,7 +4232,7 @@ private:
 
         res->index = slot.task->index;
 
-        // k19-pf debug (LLAMA_MTP_KV_HASH=1): a hash of the drafter's whole sequence state (its K / V and indexer cells) at the end of
+        // debug (LLAMA_MTP_KV_HASH=1): a hash of the drafter's whole sequence state (its K / V and indexer cells) at the end of
         // the request, to compare the drafter's caches of two runs (LLAMA_MTP_PROMPT_KV_ONLY=0 / 1)
         static const bool mtp_kv_hash = getenv("LLAMA_MTP_KV_HASH") != nullptr && atoi(getenv("LLAMA_MTP_KV_HASH")) != 0;
         if (mtp_kv_hash && ctx_dft && spec_bg_join()) {
@@ -4549,7 +4549,7 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    // k15-pp: the checkpoint at a merged break (n_tokens_at tokens of the slot, last position pos_at), from the state the decode captured
+    // the checkpoint at a merged break (n_tokens_at tokens of the slot, last position pos_at), from the state the decode captured
     // there; only where the draft and the speculative state hold nothing a checkpoint at that position would need (a draft without
     // recurrent / SWA rows, no stashed boundary row)
     void create_checkpoint_captured(server_slot & slot, int64_t n_tokens_at, llama_pos pos_at) {
@@ -4573,7 +4573,7 @@ private:
         create_checkpoint(slot, slot.prompt.n_tokens() - n_tokens_at, pmin, pos_at, true);
     }
 
-    // k19-ckptkeep: which checkpoint a full list keeps no matter what. Agentic clients send many requests that share the system prompt +
+    // which checkpoint a full list keeps no matter what. Agentic clients send many requests that share the system prompt +
     // tools but diverge after it (a new conversation, a rewritten history, a sub-agent); a hybrid / recurrent model cannot roll its state
     // back, so once no checkpoint lies inside that prefix such a request re-reads the whole prompt. The prefix checkpoint is the last one
     // at or before the first user message of the current prompt (the break the server makes there), else the oldest (no message spans:
@@ -4628,14 +4628,14 @@ private:
 
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool captured = false) {
         const int id_task = slot.task->id;
-        // k19-host: with the drafter's pass on the worker (LLAMA_MTP_PROMPT_BG) the draft part is queued behind it; the launch completed
+        // with the drafter's pass on the worker (LLAMA_MTP_PROMPT_BG) the draft part is queued behind it; the launch completed
         // every earlier asynchronous draft save, so none is in flight for the evictions below
         const bool dft_bg = spec_bg.live && ctx_dft != nullptr;
 
         // the previous checkpoint's asynchronous copy may still be running (LLAMA_STATE_ASYNC_LAZY): done before any is evicted
         llama_state_seq_async_wait(ctx_tgt);
         if (ctx_dft && !dft_bg) {
-            llama_state_seq_async_wait(ctx_dft); // k13-pp: the draft part is saved asynchronously too (ckpt_dft_async)
+            llama_state_seq_async_wait(ctx_dft); // the draft part is saved asynchronously too (ckpt_dft_async)
         }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -4643,7 +4643,7 @@ private:
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         std::list<common_prompt_checkpoint> dropped;
 
-        // k19-ckptkeep: neither loop below drops the prefix checkpoint (ckpt_prefix_pos); list erasures keep the iterator valid
+        // neither loop below drops the prefix checkpoint (ckpt_prefix_pos); list erasures keep the iterator valid
         const auto prot = ckpt_prefix_pos(slot.prompt.checkpoints, params_base.n_ctx_checkpoints, ckpt_first_user_pos(slot));
 
         int64_t last = -1;
@@ -4666,7 +4666,7 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            // k19-ckptkeep: not the prefix checkpoint (system prompt + tools), which a new conversation or an edited history can still
+            // not the prefix checkpoint (system prompt + tools), which a new conversation or an edited history can still
             // restore; the oldest other one instead (ckpt_evict_pos)
             const auto victim = ckpt_evict_pos(slot.prompt.checkpoints, prot);
             const auto & cur = *victim;
@@ -4709,8 +4709,8 @@ private:
         // the next llama_decode() is queued while the state is still being copied: the copy is complete when it returns
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC | (captured ? LLAMA_STATE_SEQ_FLAGS_CAPTURED : 0));
         const int64_t t_tr1 = t_tr0 ? ggml_time_us() : 0;
-        // k13-pp: the draft's rows are read on the draft's own stream after its queued prompt pass, so the target's next ubatch is
-        // queued while the draft still computes (the synchronous read waited for the draft pass, ~1.5 ms per chat prompt on G4);
+        // the draft's rows are read on the draft's own stream after its queued prompt pass, so the target's next ubatch is
+        // queued while the draft still computes (the synchronous read waited for the draft pass, ~1.5 ms per chat prompt on RTX PRO 6000);
         // the save is complete when the draft's next decode() returns, or at any state call / synchronize of the draft context.
         // LLAMA_CKPT_DFT_ASYNC=0: the synchronous read as before.
         static const bool ckpt_dft_async = getenv("LLAMA_CKPT_DFT_ASYNC") == nullptr || atoi(getenv("LLAMA_CKPT_DFT_ASYNC")) != 0;
@@ -4746,7 +4746,7 @@ private:
                     cur.data_dft.size()/1048576.0, (ggml_time_us() - t_tr1)/1e3);
         }
 
-        // k15-pp debug (LLAMA_CKPT_HASH=1): a hash of the target part, to compare checkpoints taken at one position in different ways
+        // debug (LLAMA_CKPT_HASH=1): a hash of the target part, to compare checkpoints taken at one position in different ways
         static const bool ckpt_hash = getenv("LLAMA_CKPT_HASH") != nullptr && atoi(getenv("LLAMA_CKPT_HASH")) != 0;
         if (ckpt_hash) {
             llama_state_seq_async_wait(ctx_tgt);
@@ -4883,7 +4883,7 @@ private:
             }
             checkpoints.push_back(std::move(cur));
             if (checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
-                // k19-ckptkeep: as create_checkpoint, no message spans here: the oldest is the protected one
+                // as create_checkpoint, no message spans here: the oldest is the protected one
                 checkpoints.erase(ckpt_evict_pos(checkpoints, ckpt_prefix_pos(checkpoints, params_base.n_ctx_checkpoints, -1)));
             }
         }
@@ -4991,7 +4991,7 @@ private:
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
-        // k19-host: any task but the loop's own next-response tick and the read-only ones ends the drafter's background pass first
+        // any task but the loop's own next-response tick and the read-only ones ends the drafter's background pass first
         if (!is_yielding && task.type != SERVER_TASK_TYPE_NEXT_RESPONSE && task.type != SERVER_TASK_TYPE_METRICS &&
                 task.type != SERVER_TASK_TYPE_SLOT_GET) {
             spec_bg_join_or_abort();
@@ -5060,10 +5060,10 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                // k15-idlewait (LLAMA_PCS_IDLE_SLOTS_ASYNC=0: synchronous, copied, as before): the save of an idle slot
+                                // (LLAMA_PCS_IDLE_SLOTS_ASYNC=0: synchronous, copied, as before): the save of an idle slot
                                 // at a new task takes the request-save path: the state rows read into the pinned staging the context
                                 // holds (no new pinned memory, else synchronous), and with a unified KV cache, where the slot is cleared
-                                // right after, its checkpoints move into the entry instead of being copied. G4 fn4 16 GB -np 4 chat:
+                                // right after, its checkpoints move into the entry instead of being copied. RTX PRO 6000 Flash-Next 16 GB -np 4 chat:
                                 // 52.7 ms of synchronous reads (131.8 MiB) before the new task's prompt
                                 static const bool idle_slots_async = getenv("LLAMA_PCS_IDLE_SLOTS_ASYNC") == nullptr ||
                                     atoi(getenv("LLAMA_PCS_IDLE_SLOTS_ASYNC")) != 0;
@@ -5188,7 +5188,7 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
-                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back, the entry keeps copies (as with the lend off)
+                    if (slot->ckpt_lent && prompt_cache) { // the lent checkpoints come back, the entry keeps copies (as with the lend off)
                         prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0, true);
                         SLT_INF(*slot, "slot action: %zu lent checkpoint(s) back, the cache entry keeps copies\n", slot->prompt.checkpoints.size());
                         slot->ckpt_lent = false;
@@ -5255,7 +5255,7 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
-                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back, the entry keeps copies (as with the lend off)
+                    if (slot->ckpt_lent && prompt_cache) { // the lent checkpoints come back, the entry keeps copies (as with the lend off)
                         prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0, true);
                         SLT_INF(*slot, "slot action: %zu lent checkpoint(s) back, the cache entry keeps copies\n", slot->prompt.checkpoints.size());
                         slot->ckpt_lent = false;
@@ -5329,7 +5329,7 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
-                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back, the entry keeps copies (as with the lend off)
+                    if (slot->ckpt_lent && prompt_cache) { // the lent checkpoints come back, the entry keeps copies (as with the lend off)
                         prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0, true);
                         SLT_INF(*slot, "slot action: %zu lent checkpoint(s) back, the cache entry keeps copies\n", slot->prompt.checkpoints.size());
                         slot->ckpt_lent = false;
@@ -5453,14 +5453,14 @@ private:
     };
 #endif
 
-    // k11 (LLAMA_LM_CKPT_MERGE): see lm_breaks. Only for a slot alone in the batch, a target with layer-major prompts,
+    // (LLAMA_LM_CKPT_MERGE): see lm_breaks. Only for a slot alone in the batch, a target with layer-major prompts,
     // no mtmd input and speculative impls that read the target rows of a segment (MTP, draft models, n-gram).
     // The prompt's ubatches and kernels are those of the separate calls, but the MoE cache is seeded once (from the routing of
     // the ubatch before the last) instead of once per call, and the checkpoint 4 + n_ubatch tokens before the end is not made (the
-    // one 4 tokens before the end is). k11 saw other decode text after the merged prompt where the host computes misses or the
-    // fetch overlap splits a layer by hit / miss (G4 Qwen3.6 UD-Q4_K_XL + MTP 8 GB, from token 14 / 31 / >64 of 2k / 4.6k / 8k).
-    // k15-pp: on by default wherever prompts run layer-major (k13-small: was only on a small device, common_fit_small_device).
-    // Separate, the last ubatch before that checkpoint ran alone and streamed every host expert a second time: G4 Qwen3.6-35B-A3B
+    // one 4 tokens before the end is). The earlier measurement saw other decode text after the merged prompt where the host computes misses or the
+    // fetch overlap splits a layer by hit / miss (RTX PRO 6000 Qwen3.6 at 4 bits + MTP 8 GB, from token 14 / 31 / >64 of 2k / 4.6k / 8k).
+    // on by default wherever prompts run layer-major (was only on a small device, common_fit_small_device).
+    // Separate, the last ubatch before that checkpoint ran alone and streamed every host expert a second time: RTX PRO 6000 Qwen3.6-35B-A3B
     // Q4 + MTP at 12 GB, 2k prompt [1532] [512] [4] = 27.7 GB of uploads, 16.0 merged, 3188 -> 5226 tok/s. Merged, the output is
     // md5-equal with the misses pinned on the device (LLAMA_MOE_CPU_MISS=0) and decode speed is unchanged; with the misses on the host
     // the decode after the prompt may take another text (Qwen3.8-Flash-Next 32 GB 8k), as the cache is seeded once.
@@ -5471,12 +5471,12 @@ private:
             common_speculative_rows_ok(spec.get());
     }
 
-    // k15-ttft (LLAMA_CKPT_NEAR_MERGE=1: on, opt-in): the near prompt checkpoint (4 tokens before the end) from a capture inside the prompt's
+    // (LLAMA_CKPT_NEAR_MERGE=1: on, opt-in): the near prompt checkpoint (4 tokens before the end) from a capture inside the prompt's
     // decode. Only for a slot alone in the batch, no mtmd input, speculative impls that read the target rows of a segment, a memory
     // whose partial state is the recurrent rows (llama_state_capture_supported), and where create_checkpoint_captured can make the
     // checkpoint: a draft without a partial state and no speculative state stashed per checkpoint (else the separate call, as before)
     bool near_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev) const {
-        // opt-in (LLAMA_CKPT_NEAR_MERGE=1): exact and multi-turn reuse unchanged, but slower on G4 (Qwen3.6 MTP 32 GB chat 1413 -> 1269
+        // opt-in (LLAMA_CKPT_NEAR_MERGE=1): exact and multi-turn reuse unchanged, but slower on RTX PRO 6000 (Qwen3.6 MTP 32 GB chat 1413 -> 1269
         // prompt tok/s, TTFT 54 -> 61 ms; 2k -2.4%; 12 GB chat -2.6%): the merged decode is GPU-bound for longer after its last launch
         // than the two separate calls
         static const bool on = getenv("LLAMA_CKPT_NEAR_MERGE") != nullptr && atoi(getenv("LLAMA_CKPT_NEAR_MERGE")) != 0;
@@ -5485,7 +5485,7 @@ private:
                 !common_speculative_rows_ok(spec.get())) {
             return false;
         }
-        const_cast<server_context_impl *>(this)->spec_bg_join_or_abort(); // k19-host: the draft context is read below
+        const_cast<server_context_impl *>(this)->spec_bg_join_or_abort(); // the draft context is read below
         if (ctx_dft && llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 16) {
             return false;
         }
@@ -5497,7 +5497,7 @@ private:
     }
 
     void update_slots() {
-        // k19-host: the first pass after a background drafter launch continues the slot's prompt beside it (its [4] tail); any later one joins
+        // the first pass after a background drafter launch continues the slot's prompt beside it (its [4] tail); any later one joins
         if (spec_bg.live && spec_bg.hold) {
             spec_bg.hold = false;
         } else {
@@ -5532,10 +5532,10 @@ private:
 
                 metrics_flush_idle();
 
-                // k11-decode: the next prompt starts from the worst-case pp plan (a verify window may have re-planned it)
-                // k13-fn: the draft context's MoE cache re-calibrates between requests too
-                // k15-ttft: both run once the server has stayed idle (server_queue::on_idle_work), not before a request that is
-                // already arriving (G4-class host, Qwen3.6 MTP with a CPU-miss MoE cache: a 50 ms re-calibration ahead of a chat prompt)
+                // the next prompt starts from the worst-case pp plan (a verify window may have re-planned it)
+                // the draft context's MoE cache re-calibrates between requests too
+                // both run once the server has stayed idle (server_queue::on_idle_work), not before a request that is
+                // already arriving (RTX PRO 6000-class host, Qwen3.6 MTP with a CPU-miss MoE cache: a 50 ms re-calibration ahead of a chat prompt)
                 queue_tasks.request_idle_work();
 
                 return; // skip further processing
@@ -5623,10 +5623,10 @@ private:
     }
 
     void pre_decode() {
-        // k19-host: beside the drafter's background pass only the batch of the slot's last prompt tokens is built (its seq_rm and checkpoint
+        // beside the drafter's background pass only the batch of the slot's last prompt tokens is built (its seq_rm and checkpoint
         // queue their draft parts behind the pass); anything else joins it first
         if (spec_bg.live) {
-            // k19-studio-np4: with several slots, only while the slot of the pass is the only one processing (spec_bg_slot)
+            // with several slots, only while the slot of the pass is the only one processing (spec_bg_slot)
             const server_slot * bs = spec_bg_slot();
             const bool tail = bs != nullptr && bs->id == spec_bg.slot_id && bs->state == SLOT_STATE_PROCESSING_PROMPT && bs->task &&
                 !bs->task->tokens.has_mtmd && bs->task->n_tokens() > bs->prompt.n_tokens() &&
@@ -5715,7 +5715,7 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
-        // k19-small1115: another slot active (prompt or generation): the windows of every slot are cut to the k19-tpp floor this round
+        // another slot active (prompt or generation): the windows of every slot are cut to priced-window floor this round
         // (the drafts of a --parallel N server without the wider windows); a lone request keeps them (see load_model)
         int32_t spec_floor_cap = 0;
         if (spec && spec_active_cap > 0) {
@@ -5787,10 +5787,10 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        // k19-hostgap (LLAMA_SPEC_PROMPT_INCR=0: a full copy each time, as before): the drafter's copy of the prompt
+                        // (LLAMA_SPEC_PROMPT_INCR=0: a full copy each time, as before): the drafter's copy of the prompt
                         // is extended by the tokens past its length when it is still a prefix of the slot's tokens (text-only
                         // slots, where the text tokens are the tokens): the same vector, without copying the whole context every
-                        // pass (8k context on a Colab A100 host: ~17 us per pass, with the GPU idle)
+                        // pass (8k context on a A100 host: ~17 us per pass, with the GPU idle)
                         static const bool incr_env = getenv("LLAMA_SPEC_PROMPT_INCR") == nullptr || atoi(getenv("LLAMA_SPEC_PROMPT_INCR")) != 0;
                         const llama_tokens & cur = slot.prompt.tokens.get_tokens();
                         auto & sp = slot.spec_prompt;
@@ -5823,7 +5823,7 @@ private:
                         };
                         common_speculative_get_draft_params(spec.get(), slot.id).shared = spec_floor_cap > 0;
 
-                        // k19-sharednoise: the target draws with shared noise (LLAMA_SHARED_NOISE=1): the drafter takes the same noise
+                        // the target draws with shared noise (LLAMA_SHARED_NOISE=1): the drafter takes the same noise
                         // and the verify samples and matches (LLAMA_SHARED_NOISE_DRAFT=0: the drafter as before, for attribution)
                         if (spec_sn_draft_on() && common_sampler_shared_noise_draft_init(slot.smpl.get(), slot.spec_sn)) {
                             auto & dpr = common_speculative_get_draft_params(spec.get(), slot.id);
@@ -5837,7 +5837,7 @@ private:
                             }
                         } else if (spec_draft_pen_on() && !params_base.speculative.draft.probabilistic &&
                                    common_sampler_penalty_draft_init(slot.smpl.get(), slot.spec_sn)) {
-                            // k19-q4xaccept: the request has penalties: drafts are the argmax after them (spec_draft_pen_on)
+                            // the request has penalties: drafts are the argmax after them (spec_draft_pen_on)
                             auto & dpr = common_speculative_get_draft_params(spec.get(), slot.id);
                             dpr.sn       = &slot.spec_sn;
                             dpr.result_q = nullptr;
@@ -5895,7 +5895,7 @@ private:
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
-                // k19-rollback: a recurrent target without rollback rows copies its state rows to host memory on the device stream instead
+                // a recurrent target without rollback rows copies its state rows to host memory on the device stream instead
                 // (llama_rs_snap_save: no host wait, no serialised state). A replay of the accepted tokens starts from that same copy, so
                 // it keeps it. LLAMA_SPEC_RS_SNAP=0: the serialised checkpoint, as before
                 static const bool rs_snap_env = getenv("LLAMA_SPEC_RS_SNAP") == nullptr || atoi(getenv("LLAMA_SPEC_RS_SNAP")) != 0;
@@ -5970,7 +5970,7 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
-                        // k15-hostcut: from when the task was posted, so prompt_ms covers what delayed it on the server loop (the client's TTFT
+                        // from when the task was posted, so prompt_ms covers what delayed it on the server loop (the client's TTFT
                         // less the request's parse, tokenize and delivery)
                         static const bool from_post = getenv("LLAMA_PROMPT_TIME_FROM_POST") == nullptr || atoi(getenv("LLAMA_PROMPT_TIME_FROM_POST")) != 0;
                         slot.stats.update_prompt_start(from_post ? slot.task->t_posted_us : 0);
@@ -6316,7 +6316,7 @@ private:
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     if (spec_bg.live && slot.ctx_dft) {
-                        // k19-host: the draft's part behind the drafter's pass on the worker, in the order of the in-line pass
+                        // the draft's part behind the drafter's pass on the worker, in the order of the in-line pass
                         if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
                             GGML_ABORT("failed to remove sequence %d with p0=%d, p1=-1\n", slot.id, p0);
                         }
@@ -6492,30 +6492,30 @@ private:
                         if (do_checkpoint) {
                             // layer-major prompts read a whole batch of ubatches in one expert pass, so the last ubatch before this checkpoint
                             // costs a pass of its own. LLAMA_MOE_LAYER_MAJOR_CKPT=1 (opt-in) moves the checkpoint one batch before the end
-                            // instead (faster prompts, but other ubatch boundaries, so other text, and G4 Qwen3.6 + MTP decode -4..-5%);
+                            // instead (faster prompts, but other ubatch boundaries, so other text, and RTX PRO 6000 Qwen3.6 + MTP decode -4..-5%);
                             // LLAMA_SERVER_CKPT_BATCH=1 moves it without layer-major prompts, for an A/B with the same batches
                             static const bool lm = (getenv("LLAMA_MOE_LAYER_MAJOR_CKPT") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_CKPT")) != 0) ||
                                 (getenv("LLAMA_SERVER_CKPT_BATCH") != nullptr && atoi(getenv("LLAMA_SERVER_CKPT_BATCH")) != 0);
                             const int checkpoint_offsets[] = {4 + (lm ? n_batch : n_ubatch), 4};
 
-                            // k9-prompt-pass: n_batch raised for layer-major prompts at an explicit -ub (common_moe_cache_auto_ubatch): the
+                            // n_batch raised for layer-major prompts at an explicit -ub (common_moe_cache_auto_ubatch): the
                             // offsets are clamped to the n_batch given, so the prompt splits into the same batches and ubatches as before
                             const int n_batch_clamp = !lm && params_base.n_batch_ckpt > 0 ? std::min<int>(n_batch, params_base.n_batch_ckpt) : n_batch;
-                            // k11: LLAMA_SERVER_CKPT_SINGLE_MAX=N (opt-in, default 0 = off): a prompt whose part still to process when its
+                            // LLAMA_SERVER_CKPT_SINGLE_MAX=N (opt-in, default 0 = off): a prompt whose part still to process when its
                             // batch starts is at most N tokens (and fits one ubatch) runs in one pass, without the separate pass of its last 4
                             // tokens; its checkpoint is then made at the end of the prompt, so a next prompt that differs in those last tokens
                             // is processed again from the previous checkpoint. Other ubatch shapes, so other numerics (KLD-gated, not md5-equal)
-                            // k13-pp: only where a next prompt pays at most this batch again: the whole prompt is at most N tokens, or the
+                            // only where a next prompt pays at most this batch again: the whole prompt is at most N tokens, or the
                             // batch starts at the last user message (a checkpoint is made there). A single-pass prompt makes no checkpoint of
                             // its own (the memory is empty before its only pass), so without that bound a raw prompt that grows by a few
                             // tokens per turn found no usable checkpoint and ran again from the start. LLAMA_SERVER_CKPT_SINGLE_ANY=1: the
-                            // k11 rule (any prompt whose rest is at most N). Still opt-in: the KLD gate  failed on G4 for
+                            // rule (any prompt whose rest is at most N). Still opt-in: the KLD gate  failed on RTX PRO 6000 for
                             // Qwen3.6-35B-A3B Q4 (first-token p99 0.0058 vs 0.0024 for -fa off), LFM2.5 (first-token mean 0.24 vs 0.065) and
                             // gemma-4 26B (decode top-1 98.9 vs 99.7%)
-                            // k15-ttft: on by default (N = 128) where the single pass is reassociation-only
+                            // on by default (N = 128) where the single pass is reassociation-only
                             // (equivalence rule, llama_single_pass_equivalent: all weights on CUDA, no host-computed expert, no F16 matmul weight) and
                             // the split pass would run at least 4 tokens before its last 4 (below that MMVF F32 / FlashAttention vec kernels
-                            // take the first pass, other formats). An explicit LLAMA_SERVER_CKPT_SINGLE_MAX keeps the k11 meaning on every
+                            // take the first pass, other formats). An explicit LLAMA_SERVER_CKPT_SINGLE_MAX keeps older meaning on every
                             // placement (0 = off, the kill switch)
                             static const char * ckpt_single_env = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX");
                             static const bool ckpt_single_eq = ckpt_single_env == nullptr && llama_single_pass_equivalent(ctx_tgt);
@@ -6539,14 +6539,14 @@ private:
                                 }
                                 const int n_last = std::min(n_batch_clamp, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    // k11: under layer-major prompts the batch goes on past the far checkpoint, its ubatches end there
+                                    // under layer-major prompts the batch goes on past the far checkpoint, its ubatches end there
                                     // (only when the rest up to the near checkpoint fits this batch: else the batches, so the ubatches, would differ)
-                                    // k15-pp (LLAMA_LM_CKPT_MERGE_SPAN, default on; =0 off): only where the group spans the break; elsewhere the separate
-                                    // calls seed the cache between them and the merge only lost that (q4x 12 GB 640-token prompt: +14% uploads)
-                                    // k19-mergespan: on by default again (LLAMA_LM_CKPT_MERGE_SPAN=0 = merge every eligible break). Without it the
-                                    // merge changed one first token of 48 on G4 Flash-Next 32 GB long48 (first-token top-1 0.979 vs a -fa off band of
+                                    // (LLAMA_LM_CKPT_MERGE_SPAN, default on; =0 off): only where the group spans the break; elsewhere the separate
+                                    // calls seed the cache between them and the merge only lost that (4-bit MoE 12 GB 640-token prompt: +14% uploads)
+                                    // on by default again (LLAMA_LM_CKPT_MERGE_SPAN=0 = merge every eligible break). Without it the
+                                    // merge changed one first token of 48 on RTX PRO 6000 Flash-Next 32 GB long48 (first-token top-1 0.979 vs a -fa off band of
                                     // 1.000, p99 at the band edge) in two launches; with it long48 is byte-identical to the merge off and the 8k TTFT
-                                    // stays the merge's (1.553 vs 1.551 s, merge off 2.030 s). Cost: G4 gemma-4 26B-A4B UD-Q3_K_M 8 GB chat TTFT
+                                    // stays the merge's (1.553 vs 1.551 s, merge off 2.030 s). Cost: RTX PRO 6000 gemma-4 26B-A4B at 3 bits 8 GB chat TTFT
                                     // 0.151 -> 0.185 s (measured 10-25, the reason it had been off)
                                     static const bool lm_span_env = getenv("LLAMA_LM_CKPT_MERGE_SPAN") == nullptr || atoi(getenv("LLAMA_LM_CKPT_MERGE_SPAN")) != 0;
                                     if (k == 0 && offset != 4 && batch.size() + (n_last - 4) <= n_batch && lm_ckpt_merge_ok(slot, n_tokens_prev, lm) &&
@@ -6557,10 +6557,10 @@ private:
                                         }
                                         break;
                                     }
-                                    // k15-ttft: the checkpoint 4 tokens before the end is taken inside this decode (llama_set_state_capture)
+                                    // the checkpoint 4 tokens before the end is taken inside this decode (llama_set_state_capture)
                                     // instead of after a decode of its own: the same ubatches (the last 4 tokens still run as one), one call,
                                     // no host gap between them, and under layer-major prompts one expert pass (see near_ckpt_merge_ok)
-                                    // k15-pp2: beside the far capture of this batch too (two captures per decode)
+                                    // beside the far capture of this batch too (two captures per decode)
                                     if (k == 1 && do_checkpoint && (int) lm_caps.size() < lm_cap_max() &&
                                             (lm_caps.empty() || lm_caps[0].slot == slot.id) && batch.size() + n_last <= n_batch &&
                                             near_ckpt_merge_ok(slot, n_tokens_prev)) {
@@ -6583,7 +6583,7 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    // k15-small4: a layer-major batch merged across the far checkpoint (lm_caps[0]) ends, for this rule, where that checkpoint
+                    // a layer-major batch merged across the far checkpoint (lm_caps[0]) ends, for this rule, where that checkpoint
                     // is captured, as the batches without the merge do: else the batch before it counted as near the end and made a checkpoint
                     // of its own at its start (q3m 4 GB, 8k prompt at n_batch 8192: 3 checkpoints of 62.8 MiB instead of 2, RssAnon +63 MiB
                     // per long prompt). LLAMA_SERVER_CKPT_MERGED_END=0: the end of the merged batch, as before
@@ -6741,14 +6741,14 @@ private:
             has_prompt |= batch.tokens[i].is_prompt;
         }
 
-        // k19-host: the target decode beside the drafter's background pass is at most spec_bg_tail_max tokens of the one slot: such a decode
+        // the target decode beside the drafter's background pass is at most spec_bg_tail_max tokens of the one slot: such a decode
         // is not layer-major (which may free the drafter's compute buffers) and writes at most that many next-n rows (the stash holds them),
         // it never grows the next-n store (64 rows at least, the pass's batch had more). Anything else joins first
-        // k19-host (LLAMA_MTP_PROMPT_BG_GROUP): beside a pass launched in group mode the slot's next prompt batch of any size runs, the
+        // (LLAMA_MTP_PROMPT_BG_GROUP): beside a pass launched in group mode the slot's next prompt batch of any size runs, the
         // target waits for the pass (its next-n hold) before it writes the rows or frees the drafter's compute buffers
-        // k19-npkdp (LLAMA_MTP_PROMPT_BG_MULTI_JOIN=1: join at -np > 1 as before): with several slots, the batch of the pass's slot while it
+        // (LLAMA_MTP_PROMPT_BG_MULTI_JOIN=1: join at -np > 1 as before): with several slots, the batch of the pass's slot while it
         // is the only one processing (spec_bg_slot) runs beside the pass too; at -np 4 the join here put the drafter's pass back in line
-        // before every 8192-token group of a long prompt (G4 Flash-Next 16 GB 30k: 99-144 ms between the batch build and the group)
+        // before every 8192-token group of a long prompt (RTX PRO 6000 Flash-Next 16 GB 30k: 99-144 ms between the batch build and the group)
         static const bool bg_multi_join = getenv("LLAMA_MTP_PROMPT_BG_MULTI_JOIN") != nullptr && atoi(getenv("LLAMA_MTP_PROMPT_BG_MULTI_JOIN")) != 0;
         const server_slot * bg_only = spec_bg.live && slots.size() > 1 && !bg_multi_join ? spec_bg_slot() : nullptr;
         const bool bg_other = slots.size() != 1 && (bg_only == nullptr || bg_only->id != spec_bg.slot_id);
@@ -6766,14 +6766,14 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        // k11 (LLAMA_LM_CKPT_MERGE): the breaks inside this view, relative to it
+        // (LLAMA_LM_CKPT_MERGE): the breaks inside this view, relative to it
         std::vector<int32_t> seg_breaks;
         for (const int32_t b : lm_breaks) {
             if (b > off && b < off + batch.view.size()) {
                 seg_breaks.push_back(b - off);
             }
         }
-        // k15-pp (LLAMA_LM_CKPT_CAPTURE=0 off): the checkpoint the merged break skips is taken inside the decode
+        // (LLAMA_LM_CKPT_CAPTURE=0 off): the checkpoint the merged break skips is taken inside the decode
         static const bool lm_cap_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
         bool lm_cap_req = false;
         std::vector<lm_cap_req_t> caps_req;   // the captures asked for this view
@@ -6787,11 +6787,11 @@ private:
             llama_set_ubatch_breaks(ctx_tgt, seg_breaks.data(), (int32_t) seg_breaks.size());
             SRV_DBG("k11 merged prompt batch of %d tokens, %zu ubatch breaks (first at %d)\n", batch.view.size(), seg_breaks.size(), seg_breaks[0]);
         }
-        // k15-ttft: the captured checkpoint is made before the wait for the batch's outputs, so its bookkeeping and the queued copies
-        // overlap the ubatches still computing (made after the wait, the near checkpoint's merge cost G4 Qwen3.6 32 GB chat 6 ms of TTFT);
-        // LLAMA_CKPT_CAP_EARLY=0: after the wait, as k15-pp did
+        // the captured checkpoint is made before the wait for the batch's outputs, so its bookkeeping and the queued copies
+        // overlap the ubatches still computing (made after the wait, the near checkpoint's merge cost RTX PRO 6000 Qwen3.6 32 GB chat 6 ms of TTFT);
+        // LLAMA_CKPT_CAP_EARLY=0: after the wait, as the earlier rule did
         static const bool cap_early = getenv("LLAMA_CKPT_CAP_EARLY") == nullptr || atoi(getenv("LLAMA_CKPT_CAP_EARLY")) != 0;
-        // k15-pp3: the overlap below makes the checkpoints up to a segment's end before it gives that segment to the drafter
+        // the overlap below makes the checkpoints up to a segment's end before it gives that segment to the drafter
         size_t caps_done = 0;
         auto cap_checkpoint_upto = [&](int64_t b_rel) {
             // in batch order: a checkpoint list keeps the order the separate calls made them in
@@ -6812,7 +6812,7 @@ private:
             lm_caps.erase(std::remove_if(lm_caps.begin(), lm_caps.end(), [&](const lm_cap_req_t & c) {
                 return c.batch > off && c.batch < off + batch.view.size(); }), lm_caps.end());
         };
-        // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): see below
+        // (LLAMA_MTP_PROMPT_OVERLAP=0 off): see below
         static const bool overlap_env = getenv("LLAMA_MTP_PROMPT_OVERLAP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_OVERLAP")) != 0;
         const bool caps_sorted  = std::is_sorted(caps_req.begin(), caps_req.end(), [](const lm_cap_req_t & a, const lm_cap_req_t & b) {
             return a.batch < b.batch; });
@@ -6820,7 +6820,7 @@ private:
             (!lm_cap_req || (cap_early && caps_sorted));
         // the checkpoint (slot state) is made on this thread, outside the yield; with the overlap, the drafter's early segments too
         const bool sync_after = (lm_cap_req && cap_early) || spec_overlap;
-        // k19-host (diagnostic, LLAMA_DECODE_PHASE_LOG=1): host time of the server's steps of a decode of more than 64 tokens
+        // (diagnostic, LLAMA_DECODE_PHASE_LOG=1): host time of the server's steps of a decode of more than 64 tokens
         static const bool srv_phase = getenv("LLAMA_DECODE_PHASE_LOG") != nullptr && atoi(getenv("LLAMA_DECODE_PHASE_LOG")) != 0;
         const int64_t t_ph0 = srv_phase && batch.view.size() > 64 ? ggml_time_us() : 0;
         auto srv_ph = [&](const char * what) {
@@ -6847,7 +6847,7 @@ private:
                 srv_pass_timer().stamp(server_pass_timer::DEC2);
             }
         });
-        // k19-host: a drafter pass beside this decode is complete before anything below reads the rows or the speculative state
+        // a drafter pass beside this decode is complete before anything below reads the rows or the speculative state
         // (the target's next-n hold normally joined it already, when it wrote the rows)
         if (spec_bg.live && !spec_bg_join()) {
             SRV_ERR("%s", "failed to process speculative batch\n");
@@ -6856,7 +6856,7 @@ private:
         if (lm_cap_req && !(spec_overlap && ret == 0)) {
             cap_checkpoint();
         }
-        // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): the drafter's own pass over the segments whose target rows are already on the host
+        // (LLAMA_MTP_PROMPT_OVERLAP=0 off): the drafter's own pass over the segments whose target rows are already on the host
         // (a layer-major group followed by more ubatches in this decode, e.g. [1532] [512] then the [4] before the near checkpoint) runs
         // while the target still computes the rest, instead of after the target's wait. Same segments, same rows, same order: the
         // drafter's KV and outputs are those of the separate pass
@@ -6951,7 +6951,7 @@ private:
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
-            // k15-idlewait: a cache entry dropped during its save goes back to the pool (the decode joined the save)
+            // a cache entry dropped during its save goes back to the pool (the decode joined the save)
             if (prompt_cache && !prompt_cache->dropped_inflight.empty()) {
                 prompt_cache->wait_inflight();
             }
@@ -6961,14 +6961,14 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            // k19-host: the drafter's background pass of the previous prompt batch is complete before this batch's pass
+            // the drafter's background pass of the previous prompt batch is complete before this batch's pass
             bool ok = spec_bg_join() && spec_early_ok;
-            // k19-host (LLAMA_MTP_PROMPT_BG=0 off): this batch's pass on a worker, beside the slot's next (last, <= spec_bg_tail_max token)
+            // (LLAMA_MTP_PROMPT_BG=0 off): this batch's pass on a worker, beside the slot's next (last, <= spec_bg_tail_max token)
             // prompt decode; same segments, rows and order (see spec_bg_state_t)
             static const bool bg_env = getenv("LLAMA_MTP_PROMPT_BG") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG")) != 0;
-            // k19-host (LLAMA_MTP_PROMPT_BG_GROUP=0: only beside the last <= 64 prompt tokens): also beside the slot's next prompt batch of
+            // (LLAMA_MTP_PROMPT_BG_GROUP=0: only beside the last <= 64 prompt tokens): also beside the slot's next prompt batch of
             // any size (the batches of a long prompt, each a released layer-major group at 16 GB): its pre-group host work (members, measure,
-            // allocation, ~65 ms with the GPU idle on G4 Flash-Next 16 GB) runs while the drafter computes. The target context waits for
+            // allocation, ~65 ms with the GPU idle on RTX PRO 6000 Flash-Next 16 GB) runs while the drafter computes. The target context waits for
             // the pass (llama_set_nextn_hold) before it writes the next-n rows the pass reads or frees the drafter's compute buffers
             static const bool bg_group_env = getenv("LLAMA_MTP_PROMPT_BG_GROUP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG_GROUP")) != 0;
             // kdp (LLAMA_MTP_DRAFT_LEND=0 off; LLAMA_MTP_PROMPT_TAIL=N rows, default 2048, 0 off): a prompt batch with at least N of the
@@ -6976,7 +6976,7 @@ private:
             // next batch pairs with this batch's last row), so the drafter computes only the batches that hold the prompt's last N rows
             // (at least N rows) and no drafter pass is in flight beside the earlier layer-major groups: those can borrow the drafter's device
             // weights for a deeper staging arena (llama_context::decode_layer_major). Drafts are verified: only the acceptance moves.
-            // G4 fn4 UD-IQ4_XS 12 GB + the requantized Q8_0 drafter, ctx 32768 (kdp_g1, 3 launches): depth 2 -> 3, 8k / 16k / 30k e2e
+            // RTX PRO 6000 Flash-Next at 4 bits 12 GB + the requantized Q8_0 drafter, ctx 32768 (3 launches): depth 2 -> 3, 8k / 16k / 30k e2e
             // 4.714 / 6.346 / 10.360 -> 4.473 / 6.145 / 9.103 s (no drafter: 4.524 / 6.417 / 9.392)
             static const bool    lend_env = getenv("LLAMA_MTP_DRAFT_LEND") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND")) != 0;
             static const int32_t tail_env = getenv("LLAMA_MTP_PROMPT_TAIL") ? std::max(0, atoi(getenv("LLAMA_MTP_PROMPT_TAIL"))) : 2048;
@@ -6987,10 +6987,10 @@ private:
             }
             bool skip = false;
             // only where the target's groups lend (llama_mtp_draft_lend_active): elsewhere the skip would cost acceptance for nothing
-            // (G4 fn4 16 GB, depth 4 without the lend: 30k e2e +0.9%)
-            // k19-np12b (LLAMA_MTP_PROMPT_TAIL_MULTI=0: -np 1 only, as before): with several slots, the skip for the slot that is the only one
+            // (RTX PRO 6000 Flash-Next 16 GB, depth 4 without the lend: 30k e2e +0.9%)
+            // (LLAMA_MTP_PROMPT_TAIL_MULTI=0: -np 1 only, as before): with several slots, the skip for the slot that is the only one
             // processing (spec_bg_slot). At -np 4 the target's groups lent the drafter's weights but its pass still ran over every early batch,
-            // with a weight remap before each: G4 Qwen3.8-Flash-Next 12 GB -np 4 with the q3_k drafter admitted, 30k TTFT 7.35 vs 6.27 s
+            // with a weight remap before each: RTX PRO 6000 Qwen3.8-Flash-Next 12 GB -np 4 with the q3_k drafter admitted, 30k TTFT 7.35 vs 6.27 s
             static const bool skip_multi_env = getenv("LLAMA_MTP_PROMPT_TAIL_MULTI") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_TAIL_MULTI")) != 0;
             const server_slot * skip_sl = slots.size() == 1 ? &slots[0] : (skip_multi_env ? spec_bg_slot() : nullptr);
             if (!dft_off && lend_env && tail_env > 0 && ok && ret == 0 && skip_sl != nullptr && has_prompt && ctx_dft && seg_breaks.empty() &&
@@ -7022,8 +7022,8 @@ private:
                 }
             }
             int32_t n_rest = 0;
-            // k19-host (LLAMA_MTP_PROMPT_BG_MIN=N tokens, default min(n_ubatch, 1024)): only a prompt batch of at least N tokens runs its
-            // drafter pass on the worker, a shorter one in line as before: G4 Flash-Next + Q8_0 MTP 16 GB, batch 17, chat TTFT +4 ms
+            // (LLAMA_MTP_PROMPT_BG_MIN=N tokens, default min(n_ubatch, 1024)): only a prompt batch of at least N tokens runs its
+            // drafter pass on the worker, a shorter one in line as before: RTX PRO 6000 Flash-Next + Q8_0 MTP 16 GB, batch 17, chat TTFT +4 ms
             // (0.357 vs 0.352-0.353) with the worker on short prompts, where its pass is too short to hide anything
             static const int32_t bg_min = [&]() {
                 const char * e = getenv("LLAMA_MTP_PROMPT_BG_MIN");
@@ -7031,7 +7031,7 @@ private:
                 SRV_INF("mtp prompt pass on a worker for prompt batches of at least %d tokens (LLAMA_MTP_PROMPT_BG_MIN)\n", v);
                 return v;
             }();
-            // k19-studio-np4: the only slot, or the only processing one of several (spec_bg_slot, LLAMA_MTP_PROMPT_BG_MULTI=0 off)
+            // the only slot, or the only processing one of several (spec_bg_slot, LLAMA_MTP_PROMPT_BG_MULTI=0 off)
             const server_slot * bg_sl = spec_bg_slot();
             bool bg = !dft_off && !skip && bg_env && ok && ret == 0 && bg_sl != nullptr && has_prompt && batch.view.size() > spec_bg_tail_max &&
                 batch.view.size() >= bg_min && off + batch.view.size() == batch.size() && common_speculative_rows_ext_floats(spec.get()) > 0;
@@ -7115,7 +7115,7 @@ private:
                 if (spec_bg.group) {
                     llama_set_nextn_hold(ctx_tgt, &server_context_impl::spec_bg_hold_cb, this);
                 } else if (spec_bg_free_hold_on()) {
-                    // k19-q4x262: the [<= spec_bg_tail_max] tail decode beside the pass writes no rows the pass reads (they are stashed),
+                    // the [<= spec_bg_tail_max] tail decode beside the pass writes no rows the pass reads (they are stashed),
                     // but it may still free the drafter's compute buffers (MoE cache banks coming back after a released prompt):
                     // the pass ends first there
                     llama_set_nextn_hold_free(ctx_tgt, &server_context_impl::spec_bg_hold_cb, this);
@@ -7137,7 +7137,7 @@ private:
                     ok = common_speculative_process(spec.get(), batch.view);
                 } else {
                     // the segments one at a time, as the separate batches would have been (the draft keeps its own batches);
-                    // k15-pp3: from the first one the overlap above did not process
+                    // from the first one the overlap above did not process
                     int32_t a = spec_seg_a;
                     for (size_t k = spec_seg_done; k <= seg_breaks.size() && ok; ++k) {
                         const int32_t b = k < seg_breaks.size() ? seg_breaks[k] : batch.view.size();
@@ -7201,7 +7201,7 @@ private:
             return idx >= off && idx < off + n_batch_tokens;
         };
 
-        // k19-host: a slot that samples in this view uses the speculative state (begin, draft, accept): the background pass ends first
+        // a slot that samples in this view uses the speculative state (begin, draft, accept): the background pass ends first
         if (spec_bg.live) {
             bool samples = false;
             for (const auto & slot : slots) {
@@ -7273,10 +7273,10 @@ private:
                     slot.prefault_next_save();
                 }
 
-                // k15-lfm2: a request under spill mode 3 that cannot draft (no repeat is long enough on a long prompt) gains nothing from
-                // the pinned host path: its decode follows the CPU-miss rule (G4 LFM2.5 12 GB 16k, k15 re-bench: pinned 235.1 tok/s,
+                // a request under spill mode 3 that cannot draft (no repeat is long enough on a long prompt) gains nothing from
+                // the pinned host path: its decode follows the CPU-miss rule (RTX PRO 6000 LFM2.5 12 GB 16k, re-bench: pinned 235.1 tok/s,
                 // LLAMA_SPEC_SPILL=0 286.7). Its prompt ran pinned (all-device), so its first token is unchanged.
-                // Opt-in, LLAMA_SPEC_SPILL_UNPIN_LONG=1 (mixed on G4, see server_spec_spill_unpin_long)
+                // Opt-in, LLAMA_SPEC_SPILL_UNPIN_LONG=1 (mixed on RTX PRO 6000, see server_spec_spill_unpin_long)
                 if (spill_pinned && !spill_pin_lifted && server_spec_spill_unpin_long() == 1 && params_base.n_parallel == 1) {
                     const auto & ns = params_base.speculative.ngram_suffix;
                     if (ns.long_prompt > 0 && ns.n_min_match_long > 64 && slot.prompt.n_tokens() >= ns.long_prompt) {
@@ -7398,10 +7398,10 @@ private:
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (slot.spec_is_replay && (slot.use_spec_rejection() || !spec_replay_reverify())) {
-                    // k18: greedy replays too re-accept the tokens the first verify accepted. Verifying them again assumes the
+                    // greedy replays too re-accept the tokens the first verify accepted. Verifying them again assumes the
                     // replay batch computes the same argmax as the verify batch; where batch shape and routing change the rows'
                     // numerics (MoE cache host / device split, CPU misses) a near tie flips between the two batches, each replay
-                    // rolls back again and the request never ends (G4 Qwen3.6-35B-A3B UD-Q4_K_XL 7 GB + Qwen3.5-0.8B draft-simple 4,
+                    // rolls back again and the request never ends (RTX PRO 6000 Qwen3.6-35B-A3B at 4 bits 7 GB + Qwen3.5-0.8B draft-simple 4,
                     // FFN requantized: 12 tokens of the 2k cell, then restore / replay forever, 4 of 4 launches).
                     // LLAMA_SPEC_REPLAY_REVERIFY=1: verify greedy replays again (the old behaviour)
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
@@ -7412,7 +7412,7 @@ private:
                 }
                 srv_pass_timer().stamp(server_pass_timer::ACC1);
                 if (FILE * lf = common_spec_acc_log(); lf != nullptr && synth_probs.empty()) {
-                    // k19-q4xaccept diagnostic: drafts, then the tokens kept (the last one is the target's own at the first mismatch)
+                    // diagnostic: drafts, then the tokens kept (the last one is the target's own at the first mismatch)
                     std::string vs = string_format("V %d %d %d", slot.spec_is_replay ? 1 : 0, (int) slot.spec_draft.size(), use_rejection ? 1 : 0);
                     for (llama_token t : slot.spec_draft) {
                         vs += " " + std::to_string(t);
@@ -7423,7 +7423,7 @@ private:
                     }
                     fprintf(lf, "%s\n", vs.c_str());
                 }
-                // k13: the probabilities of the accepted tokens come from their verify rows, read now (a rollback below may decode
+                // the probabilities of the accepted tokens come from their verify rows, read now (a rollback below may decode
                 // again); they were left empty, so drafted positions looked like a uniform distribution to the KLD gate
                 slot.spec_probs.clear();
                 if (slot.task->params.sampling.n_probs > 0 && !slot.spec_is_replay && synth_probs.empty()) {
@@ -7535,7 +7535,7 @@ private:
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
 
-                // k13: see spec_probs (filled at the verify, before the rollback)
+                // see spec_probs (filled at the verify, before the rollback)
                 if (i < slot.spec_probs.size() && slot.spec_probs[i].tok == result.tok) {
                     result.prob  = slot.spec_probs[i].prob;
                     result.probs = std::move(slot.spec_probs[i].probs);

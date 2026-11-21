@@ -1715,7 +1715,7 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-// k11: give the buffers of a dropped cache entry back to the state pool (the next save takes them, already resident)
+// give the buffers of a dropped cache entry back to the state pool (the next save takes them, already resident)
 static void prompt_state_recycle(server_prompt_cache_state & st) {
     common_state_buf_recycle(std::move(st.data.main));
     common_state_buf_recycle(std::move(st.data.drft));
@@ -1725,7 +1725,7 @@ static void prompt_state_recycle(server_prompt_cache_state & st) {
     }
 }
 
-// k11: a copy of the checkpoints into pooled buffers (a plain copy faults in every page of a fresh allocation)
+// a copy of the checkpoints into pooled buffers (a plain copy faults in every page of a fresh allocation)
 static common_prompt_checkpoint prompt_checkpoint_clone(const common_prompt_checkpoint & c) {
     common_prompt_checkpoint d;
     d.n_tokens = c.n_tokens;
@@ -1757,7 +1757,7 @@ static std::list<common_prompt_checkpoint> prompt_checkpoints_clone(const std::l
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft,
         std::list<common_prompt_checkpoint> * take_from, llama_pos keep_max) {
-    const bool clone_async = clone_async_next; // for this call only (k15-idlewait, server_slot::prompt_save)
+    const bool clone_async = clone_async_next; // for this call only (server_slot::prompt_save)
     clone_async_next = false;
     wait_inflight(); // the previous save is complete before entries are compared, erased or evicted
 
@@ -1810,18 +1810,18 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    // k19-crash8k: the cache also leaves the host this much available memory (LLAMA_PROMPT_CACHE_HOST_FLOOR_MIB, default 6144, 0 = off):
+    // the cache also leaves the host this much available memory (LLAMA_PROMPT_CACHE_HOST_FLOOR_MIB, default 6144, 0 = off):
     // the oldest entries go first, and a state that does not fit even then is not saved. --cache-ram (default 8192 MiB) is a limit of
     // its own that nothing else plans around: the MoE host tier takes MemAvailable minus its reserve and room at load (pinned, so not
     // reclaimable), and on Linux a large allocation does not fail (no bad_alloc above) - the kernel kills the process later instead.
-    // Flash-Next UD-IQ4_XS from the disk at 12 GB on a 54 GB L4 VM: 35.6 GB inclusive tier + 5.4 GB ring / prefetch staging pinned,
+    // Flash-Next at 4 bits from the disk at 12 GB on a 54 GB L4 VM: 35.6 GB inclusive tier + 5.4 GB ring / prefetch staging pinned,
     // 12 saved 8200-token prompts (4.3 GB) left 0.6-3.6 GB available, the 13th prompt's prefill was OOM-killed (SIGKILL, no log line)
     {
         static const size_t floor_bytes = [] {
             const char * e = getenv("LLAMA_PROMPT_CACHE_HOST_FLOOR_MIB");
             return (size_t) (e != nullptr ? std::max<long long>(0, atoll(e)) : 6144) << 20;
         }();
-        // k19-core2: minus the registered (pinned) model pages MemAvailable still counts (LLAMA_PROMPT_CACHE_HOST_FLOOR_RAW=1: MemAvailable)
+        // minus the registered (pinned) model pages MemAvailable still counts (LLAMA_PROMPT_CACHE_HOST_FLOOR_RAW=1: MemAvailable)
         static const bool raw = getenv("LLAMA_PROMPT_CACHE_HOST_FLOOR_RAW") != nullptr && atoi(getenv("LLAMA_PROMPT_CACHE_HOST_FLOOR_RAW")) != 0;
         const uint64_t avail = floor_bytes > 0 ? (raw ? llama_available_memory() : llama_available_memory_reclaimable()) : 0;
         if (avail > 0) {
@@ -1847,7 +1847,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     common_state_buf state_data_tgt;
     common_state_buf state_data_dft;
 
-    // k17: the originals the copy thread below returns to the pool are announced to it before the prefault requests (state and copies)
+    // the originals the copy thread below returns to the pool are announced to it before the prefault requests (state and copies)
     const bool clone_split = clone_async && take_from != nullptr && take_from == &prompt.checkpoints;
     std::vector<size_t> pending;
     if (clone_split) {
@@ -1893,7 +1893,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     std::list<common_prompt_checkpoint> ckpts;
     if (clone_split) {
-        // k15-idlewait: the ones the slot drops get pooled buffers here (as prompt_checkpoint_clone), their bytes are copied on
+        // the ones the slot drops get pooled buffers here (as prompt_checkpoint_clone), their bytes are copied on
         // clone_thread, which then puts the originals back to the pool (as the erase at the prompt start would have); the rest as before
         struct copy_job { uint8_t * dst; const uint8_t * src; size_t n; };
         std::vector<copy_job> jobs;
@@ -2147,7 +2147,7 @@ bool server_prompt_cache::ckpt_return(const server_tokens & tokens, std::list<co
 }
 
 bool server_prompt_cache::drop_newest(const server_tokens & tokens) {
-    // k15-idlewait: the entry of a save still copying leaves the cache now, its buffers once the copy is done (LLAMA_PCS_DROP_DEFER=0:
+    // the entry of a save still copying leaves the cache now, its buffers once the copy is done (LLAMA_PCS_DROP_DEFER=0:
     // wait for the copy here, as before)
     static const bool defer = getenv("LLAMA_PCS_DROP_DEFER") == nullptr || atoi(getenv("LLAMA_PCS_DROP_DEFER")) != 0;
     if (defer && drop_defer_ok && inflight != nullptr) {

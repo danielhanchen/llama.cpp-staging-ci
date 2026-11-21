@@ -1,4 +1,4 @@
-// Row-count invariance of a speculative verify batch (k19-fn-tpp): after the same prompt, the first verify batch (llama_set_verify)
+// Row-count invariance of a speculative verify batch: after the same prompt, the first verify batch (llama_set_verify)
 // of width A and of width B > A over the same tokens. Rows 0 .. A-1 of both must be byte-equal (logits, and with VERIFY_DUMP=1
 // every graph node, sliced along its token axis); the first node whose rows differ names the row-count dependent kernel.
 //

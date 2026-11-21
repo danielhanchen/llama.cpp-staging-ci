@@ -1,5 +1,5 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// llama-vgraph (k19-vgraph): the verify passes of a speculative target as the context grows, without a drafter. After a prompt of
+// llama-vgraph: the verify passes of a speculative target as the context grows, without a drafter. After a prompt of
 // L synthetic tokens, VG_PASSES verify batches of a width drawn from VG_WEIGHTS (or VG_FIXED) are decoded; each accepts a drawn number
 // of its rows, the rest is removed from the memory (the rollback of a speculative step) and the next batch starts at the argmax of
 // the last accepted row. The schedule depends only on VG_SEED, so two builds decode the same batches: the hash of every logits row
@@ -60,7 +60,7 @@ static std::atomic<int> g_big_captures{0};
 static std::atomic<int> g_rebuilds{0}; // kept graphs not reused (LLAMA_GRAPH_SMALL_WHY=N)
 static std::atomic<int> g_invalid{0};  // kept graphs invalidated (LLAMA_GRAPH_SMALL_WHY=N)
 static int g_big_nodes = 1000;
-static const bool g_log_all = getenv("VG_LOG_ALL") != nullptr; // k19-vwidth: every log line
+static const bool g_log_all = getenv("VG_LOG_ALL") != nullptr; // every log line
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     const char * p = strstr(text, "CUDA graph capture ");
@@ -149,7 +149,7 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_vocab = llama_vocab_n_tokens(vocab);
-    // k19-vwidth: small vocabularies (the tiny test models) draw their tokens from the whole vocabulary
+    // small vocabularies (the tiny test models) draw their tokens from the whole vocabulary
     const int      tok_lo  = n_vocab > 60000 ? 1000 : 0;
     const uint64_t tok_rnd = (uint64_t) std::max(1, std::min(50000, n_vocab - tok_lo));
     const int n_batch = llama_n_batch(ctx);

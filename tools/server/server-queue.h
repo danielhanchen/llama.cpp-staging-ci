@@ -13,7 +13,7 @@
 
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
-// k19-hostgap: yields ended so far, and how many of them ended without waiting for the worker (LLAMA_SERVER_YIELD_FAST)
+// yields ended so far, and how many of them ended without waiting for the worker (LLAMA_SERVER_YIELD_FAST)
 void server_queue_yield_counts(int64_t & n_fast, int64_t & n_total);
 
 struct server_queue {
@@ -42,7 +42,7 @@ private:
         bool stop     = false;
         bool busy     = false; // set by yield_to_queue(), cleared by the worker once it is done processing tasks
         bool yielding = false; // work() is still running on the start_loop() thread
-        // k19-hostgap (LLAMA_SERVER_YIELD_FAST, default 1): the worker waits for tasks on condition_tasks with nothing in hand
+        // LLAMA_SERVER_YIELD_FAST, default 1: the worker waits for tasks on condition_tasks with nothing in hand
         // (parked); a yield that ends while it is parked takes busy back without waking it (released): it sleeps on and, when
         // something wakes it, returns to the wait on cv without processing a task
         bool parked   = false;
@@ -60,7 +60,7 @@ private:
 public:
     ~server_queue() { worker_stop(); }
 
-    // k15-idlewait: a task waits in the queue (the idle work's abort check, see llama_set_idle_abort)
+    // a task waits in the queue (the idle work's abort check, see llama_set_idle_abort)
     bool has_tasks() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return !queue_tasks.empty();
@@ -130,7 +130,7 @@ public:
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //
 
-    // k15-ttft: work for an idle server (the MoE cache's re-calibration, the prompt plan restore) that a request arriving right after
+    // work for an idle server (the MoE cache's re-calibration, the prompt plan restore) that a request arriving right after
     // the slots go idle should not wait for: request_idle_work() from update_slots(); start_loop() runs the callback once no task has
     // arrived for idle_work_delay_ms (LLAMA_SERVER_IDLE_WORK_DELAY_MS, opt-in; default 0 = at once, as before), and a task that arrives
     // first is processed first (the work stays pending until the next idle period). Main thread only.
