@@ -3102,16 +3102,31 @@ static void common_draft_mem_reserve(const common_params & params, const llama_m
         const size_t kv = has_draft && mparams_dft.n_gpu_layers != 0 ? common_fit_dflash_estimate(params_dft.model.path, cparams_dft, compute, params.model.path, cparams.n_ubatch) : 0;
         ggml_backend_dev_t dev = nullptr;
         if (kv > 0) {
+            std::vector<ggml_backend_dev_t> cand;
             if (!params_dft.devices.empty()) {
-                dev = params_dft.devices[0]; // nullptr: the draft is not offloaded
+                for (ggml_backend_dev_t d : params_dft.devices) {
+                    if (d == nullptr) {
+                        break; // a leading nullptr: the draft is not offloaded
+                    }
+                    cand.push_back(d);
+                }
             } else {
-                for (size_t i = 0; i < ggml_backend_dev_count() && dev == nullptr; ++i) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                     ggml_backend_dev_t d = ggml_backend_dev_get(i);
                     if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                        dev = d;
+                        cand.push_back(d);
                     }
                 }
             }
+            // -sm none: the model loader keeps only device main_gpu of that list (llama_model_load_from_file_impl)
+            size_t idx = 0;
+            if (mparams_dft.split_mode == LLAMA_SPLIT_MODE_NONE && mparams_dft.main_gpu > 0 && (size_t) mparams_dft.main_gpu < cand.size()) {
+                idx = (size_t) mparams_dft.main_gpu;
+            }
+            if (mparams_dft.split_mode == LLAMA_SPLIT_MODE_NONE && mparams_dft.main_gpu < 0) {
+                cand.clear();
+            }
+            dev = idx < cand.size() ? cand[idx] : nullptr;
         }
         size_t weights = 0;
         if (dev != nullptr) {
