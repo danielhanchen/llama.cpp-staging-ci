@@ -886,12 +886,19 @@ static void common_params_fit_impl(
             bool estimated = false; // a DFlash draft priced from its GGUF (below)
             const int nextn_main = g_fit_nextn;
             g_fit_nextn = 0; // the extra model is not the target
+            // the flash attention state and KQ reserve the placement reads are the main model's, not the extra model's
+            const bool    fa_off_main = g_fit_fa_off;
+            const int64_t kq_main     = g_fit_faoff_kq;
             try {
                 measured = common_get_device_memory_data_impl(
                     extra->path_model, &mp_x, &cp_x, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
-                g_fit_nextn = nextn_main;
+                g_fit_nextn    = nextn_main;
+                g_fit_fa_off   = fa_off_main;
+                g_fit_faoff_kq = kq_main;
             } catch (const std::runtime_error & e) {
-                g_fit_nextn = nextn_main;
+                g_fit_nextn    = nextn_main;
+                g_fit_fa_off   = fa_off_main;
+                g_fit_faoff_kq = kq_main;
                 dmds_extra = dmds_t(devs.size() + 1);
                 key_extra = key;
                 // a DFlash / DSpark draft needs its target to be created: its estimate (weights, K/V, compute and the target's growth for
