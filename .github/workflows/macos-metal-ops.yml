@@ -1,0 +1,188 @@
+name: macos-metal-ops
+
+on:
+  push:
+    branches:
+      - 'ci/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  metal:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, arm: head }
+          - { os: macos-15, arm: base }
+          - { os: macos-26, arm: head }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Base arm (the lever commits reversed)
+        if: matrix.arm == 'base'
+        shell: bash
+        run: |
+          git apply -R ci-metalspd.patch
+          echo "base arm: ci-metalspd.patch reversed" | tee -a summary_pre.txt
+
+      - name: System info
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          [ -f summary_pre.txt ] && cat summary_pre.txt >> ci-logs/summary.txt
+          {
+            echo "leg: ${{ matrix.os }} ${{ matrix.arm }}"
+            echo "sha: ${GITHUB_SHA}"
+            sw_vers
+            sysctl -n machdep.cpu.brand_string
+            sysctl -n hw.logicalcpu
+            xcrun clang --version | head -1
+            system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Chipset|Metal" || true
+          } 2>&1 | tee ci-logs/sysinfo.txt
+
+      - name: Build
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          NJ=$(sysctl -n hw.logicalcpu)
+          rc=0
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=ON > ci-logs/configure.log 2>&1 || rc=$?
+          T="test-backend-ops llama-completion llama-server test-dflash2-conv-exact"
+          [ "${{ matrix.arm }}" = head ] && T="$T test-moe-reduce-exact test-metal-async-copy"
+          [ "$rc" = 0 ] && { cmake --build build --config Release -j "$NJ" --target $T > ci-logs/build.log 2>&1 || rc=$?; }
+          tail -30 ci-logs/build.log
+          grep -n -E "warning:|error:" ci-logs/build.log > ci-logs/build_diags.txt 2>/dev/null || true
+          echo "build_rc=$rc warnings=$(grep -c 'warning:' ci-logs/build_diags.txt || true) errors=$(grep -c 'error:' ci-logs/build_diags.txt || true)" | tee -a ci-logs/summary.txt
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Metal device and targeted ops
+        if: steps.build.outputs.rc == '0'
+        shell: bash
+        run: |
+          B=build/bin
+          $B/test-backend-ops -b MTL0 -o ARGMAX > ci-logs/tbo_argmax.log 2>&1; echo "tbo_argmax_rc=$?" | tee -a ci-logs/summary.txt
+          grep -E "simdgroup|GPU family|GPU name|has tensor|bfloat" ci-logs/tbo_argmax.log | head -12 | sed 's/^/device: /' | tee -a ci-logs/summary.txt
+          for o in ARGMAX MOE_REDUCE DFLASH2_CONV; do
+            log=ci-logs/tbo_$(echo $o | tr A-Z a-z).log
+            [ "$o" != ARGMAX ] && { $B/test-backend-ops -b MTL0 -o $o > $log 2>&1; echo "tbo_${o}_rc=$?" | tee -a ci-logs/summary.txt; }
+            echo "tbo_${o}: ok=$(grep -c '  OK' $log || true) fail=$(grep -c 'FAIL' $log || true) not_supported=$(grep -c 'not supported' $log || true) $(grep -E 'tests passed' $log | head -1)" | tee -a ci-logs/summary.txt
+          done
+          GGML_METAL_FUSION_DISABLE=1 $B/test-backend-ops -b MTL0 -o MOE_REDUCE > ci-logs/tbo_moe_reduce_nofuse.log 2>&1; echo "tbo_MOE_REDUCE_nofuse_rc=$? $(grep -E 'tests passed' ci-logs/tbo_moe_reduce_nofuse.log | head -1)" | tee -a ci-logs/summary.txt
+          $B/test-dflash2-conv-exact > ci-logs/dflash2_exact.log 2>&1; echo "dflash2_conv_exact_rc=$? $(tail -2 ci-logs/dflash2_exact.log | tr '\n' ' ')" | tee -a ci-logs/summary.txt
+
+      - name: Exactness and copy tests (head)
+        if: steps.build.outputs.rc == '0' && matrix.arm == 'head'
+        shell: bash
+        run: |
+          B=build/bin
+          GGML_METAL_FUSION_DEBUG=2 $B/test-moe-reduce-exact > ci-logs/moe_exact.log 2>&1; echo "moe_reduce_exact_rc=$? $(tail -2 ci-logs/moe_exact.log | tr '\n' ' ') fused=$(grep -c 'fuse: MOE_REDUCE' ci-logs/moe_exact.log || true)" | tee -a ci-logs/summary.txt
+          GGML_METAL_FUSION_DISABLE=1 $B/test-moe-reduce-exact > ci-logs/moe_exact_nofuse.log 2>&1; echo "moe_reduce_exact_nofuse_rc=$? $(tail -2 ci-logs/moe_exact_nofuse.log | tr '\n' ' ')" | tee -a ci-logs/summary.txt
+          GGML_METAL_FUSION_DEBUG=2 GGML_METAL_MOE_REDUCE_MAX=8 $B/test-moe-reduce-exact > ci-logs/moe_exact_max8.log 2>&1; echo "moe_reduce_exact_max8_rc=$? $(tail -2 ci-logs/moe_exact_max8.log | tr '\n' ' ') fused=$(grep -c 'fuse: MOE_REDUCE' ci-logs/moe_exact_max8.log || true)" | tee -a ci-logs/summary.txt
+          grep -E "DIFFER" ci-logs/moe_exact*.log | head -20 | sed 's/^/moe_differ: /' | tee -a ci-logs/summary.txt || true
+          $B/test-metal-async-copy > ci-logs/async_copy.log 2>&1; echo "async_copy_rc=$? $(tail -2 ci-logs/async_copy.log | tr '\n' ' ')" | tee -a ci-logs/summary.txt
+          GGML_METAL_UPLOAD_NOCOPY=0 $B/test-metal-async-copy > ci-logs/async_copy_copy.log 2>&1; echo "async_copy_nocopy0_rc=$? $(tail -2 ci-logs/async_copy_copy.log | tr '\n' ' ')" | tee -a ci-logs/summary.txt
+
+      - name: Full test-backend-ops on MTL0
+        if: steps.build.outputs.rc == '0'
+        shell: bash
+        run: |
+          timeout 3000 build/bin/test-backend-ops -b MTL0 > ci-logs/tbo_full.log 2>&1; echo "tbo_full_rc=$?" | tee -a ci-logs/summary.txt
+          echo "tbo_full: ok=$(grep -c '  OK' ci-logs/tbo_full.log || true) fail=$(grep -c 'FAIL' ci-logs/tbo_full.log || true) not_supported=$(grep -c 'not supported' ci-logs/tbo_full.log || true) $(grep -E 'tests passed' ci-logs/tbo_full.log | head -1)" | tee -a ci-logs/summary.txt
+          grep -E "FAIL" ci-logs/tbo_full.log | head -40 > ci-logs/tbo_full_fail.txt || true
+          for o in GLU ADD MUL SUB DIV SILU GELU ; do
+            echo "tbo_full_$o: ok=$(grep -E "^  $o\(" ci-logs/tbo_full.log | grep -c 'OK' || true) fail=$(grep -E "^  $o\(" ci-logs/tbo_full.log | grep -c 'FAIL' || true) ns=$(grep -E "^  $o\(" ci-logs/tbo_full.log | grep -c 'not supported' || true)" | tee -a ci-logs/summary.txt
+          done
+
+      - name: Tiny model splits, copies and greedy md5
+        if: steps.build.outputs.rc == '0'
+        shell: bash
+        run: |
+          M=models/stories15M-q4_0.gguf
+          mkdir -p models
+          curl -sSfL --retry 5 -o "$M" https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf
+          echo "model_md5=$(md5 -q "$M")" | tee -a ci-logs/summary.txt
+          P="Once upon a time there was a little girl named Lily who lived in a small house near the woods with her mother, her father and her old dog. Every morning she walked to the river to watch the fish, and every evening she told her dog a story about the stars. One day she found a strange blue stone in the water and"
+          python3 - "$P" <<'PY'
+          import sys; open('prompt.txt','w').write(sys.argv[1])
+          PY
+          run() { # name, env...
+            name=$1; shift
+            env "$@" GGML_SCHED_DEBUG=2 build/bin/llama-completion -m "$M" -f prompt.txt -n 24 --temp 0 --seed 1 -ngl 99 -t 2 -c 512 -no-cnv -v > ci-logs/tm_$name.txt 2> ci-logs/tm_$name.log < /dev/null
+            rc=$?
+            python3 - ci-logs/tm_$name.log "$name" "$rc" ci-logs/tm_$name.txt <<'PY' | tee -a ci-logs/summary.txt
+          import re, sys, hashlib
+          log, name, rc, txt = sys.argv[1:5]
+          lines = open(log, errors='replace').read().split('\n')
+          units = {'B': 1, 'K': 1024, 'M': 1024**2, 'G': 1024**3}
+          graphs = []  # one entry per printed assignment: [n_splits, n_cpu_splits, bytes_in]
+          prev = None
+          for l in lines:
+              m = re.search(r'## SPLIT #(\d+): (\S+) # (\d+) inputs(.*)', l)
+              if not m:
+                  continue
+              i = int(m.group(1))
+              if i == 0:
+                  graphs.append([0, 0, 0])
+              g = graphs[-1]
+              g[0] += 1
+              g[1] += m.group(2).startswith('CPU')
+              for sz in re.findall(r'\(\s*(\d+)([KMG])\)', m.group(4)):
+                  g[2] += float(sz[0]) * units[sz[1]]
+          md5 = hashlib.md5(open(txt, 'rb').read()).hexdigest()
+          seq = ' '.join(f"{g[0]}/{g[1]}/{g[2]/1024:.0f}K" for g in graphs)
+          tot = [sum(g[k] for g in graphs) for k in range(3)]
+          print(f"tm_{name}: rc={rc} md5={md5} graphs={len(graphs)} total splits={tot[0]} cpu_splits={tot[1]} input_KiB={tot[2]/1024:.0f}")
+          print(f"tm_{name}_seq (splits/cpu/inputs per graph): {seq}")
+          PY
+            grep -E "node #.*\(\s*KQ_MASK\)" ci-logs/tm_$name.log | head -3 | sed "s/^/tm_${name}_kqmask: /" | tee -a ci-logs/summary.txt || true
+          }
+          run default
+          run kqcheck0 LLAMA_KQ_MASK_DEVICE_CHECK=0
+          run fadis LLAMA_ARG_FLASH_ATTN=off
+          build/bin/llama-completion -m "$M" -f prompt.txt -n 24 --temp 0 --seed 1 -ngl 0 -t 2 -c 512 -no-cnv > ci-logs/tm_ngl0.txt 2> ci-logs/tm_ngl0.log < /dev/null
+          echo "tm_ngl0: rc=$? md5=$(md5 -q ci-logs/tm_ngl0.txt)" | tee -a ci-logs/summary.txt
+          head -c 600 ci-logs/tm_default.txt; echo
+          srv() { # name, env...
+            name=$1; shift
+            env "$@" build/bin/llama-server -m "$M" -ngl 99 -t 2 -c 512 --port 8091 > ci-logs/srv_$name.log 2>&1 &
+            SP=$!
+            ok=0
+            for i in $(seq 1 120); do curl -sf http://127.0.0.1:8091/health > /dev/null 2>&1 && { ok=1; break; }; sleep 1; done
+            rc=99
+            if [ "$ok" = 1 ]; then
+              curl -sf http://127.0.0.1:8091/completion -H 'Content-Type: application/json' \
+                -d '{"prompt":"Once upon a time","n_predict":48,"temperature":0,"seed":1,"cache_prompt":false}' > ci-logs/srv_$name.json && rc=0
+            fi
+            kill "$SP" 2>/dev/null || true
+            wait "$SP" 2>/dev/null || true
+            python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['content'])" ci-logs/srv_$name.json > ci-logs/srv_$name.txt 2>/dev/null || rc=98
+            echo "srv_$name: rc=$rc md5=$(md5 -q ci-logs/srv_$name.txt) $(grep -o 'greedy requests are sampled on the device: [a-z]*' ci-logs/srv_$name.log | head -1)" | tee -a ci-logs/summary.txt
+          }
+          srv default
+          srv greedy0 LLAMA_SERVER_DEVICE_GREEDY=0
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          cat ci-logs/summary.txt || true
+          cat ci-logs/summary.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.os }}-${{ matrix.arm }}
+          path: ci-logs/
+          retention-days: 30

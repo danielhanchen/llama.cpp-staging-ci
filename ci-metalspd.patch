@@ -1,0 +1,1201 @@
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index 59fa88f2c9c..d26a6d2952d 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -1615,12 +1615,13 @@ inline static void ggml_vec_norm_inv_f32(const int n, float * s, const float * x
+     *s = 1.f/(*s);
+ }
+ 
++// the lowest index of the maximum (as the host greedy sampler and the GPU backends); NaN never compares greater, and a row without a
++// value above -inf gives 0
+ inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
+     float max = -INFINITY;
+     int idx = 0;
+     for (int i = 0; i < n; ++i) {
+-        max = MAX(max, x[i]);
+-        if (max == x[i]) { idx = i; }
++        if (x[i] > max) { max = x[i]; idx = i; }
+     }
+     *s = idx;
+ }
+diff --git a/ggml/src/ggml-cuda/argmax.cu b/ggml/src/ggml-cuda/argmax.cu
+index 67355e55d30..c00a1efdff9 100644
+--- a/ggml/src/ggml-cuda/argmax.cu
++++ b/ggml/src/ggml-cuda/argmax.cu
+@@ -64,8 +64,9 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
+         }
+     }
+ 
++    // a row without a value above -FLT_MAX (all -inf or NaN) gives column 0, as the CPU backend
+     if (warp_id == 0 && lane_id == 0) {
+-        dst[row] = argmax;
++        dst[row] = argmax < 0 ? 0 : argmax;
+     }
+ }
+ 
+@@ -144,7 +145,7 @@ static __global__ void argmax_f32_join(const float * __restrict__ part_val, cons
+         argmax_merge(maxval, argmax, val, col);
+     }
+     if (threadIdx.x == 0) {
+-        dst[row] = argmax;
++        dst[row] = argmax < 0 ? 0 : argmax;
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e9064666f62..208f4bc33d5 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -12,6 +12,9 @@
+ 
+ #import <Metal/Metal.h>
+ 
++#include <stdlib.h>
++#include <unistd.h>
++
+ #undef MIN
+ #undef MAX
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+@@ -323,13 +326,39 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
+     return ggml_metal_buffer_get_id(buffer->context, t);
+ }
+ 
++// a shared Metal buffer over the host pages holding [data, data + size) without a copy (the pointer and length that
++// newBufferWithBytesNoCopy takes must be page aligned: the whole pages are wrapped and *offs is the offset of data in them);
++// nil if Metal refuses the range. The host memory must stay valid until the copy that reads or writes it has completed
++static id<MTLBuffer> ggml_metal_wrap_host_pages(id<MTLDevice> device, const void * data, size_t size, size_t * offs) {
++    const uintptr_t page = (uintptr_t) getpagesize();
++    const uintptr_t p    = (uintptr_t) data;
++    const uintptr_t p0   = p & ~(page - 1);
++    const uintptr_t p1   = (p + size + page - 1) & ~(page - 1);
++    *offs = (size_t) (p - p0);
++    return [device newBufferWithBytesNoCopy:(void *) p0
++                                     length:(NSUInteger) (p1 - p0)
++                                    options:MTLResourceStorageModeShared
++                                deallocator:nil];
++}
++
+ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     @autoreleasepool {
+-        // wrap the source data into a Metal buffer
++        // wrap the source data into a Metal buffer: uploads of 64 KiB or more read the caller's pages in place (the asynchronous
++        // contract keeps them valid until the context synchronizes, which waits for this command buffer), smaller ones and any range
++        // Metal refuses copy it into a new buffer as before; GGML_METAL_UPLOAD_NOCOPY=0: always the copy
++        static const bool nocopy = getenv("GGML_METAL_UPLOAD_NOCOPY") == NULL || atoi(getenv("GGML_METAL_UPLOAD_NOCOPY")) != 0;
+         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
+-        id<MTLBuffer> buf_src = [device newBufferWithBytes:data
+-                                                    length:size
+-                                                   options:MTLResourceStorageModeShared];
++        size_t src_offs = 0;
++        id<MTLBuffer> buf_src = nil;
++        if (nocopy && size >= 64*1024) {
++            buf_src = ggml_metal_wrap_host_pages(device, data, size, &src_offs);
++        }
++        if (buf_src == nil) {
++            src_offs = 0;
++            buf_src = [device newBufferWithBytes:data
++                                          length:size
++                                         options:MTLResourceStorageModeShared];
++        }
+ 
+         GGML_ASSERT(buf_src);
+ 
+@@ -347,7 +376,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
+         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+ 
+         [encoder copyFromBuffer:buf_src
+-                   sourceOffset:0
++                   sourceOffset:src_offs
+                        toBuffer:bid_dst.metal
+               destinationOffset:bid_dst.offs
+                            size:size];
+@@ -371,11 +400,10 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
+ 
+ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     @autoreleasepool {
++        // the destination pages wrapped in place (a pointer that is not page aligned, e.g. a later row of the logits, as well)
+         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
+-        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
+-                                                          length:size
+-                                                         options:MTLResourceStorageModeShared
+-                                                     deallocator:nil];
++        size_t dst_offs = 0;
++        id<MTLBuffer> buf_dst = ggml_metal_wrap_host_pages(device, data, size, &dst_offs);
+ 
+         GGML_ASSERT(buf_dst);
+ 
+@@ -395,7 +423,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+         [encoder copyFromBuffer:bid_src.metal
+                    sourceOffset:bid_src.offs
+                        toBuffer:buf_dst
+-              destinationOffset:0
++              destinationOffset:dst_offs
+                            size:size];
+ 
+         [encoder endEncoding];
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 2c7972b0a5d..9d1c6ee1ce5 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1062,7 +1062,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+             {
+                 nsg = N_SG_MXFP4;
+                 nr0 = N_R0_MXFP4;
+-                smem = 32*sizeof(float);
+             } break;
+         case GGML_TYPE_Q2_K:
+             {
+@@ -1387,7 +1386,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+             {
+                 nsg = N_SG_MXFP4;
+                 nr0 = N_R0_MXFP4;
+-                smem = 32*sizeof(float);
+             } break;
+         case GGML_TYPE_Q2_K:
+             {
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index d78ca7c4b7f..3436a83eea4 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <cstdlib>
+ #include <cstring>
+ #include <set>
+ #include <string>
+@@ -500,7 +501,16 @@ static bool ggml_metal_fusion_check_topk_moe(
+     return true;
+ }
+ 
+-#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 8
++#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 16
++
++// the largest expert count fused (2 to 16, default 16); GGML_METAL_MOE_REDUCE_MAX=8: up to 8 experts as before
++static int ggml_metal_moe_reduce_max_experts() {
++    static const int n = [] {
++        const char * e = getenv("GGML_METAL_MOE_REDUCE_MAX");
++        return e == nullptr ? GGML_METAL_MOE_REDUCE_MAX_EXPERTS : std::max(1, std::min(GGML_METAL_MOE_REDUCE_MAX_EXPERTS, atoi(e)));
++    }();
++    return n;
++}
+ 
+ struct ggml_metal_moe_reduce_match {
+     const ggml_tensor * experts;
+@@ -525,7 +535,7 @@ static bool ggml_metal_fusion_match_moe_reduce(
+     const int raw_count     = (int) ops_all.size();
+     const int n_expert_used = raw_count / 2;
+ 
+-    if (n_expert_used < 2 || n_expert_used > GGML_METAL_MOE_REDUCE_MAX_EXPERTS ||
++    if (n_expert_used < 2 || n_expert_used > ggml_metal_moe_reduce_max_experts() ||
+         raw_count != 2 * n_expert_used) {
+         return false;
+     }
+@@ -755,6 +765,22 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
+     GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+ };
+ 
++// MUL, then n VIEWs, then n - 1 ADDs (9 to 16 experts: Qwen3.8-Flash-Next routes 10)
++static std::vector<ggml_op> ggml_metal_ops_moe_reduce(int n) {
++    std::vector<ggml_op> ops = { GGML_OP_MUL };
++    ops.insert(ops.end(), n, GGML_OP_VIEW);
++    ops.insert(ops.end(), n - 1, GGML_OP_ADD);
++    return ops;
++}
++static const std::vector<ggml_op> ops_moe_reduce_9 = ggml_metal_ops_moe_reduce(9);
++static const std::vector<ggml_op> ops_moe_reduce_10 = ggml_metal_ops_moe_reduce(10);
++static const std::vector<ggml_op> ops_moe_reduce_11 = ggml_metal_ops_moe_reduce(11);
++static const std::vector<ggml_op> ops_moe_reduce_12 = ggml_metal_ops_moe_reduce(12);
++static const std::vector<ggml_op> ops_moe_reduce_13 = ggml_metal_ops_moe_reduce(13);
++static const std::vector<ggml_op> ops_moe_reduce_14 = ggml_metal_ops_moe_reduce(14);
++static const std::vector<ggml_op> ops_moe_reduce_15 = ggml_metal_ops_moe_reduce(15);
++static const std::vector<ggml_op> ops_moe_reduce_16 = ggml_metal_ops_moe_reduce(16);
++
+ static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+ 
+ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+@@ -783,6 +809,14 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_6,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_9,          {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_10,         {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_11,         {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_12,         {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_13,         {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_14,         {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_15,         {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_16,         {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
+     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+ };
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.h b/ggml/src/ggml-metal/ggml-metal-fusion.h
+index 5d994c249a9..32fa6f45788 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.h
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.h
+@@ -20,7 +20,7 @@ struct ggml_metal_device_props;
+ 
+ // the maximum number of nodes that can be fused in a single kernel
+ // (also the maximum length of a packed fusion group during graph optimization)
+-#define GGML_METAL_FUSION_MAX 16
++#define GGML_METAL_FUSION_MAX 32
+ 
+ typedef enum ggml_metal_fusion_mode {
+     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 53c98161851..8a6e2f4937f 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -14,6 +14,7 @@
+ #include <algorithm>
+ #include <limits>
+ #include <cmath>
++#include <cstdlib>
+ 
+ // threadgroups needed to fill the GPU
+ // TODO: dedup
+@@ -895,7 +896,9 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+     if (pipeline.cnt) {
+         const int n = pipeline.c4 ? ggml_nelements(op)/4 : ggml_nelements(op);
+ 
+-        ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, 1, 1, 1);
++        const int nth = MIN(256, n);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
+     } else {
+         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+         const int nth = MIN(args.ne00, nth_max);
+@@ -948,7 +951,9 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
+ 
+     const int64_t nrows = ggml_nrows(op->src[0]);
+ 
+-    const int32_t nth = std::max(1, std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne00/2));
++    // split each row over several threadgroups: with a single row (decode) one threadgroup would run on one GPU core
++    const int32_t nth = std::max(1, std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), std::min(256, ne0)));
++    const int32_t nk  = (ne0 + nth - 1)/nth;
+ 
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+@@ -960,7 +965,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
+     }
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
++    ggml_metal_encoder_dispatch_threadgroups(enc, nk, nrows, 1, nth, 1, 1);
+ 
+     return 1;
+ }
+@@ -3383,6 +3388,22 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
+     //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
+     //    return 0;
+     //}
++    // except where no batch size can use it: the F16 dequant pass only runs for these K types (use_kv_f16), and the cache types of a
++    // graph do not change between batch sizes, so this cannot reallocate graphs (an F16 KV cache of 32k cells with 8 heads of 128
++    // reserved 128 MiB it never used); GGML_METAL_FA_KV_F16_RESERVE=1: always reserve, as before
++    static const bool reserve_all = getenv("GGML_METAL_FA_KV_F16_RESERVE") != nullptr && atoi(getenv("GGML_METAL_FA_KV_F16_RESERVE")) != 0;
++    if (!reserve_all) {
++        switch (op->src[1]->type) {
++            case GGML_TYPE_Q4_0:
++            case GGML_TYPE_Q4_1:
++            case GGML_TYPE_Q5_0:
++            case GGML_TYPE_Q5_1:
++            case GGML_TYPE_Q8_0:
++                break;
++            default:
++                return 0;
++        }
++    }
+ 
+     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
+ 
+@@ -4236,7 +4257,9 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+ 
+     if (pipeline.cnt) {
+-        ggml_metal_encoder_dispatch_threadgroups(enc, args.ne0, ggml_nrows(op), 1, 1, 1, 1);
++        const int nth = MIN(256, args.ne0);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne0 + nth - 1)/nth, ggml_nrows(op), 1, nth, 1, 1);
+     } else {
+         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+ 
+diff --git a/ggml/src/ggml-metal/kernels/argsort.metal b/ggml/src/ggml-metal/kernels/argsort.metal
+index 5231b8395c9..4cafa1a7042 100644
+--- a/ggml/src/ggml-metal/kernels/argsort.metal
++++ b/ggml/src/ggml-metal/kernels/argsort.metal
+@@ -468,12 +468,17 @@ kernel void kernel_moe_reduce_f32(
+         return;
+     }
+ 
+-    const int n_expert_used = FC_moe_reduce_n_expert_used;
+-
+-    const int64_t base = token * (int64_t) n_expert_used * args.ne00 + col;
+-    float sum = 0.0f;
+-    FOR_UNROLL (int e = 0; e < n_expert_used; ++e) {
+-        sum += experts[base + e * args.ne00] * weights[token * n_expert_used + e];
++    // the values of the unfused MUL and ADD chain: each product rounded, then added in expert order from the first product
++    // (no fused multiply-add, no reassociation under fast math)
++    {
++#pragma clang fp contract(off) reassociate(off)
++        const int n_expert_used = FC_moe_reduce_n_expert_used;
++
++        const int64_t base = token * (int64_t) n_expert_used * args.ne00 + col;
++        float sum = experts[base] * weights[token * n_expert_used];
++        FOR_UNROLL (int e = 1; e < n_expert_used; ++e) {
++            sum += experts[base + e * args.ne00] * weights[token * n_expert_used + e];
++        }
++        dst[token * args.ne00 + col] = sum;
+     }
+-    dst[token * args.ne00 + col] = sum;
+ }
+diff --git a/ggml/src/ggml-metal/kernels/binbcast.metal b/ggml/src/ggml-metal/kernels/binbcast.metal
+index 7c7ab9b5eb9..74cbcb58153 100644
+--- a/ggml/src/ggml-metal/kernels/binbcast.metal
++++ b/ggml/src/ggml-metal/kernels/binbcast.metal
+@@ -22,8 +22,13 @@ kernel void kernel_bin_fuse_impl(
+ 
+     if (FC_RB) {
+         // row broadcast
+-        const uint i0 = tgpig.y*args.ne00 + tgpig.x;
+-        const uint i1 = FC_CB ? tgpig.x%args.ne10 : tgpig.x;
++        const uint i = tgpig.x*ntg.x + tpitg.x;
++        if (i >= (uint) args.ne0) {
++            return;
++        }
++
++        const uint i0 = tgpig.y*args.ne00 + i;
++        const uint i1 = FC_CB ? i%args.ne10 : i;
+ 
+         device const T0 * src0_row = (device const T0 *) (src0);
+         device       T  * dst_row  = (device       T  *) (dst);
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index fb27983db3e..b48a4ca7f51 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -1,5 +1,7 @@
+ #include "common.h"
+ 
++#define ARGMAX_NONE 0x7fffffff
++
+ kernel void kernel_argmax_f32(
+         constant ggml_metal_kargs_argmax & args,
+         device   const char * src0,
+@@ -12,8 +14,10 @@ kernel void kernel_argmax_f32(
+         uint    ntg[[threads_per_threadgroup]]) {
+     device const float * x_row = (device const float *) ((device const char *) src0 + tgpig * args.nb01);
+ 
++    // the lowest column of the maximum, as the CPU backend and the host greedy sampler; NaN never compares greater, and a row
++    // without a value above -inf (all -inf or NaN) gives column 0
+     float   lmax = -INFINITY;
+-    int32_t larg = -1;
++    int32_t larg = ARGMAX_NONE;
+ 
+     for (int i00 = tpitg; i00 < args.ne00; i00 += ntg) {
+         if (x_row[i00] > lmax) {
+@@ -24,7 +28,7 @@ kernel void kernel_argmax_f32(
+ 
+     // find the argmax value in the block
+     float max_val = simd_max(lmax);
+-    int32_t arg_val = simd_max(select(-1, larg, lmax == max_val));
++    int32_t arg_val = simd_min(select(ARGMAX_NONE, larg, lmax == max_val));
+ 
+     device int32_t * dst_i32 = (device int32_t *) dst;
+ 
+@@ -34,7 +38,7 @@ kernel void kernel_argmax_f32(
+     if (ntg > N_SIMDWIDTH) {
+         if (sgitg == 0) {
+             shared_maxval[tiisg] = -INFINITY;
+-            shared_argmax[tiisg] = -1;
++            shared_argmax[tiisg] = ARGMAX_NONE;
+         }
+ 
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+@@ -50,14 +54,14 @@ kernel void kernel_argmax_f32(
+         arg_val = shared_argmax[tiisg];
+ 
+         float max_val_reduced   = simd_max(max_val);
+-        int32_t arg_val_reduced = simd_max(select(-1, arg_val, max_val == max_val_reduced));
++        int32_t arg_val_reduced = simd_min(select(ARGMAX_NONE, arg_val, max_val == max_val_reduced));
+ 
+-        dst_i32[tgpig] = arg_val_reduced;
++        dst_i32[tgpig] = arg_val_reduced == ARGMAX_NONE ? 0 : arg_val_reduced;
+ 
+         return;
+     }
+ 
+-    dst_i32[tgpig] = arg_val;
++    dst_i32[tgpig] = arg_val == ARGMAX_NONE ? 0 : arg_val;
+ }
+ 
+ kernel void kernel_diag_f32(
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 0d1069f2c88..15d0da60351 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -3030,6 +3030,22 @@ kernel void kernel_mul_mv_iq4_xs_f32(
+     kernel_mul_mv_iq4_xs_f32_impl<N_R0_IQ4_XS, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+ }
+ 
++// decode the E2M1 value in the low nibble of n, scaled by 2^-14, without a lookup table: the 3 magnitude bits
++// land in the fp16 exponent/mantissa (e=0 gives the 0.5 subnormal)
++static inline half mxfp4_dq1(uint32_t n) {
++    const half c = as_type<half>(ushort((n & 7) << 9));
++    return (n & 8) ? -c : c;
++}
++
++// low / high nibbles of the 4 bytes of w, in byte order, scaled by 2^-14
++static inline float4 mxfp4_lo4(uint32_t w) {
++    return float4(mxfp4_dq1(w), mxfp4_dq1(w >> 8), mxfp4_dq1(w >> 16), mxfp4_dq1(w >> 24));
++}
++
++static inline float4 mxfp4_hi4(uint32_t w) {
++    return float4(mxfp4_dq1(w >> 4), mxfp4_dq1(w >> 12), mxfp4_dq1(w >> 20), mxfp4_dq1(w >> 28));
++}
++
+ template<int NR0, typename args_t>
+ void kernel_mul_mv_mxfp4_f32_impl(
+         args_t args,
+@@ -3042,8 +3058,6 @@ void kernel_mul_mv_mxfp4_f32_impl(
+         ushort sgitg) {
+     const short NSG = FC_mul_mv_nsg;
+ 
+-    threadgroup float * shmem_f32 = (threadgroup float *) shmem;
+-
+     const int r0 = tgpig.x;
+     const int r1 = tgpig.y;
+     const int im = tgpig.z;
+@@ -3065,9 +3079,6 @@ void kernel_mul_mv_mxfp4_f32_impl(
+     const short ix = tiisg/2;  // 0...15
+     const short it = tiisg%2;  // 0 or 1
+ 
+-    shmem_f32[tiisg] = kvalues_mxfp4_f[tiisg%16];
+-    threadgroup_barrier(mem_flags::mem_threadgroup);
+-
+     float4 yl[4];
+     float sumf[NR0]={0.f};
+ 
+@@ -3087,14 +3098,25 @@ void kernel_mul_mv_mxfp4_f32_impl(
+             device const block_mxfp4 & xb = x[row*ns01 + ib];
+             device const uint8_t     * q2 = (device const uint8_t *)(xb.qs + 8*it);
+ 
+-            float4 acc1 = yl[0]*float4(shmem_f32[q2[0] &  0x0F], shmem_f32[q2[1] &  0x0F], shmem_f32[q2[2] &  0x0F], shmem_f32[q2[3] &  0x0F]);
+-            float4 acc2 = yl[1]*float4(shmem_f32[q2[0] >> 4   ], shmem_f32[q2[1] >> 4   ], shmem_f32[q2[2] >> 4   ], shmem_f32[q2[3] >> 4   ]);
+-            float4 acc3 = yl[2]*float4(shmem_f32[q2[4] &  0x0F], shmem_f32[q2[5] &  0x0F], shmem_f32[q2[6] &  0x0F], shmem_f32[q2[7] &  0x0F]);
+-            float4 acc4 = yl[3]*float4(shmem_f32[q2[4] >> 4   ], shmem_f32[q2[5] >> 4   ], shmem_f32[q2[6] >> 4   ], shmem_f32[q2[7] >> 4   ]);
++            // blocks are 17 bytes, so the 8 quant bytes are only byte aligned: read the aligned words that cover them
++            // and funnel-shift. the third word is read only when needed so no word past the block end is touched
++            device const uint32_t * pw = (device const uint32_t *)((ulong) q2 & ~3ul);
++            const uint sh = ((uint)(ulong) q2 & 3u)*8;
++            const uint32_t a = pw[0];
++            const uint32_t b = pw[1];
++            const uint32_t c = pw[sh ? 2 : 1];
++            const uint32_t w0 = (a >> sh) | ((b << 1) << (31 - sh));
++            const uint32_t w1 = (b >> sh) | ((c << 1) << (31 - sh));
++
++            float4 acc1 = yl[0]*mxfp4_lo4(w0);
++            float4 acc2 = yl[1]*mxfp4_hi4(w0);
++            float4 acc3 = yl[2]*mxfp4_lo4(w1);
++            float4 acc4 = yl[3]*mxfp4_hi4(w1);
+ 
+             acc1 = (acc1 + acc3) + (acc2 + acc4);
+ 
+-            sumf[row] += e8m0_to_fp32(xb.e) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
++            // 16384 undoes the 2^-14 of the decode
++            sumf[row] += (e8m0_to_fp32(xb.e)*16384.0f) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+         }
+ 
+         yb += 16 * QK_MXFP4;
+diff --git a/ggml/src/ggml-metal/kernels/unary.metal b/ggml/src/ggml-metal/kernels/unary.metal
+index e50a6486394..c277400d004 100644
+--- a/ggml/src/ggml-metal/kernels/unary.metal
++++ b/ggml/src/ggml-metal/kernels/unary.metal
+@@ -20,7 +20,7 @@ kernel void kernel_unary_impl(
+     int i0;
+ 
+     if (FC_CNT) {
+-        i0 = tgpig.x;
++        i0 = tgpig.x*ntg.x + tpitg.x;
+ 
+         src0_ptr = (device const T0 *) (src0);
+         dst_ptr  = (device       T  *) (dst);
+@@ -43,6 +43,10 @@ kernel void kernel_unary_impl(
+             if (i0 >= args.ne0) {
+                 return;
+             }
++        } else {
++            if (i0 >= args.ne00*args.ne01*args.ne02*args.ne03) {
++                return;
++            }
+         }
+ 
+         const TC x = (TC) src0_ptr[i0];
+@@ -209,14 +213,15 @@ kernel void kernel_reglu(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -235,14 +240,15 @@ kernel void kernel_geglu(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -263,14 +269,15 @@ kernel void kernel_swiglu(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -291,14 +298,15 @@ kernel void kernel_swiglu_oai(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         float x0 = src0_row[i0];
+         float x1 = src1_row[i0];
+ 
+@@ -323,14 +331,15 @@ kernel void kernel_swiglu_clamp(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float gate = min((float) src0_row[i0], args.limit);
+         const float up = clamp((float) src1_row[i0], -args.limit, args.limit);
+ 
+@@ -349,14 +358,15 @@ kernel void kernel_geglu_erf(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -377,14 +387,15 @@ kernel void kernel_geglu_quick(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7f4da8a287a..ff9ad751c0d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -69,6 +69,34 @@
+ 
+ static bool moe_cache_released_counts(); // (defined beside moe_cache_refill_from_ids)
+ 
++// whether every device of the model runs GGML_OP_KQ_MASK: a device without it (Metal, Vulkan, the meta device of -sm tensor) gets the
++// device KQ mask as a CPU split and a copy of the mask, where the host mask has the same values in an input; then the graphs keep the
++// host mask. LLAMA_KQ_MASK_DEVICE_CHECK=0: the device mask regardless, as before
++static bool model_devices_kq_mask(const llama_model & model) {
++    static const bool check = getenv("LLAMA_KQ_MASK_DEVICE_CHECK") == nullptr || atoi(getenv("LLAMA_KQ_MASK_DEVICE_CHECK")) != 0;
++    if (!check || model.devices.empty()) {
++        return true;
++    }
++    ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(ip);
++    if (ctx == nullptr) {
++        return true;
++    }
++    ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 5, 256, 1);
++    ggml_tensor * toks  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 8, 64, 1);
++    bool ok = true;
++    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
++        ggml_tensor * m = ggml_kq_mask(ctx, cells, toks, type);
++        for (const auto & d : model.devices) {
++            if (d.dev != nullptr && !ggml_backend_dev_supports_op(d.dev, m)) {
++                ok = false;
++            }
++        }
++    }
++    ggml_free(ctx);
++    return ok;
++}
++
+ // the lowest compute capability (major*100 + minor*10) of the model's GPU devices, -1 if one is not a CUDA device or there is none
+ static int model_gpu_min_cc(const llama_model & model) {
+     int cc_min = -1;
+@@ -500,6 +528,7 @@ llama_context::llama_context(
+     cparams.exact_split             = 0;
+     cparams.dsv41_far               = 0;
+     cparams.offload_kqv             = params.offload_kqv;
++    cparams.kq_mask_dev             = model_devices_kq_mask(model);
+     cparams.no_perf                 = params.no_perf;
+     cparams.warmup                  = false;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 6ae6af1bc0b..7b5c63336b7 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -49,6 +49,7 @@ struct llama_cparams {
+     uint32_t dsv41_far = 0;       // leading rows of the current ubatch that stop before hparams.dsv41_far_layer (0 = none)
+     bool causal_attn;
+     bool offload_kqv;
++    bool kq_mask_dev = true;   // every device of the model runs GGML_OP_KQ_MASK (llm_graph's device KQ mask)
+     bool flash_attn;
+     bool auto_fa;
+     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 4074da25492..230e2268184 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -53,13 +53,14 @@ static bool kq_mask_settable(const ggml_tensor * t) {
+ // cells and the tokens (I32 inputs of 3 x n_kv and 5 x n_tokens) instead of a host mask of n_kv x n_tokens, the same values
+ // (llama_kv_cache::set_input_kq_mask fills either). A layer-major group kept the host masks of all its members until computed
+ // (16384 tokens: 288 MiB of f16 host masks, plus their build on the host). Only where the host mask has no ALiBi, sequence ids
+-// < 64, and not the non-causal SWA_FULL span, with the attention offloaded; LLAMA_KQ_MASK_DEVICE=0 off
++// < 64, and not the non-causal SWA_FULL span, with the attention offloaded to devices that run the op (cparams.kq_mask_dev);
++// LLAMA_KQ_MASK_DEVICE=0 off
+ // decode / verify ubatches (fewer than LLAMA_KQ_MASK_DEVICE_MIN_TOKENS, 64) keep the host mask: their host masks are small, while the
+ // cells input is n_kv rows each step (RTX PRO 6000 the 4-bit model 12 GB with device masks at every ubatch: decode 8k / 16k -13 / -18%)
+ static bool kq_mask_device_ok(const llama_ubatch & ubatch, const llama_hparams & hparams, const llama_cparams & cparams) {
+     static const bool env = getenv("LLAMA_KQ_MASK_DEVICE") == nullptr || atoi(getenv("LLAMA_KQ_MASK_DEVICE")) != 0;
+     static const uint32_t min_tokens = getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS"))) : 64;
+-    return env && ubatch.n_tokens >= min_tokens && cparams.offload_kqv && !hparams.use_alibi && cparams.n_seq_max <= 64 &&
++    return env && ubatch.n_tokens >= min_tokens && cparams.offload_kqv && cparams.kq_mask_dev && !hparams.use_alibi && cparams.n_seq_max <= 64 &&
+         (cparams.causal_attn || hparams.non_causal_type != LLAMA_NON_CAUSAL_TYPE_SWA_FULL);
+ }
+ 
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 0d03a9d4cd0..1fd211af51e 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -480,6 +480,23 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+     ggml_build_forward_expand(g.gf, out);
+ }
+ 
++// whether the device holding a weight runs the node; true without a device (an unallocated weight, as the fused op always was);
++// LLAMA_DFLASH2_CONV_DEV_CHECK=0: the fused op on every device
++static bool dflash2_conv_dev_ok(const ggml_tensor * w, const ggml_tensor * node) {
++    static const bool check = getenv("LLAMA_DFLASH2_CONV_DEV_CHECK") == nullptr || atoi(getenv("LLAMA_DFLASH2_CONV_DEV_CHECK")) != 0;
++    if (!check) {
++        return true;
++    }
++    while (w->view_src != nullptr) {
++        w = w->view_src;
++    }
++    if (w->buffer == nullptr) {
++        return true;
++    }
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer));
++    return dev == nullptr || ggml_backend_dev_supports_op(dev, node);
++}
++
+ static ggml_tensor * build_dflash2_conv(
+         llm_graph_context & g,
+         ggml_tensor * hidden,
+@@ -514,13 +531,18 @@ static ggml_tensor * build_dflash2_conv(
+     }();
+     if (fused && hidden->type == GGML_TYPE_F32 && dynamic->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32 &&
+             ggml_is_contiguous(dynamic) && ggml_is_contiguous(base) && dynamic->ne[0] == n_groups * kernel_size * 2) {
+-        static bool logged = false;
+-        if (!logged) {
+-            logged = true;
+-            LLAMA_LOG_INFO("DFlash2 conv fused (ggml_dflash2_conv, LLAMA_DFLASH2_CONV_FUSED=0 off)\n");
+-        }
+         ggml_tensor * base_1d = ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]);
+-        return ggml_dflash2_conv(ctx0, hidden, dynamic, base_1d, (int) kernel_size, (int) group_size, (int) n_blocks, side);
++        ggml_tensor * conv = ggml_dflash2_conv(ctx0, hidden, dynamic, base_1d, (int) kernel_size, (int) group_size, (int) n_blocks, side);
++        // only where the device of the weights runs the op (a device without it would run it as a CPU split between the drafter's
++        // device nodes, with the copies there and back): elsewhere the chain below, on the device
++        if (dflash2_conv_dev_ok(base, conv)) {
++            static bool logged = false;
++            if (!logged) {
++                logged = true;
++                LLAMA_LOG_INFO("DFlash2 conv fused (ggml_dflash2_conv, LLAMA_DFLASH2_CONV_FUSED=0 off)\n");
++            }
++            return conv;
++        }
+     }
+ 
+     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index d195af82081..7ecef0d8720 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -583,6 +583,10 @@ llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)
+ llama_build_and_test(test-moe-tc-exact.cpp LINK ggml)
+ # ggml_dflash2_conv vs the add / mul / pad chain of the DFlash2 drafter's conv, byte for byte on every device (CPU always)
+ llama_build_and_test(test-dflash2-conv-exact.cpp LINK ggml)
++# the MoE expert reduction (MUL, VIEWs, ADD chain) on Metal, fused or not, vs the CPU backend, byte for byte (SKIP without a Metal device)
++llama_build_and_test(test-moe-reduce-exact.cpp LINK ggml)
++# Metal asynchronous host <-> device copies at page and non-page offsets, round trip byte for byte (SKIP without a Metal device)
++llama_build_and_test(test-metal-async-copy.cpp LINK ggml)
+ # the rows-per-block lever of the dense 2..8 column mat-vec vs the launch it replaces, byte for byte (SKIP without a CUDA device)
+ llama_build_and_test(test-mmvqcols-exact.cpp LINK ggml)
+ # the ported few-row int8 MMQ (GGML_CUDA_MMQ_FEW) on dense K-quant / IQ4_XS / Q8_0 products at 2..8 columns vs mmvq + fp64 reference (NMSE gates,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 73055f34de1..f17a9533a84 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2978,14 +2978,18 @@ struct test_norm_mrope : public test_case {
+ struct test_argmax : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne;
++    const int mode; // 0: unique values, 1: few distinct values (the maximum repeats), 2: as 1 with every other row all -inf
+ 
+     std::string vars() override {
++        if (mode != 0) {
++            return VARS_TO_STR3(type, ne, mode);
++        }
+         return VARS_TO_STR2(type, ne);
+     }
+ 
+     test_argmax(ggml_type type = GGML_TYPE_F32,
+-            std::array<int64_t, 4> ne = {10, 100, 1, 1})
+-        : type(type), ne(ne) {}
++            std::array<int64_t, 4> ne = {10, 100, 1, 1}, int mode = 0)
++        : type(type), ne(ne), mode(mode) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+@@ -3002,11 +3006,11 @@ struct test_argmax : public test_case {
+         std::default_random_engine rng(rd());
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+             if (t->type == GGML_TYPE_F32) {
+-                // initialize with unique values to avoid ties
++                // mode 0: unique values to avoid ties; modes 1 / 2: the lowest index of the maximum, 0 for an all -inf row
+                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                     std::vector<float> data(t->ne[0]);
+                     for (int i = 0; i < t->ne[0]; i++) {
+-                        data[i] = i;
++                        data[i] = mode == 0 ? i : (mode == 2 && r % 2 == 0) ? -INFINITY : (float) (i % 7) - 3.0f;
+                     }
+                     std::shuffle(data.begin(), data.end(), rng);
+                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+@@ -12631,6 +12635,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 1, 1, 1}));
+     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 7, 1, 1}));
+     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {40000,  3, 1, 1}));
++    // ties and all -inf rows
++    for (int mode : {1, 2}) {
++        for (int64_t ne0 : {32, 100, 1024, 5438, 248320}) {
++            test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {ne0, 7, 1, 1}, mode));
++        }
++        test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 1, 1, 1}, mode));
++    }
+ 
+     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
+         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
+@@ -14857,13 +14868,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
+-    // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
++    // Cover the supported boundaries, common k = 8 and k = 10 shapes, interleaved views and adds, and k = 16.
+     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
+     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
+     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));
++    test_cases.emplace_back(new test_moe_reduce(2048, 10, 1));
++    test_cases.emplace_back(new test_moe_reduce(2048, 10, 7));
++    test_cases.emplace_back(new test_moe_reduce(2048, 10, 128, false, true));
+     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
+     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
+     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
++    test_cases.emplace_back(new test_moe_reduce(2048, 17, 8));
+ 
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+diff --git a/tests/test-metal-async-copy.cpp b/tests/test-metal-async-copy.cpp
+new file mode 100644
+index 00000000000..4a69d4f4d02
+--- /dev/null
++++ b/tests/test-metal-async-copy.cpp
+@@ -0,0 +1,115 @@
++// round trip of the asynchronous host <-> device copies on the Metal devices: ggml_backend_tensor_set_async from host pointers at
++// page and non-page offsets, sizes from 4 bytes to 8 MiB (the zero-copy upload of 64 KiB or more and the copied one below it),
++// then ggml_backend_tensor_get_async into non-page-aligned host memory; every byte must come back. The source is overwritten only
++// after the synchronize. SKIP without a Metal device; exit 1 on any difference.
++
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++int main() {
++    ggml_backend_load_all();
++
++    const size_t n_bytes = 32u << 20;
++    int n_cases = 0;
++    int n_diff  = 0;
++    for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(d);
++        if (strncmp(ggml_backend_dev_name(dev), "MTL", 3) != 0) {
++            continue;
++        }
++        ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
++        if (be == nullptr) {
++            continue;
++        }
++        ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
++        ggml_context * ctx = ggml_init(ip);
++        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) n_bytes);
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
++
++        std::mt19937 rng(42);
++        std::vector<uint8_t> host(n_bytes + 2*16384);
++        std::vector<uint8_t> back(n_bytes + 2*16384);
++        for (size_t size : { (size_t) 4, (size_t) 100, (size_t) 4096, (size_t) 65535, (size_t) 65536, (size_t) 65536 + 7,
++                (size_t) 1 << 20, ((size_t) 8 << 20) + 12 }) {
++            for (size_t src_off : { (size_t) 0, (size_t) 4, (size_t) 100, (size_t) 4097, (size_t) 16384 }) {
++                for (size_t dst_off : { (size_t) 0, (size_t) 12, (size_t) 16384 + 4 }) {
++                    if (dst_off + size > n_bytes) {
++                        continue;
++                    }
++                    std::vector<uint8_t> keep(size);
++                    for (size_t i = 0; i < size; ++i) {
++                        keep[i] = host[src_off + i] = (uint8_t) rng();
++                    }
++                    ggml_backend_tensor_set_async(be, t, host.data() + src_off, dst_off, size);
++                    ggml_backend_synchronize(be);
++                    // the source may change after the synchronize
++                    memset(host.data() + src_off, 0xA5, size);
++                    const size_t back_off = 3 + (src_off % 7);
++                    memset(back.data(), 0, size + back_off + 16);
++                    ggml_backend_tensor_get_async(be, t, back.data() + back_off, dst_off, size);
++                    ggml_backend_synchronize(be);
++                    bool ok = memcmp(keep.data(), back.data() + back_off, size) == 0;
++                    // the async get wrote nothing outside its range
++                    ok = ok && back[back_off - 1] == 0 && back[back_off + size] == 0;
++                    n_cases++;
++                    if (!ok) {
++                        n_diff++;
++                        printf("  DIFFER size %zu src_off %zu dst_off %zu\n", size, src_off, dst_off);
++                    }
++                }
++            }
++        }
++        // the uploaded bytes themselves: one more upload checked against a kept copy
++        {
++            const size_t size = ((size_t) 8 << 20) + 12;
++            std::vector<uint8_t> keep(size);
++            for (size_t i = 0; i < size; ++i) {
++                keep[i] = host[100 + i] = (uint8_t) rng();
++            }
++            ggml_backend_tensor_set_async(be, t, host.data() + 100, 12, size);
++            ggml_backend_synchronize(be);
++            memset(host.data() + 100, 0, size);
++            std::vector<uint8_t> got(size);
++            ggml_backend_tensor_get(t, got.data(), 12, size);
++            const bool ok = memcmp(keep.data(), got.data(), size) == 0;
++            n_cases++;
++            if (!ok) {
++                n_diff++;
++                printf("  DIFFER upload content\n");
++            }
++            for (size_t size2 : { (size_t) 100, (size_t) 65536 + 7, (size_t) 1 << 20 }) {
++                std::vector<uint8_t> keep2(size2);
++                for (size_t i = 0; i < size2; ++i) {
++                    keep2[i] = host[4097 + i] = (uint8_t) rng();
++                }
++                ggml_backend_tensor_set_async(be, t, host.data() + 4097, 16384 + 4, size2);
++                ggml_backend_synchronize(be);
++                std::vector<uint8_t> got2(size2);
++                ggml_backend_tensor_get(t, got2.data(), 16384 + 4, size2);
++                n_cases++;
++                if (memcmp(keep2.data(), got2.data(), size2) != 0) {
++                    n_diff++;
++                    printf("  DIFFER upload content size %zu\n", size2);
++                }
++            }
++        }
++        ggml_backend_buffer_free(buf);
++        ggml_free(ctx);
++        ggml_backend_free(be);
++    }
++    if (n_cases == 0) {
++        printf("test-metal-async-copy: SKIP (no Metal device)\n");
++        return 0;
++    }
++    printf("test-metal-async-copy: %d cases, %d differ\n", n_cases, n_diff);
++    printf("%s\n", n_diff == 0 ? "OK" : "FAIL");
++    return n_diff == 0 ? 0 : 1;
++}
+diff --git a/tests/test-moe-reduce-exact.cpp b/tests/test-moe-reduce-exact.cpp
+new file mode 100644
+index 00000000000..7b1f68f01e4
+--- /dev/null
++++ b/tests/test-moe-reduce-exact.cpp
+@@ -0,0 +1,134 @@
++// bit identity of the MoE expert reduction (MUL of the expert outputs by their weights, one VIEW per expert, then the ADD chain, as
++// build_moe_ffn builds it) on the Metal devices against the CPU backend. Metal runs the chain as one fused kernel (2 to 16 experts,
++// GGML_METAL_FUSION_DISABLE=1: the unfused ops); its output must be the bytes of the unfused chain. SKIP without a Metal device.
++// Finite random inputs, shapes of the routed MoEs (2 to 16 experts, 1 to 33 tokens, odd and lm-sized rows). A negative control
++// changes one weight on the device: its output must differ. Prints the number of cases and of differing ones; exit 1 on any difference.
++
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++struct reduce_case {
++    int64_t n_embd, k, T;
++};
++
++static std::vector<float> run(ggml_backend_t backend, const reduce_case & c, const std::vector<float> & ex, const std::vector<float> & wt) {
++    ggml_init_params ip = { 256*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(ip);
++    ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.n_embd, c.k, c.T);
++    ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, c.k, c.T);
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
++    std::vector<ggml_tensor *> views(c.k);
++    for (int64_t e = 0; e < c.k; ++e) {
++        views[e] = ggml_view_2d(ctx, weighted, c.n_embd, c.T, weighted->nb[2], e * weighted->nb[1]);
++        ggml_build_forward_expand(gf, views[e]);
++    }
++    ggml_tensor * out = views[0];
++    for (int64_t e = 1; e < c.k; ++e) {
++        out = ggml_add(ctx, out, views[e]);
++        ggml_build_forward_expand(gf, out);
++    }
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    ggml_backend_tensor_set(experts, ex.data(), 0, ex.size() * sizeof(float));
++    ggml_backend_tensor_set(weights, wt.data(), 0, wt.size() * sizeof(float));
++    std::vector<float> res;
++    if (ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS) {
++        res.resize(ggml_nelements(out));
++        ggml_backend_tensor_get(out, res.data(), 0, res.size() * sizeof(float));
++    }
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++    return res;
++}
++
++int main() {
++    ggml_backend_load_all();
++
++    std::vector<reduce_case> cases;
++    for (int64_t k : { 2, 4, 8, 9, 10, 12, 16 }) {
++        for (int64_t T : { 1, 7, 33 }) {
++            cases.push_back({ 2048, k, T });
++        }
++        cases.push_back({ 63, k, 5 });
++    }
++    cases.push_back({ 4096, 10, 1 });
++
++    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++    if (cpu == nullptr) {
++        printf("test-moe-reduce-exact: no CPU backend\n");
++        return 1;
++    }
++
++    int n_cases = 0;
++    int n_diff  = 0;
++    int n_ctl   = 0;
++    for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(d);
++        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
++        if ((type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) ||
++                strncmp(ggml_backend_dev_name(dev), "MTL", 3) != 0) {
++            continue;
++        }
++        ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
++        if (be == nullptr) {
++            continue;
++        }
++        std::mt19937 rng(1234);
++        std::normal_distribution<float> nd(0.0f, 1.0f);
++        std::uniform_real_distribution<float> ud(0.0f, 1.0f);
++        for (const auto & c : cases) {
++            std::vector<float> ex(c.n_embd * c.k * c.T);
++            std::vector<float> wt(c.k * c.T);
++            for (auto & x : ex) {
++                x = nd(rng);
++            }
++            for (auto & x : wt) {
++                x = ud(rng);
++            }
++            const std::vector<float> a = run(cpu, c, ex, wt);
++            const std::vector<float> b = run(be, c, ex, wt);
++            const int r = a.size() != b.size() || memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0 ? 1 : 0;
++            int n_el = 0;
++            if (r && a.size() == b.size()) {
++                for (size_t i = 0; i < a.size(); ++i) {
++                    n_el += memcmp(&a[i], &b[i], sizeof(float)) != 0;
++                }
++            }
++            printf("  %s n_embd %lld k %lld T %lld: %s", ggml_backend_dev_name(dev), (long long) c.n_embd, (long long) c.k,
++                    (long long) c.T, r ? "DIFFER" : "equal");
++            if (r) {
++                printf(" (%d of %zu elements)", n_el, a.size());
++            }
++            printf("\n");
++            n_cases++;
++            n_diff += r;
++            if (c.k == 10 && c.T == 7) {
++                // negative control: one weight changed, the device output must change
++                std::vector<float> wt2 = wt;
++                wt2[3] += 0.25f;
++                const std::vector<float> b2 = run(be, c, ex, wt2);
++                const bool ctl_ok = b2.size() == b.size() && memcmp(b.data(), b2.data(), b.size() * sizeof(float)) != 0;
++                printf("  %s negative control k 10: %s\n", ggml_backend_dev_name(dev), ctl_ok ? "differs (ok)" : "SAME (broken)");
++                n_ctl += ctl_ok ? 0 : 1;
++            }
++        }
++        ggml_backend_free(be);
++    }
++    ggml_backend_free(cpu);
++
++    if (n_cases == 0) {
++        printf("test-moe-reduce-exact: SKIP (no Metal device)\n");
++        return 0;
++    }
++    printf("test-moe-reduce-exact: %d cases, %d differ, %d broken controls\n", n_cases, n_diff, n_ctl);
++    printf("%s\n", n_diff == 0 && n_ctl == 0 ? "OK" : "FAIL");
++    return n_diff == 0 && n_ctl == 0 ? 0 : 1;
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 2f005a0dcec..d72f1d642d7 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2751,11 +2751,12 @@ private:
+                 ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
+                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                 const char * rn = reg ? ggml_backend_reg_name(reg) : "";
+-                // an integrated GPU too (ggml-cuda reports prop.integrated as IGPU: Strix Halo gfx1151, Jetson, DGX Spark); the
+-                // argmax runs in the same graph on the same backend, nothing is sized from memory
++                // an integrated GPU too (ggml-cuda reports prop.integrated as IGPU: Strix Halo gfx1151, Jetson, DGX Spark), and Metal
++                // (its argmax takes the lowest column on a tie, as the host greedy sampler); the argmax runs in the same graph on the
++                // same backend, nothing is sized from memory
+                 const enum ggml_backend_dev_type dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+                 device_greedy_ok = dev && (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+-                    (strcmp(rn, "CUDA") == 0 || strcmp(rn, "ROCm") == 0);
++                    (strcmp(rn, "CUDA") == 0 || strcmp(rn, "ROCm") == 0 || strcmp(rn, "MTL") == 0);
+             }
+         }
+ 
