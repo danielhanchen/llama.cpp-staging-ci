@@ -121,6 +121,7 @@ public:
     bool in_prepare    = false; // prepare() simulates find_slot on a copy of the cells: no commit from there
     void replay_commit_cells(const std::vector<uint8_t> & which, bool sync);
     void replay_commit_cell(int32_t c);
+    void replay_commit_seq(llama_seq_id seq_id) const; // state_write / state_read: the windows of that sequence only (all for seq_id < 0)
     void replay_commit_ubatch(const llama_ubatch & ubatch, bool placed);
     // find_slot moves the rollback rows of the cells it swaps with them: the snapshot groups 1..n_rs_seq (state and conv rows)
     // and, with replay, a pending window (instead of committing it). The ubatch graph copies only the live rows (s_copy), so a verify
