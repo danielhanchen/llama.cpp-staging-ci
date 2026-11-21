@@ -324,6 +324,15 @@ int64_t common_fit_place8_grow_size(int64_t size_ok, int64_t size_cap, int64_t g
     return -1;
 }
 
+bool common_fit_extra_lent_excluded(bool lent, bool decode_sized) {
+    return lent && !decode_sized;
+}
+
+bool common_fit_placemid_decode_sized() {
+    const char * e = getenv("LLAMA_FIT_PLACEMID_DECODE_SIZED");
+    return e == nullptr || atoi(e) != 0;
+}
+
 // (lazy KV): the MoE cache sizes a fit raised by the unbacked KV, and by how much (every fit of the process)
 static std::vector<std::pair<size_t, size_t>> g_kv_lazy_grants;
 
@@ -950,7 +959,7 @@ static void common_params_fit_impl(
         }
 
         // a lent extra model (common_fit_extra_model::lent) holds only its context while the main model's prompt ubatches run
-        const bool lent = extra->lent && !decode_sized;
+        const bool lent = common_fit_extra_lent_excluded(extra->lent, decode_sized);
         for (size_t id = 0; id < dmds.size(); id++) {
             dmds[id].mb.model   += lent ? 0 : dmds_extra[id].mb.model;
             dmds[id].mb.context += dmds_extra[id].mb.context;
@@ -2351,6 +2360,9 @@ static void common_params_fit_impl(
                     int64_t        grow    = 0;
                     cparams->n_ubatch = ub_rel;
                     common_fit_place8_env(ub_rel, true, 0, false, devs[0]);
+                    // decode-sized as in the small-device branch: the cache sized here is resident at decode beside a lent drafter's
+                    // device weights and compute buffers (only prompt ubatches over ub_rel run with the banks released and borrow them)
+                    const bool mid_decode = common_fit_placemid_decode_sized();
                     auto measure_mid = [&](size_t cache, dmds_t & d) {
                         cparams->moe_cache_size = cache;
                         try {
@@ -2358,7 +2370,7 @@ static void common_params_fit_impl(
                         } catch (const std::runtime_error &) {
                             return false;
                         }
-                        add_extra_memory(d);
+                        add_extra_memory(d, nullptr, nullptr, mid_decode);
                         return true;
                     };
                     dmds_t d_s;
@@ -2392,6 +2404,10 @@ static void common_params_fit_impl(
                         LOG_INF("%s: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> %zu MiB; "
                             "ubatches of more than %u tokens run with the cache banks released, layer-major groups as before ("
                             "LLAMA_FIT_PLACEMID=0 off)\n", __func__, grow/MiB, (size_t) (size_ok/MiB), (size_t) (cparams->moe_cache_size/MiB), ub_rel);
+                        if (extra != nullptr && extra->lent) {
+                            LOG_INF("%s: the lent drafter beside that cache is counted with %s (LLAMA_FIT_PLACEMID_DECODE_SIZED=%d)\n", __func__,
+                                mid_decode ? "its device weights and compute buffers" : "its context only", mid_decode ? 1 : 0);
+                        }
                     } else {
                         common_fit_place8_env(0);
                         cparams->moe_cache_size = size_ok;
