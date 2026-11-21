@@ -1302,7 +1302,10 @@ void launch_fattn(
             qsa = &it->second;
         }
     }
-    const bool qsa_gather = qsa && !qsa->prompt && use_sparse && ggml_cuda_qsa_maskless_gather_ok(*qsa) && ggml_cuda_qsa_maskless_mode() == 1;
+    // (one query per tile only: a wider tile shares the union of its queries' cells, where the causal mask of one query is finite at
+    // cells only another query selected, so it takes the dense mask)
+    const bool qsa_gather = qsa && !qsa->prompt && use_sparse && ncols1 == 1 && ggml_cuda_qsa_maskless_gather_ok(*qsa) &&
+        ggml_cuda_qsa_maskless_mode() == 1;
     // the mask node's buffer may hold the selection or the causal mask (the allocator reused it), then a pool copy takes the mask;
     // allocated before the kernel's pool buffers, freed after them
     // (the dense mask of the graph node, all of its padded cells; the launch reads the live ones through the same strides)
