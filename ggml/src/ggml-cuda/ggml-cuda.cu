@@ -8372,20 +8372,25 @@ static void ggml_cuda_qsa_sel_launch(ggml_backend_cuda_context * cuda_ctx, const
 // where the node may fuse). Nothing is allocated, written or launched; the kernels are kept loaded for the life of the process.
 thread_local bool ggml_cuda_preload_active = false;
 static thread_local std::unordered_set<const void *> * ggml_cuda_preload_seen = nullptr;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static thread_local int ggml_cuda_preload_n_new = 0;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 void ggml_cuda_preload_func(const void * fn) {
     if (fn == nullptr || (ggml_cuda_preload_seen != nullptr && !ggml_cuda_preload_seen->insert(fn).second)) {
         return;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     cudaFuncAttributes attr;
     if (cudaFuncGetAttributes(&attr, fn) == cudaSuccess) {
         ggml_cuda_preload_n_new++;
     } else {
         (void) cudaGetLastError();
     }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static void ggml_cuda_preload_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * node) {
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
@@ -8494,6 +8499,7 @@ static int ggml_backend_cuda_preload_graph(ggml_backend_t backend, ggml_cgraph *
     (void) cudaGetLastError();
     return ggml_cuda_preload_n_new;
 }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 // (GGML_CUDA_DISABLE_SET_ROWS_PAIR=1 off): a SET_ROWS whose next compute node is another SET_ROWS of the same types (the K and
 // V cache stores of an attention layer, the two index-cache stores of a QSA layer) runs with it in one launch. Neither reads or writes
@@ -13746,9 +13752,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_memset_tensor_async") == 0) {
         return (void *)ggml_backend_cuda_memset_tensor_async;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_cuda_preload_graph") == 0) {
         return (void *)ggml_backend_cuda_preload_graph;
     }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_copy_regions_async") == 0) {
         return (void *)ggml_backend_cuda_copy_regions_async;
     }
