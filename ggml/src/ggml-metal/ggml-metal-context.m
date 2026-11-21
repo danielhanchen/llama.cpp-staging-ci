@@ -330,7 +330,7 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
 // newBufferWithBytesNoCopy takes must be page aligned: the whole pages are wrapped and *offs is the offset of data in them);
 // nil if Metal refuses the range. The host memory must stay valid until the copy that reads or writes it has completed
 static id<MTLBuffer> ggml_metal_wrap_host_pages(id<MTLDevice> device, const void * data, size_t size, size_t * offs) {
-    const uintptr_t page = (uintptr_t) getpagesize();
+    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
     const uintptr_t p    = (uintptr_t) data;
     const uintptr_t p0   = p & ~(page - 1);
     const uintptr_t p1   = (p + size + page - 1) & ~(page - 1);
@@ -346,7 +346,11 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
         // wrap the source data into a Metal buffer: uploads of 64 KiB or more read the caller's pages in place (the asynchronous
         // contract keeps them valid until the context synchronizes, which waits for this command buffer), smaller ones and any range
         // Metal refuses copy it into a new buffer as before; GGML_METAL_UPLOAD_NOCOPY=0: always the copy
-        static const bool nocopy = getenv("GGML_METAL_UPLOAD_NOCOPY") == NULL || atoi(getenv("GGML_METAL_UPLOAD_NOCOPY")) != 0;
+        static int nocopy = -1;
+        if (nocopy < 0) {
+            const char * e = getenv("GGML_METAL_UPLOAD_NOCOPY");
+            nocopy = e == NULL || atoi(e) != 0;
+        }
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
         size_t src_offs = 0;
         id<MTLBuffer> buf_src = nil;

@@ -43,7 +43,7 @@ index 67355e55d30..c00a1efdff9 100644
  }
  
 diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
-index e9064666f62..208f4bc33d5 100644
+index e9064666f62..1dc5c11ce51 100644
 --- a/ggml/src/ggml-metal/ggml-metal-context.m
 +++ b/ggml/src/ggml-metal/ggml-metal-context.m
 @@ -12,6 +12,9 @@
@@ -56,7 +56,7 @@ index e9064666f62..208f4bc33d5 100644
  #undef MIN
  #undef MAX
  #define MIN(a, b) ((a) < (b) ? (a) : (b))
-@@ -323,13 +326,39 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
+@@ -323,13 +326,43 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
      return ggml_metal_buffer_get_id(buffer->context, t);
  }
  
@@ -64,7 +64,7 @@ index e9064666f62..208f4bc33d5 100644
 +// newBufferWithBytesNoCopy takes must be page aligned: the whole pages are wrapped and *offs is the offset of data in them);
 +// nil if Metal refuses the range. The host memory must stay valid until the copy that reads or writes it has completed
 +static id<MTLBuffer> ggml_metal_wrap_host_pages(id<MTLDevice> device, const void * data, size_t size, size_t * offs) {
-+    const uintptr_t page = (uintptr_t) getpagesize();
++    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
 +    const uintptr_t p    = (uintptr_t) data;
 +    const uintptr_t p0   = p & ~(page - 1);
 +    const uintptr_t p1   = (p + size + page - 1) & ~(page - 1);
@@ -81,7 +81,11 @@ index e9064666f62..208f4bc33d5 100644
 +        // wrap the source data into a Metal buffer: uploads of 64 KiB or more read the caller's pages in place (the asynchronous
 +        // contract keeps them valid until the context synchronizes, which waits for this command buffer), smaller ones and any range
 +        // Metal refuses copy it into a new buffer as before; GGML_METAL_UPLOAD_NOCOPY=0: always the copy
-+        static const bool nocopy = getenv("GGML_METAL_UPLOAD_NOCOPY") == NULL || atoi(getenv("GGML_METAL_UPLOAD_NOCOPY")) != 0;
++        static int nocopy = -1;
++        if (nocopy < 0) {
++            const char * e = getenv("GGML_METAL_UPLOAD_NOCOPY");
++            nocopy = e == NULL || atoi(e) != 0;
++        }
          id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
 -        id<MTLBuffer> buf_src = [device newBufferWithBytes:data
 -                                                    length:size
@@ -100,7 +104,7 @@ index e9064666f62..208f4bc33d5 100644
  
          GGML_ASSERT(buf_src);
  
-@@ -347,7 +376,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
+@@ -347,7 +380,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
          id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
  
          [encoder copyFromBuffer:buf_src
@@ -109,7 +113,7 @@ index e9064666f62..208f4bc33d5 100644
                         toBuffer:bid_dst.metal
                destinationOffset:bid_dst.offs
                             size:size];
-@@ -371,11 +400,10 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
+@@ -371,11 +404,10 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
  
  void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
      @autoreleasepool {
@@ -124,7 +128,7 @@ index e9064666f62..208f4bc33d5 100644
  
          GGML_ASSERT(buf_dst);
  
-@@ -395,7 +423,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+@@ -395,7 +427,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
          [encoder copyFromBuffer:bid_src.metal
                     sourceOffset:bid_src.offs
                         toBuffer:buf_dst
