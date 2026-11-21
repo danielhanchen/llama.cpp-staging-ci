@@ -3015,14 +3015,16 @@ std::vector<size_t> common_fit_margin_steps_mib(const char * spec) {
     return steps;
 }
 
-std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size_t> & margins, const std::vector<size_t> & steps) {
+std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size_t> & margins, const std::vector<size_t> & steps,
+                                                           const std::vector<size_t> & reserve) {
     std::vector<std::vector<size_t>> trials;
     for (const size_t step : steps) {
         std::vector<size_t> mg = margins;
         bool lower = false;
-        for (auto & m : mg) {
-            if (m > step) {
-                m = step;
+        for (size_t i = 0; i < mg.size(); i++) {
+            const size_t r = i < reserve.size() ? std::min(reserve[i], mg[i]) : 0;
+            if (mg[i] - r > step) {
+                mg[i] = step + r;
                 lower = true;
             }
         }
