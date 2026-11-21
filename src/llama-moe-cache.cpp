@@ -8934,7 +8934,7 @@ struct llama_moe_cache::impl {
             short_fast(n_tokens) &&
             n_tokens > cm_prompt_force && cm_on[n_tokens] != 0 && cmt_host_ok && !cm_prompt_off();
     }
-    // only where the cache holds at most LLAMA_MOE_PIN_PROMPT_SHORT_MAX_FRAC (0.25) of the host experts: srv_kld short192 against the
+    // only where the cache holds at most LLAMA_MOE_PIN_PROMPT_SHORT_MAX_FRAC (0.25) of the host experts: the 192-prompt short KLD check against the
     // base, LFM2.5 4 GB (14.6% cached) first-token KLD mean / p99 / top-1 0.099 / 0.84 / 0.885 inside the -fa off band
     // (0.154 / 1.32 / 0.854); 8 GB (40%) 0.144 / 1.53 / 0.849, p99 and top-1 just outside it (1.16 / 0.854)
     bool cm_pin_short() const {
@@ -9504,14 +9504,14 @@ struct llama_moe_cache::impl {
     // LLAMA_MOE_PREFETCH_AUTO_LO, default 0 = not in that band; 10 was measured); 8 GB (3.7% cached, single-token decode) lost 1-3.5%.
     // The 16 GB band is opt-in: with DFlash2 it passed (below), with the Studio MTP n2 drafter a long48 KLD run put the first token outside
     // the -fa off band (mean / p99 0.0040 / 0.049 vs 0.0034 / 0.022: the prompt's small tail batch takes the prefetch there). Off in between (32 GB: 41%, chat +7% but 8k -6..-15%) and on other devices (A100 80 GB at 48 GB: level).
-    // 16 GB (15.5% cached), RTX PRO 6000: chat level / +4.5% (two VMs), 8k +7.7 / +7.9% (other texts: host path); srv_kld long48 inside the band
+    // 16 GB (15.5% cached), RTX PRO 6000: chat level / +4.5% (two VMs), 8k +7.7 / +7.9% (other texts: host path); the 48-prompt long-context KLD check inside the band
     // (first-token mean / p99 0.0030 / 0.017 vs 0.0044 / 0.022); reference-scored 1 glitch in 5120 tokens vs 3 with it off. 24 GB
     // (27.1%) is left out: chat level, 8k +5.5..7.6% (other text), but a long48 KLD run put one position above the band's max (0.230 vs
     // 0.093; first-token stats inside)
     // an RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits DFlash2 n6, 3 interleaved launches per arm: N=10 MAX=1 at 48 GB (70.7%
     // cached) chat 278.4 -> 292.4 and 286.8 -> 303.5 tok/s on two VMs (same 256-token text), 8k 175.2 -> 197.1 (texts vary per launch
     // there in every arm); 16 GB chat +4.5%, 8k +7.9% (other texts: host path); 32 GB (41%) chat +7..9% but 8k -6..-15% (more 3-row
-    // windows); A100 80 GB at 48 GB level. 78-91% of the prefetched experts are hit by the next layer. srv_kld long48 at 48 GB inside
+    // windows); A100 80 GB at 48 GB level. 78-91% of the prefetched experts are hit by the next layer. the 48-prompt long-context KLD check at 48 GB inside
     // the -fa off band (first-token mean 0.0002 vs 0.0067), reference-scored texts 0 glitches in 8192 tokens. The text follows the
     // residency only through the route tail skip and the host path: LLAMA_MOE_ROUTE_TAIL_SKIP=0 gives the same text with it on and off
     struct pf_cfg_t {
@@ -12053,7 +12053,7 @@ struct llama_moe_cache::impl {
         const int32_t n0 = n;
         // (LLAMA_MOE_LM_LEND_GRAPH_PARTS=0 off): a graph-only lend tries one part per bank first. In one part the graph had to fit
         // the tail of a single bank, so the slots lent (and refilled after the group) were ~2.6x the graph: RTX PRO 6000 Qwen3.8-Flash-Next 32 GB 8k,
-        // a 1740 MiB graph took 2009 slots (4463 MiB); Qwen3.6 the 4-bit Qwen3.6 local, 509 MiB took 740 slots (1341 MiB)
+        // a 1740 MiB graph took 2009 slots (4463 MiB); Qwen3.6 at 4 bits on a local host, 509 MiB took 740 slots (1341 MiB)
         static const bool graph_parts_env = getenv("LLAMA_MOE_LM_LEND_GRAPH_PARTS") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND_GRAPH_PARTS")) != 0;
         const bool parts_first = graph_only && graph_parts_env && n_graph > 1 && g.banks.size() > 1;
         const int  mp          = parts_first ? std::max<int>(max_parts, (int) g.banks.size()) : max_parts;

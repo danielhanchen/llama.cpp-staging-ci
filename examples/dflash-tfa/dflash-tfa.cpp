@@ -1,4 +1,4 @@
-// k19-df2acc: same-text (teacher-forced) acceptance of a draft model.
+// same-text (teacher-forced) acceptance of a draft model.
 //
 // The target decodes a FIXED continuation instead of its own greedy text, and the drafter drafts at each window start as it would in
 // a speculative run: the prompt is decoded and fed to the drafter, then per window the drafter drafts from the anchor C[j] (position
