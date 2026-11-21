@@ -5367,6 +5367,9 @@ void ggml_cpu_init(void) {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
         ggml_cpu_iq_kernels_log();
 #endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        ggml_cpu_arm_kernels_log();
+#endif
         is_first_call = false;
     }
 
