@@ -846,6 +846,13 @@ struct llama_moe_cache::impl {
         bool     devseed      = false;   // large prefetched batches seed the group on the device (see devseed_plan)
         bool     host_read    = false;   // the graph being allocated reads the banks through host lookups (see set_graph)
         int64_t  host_need    = 0;       // the most distinct experts one of its host lookups may need in a layer of the group
+        // asynchronous refill of the lent slots (see rf_on)
+        int32_t  rf_idx     = -1;      // the group's index in the device's refill table, -1: refills stay synchronous
+        int32_t  rf_epoch   = 0;       // the last refill queued
+        bool     rf_pending = false;   // a refill whose uploads the compute stream has not waited for yet
+        int      rf_skip    = 0;       // prepare calls that still leave it pending (the graph it overlaps)
+        ggml_backend_event_t rf_ev0 = nullptr; // compute stream -> upload stream: the cleared slots
+        ggml_backend_event_t rf_ev1 = nullptr; // upload stream -> compute stream: the refill complete
     };
 
     struct layer {
@@ -2301,6 +2308,7 @@ struct llama_moe_cache::impl {
     // like the experts a split keeps on the device (an empty cache uploads every expert of a large batch); most routed first where
     // a prompt recorded the routing (a late prefill, see seed_unavailable), else the lowest ids
     void prefill() {
+        rf_join_all(); // asynchronous refill (see rf_on)
         size_t n_fill  = 0;
         size_t n_bytes = 0;
         std::vector<int32_t> fill_ids;
@@ -4038,6 +4046,16 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        // asynchronous refill (see rf_on): its uploads complete before the banks are freed
+        for (rf_dev_t & d : rf_devs) {
+            if (d.be != nullptr) {
+                ggml_backend_synchronize(d.be);
+            }
+        }
+        if (rfs.async > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: asynchronous refills: %llu (%.2f MiB), synchronous %llu, compute-stream waits %llu\n", tag,
+                (unsigned long long) rfs.async, rfs.bytes/1048576.0, (unsigned long long) rfs.sync, (unsigned long long) rfs.joins);
+        }
         // the weight store is destroyed first (llama_context): its destructor completes the reads ahead into the RAM slots, which are
         // still allocated then; wstore is not used here
         single_stop_all();
@@ -7836,6 +7854,101 @@ struct llama_moe_cache::impl {
     // On by default on CUDA devices (k19-d2h3; LLAMA_MOE_D2H_STREAM=0: on the compute stream as before; =1: on any device whose backend
     // gives a second instance and events, e.g. ROCm / Vulkan / Metal / SYCL, which keep the compute stream unless asked: not measured
     // there); LLAMA_MOE_D2H_STREAM_CHUNKS=N (default 4, 2..16)
+    // Asynchronous refill (LLAMA_MOE_REFILL_ASYNC, default on; =0: synchronous, as before). When a prompt gives its lent slots back (unlend),
+    // the uploads that refill them run on a second stream of the device instead of the compute stream, so the graph after the prompt
+    // (the tail of a prompt, a decode) computes while they run: each assign of a small batch waits on the device for the refill of its
+    // own layer before it reads hits, and for the layer of a victim's expert before it gives that slot to another (ggml_cuda_moe_refill_*).
+    // Every slot is read and written after the refill as before: the same slots, contents and outputs. The compute stream waits for the
+    // whole refill at the next ubatch (prepare), and before anything else touches the slots (lend, unlend, uploads, copies, seeds).
+    // Only for groups with device lookups, experts in pinned host memory (no RAM tier, no weight store) and CUDA
+    bool rf_on = [] {
+        const char * e = getenv("LLAMA_MOE_REFILL_ASYNC");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    typedef int  (*rf_register_t)(ggml_backend_t, const ggml_tensor *);
+    typedef bool (*rf_need_t)(ggml_backend_t, const ggml_tensor *, const int32_t *, int, int32_t);
+    typedef bool (*rf_done_t)(ggml_backend_t, const ggml_tensor *, int, int32_t);
+    rf_need_t rf_need_fn = nullptr;
+    rf_done_t rf_done_fn = nullptr;
+    struct rf_dev_t {
+        bool tried = false;
+        ggml_backend_t be = nullptr;
+    };
+    std::vector<rf_dev_t> rf_devs;
+    bool rf_any      = false; // some group has a refill pending
+    bool in_prepare  = false;
+    struct { uint64_t async = 0, sync = 0, joins = 0, bytes = 0; } rfs;
+    std::vector<int32_t> rf_layers;
+
+    ggml_backend_t rf_backend(int32_t id) const {
+        return (size_t) id < rf_devs.size() ? rf_devs[id].be : nullptr;
+    }
+
+    // the upload stream of device id (a second instance of its backend), nullptr where there is none
+    ggml_backend_t rf_get(int32_t id) {
+        if (rf_devs.size() < devices.size()) {
+            rf_devs.resize(devices.size());
+        }
+        rf_dev_t & d = rf_devs[id];
+        if (!d.tried) {
+            d.tried = true;
+            ggml_backend_dev_t dev = ggml_backend_get_device(devices[id].backend);
+            d.be = dev != nullptr ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+            if (d.be == nullptr) {
+                LLAMA_LOG_WARN("%s: MoE cache: no second stream on device %d: the refills of lent slots stay synchronous\n", __func__, id);
+            }
+        }
+        return d.be;
+    }
+
+    // a group whose refill may run on the upload stream
+    bool rf_eligible(group & g) {
+        if (!rf_on || g.rf_idx < 0 || !g.dev_lookup || verify_enabled || rf_need_fn == nullptr || rf_done_fn == nullptr) {
+            return false;
+        }
+        for (int32_t il : g.layers) {
+            if (host_layer(il)) {
+                return false;
+            }
+            for (const ggml_tensor * t : layers[il].experts) {
+                if (wstore != nullptr && wstore->covers(t)) {
+                    return false;
+                }
+            }
+        }
+        if (rf_get(g.id) == nullptr) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(devices[g.id].backend);
+        if (g.rf_ev0 == nullptr) {
+            g.rf_ev0 = ggml_backend_event_new(dev);
+        }
+        if (g.rf_ev1 == nullptr) {
+            g.rf_ev1 = ggml_backend_event_new(dev);
+        }
+        return g.rf_ev0 != nullptr && g.rf_ev1 != nullptr;
+    }
+
+    // the compute stream waits for the refill of g (nothing on the host)
+    void rf_join(group & g) {
+        if (!g.rf_pending) {
+            return;
+        }
+        ggml_backend_event_wait(devices[g.id].backend, g.rf_ev1);
+        g.rf_pending = false;
+        rfs.joins++;
+        rf_any = std::any_of(groups.begin(), groups.end(), [](const group & x) { return x.rf_pending; });
+    }
+
+    void rf_join_all() {
+        if (!rf_any) {
+            return;
+        }
+        for (group & g : groups) {
+            rf_join(g);
+        }
+    }
+
     struct d2h_dev_t {
         bool tried = false;
         ggml_backend_t be = nullptr;
@@ -7909,6 +8022,7 @@ struct llama_moe_cache::impl {
 
     // exclusive: the experts evicted from device slots are copied back into RAM before the slots are overwritten (same backend, in order)
     void demote(ggml_backend_t backend, group & g, const std::vector<std::pair<int32_t, int32_t>> & ev) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         const int32_t n_expert = g.lru.n_expert;
         for (const auto & [s, key] : ev) {
             const int32_t il = key / n_expert;
@@ -7996,6 +8110,9 @@ struct llama_moe_cache::impl {
     size_t upload_fills(ggml_backend_t backend, int32_t il, const std::vector<moe_cache_lru::fill> & fl, const std::vector<std::pair<int32_t, int32_t>> * ev) {
         const layer & l = layers[il];
         group & g = groups[l.ig];
+        if (backend != rf_backend(g.id)) {
+            rf_join(g); // asynchronous refill (see rf_on): only this group's slots are being written
+        }
         GGML_ASSERT(!devices[g.id].released && "MoE cache: an upload while the banks are released");
         size_t bytes = 0;
         const std::vector<moe_cache_lru::fill> * rest = &fl;
@@ -8205,6 +8322,7 @@ struct llama_moe_cache::impl {
     uint64_t n_shadow_async = 0;
     // async only from a seed (allow_async): lend / retire / release hand the slots to the graph allocation or free them right after
     void shadow_slots(ggml_backend_t backend, group & g, const std::vector<std::pair<int32_t, int32_t>> & ev, bool allow_async = false) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         if (!host || ev.empty()) {
             return;
         }
@@ -8442,6 +8560,15 @@ struct llama_moe_cache::impl {
             g.dev_lookup = true;
             LLAMA_LOG_INFO("%s: %s: MoE cache lookups of small batches run on the device for %zu layers (LLAMA_MOE_CACHE_DEVICE=0 to disable)\n",
                 __func__, ggml_backend_name(backend), g.layers.size());
+            // asynchronous refill (see rf_on): registered before any graph reads the group, so every assign knows its table entry
+            if (rf_on) {
+                auto rf_register = (rf_register_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_refill_register");
+                rf_need_fn = (rf_need_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_refill_need");
+                rf_done_fn = (rf_done_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_refill_done");
+                if (rf_register != nullptr && rf_need_fn != nullptr && rf_done_fn != nullptr && layers.size() <= 128) {
+                    g.rf_idx = rf_register(backend, g.state);
+                }
+            }
         }
         if (core_on) {
             core_drop();
@@ -11506,6 +11633,7 @@ struct llama_moe_cache::impl {
 
     // debug: every slot the host state maps must hold the bytes of its expert
     void verify(group & g, const char * tag) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         ggml_backend_synchronize(devices[g.id].backend);
         const int32_t n_expert = g.lru.n_expert;
         std::vector<uint8_t> buf;
@@ -11589,6 +11717,21 @@ struct llama_moe_cache::impl {
     }
 
     void prepare(int64_t n_tokens) {
+        // asynchronous refill (see rf_on): the compute stream waits for it from the ubatch after the graph it overlaps
+        if (rf_any) {
+            for (group & g : groups) {
+                if (g.rf_pending && g.rf_skip > 0 && n_tokens <= n_small_max) {
+                    g.rf_skip--;
+                } else {
+                    rf_join(g);
+                }
+            }
+        }
+        struct in_prepare_scope {
+            bool & f;
+            explicit in_prepare_scope(bool & f_) : f(f_) { f = true; }
+            ~in_prepare_scope() { f = false; }
+        } ips(in_prepare);
         ua_drain();
         // k19-l4ttft: a small batch ends the prompt (the scratch of the prompt layer reads is not read again)
         if (n_tokens <= n_small_max && (plr.il >= 0 || plr.p_t0 != 0)) {
@@ -11694,6 +11837,7 @@ struct llama_moe_cache::impl {
     // the scheduler places the prefetched copies of a large batch: they go to the last slots of the largest group of the device, which
     // are evicted while lent, so the device does not keep a staging arena that only large batches use; n_copies = 0 takes the slots back
     void lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, int64_t n_tokens) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
         // released (see release): no slots to lend, nothing to take back
         if (it_dev == devices.end() || !it_dev->buf_bank || it_dev->released) {
@@ -12232,6 +12376,7 @@ struct llama_moe_cache::impl {
     // read) follows g.n_slots, so nothing can map an expert to a retired slot; the banks and their views keep their load size, so the
     // graphs keep their shapes. Returns the bytes given back
     size_t retire(group & g, int32_t n_new) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         device & d = devices[g.id];
         ggml_backend_t backend = d.backend;
         const int32_t n_old = g.n_slots;
@@ -12312,6 +12457,7 @@ struct llama_moe_cache::impl {
 
     // k19-t4small: the lookup state and the op views of g follow a slot count n (as retire sets them)
     void set_slot_count(group & g, int32_t n) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         if (g.state != nullptr) {
             // the device lookup reads the slot count from the length of its state (n_hdr + 3*n_slots)
             g.state->ne[0] = n_hdr + 3*(int64_t) n;
@@ -12372,6 +12518,7 @@ struct llama_moe_cache::impl {
     // about bytes of device memory (each group at most to n_slots_cap). The new slots are empty, the next victims: the decode admits
     // its misses into them. Not while the banks are released or slots are lent. Returns the bytes of slots added
     size_t ext_grow(int32_t id, size_t bytes) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         device & d = devices[id];
         if (!ext_on || bytes == 0 || !d.buf_bank || !d.bank_lazy || d.released || core_on) {
             return 0;
@@ -12570,6 +12717,7 @@ struct llama_moe_cache::impl {
     // copies then find no expert cached, the lend callback lends nothing, see lend) and the experts they held wait in refill; restore
     // allocates the banks again and refills the slots as after a lend (unlend)
     bool release(int32_t id) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         device & d = devices[id];
         if (d.released || !d.buf_bank || !d.ctx_bank || single_no_alloc) {
             return false;
@@ -12673,6 +12821,7 @@ struct llama_moe_cache::impl {
     }
 
     void unlend(group & g) {
+        rf_join_all();
         prompt_flush();
         ggml_backend_t backend = devices[g.id].backend;
         ggml_backend_synchronize(backend);
@@ -12761,27 +12910,61 @@ struct llama_moe_cache::impl {
             budget = std::min(budget, refill_cap_once / g.expert_bytes);
         }
         const size_t budget0 = budget;
+        // asynchronous refill (see rf_on): every layer of the group is marked pending, and done on the upload stream after its uploads
+        ggml_backend_t up = refill_enabled && rf_eligible(g) ? rf_backend(g.id) : nullptr;
+        const int32_t ep = g.rf_epoch + 1;
+        if (up != nullptr) {
+            rf_layers.assign(g.layers.begin(), g.layers.end());
+            if (rf_need_fn(backend, g.state, rf_layers.data(), (int) rf_layers.size(), ep)) {
+                g.rf_epoch = ep;
+                // the uploads after the clear above
+                ggml_backend_event_record(g.rf_ev0, backend);
+                ggml_backend_event_wait(up, g.rf_ev0);
+            } else {
+                up = nullptr;
+            }
+        }
+        const size_t bytes0 = stats_refill.bytes;
         for (int32_t il : g.layers) {
-            if ((size_t) il >= refill.size() || refill[il].empty()) {
-                continue;
-            }
-            std::vector<int32_t> & ids_il = refill[il];
-            const int32_t * slots = g.lru.slot_map[il];
-            ids_il.erase(std::remove_if(ids_il.begin(), ids_il.end(), [&](int32_t e) { return slots[e] >= 0; }), ids_il.end());
-            if (ids_il.size() > budget) {
-                ids_il.resize(budget);
-            }
-            budget -= ids_il.size();
-            size_t n_hit = 0;
-            if (refill_enabled && !ids_il.empty() && g.lru.plan(il, ids_il.data(), ids_il.size(), fills, n_hit)) {
-                // streamed experts: from the RAM tier, else the reads of the refill are issued together by the weight store (never inline page faults)
-                if (host_layer(il)) {
-                    host->begin_call();
+            if ((size_t) il < refill.size() && !refill[il].empty()) {
+                std::vector<int32_t> & ids_il = refill[il];
+                const int32_t * slots = g.lru.slot_map[il];
+                ids_il.erase(std::remove_if(ids_il.begin(), ids_il.end(), [&](int32_t e) { return slots[e] >= 0; }), ids_il.end());
+                if (ids_il.size() > budget) {
+                    ids_il.resize(budget);
                 }
-                stats_refill.bytes += upload_fills(backend, il, fills, nullptr);
-                stats_refill.misses += fills.size();
+                budget -= ids_il.size();
+                size_t n_hit = 0;
+                if (refill_enabled && !ids_il.empty() && g.lru.plan(il, ids_il.data(), ids_il.size(), fills, n_hit)) {
+                    // streamed experts: from the RAM tier, else the reads of the refill are issued together by the weight store (never inline page faults)
+                    if (host_layer(il)) {
+                        host->begin_call();
+                    }
+                    stats_refill.bytes += upload_fills(up != nullptr ? up : backend, il, fills, nullptr);
+                    stats_refill.misses += fills.size();
+                }
+                ids_il.clear();
             }
-            ids_il.clear();
+            if (up != nullptr) {
+                rf_done_fn(up, g.state, il, ep); // (the same checks as rf_need_fn: never fails after it succeeded)
+            }
+        }
+        if (up != nullptr) {
+            ggml_backend_event_record(g.rf_ev1, up);
+            g.rf_pending = true;
+            // a refill started by the lend of a graph (before its prepare) stays pending through that prepare; one started inside a
+            // prepare (the device lookup's unlend) through the graph of that ubatch only
+            g.rf_skip = in_prepare ? 0 : 1;
+            rf_any = true;
+            rfs.async++;
+            rfs.bytes += stats_refill.bytes - bytes0;
+            if (rfs.async <= 2) {
+                LLAMA_LOG_INFO("%s: %s: MoE cache refill of %d lent slots (%.2f MiB) on the upload stream beside the next graph "
+                    "(LLAMA_MOE_REFILL_ASYNC=0: synchronous)\n", __func__, ggml_backend_name(backend), n,
+                    (stats_refill.bytes - bytes0)/1048576.0);
+            }
+        } else {
+            rfs.sync++;
         }
         if (refill_cap_once != SIZE_MAX) {
             refill_cap_once -= std::min(refill_cap_once, (budget0 - budget)*g.expert_bytes);
@@ -13428,6 +13611,7 @@ struct llama_moe_cache::impl {
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
@@ -13810,6 +13994,7 @@ struct llama_moe_cache::impl {
     // before the graph runs (after its allocation, which places the lent slots): enable or disable its seed plans; the device state of the
     // groups it seeds is brought up to date with the host first
     void devseed_prepare(ggml_cgraph * gf, bool enable) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         std::vector<bool> used(groups.size(), false);
         // a plan runs only if every bank of its group gets exactly one fill after it, from an expert product the scheduler left on the
         // group device that reads a device copy of the experts (else, e.g. without op offload, it is disabled and its fills copy nothing),
@@ -14108,6 +14293,7 @@ struct llama_moe_cache::impl {
     ggml_backend_buffer_ptr replay_buf; // the plan results of devseed_replay
 
     void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts, const std::vector<bool> & staged) {
+        rf_join_all(); // asynchronous refill (see rf_on)
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return;

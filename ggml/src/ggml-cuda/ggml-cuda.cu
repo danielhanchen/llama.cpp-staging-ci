@@ -13170,6 +13170,29 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
 #endif
 }
 
+// asynchronous refill of lent MoE cache slots (see moe_rf_wait): register a group by its state tensor, queue the need row of a refill
+// on the compute stream of backend, mark a layer done on the stream of the upload backend
+static int ggml_backend_cuda_moe_refill_register(ggml_backend_t backend, const ggml_tensor * state) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || state == nullptr || state->data == nullptr) {
+        return -1;
+    }
+    return ggml_cuda_moe_refill_register(*(ggml_backend_cuda_context *) backend->context, state->data);
+}
+
+static bool ggml_backend_cuda_moe_refill_need(ggml_backend_t backend, const ggml_tensor * state, const int32_t * il, int n, int32_t epoch) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || state == nullptr || state->data == nullptr) {
+        return false;
+    }
+    return ggml_cuda_moe_refill_need(*(ggml_backend_cuda_context *) backend->context, state->data, il, n, epoch);
+}
+
+static bool ggml_backend_cuda_moe_refill_done(ggml_backend_t backend, const ggml_tensor * state, int il, int32_t epoch) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || state == nullptr || state->data == nullptr) {
+        return false;
+    }
+    return ggml_cuda_moe_refill_done(*(ggml_backend_cuda_context *) backend->context, state->data, il, epoch);
+}
+
 // whether an overlapped MoE cache fetch (ggml_moe_cache_fetch with overlap) is expected to be faster on the device dev:
 // measured faster on compute capability 7.5 and 8.9 (T4, L4) at every budget; on 12.0 (RTX PRO 6000), where kernels launch with PDL,
 // the second stream made the experts and the other kernels slower, a loss with few missing experts (up to -11%), so it is off there
@@ -13537,6 +13560,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_default;
+    }
+    if (strcmp(name, "ggml_backend_moe_refill_register") == 0) {
+        return (void *)ggml_backend_cuda_moe_refill_register;
+    }
+    if (strcmp(name, "ggml_backend_moe_refill_need") == 0) {
+        return (void *)ggml_backend_cuda_moe_refill_need;
+    }
+    if (strcmp(name, "ggml_backend_moe_refill_done") == 0) {
+        return (void *)ggml_backend_cuda_moe_refill_done;
     }
     if (strcmp(name, "ggml_backend_copy_regions_async") == 0) {
         return (void *)ggml_backend_cuda_copy_regions_async;

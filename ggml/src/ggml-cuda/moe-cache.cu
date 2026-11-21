@@ -120,6 +120,36 @@ struct moe_pf_args {
     int                  max_fill;
 };
 
+// asynchronous refill of lent slots (llama_moe_cache::unlend, ggml_cuda_moe_refill_*). When a prompt gives its lent slots back, the
+// uploads that refill them may run on a second stream while the next graph computes. Per registered group (the state tensor) and
+// layer: need = the epoch of the last refill queued for the layer, done = the last one whose uploads completed (written by the upload
+// stream after them). An assign waits for its own layer before its hits are read, and for the layer of the expert a victim holds
+// before that slot is given to another expert, so every read and write of a slot comes after the refill as with a synchronous one:
+// the same slots, the same contents, the same results
+#define MOE_RF_GROUPS 16
+#define MOE_RF_LAYERS 128
+static __device__ int32_t moe_rf_tab[MOE_RF_GROUPS][2][MOE_RF_LAYERS];
+
+static __device__ __forceinline__ void moe_rf_wait(const int rf, const int il) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (rf < 0 || rf >= MOE_RF_GROUPS || (unsigned) il >= MOE_RF_LAYERS) {
+        return;
+    }
+    volatile const int32_t * need = moe_rf_tab[rf][0];
+    volatile const int32_t * done = moe_rf_tab[rf][1];
+    const int32_t n = need[il];
+    while (done[il] < n) {
+#if __CUDA_ARCH__ >= 700
+        __nanosleep(256);
+#endif
+    }
+    __threadfence();
+#else
+    GGML_UNUSED(rf);
+    GGML_UNUSED(il);
+#endif
+}
+
 static __global__ void moe_cache_assign(
         const int32_t * __restrict__ ids, int32_t * __restrict__ map, int32_t * __restrict__ state, int32_t * __restrict__ dst,
         const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots,
@@ -127,9 +157,16 @@ static __global__ void moe_cache_assign(
         int32_t * __restrict__ scores, const int grow, const int advance, const int n_scores, const int frozen = 0,
         const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr, int ids_s1 = 0, const int defer = 0,
         const int margin_q = 0, const int margin_add_q = 0, const int lookup_counts = 0, const int lo = 0,
-        const moe_pf_args pf = moe_pf_args{nullptr, nullptr, nullptr, 0, 0}) {
+        const moe_pf_args pf = moe_pf_args{nullptr, nullptr, nullptr, 0, 0}, const int rf = -1) {
     if (ids_s1 <= 0) {
         ids_s1 = ne0;
+    }
+    // a refill of this layer still uploading (see moe_rf_wait): its slots are read as hits below
+    if (rf >= 0) {
+        if (threadIdx.x == 0) {
+            moe_rf_wait(rf, il);
+        }
+        __syncthreads();
     }
     extern __shared__ int32_t smem[];
     int32_t * miss_e = smem;         // [n_ids] missing experts, in the order of their first use
@@ -540,6 +577,9 @@ static __global__ void moe_cache_assign(
         const int32_t s   = victim[j];
         const int32_t e   = take_e[j];
         const int32_t old = key_of[s];
+        if (rf >= 0 && old >= 0) {
+            moe_rf_wait(rf, old / n_expert); // the victim's expert may still be uploading into it
+        }
         if (old >= 0) {
             map[old] = -1;
         } else {
@@ -1084,6 +1124,109 @@ static moe_pf_args moe_pf_real_args(const ggml_tensor * state) {
     return moe_pf_args{it->second.mark, it->second.ev, it->second.stat, 0, 0};
 }
 
+// asynchronous refill (see moe_rf_wait): the registered groups, key: the state's device pointer
+struct moe_rf_reg {
+    int       idx    = -1;
+    int       device = -1;
+    int32_t * h_need = nullptr; // pinned [MOE_RF_LAYERS]: the source of the need row
+    int32_t * h_done = nullptr; // pinned [MOE_RF_LAYERS]: the source of each done flag
+};
+static std::mutex moe_rf_mutex;
+static std::unordered_map<const void *, moe_rf_reg> moe_rf_regs;
+static int moe_rf_count[GGML_CUDA_MAX_DEVICES] = {};
+
+static int moe_rf_real(const ggml_tensor * state) {
+    if (moe_rf_regs.empty()) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(moe_rf_mutex);
+    const auto it = moe_rf_regs.find(state->data);
+    return it == moe_rf_regs.end() ? -1 : it->second.idx;
+}
+
+int ggml_cuda_moe_refill_register(ggml_backend_cuda_context & ctx, const void * state_data) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    std::lock_guard<std::mutex> lock(moe_rf_mutex);
+    const auto it = moe_rf_regs.find(state_data);
+    if (it != moe_rf_regs.end()) {
+        return it->second.idx;
+    }
+    if (ctx.device < 0 || ctx.device >= GGML_CUDA_MAX_DEVICES || moe_rf_count[ctx.device] >= MOE_RF_GROUPS) {
+        return -1;
+    }
+    moe_rf_reg r;
+    r.device = ctx.device;
+    ggml_cuda_set_device(ctx.device);
+    if (cudaMallocHost(&r.h_need, MOE_RF_LAYERS*sizeof(int32_t)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1;
+    }
+    if (cudaMallocHost(&r.h_done, MOE_RF_LAYERS*sizeof(int32_t)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        CUDA_CHECK(cudaFreeHost(r.h_need));
+        return -1;
+    }
+    memset(r.h_need, 0, MOE_RF_LAYERS*sizeof(int32_t));
+    memset(r.h_done, 0, MOE_RF_LAYERS*sizeof(int32_t));
+    r.idx = moe_rf_count[ctx.device]++;
+    // both rows start at 0 (nothing pending); synchronous, before any graph that reads them
+    CUDA_CHECK(cudaMemcpyToSymbol(moe_rf_tab, r.h_need, MOE_RF_LAYERS*sizeof(int32_t), (size_t) (2*r.idx + 0)*MOE_RF_LAYERS*sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyToSymbol(moe_rf_tab, r.h_done, MOE_RF_LAYERS*sizeof(int32_t), (size_t) (2*r.idx + 1)*MOE_RF_LAYERS*sizeof(int32_t), cudaMemcpyHostToDevice));
+    const int idx = r.idx;
+    moe_rf_regs[state_data] = r;
+    return idx;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(state_data);
+    return -1;
+#endif
+}
+
+// the layers il[0..n) get a refill of this epoch: queued on the compute stream, before the graphs that read the slots
+bool ggml_cuda_moe_refill_need(ggml_backend_cuda_context & ctx, const void * state_data, const int32_t * il, const int n, const int32_t epoch) {
+    moe_rf_reg r;
+    {
+        std::lock_guard<std::mutex> lock(moe_rf_mutex);
+        const auto it = moe_rf_regs.find(state_data);
+        if (it == moe_rf_regs.end() || it->second.device != ctx.device) {
+            return false;
+        }
+        r = it->second;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (il[i] < 0 || il[i] >= MOE_RF_LAYERS) {
+            return false;
+        }
+    }
+    // the previous copy of this row completed: the caller synchronized the compute stream since it was queued
+    for (int i = 0; i < n; ++i) {
+        r.h_need[il[i]] = epoch;
+    }
+    ggml_cuda_set_device(ctx.device);
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(moe_rf_tab, r.h_need, MOE_RF_LAYERS*sizeof(int32_t), (size_t) (2*r.idx + 0)*MOE_RF_LAYERS*sizeof(int32_t),
+        cudaMemcpyHostToDevice, ctx.stream()));
+    return true;
+}
+
+// the uploads of layer il queued before this on the stream of ctx (the upload stream) complete the refill of this epoch there
+bool ggml_cuda_moe_refill_done(ggml_backend_cuda_context & ctx, const void * state_data, const int il, const int32_t epoch) {
+    moe_rf_reg r;
+    {
+        std::lock_guard<std::mutex> lock(moe_rf_mutex);
+        const auto it = moe_rf_regs.find(state_data);
+        if (it == moe_rf_regs.end() || it->second.device != ctx.device || il < 0 || il >= MOE_RF_LAYERS) {
+            return false;
+        }
+        r = it->second;
+    }
+    // the previous copy of this flag completed: the caller waited for the upload stream since it was queued
+    r.h_done[il] = epoch;
+    ggml_cuda_set_device(ctx.device);
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(moe_rf_tab, r.h_done + il, sizeof(int32_t), ((size_t) (2*r.idx + 1)*MOE_RF_LAYERS + il)*sizeof(int32_t),
+        cudaMemcpyHostToDevice, ctx.stream()));
+    return true;
+}
+
 // before a cache op other than a prefetch: the main stream waits for the copies of a prefetch (the next layer's lookup reads its
 // slots as cached). moe_join_pending is cleared at the end of every graph, so a prefetch of another graph is never waited for here
 static void moe_pf_join(ggml_backend_cuda_context & ctx, const int il) {
@@ -1171,7 +1314,7 @@ static void moe_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int n_scores = scores != nullptr ? (int) ggml_nelements(scores) : 0;
     moe_cache_assign<<<1, MOE_CACHE_LANES, (2*n_ids + (scores != nullptr ? 2*MOE_CACHE_WINDOW : 0))*sizeof(int32_t), side>>>(
         ids, (int32_t *) map->data, (int32_t *) state->data, res, n_ids, n_tokens, n_expert, il, n_slots, nullptr, 0, 0,
-        scores != nullptr ? (int32_t *) scores->data : nullptr, 65536 + 1, 0, n_scores, 0, 0, nullptr, n_tokens, 0, 0, 0, 0, n_core, pa);
+        scores != nullptr ? (int32_t *) scores->data : nullptr, 65536 + 1, 0, n_scores, 0, 0, nullptr, n_tokens, 0, 0, 0, 0, n_core, pa, moe_rf_real(state));
     CUDA_CHECK(cudaGetLastError());
     // GGML_CUDA_MOE_PREFETCH_Z: blocks per expert and bank of the copies (default: GGML_CUDA_MOE_FETCH_OVERLAP_Z's default, 2)
     static const int max_z = [] {
@@ -1619,7 +1762,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, ggml_get_op_params_i32(dst, 15),
             tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
             ggml_get_op_params_i32(dst, 9), n_expert >= 8 ? admit_margin_q : 0, admit_add_q, ggml_get_op_params_i32(dst, 8),
-            ggml_get_op_params_i32(dst, 7), moe_pf_real_args(state));
+            ggml_get_op_params_i32(dst, 7), moe_pf_real_args(state), moe_rf_real(state));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -1633,7 +1776,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, 0,
         tail_rank, tail_rank > 0 && skip_counts != nullptr ? (int32_t *) skip_counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
         0, 0, 0, 0, n_banks <= 3 ? ggml_get_op_params_i32(dst, 9) : 0, // core: op param 9 (host pointers of a 4th bank otherwise)
-        moe_pf_real_args(state));
+        moe_pf_real_args(state), moe_rf_real(state));
     CUDA_CHECK(cudaGetLastError());
 
     moe_cache_fetch_launch(stream, dst, dst->src + 3, n_banks, (const int32_t *) dst->data, n_ids, ne0);
