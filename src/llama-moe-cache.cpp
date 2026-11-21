@@ -12921,7 +12921,7 @@ struct llama_moe_cache::impl {
         // (LLAMA_MOE_LENT_CLEAR_ASYNC=0: off) where the refill may run on the upload stream, the lent slots are cleared there, before its
         // uploads, and the compute stream waits for the clear on the device: the same bytes in the same stream order for every later reader
         // (the compute stream's work and the refill), without the main thread waiting for it before its next launches (RTX PRO 6000
-        // Qwen3.8-Flash-Next + MTP at 48 GB: 2320 slots, ~3.5 ms before the MTP drafter's prompt pass was launched)
+        // Qwen3.8-Flash-Next + MTP at 48 GB: 2320 slots, ~3.5 ms of the main thread before the 4-token tail after an 8k prompt)
         static const bool clear_async_env = getenv("LLAMA_MOE_LENT_CLEAR_ASYNC") == nullptr || atoi(getenv("LLAMA_MOE_LENT_CLEAR_ASYNC")) != 0;
         ggml_backend_t up_clear = clear_async_env && memset_async_fn != nullptr && n > 0 && refill_enabled && rf_allow &&
             rf_lend_tokens >= rf_min_tokens && rf_eligible(g) ? rf_backend(g.id) : nullptr;
