@@ -258,6 +258,15 @@ inline bool firm_marginal_on(const rec & r, int max_tries, double min_gain) {
     return r.firm != 0 && r.on != 0 && r.tries >= max_tries && r.ratio > 1.0 - min_gain && r.ratio < 1.0;
 }
 
+// whether a replayed trial keeps the host path off in its "on" blocks too: on = LLAMA_MOE_CPU_MISS_REPLAY_OFF_FETCH (env_on), r = the
+// record the trial replays. A firm "off" record takes its recorded verdict whatever this launch times, so its two blocks with the host
+// path on only cost time: those small batches fetch their misses as after the verdict (the device's products, as without a cache).
+// Only where the recording launch also found the host slower than calibrated (host_ok 0: t_on at least 1.25 x t_off, the short prompts
+// kept off too); a record that lost by less keeps its "on" blocks, as their host products steer what the later requests generate
+inline bool replay_off_fetch(bool on, const rec & r) {
+    return on && r.firm != 0 && r.on == 0 && r.host_ok == 0;
+}
+
 // whether a launch skips the warm phase and the timing trials on such a record: skip_on = LLAMA_MOE_CPU_MISS_FIRM_SKIP (env_on),
 // trust_scope = the marginal "on" is trusted on this host (a 12..31-CPU mailbox host, LLAMA_MOE_CPU_MISS_MARGIN_TRUST); first_rec is
 // called only when both hold and returns the first trial of the calibration file (nullptr: no file or no recorded trial)

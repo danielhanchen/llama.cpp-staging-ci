@@ -345,6 +345,22 @@ int main() {
         std::remove(pm.c_str());
     }
 
+    {
+        // a replayed firm "off" keeps the host path off in its "on" blocks; an open record, an "on" or the switch off do not
+        tp::rec r;
+        r.on = 0; r.firm = 1; r.ratio = 2.47; r.host_ok = 0;
+        CHECK(tp::replay_off_fetch(true, r), "a firm off record must replay with the host path off");
+        r.host_ok = 1; r.ratio = 1.14;
+        CHECK(!tp::replay_off_fetch(true, r), "an off record whose host was not slower than calibrated keeps its on blocks");
+        r.host_ok = 0; r.ratio = 2.47;
+        CHECK(!tp::replay_off_fetch(false, r), "LLAMA_MOE_CPU_MISS_REPLAY_OFF_FETCH=0 must keep the on blocks");
+        r.firm = 0;
+        CHECK(!tp::replay_off_fetch(true, r), "an open record is timed again, not replayed");
+        r.firm = 1; r.on = 1; r.ratio = 0.8;
+        CHECK(!tp::replay_off_fetch(true, r), "a firm on record keeps its on blocks");
+        CHECK(tp::env_on(nullptr) && !tp::env_on("0") && tp::env_on("1"), "the switch is on unless set to 0");
+    }
+
     if (fails == 0) {
         printf("test-moe-trial-persist: OK\n");
     }
