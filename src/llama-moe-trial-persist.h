@@ -46,8 +46,11 @@ inline std::string calv_key(const std::string & key, const double v[4]) {
     return key + buf;
 }
 
-inline std::string tag_of(long long n_slots, int n_layers, long long max_batch) {
-    return "trials|slots=" + std::to_string(n_slots) + "|layers=" + std::to_string(n_layers) + "|max_batch=" + std::to_string(max_batch);
+// margin_trust = false (LLAMA_MOE_CPU_MISS_MARGIN_TRUST=0): a history of its own, so a record made firm by trusted marginal
+// timings is not replayed by a launch that turned the trust off
+inline std::string tag_of(long long n_slots, int n_layers, long long max_batch, bool margin_trust = true) {
+    return "trials|slots=" + std::to_string(n_slots) + "|layers=" + std::to_string(n_layers) + "|max_batch=" + std::to_string(max_batch) +
+        (margin_trust ? "" : "|margin_trust=0");
 }
 
 inline std::string format_line(const std::string & tag, const std::vector<rec> & r) {

@@ -11101,7 +11101,11 @@ struct llama_moe_cache::impl {
         }
         cmt_ps_key   = cm_cal_key_eff(*gp, layers[gp->layers[0]]);
         cmt_ps_path  = cm_cal_path(dir, cmt_ps_key);
-        cmt_ps_tag   = llama_moe_tp::tag_of(slots, (int) layers.size(), (long long) max_batch);
+        static const bool margin_trust_env = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_MARGIN_TRUST");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        cmt_ps_tag   = llama_moe_tp::tag_of(slots, (int) layers.size(), (long long) max_batch, margin_trust_env);
         cmt_ps_state = 1;
         std::vector<llama_moe_tp::rec> r;
         if (llama_moe_tp::read(cmt_ps_path, cmt_ps_key, cmt_ps_tag, r)) {
