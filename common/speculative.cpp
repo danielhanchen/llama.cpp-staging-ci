@@ -1039,6 +1039,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+int common_speculative_dflash_ev_auto_mode(const char * env) {
+    if (env == nullptr) {
+        return 2;
+    }
+    const int v = atoi(env);
+    return v == 2 ? 2 : (v != 0 ? 1 : 0);
+}
+
 // Diagnostics of the DFlash2 drafter (all off by default; none changes a draft except LLAMA_DFLASH_CYCLE)
 common_dflash_diag_t & common_dflash_diag() {
     static common_dflash_diag_t d = [] {
@@ -1150,8 +1158,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // some batch sizes on the CPU (ac_a48 48 GB 8k: EV-auto on / off gave two exact texts); =1 forces it
     static int eva_mode() {
         static const int m = [] {
-            const char * e = getenv("LLAMA_DFLASH_EV_AUTO");
-            return e == nullptr ? 2 : (atoi(e) != 0 ? 1 : 0);
+            return common_speculative_dflash_ev_auto_mode(getenv("LLAMA_DFLASH_EV_AUTO"));
         }();
         return m;
     }

@@ -603,6 +603,7 @@ llama_build_and_test(test-dsv41-cand-score-exact.cpp LINK ggml)
 llama_test(test-dsv41-cand-score-exact NAME test-dsv41-cand-score-gpu-exact ARGS --gpu)
 set_tests_properties(test-dsv41-cand-score-exact test-dsv41-cand-score-gpu-exact PROPERTIES SKIP_RETURN_CODE 77)
 llama_build_and_test(test-spec-type-gguf.cpp)
+llama_build_and_test(test-dflash-ev-auto.cpp)
 # the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
 llama_build_and_test(test-cal-build-id.cpp LINK ggml)
 llama_build_and_test(test-moe-trial-persist.cpp)   # CPU-miss trial verdicts in the calibration file
