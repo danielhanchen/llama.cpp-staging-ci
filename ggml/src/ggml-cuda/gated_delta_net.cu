@@ -16,7 +16,11 @@ static __device__ __forceinline__ float gdn_gate_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 static __device__ __forceinline__ float gdn_gate_softplus(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+    if (x > 20.0f) {
+        return x;
+    }
+    const float e = expf(x);
+    return (e <= 5.9604644775390625e-8f) ? e : logf(1.0f + e);
 }
 
 // One token of the (non-KDA) recurrence for the state column a segment of lanes_per_col lanes owns. The AR kernel and the

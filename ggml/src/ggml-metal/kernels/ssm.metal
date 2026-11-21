@@ -245,7 +245,7 @@ kernel void kernel_ssm_scan_impl(
             device const float * dt_t = dt + i0 * args.ns21;
 
             const float dt0  = dt_t[0];
-            const float dtsp = dt0 <= 20.0f ? log(1.0f + exp(dt0)) : dt0;
+            const float dtsp = softplus_tail(dt0);
             shared_x_dt[i0] = x_t[0] * dtsp;
             shared_dA[i0]   = dtsp;  // Store dtsp, compute exp(dtsp * A0) per-thread since A0 varies
         }
@@ -364,12 +364,12 @@ kernel void kernel_ssm_scan_ssd_mma_f32(
             const int32_t t = idx / HD;
             const int32_t c = idx % HD;
             const float dt0  = dt[(t0 + t) * (int32_t) args.ns21];
-            const float dtsp = dt0 <= 20.0f ? log(1.0f + exp(dt0)) : dt0;
+            const float dtsp = softplus_tail(dt0);
             shared_dtx[idx] = x[(t0 + t) * (int32_t) args.ns12 + c] * dtsp;
         }
         if (tiitg < CS) {
             const float dt0  = dt[(t0 + tiitg) * (int32_t) args.ns21];
-            const float dtsp = dt0 <= 20.0f ? log(1.0f + exp(dt0)) : dt0;
+            const float dtsp = softplus_tail(dt0);
             shared_acs[tiitg] = dtsp * A[0];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

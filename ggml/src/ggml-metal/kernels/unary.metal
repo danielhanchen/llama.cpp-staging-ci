@@ -148,7 +148,7 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_SOFTPLUS) {
-            dst_ptr[i0] = (T) select(log(1 + exp(x)), x, x > 20);
+            dst_ptr[i0] = (T) softplus_tail(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_EXPM1) {

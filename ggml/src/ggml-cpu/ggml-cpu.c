@@ -4506,6 +4506,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        // a node without elements writes nothing (e.g. the empty gather of the recurrent states that a decode reads in place, which
+        // keeps the graph of a prompt ubatch): skip it like a NOP instead of computing it and waiting on a barrier for every thread
+        // (custom ops may have side effects and are computed)
+        if (ggml_is_empty(node) && node->op != GGML_OP_CUSTOM && node->op != GGML_OP_MAP_CUSTOM1 && node->op != GGML_OP_MAP_CUSTOM2 &&
+                node->op != GGML_OP_MAP_CUSTOM3) {
+            continue;
+        }
+
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
