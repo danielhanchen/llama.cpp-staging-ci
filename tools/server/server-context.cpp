@@ -2751,11 +2751,12 @@ private:
                 ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
                 const char * rn = reg ? ggml_backend_reg_name(reg) : "";
-                // an integrated GPU too (ggml-cuda reports prop.integrated as IGPU: Strix Halo gfx1151, Jetson, DGX Spark); the
-                // argmax runs in the same graph on the same backend, nothing is sized from memory
+                // an integrated GPU too (ggml-cuda reports prop.integrated as IGPU: Strix Halo gfx1151, Jetson, DGX Spark), and Metal
+                // (its argmax takes the lowest column on a tie, as the host greedy sampler); the argmax runs in the same graph on the
+                // same backend, nothing is sized from memory
                 const enum ggml_backend_dev_type dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
                 device_greedy_ok = dev && (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
-                    (strcmp(rn, "CUDA") == 0 || strcmp(rn, "ROCm") == 0);
+                    (strcmp(rn, "CUDA") == 0 || strcmp(rn, "ROCm") == 0 || strcmp(rn, "MTL") == 0);
             }
         }
 
