@@ -361,7 +361,7 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // k16-draft: an already loaded target model whose token embeddings and lm head an MTP draft model may use instead of its own
+        // an already loaded target model whose token embeddings and lm head an MTP draft model may use instead of its own
         // copies (with mtp_borrow_io; shapes must match exactly). Must outlive the model being loaded
         const struct llama_model * model_shared;
 
@@ -372,7 +372,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
-        bool mtp_borrow_io;   // k16-draft: an MTP draft model takes token_embd / output from model_shared (no_alloc: counts them on the host)
+        bool mtp_borrow_io;   // an MTP draft model takes token_embd / output from model_shared (no_alloc: counts them on the host)
     };
 
     struct llama_sampler_seq_config {
@@ -471,7 +471,7 @@ extern "C" {
         // LLAMA_LM_CKPT_CAPTURE=0); --fit lowers it where the snapshots would cost device layers [EXPERIMENTAL]
         int32_t n_state_capture;
 
-        // k19-kvwin: recent-window ring beside a quantized KV cache [EXPERIMENTAL]: the last kv_win positions and the first kv_win_sinks
+        // recent-window ring beside a quantized KV cache [EXPERIMENTAL]: the last kv_win positions and the first kv_win_sinks
         // positions of every sequence are also kept in type_k_win / type_v_win, and the attention reads them from there
         // (-1: off; env LLAMA_KV_WIN / LLAMA_KV_WIN_SINKS / LLAMA_KV_WIN_TYPE(_K / _V) override). Needs flash attention
         int32_t        kv_win;
@@ -662,7 +662,7 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
 
-    // k9-draft: the restricted-vocabulary MTP draft head (LLAMA_MTP_DRAFT_VOCAB) gets rows for these tokens if it lacks them
+    // the restricted-vocabulary MTP draft head (LLAMA_MTP_DRAFT_VOCAB) gets rows for these tokens if it lacks them
     // (up to LLAMA_MTP_DRAFT_VOCAB_CTX of them, oldest replaced first). Returns the number of rows written; 0 without the head.
     // Call between decodes of the contexts of this model.
     LLAMA_API int32_t llama_model_draft_head_add(const struct llama_model * model, const llama_token * tokens, int32_t n_tokens);
@@ -1221,7 +1221,7 @@ extern "C" {
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
-    // k19-graph: llama_synchronize only while a decode or its output copies are still queued (the getters below already wait so)
+    // llama_synchronize only while a decode or its output copies are still queued (the getters below already wait so)
     LLAMA_API void llama_synchronize_pending(struct llama_context * ctx);
 
     // Token logits obtained from the last call to llama_decode()
