@@ -4172,6 +4172,10 @@ uma_restart:
                     if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && !all_dev && step == 1 && n_layer_sq > 0 && n_tbo(tbo) == n_tbo(tbo_in) &&
                             mp.n_gpu_layers + 1 == n_layer_sq + 1 - (mp.load_mtp ? 0 : n_nextn_sq)) {
                         one_off = { mp, cp, ts, tbo, mg, st, true };
+                        // this step's tbo is freed at the end of the iteration: point the saved fit at the saved copy
+                        if (mp.tensor_buft_overrides != nullptr && mp.tensor_buft_overrides == tbo.data()) {
+                            one_off.mp.tensor_buft_overrides = one_off.tbo.data();
+                        }
                     }
                     const bool fits_all     = st == COMMON_PARAMS_FIT_STATUS_SUCCESS && all_dev;
                     const bool take_one_off = !fits_all && step == 2 && one_off.set;
