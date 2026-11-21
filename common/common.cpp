@@ -3888,6 +3888,11 @@ uma_restart:
                 return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; })) {
             draft_needs_target = true;
         }
+        // a gemma-4 assistant reads the target's KV cache: the small-device placement above refuses it before it is measured,
+        // which is where it would be found to need its target
+        if (draft_cpu && !draft_needs_target && common_gguf_arch(params_dft.model.path) == "gemma4-assistant") {
+            draft_needs_target = true;
+        }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
         // a draft that runs on the target's context (a gemma-4 assistant reads the target's KV cache) cannot run on the CPU
         // while that cache is on the device: T4 4 GB with LLAMA_FIT_DRAFT_CPU=1 aborted in its first graph reservation (a CPU context
