@@ -2421,6 +2421,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 n_subgraphs++;
                 i_start = i + 1;
             }
+            // the graph ends in nodes the loop skips (views of host tensors, e.g. a K / V cache write into a host buffer as the last
+            // node of a graph that only stores K / V): they form the last subgraph, as a last node that is not skipped does
+            if (i_start < cgraph->n_nodes) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    backend_ctx->backend_configs[j].cgraphs[n_subgraphs].offset = i_start;
+                }
+                n_subgraphs++;
+                i_start = cgraph->n_nodes;
+            }
             GGML_ASSERT(i_start == cgraph->n_nodes);
         }
 
