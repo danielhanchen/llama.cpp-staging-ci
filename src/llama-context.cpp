@@ -8324,6 +8324,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             srcs.emplace_back(node, arr);
         }
         lm_merged_active = true;
+        moe_cache->set_lm_merged(true);
         ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
         // (LLAMA_MOE_LM_LEND=0 off): a merged graph whose compute buffers would grow past the free memory borrows its allocation from the
         // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
@@ -8399,6 +8400,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
         lm_merged_active = false;
+        moe_cache->set_lm_merged(false);
         if (st != GGML_STATUS_ALLOC_FAILED) {
             n_sub++;
             if (st == GGML_STATUS_SUCCESS) {

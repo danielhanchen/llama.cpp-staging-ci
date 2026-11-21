@@ -388,6 +388,10 @@ public:
     // staged[e]: expert e was copied to dst for this ubatch (only those can fill a slot)
     void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts, const std::vector<bool> & staged);
 
+    // a merged layer-major graph (several prompt ubatches, one copy of each host expert) runs: its seeds evict the slots of the layers
+    // it has not copied yet last (opt-in, LLAMA_MOE_SEED_KEEP_AHEAD=1)
+    void set_lm_merged(bool on);
+
     // after the graph is computed: drop the admissions of layers that were not seeded for all of their expert tensors
     void seed_end();
 
