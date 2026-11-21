@@ -1637,9 +1637,10 @@ void launch_fattn(
         // tile the same number of blocks) or none, read again by the kernel and the fixup from the live length
         const int nblocks_live = blocks_num.x;
         fixup_kind = (nblocks_live % ntiles_dst == 0 && nblocks_live > ntiles_dst) ? 1 : (ntiles_dst % nblocks_live != 0 ? 2 : 0);
-        // (or K / V read in place by the kernel, need_f16_* false: no conversion that follows the length)
+        // (or K / V read in place by the kernel, need_f16_* false: no conversion that follows the length). Not with the INT8 rows of
+        // an f16 K: their staging launch quantizes the K rows of the length it was launched with, so it is launched again per length
         dev_ok = !use_sparse && !scan_mask && K2 == nullptr && (K->type == GGML_TYPE_F16 || !need_f16_K) && (V->type == GGML_TYPE_F16 || !need_f16_V) &&
-            fixup_kind != 2;
+            fixup_kind != 2 && i8_f16 == 0;
         if (kvl && kvl->kv_len && !probe) {
             GGML_ASSERT(dev_ok && "a device KV length needs the launch choices the probe found");
             // the grid of the padded length (the block count only grows with the length), the blocks past the live count exit
