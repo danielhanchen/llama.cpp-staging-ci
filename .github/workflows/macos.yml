@@ -1,0 +1,252 @@
+name: macos
+
+on:
+  push:
+    branches:
+      - 'ci/**'
+  workflow_dispatch:
+    inputs:
+      intel:
+        description: 'Also run macos-15-intel'
+        type: boolean
+        default: false
+      legs:
+        description: 'all, or mac-cpu (only the macOS CPU-only leg)'
+        type: string
+        default: 'all'
+      tests:
+        description: 'ctest -R regex (empty = every test)'
+        type: string
+        default: ''
+      ctest_j:
+        description: 'ctest parallel jobs'
+        type: string
+        default: '3'
+      ctest_timeout:
+        description: 'per-test timeout in seconds'
+        type: string
+        default: '600'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.legs }}-${{ inputs.tests }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.legs == 'mac-cpu') && '[{"os":"macos-15","leg":"macos-15-arm64-cpu","gpu":"none","cmake_extra":"-DGGML_METAL=OFF"}]' || ((github.event_name == 'workflow_dispatch' && inputs.intel) && '[{"os":"macos-15","leg":"macos-15-arm64","gpu":"metal","cmake_extra":""},{"os":"macos-15","leg":"macos-15-arm64-cpu","gpu":"none","cmake_extra":"-DGGML_METAL=OFF"},{"os":"macos-15-intel","leg":"macos-15-x64","gpu":"none","cmake_extra":""},{"os":"ubuntu-latest","leg":"ubuntu-cpu","gpu":"none","cmake_extra":""}]' || '[{"os":"macos-15","leg":"macos-15-arm64","gpu":"metal","cmake_extra":""},{"os":"macos-15","leg":"macos-15-arm64-cpu","gpu":"none","cmake_extra":"-DGGML_METAL=OFF"},{"os":"ubuntu-latest","leg":"ubuntu-cpu","gpu":"none","cmake_extra":""}]')) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    steps:
+      - name: Leg
+        id: gate
+        shell: bash
+        run: echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Clone
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: System info
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          {
+            echo "sha: ${GITHUB_SHA}"
+            echo "ref: ${GITHUB_REF}"
+            uname -a
+            cmake --version | head -1
+            if [ "$(uname)" = "Darwin" ]; then
+              sw_vers
+              sysctl -n machdep.cpu.brand_string
+              sysctl -n hw.logicalcpu
+              xcrun clang --version | head -1
+              system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Chipset|Metal" || true
+            else
+              nproc
+              cc --version | head -1
+            fi
+          } 2>&1 | tee ci-logs/sysinfo.txt
+
+      - name: Python test deps
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: python3 -m pip install --user --break-system-packages jinja2 || python3 -m pip install --user jinja2 || true
+
+      - name: Configure and build
+        if: steps.gate.outputs.run == 'true'
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          if [ "$(uname)" = "Darwin" ]; then NJ=$(sysctl -n hw.logicalcpu); else NJ=$(nproc); fi
+          rc=0
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=ON ${{ matrix.cmake_extra }} 2>&1 | tee ci-logs/configure.log || rc=$?
+          if [ "$rc" = 0 ]; then
+            cmake --build build --config Release -j "$NJ" 2>&1 | tee ci-logs/build.log || rc=$?
+          fi
+          echo "build_rc=$rc" | tee -a ci-logs/summary.txt
+          grep -n -E "warning:|error:" ci-logs/build.log > ci-logs/build_diags.txt 2>/dev/null || true
+          echo "build_warnings=$(grep -c 'warning:' ci-logs/build_diags.txt || true) build_errors=$(grep -c 'error:' ci-logs/build_diags.txt || true)" | tee -a ci-logs/summary.txt
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: ctest
+        if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0'
+        shell: bash
+        run: |
+          cd build
+          rc=0
+          CJ="${{ inputs.ctest_j }}"; CT="${{ inputs.ctest_timeout }}"; CR="${{ inputs.tests }}"
+          CJ=${CJ:-3}; CT=${CT:-600}
+          RX=(); [ -n "$CR" ] && RX=(-R "$CR")
+          echo "ctest -j $CJ --timeout $CT ${RX[*]}" | tee -a ../ci-logs/summary.txt
+          ctest -j "$CJ" --timeout "$CT" "${RX[@]}" --output-on-failure > ../ci-logs/ctest.log 2>&1 || rc=$?
+          tail -40 ../ci-logs/ctest.log
+          cp Testing/Temporary/LastTestsFailed.log ../ci-logs/ctest_failed_first.txt 2>/dev/null || true
+          if [ "$rc" != 0 ]; then
+            # one rerun of the failures before calling them failures
+            ctest --rerun-failed -j 1 --timeout 2400 --output-on-failure > ../ci-logs/ctest_rerun.log 2>&1 || true
+            cp Testing/Temporary/LastTestsFailed.log ../ci-logs/ctest_failed_rerun.txt 2>/dev/null || true
+            tail -20 ../ci-logs/ctest_rerun.log
+          fi
+          grep -E "\*\*\*Timeout" ../ci-logs/ctest.log | sed 's/^/timeout_first: /' | tee -a ../ci-logs/summary.txt || true
+          grep -E "\*\*\*Timeout" ../ci-logs/ctest_rerun.log 2>/dev/null | sed 's/^/timeout_rerun: /' | tee -a ../ci-logs/summary.txt || true
+          grep -E "tests passed|tests failed" ../ci-logs/ctest_rerun.log 2>/dev/null | sed 's/^/ctest_rerun: /' | tee -a ../ci-logs/summary.txt || true
+          grep -E "tests passed|tests failed" ../ci-logs/ctest.log | sed 's/^/ctest_first: /' | tee -a ../ci-logs/summary.txt
+          echo "ctest_rc=$rc" | tee -a ../ci-logs/summary.txt
+          for t in test-weight-store test-llama-archs test-llama-context; do
+            grep -E "Test +#[0-9]+: $t " ../ci-logs/ctest.log | sed "s/^/ctest_line: /" | tee -a ../ci-logs/summary.txt || true
+          done
+
+      - name: Q8_K exactness (NEON on Apple, AVX2 / AVX-512 on ubuntu)
+        if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0'
+        continue-on-error: true
+        shell: bash
+        run: |
+          for e in 1 0; do
+            echo "GGML_CPU_Q8K_SIMD=$e" | tee -a ci-logs/q8k.txt
+            GGML_CPU_Q8K_SIMD=$e ./build/bin/test-q8k-exact 2>&1 | grep -E "Q8_K quantization|differ" | tee -a ci-logs/q8k.txt
+          done
+          grep -E "Q8_K quantization|differ" ci-logs/q8k.txt | sed 's/^/q8k: /' | tee -a ci-logs/summary.txt
+
+      - name: dflash2 conv NaN diagnostic
+        continue-on-error: true
+        if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0' && hashFiles('tests/test-dflash2-conv-exact.cpp') != ''
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          src = open('tests/test-dflash2-conv-exact.cpp').read()
+          old = "const int r = memcmp(a.data(), b.data(), a.size() * 4) != 0 ? 1 : 0;"
+          if old not in src:
+              print("dflash2 diagnostic: the tree already compares NaN-aware, skipped")
+              open('dflash2_skip', 'w').write('1')
+              raise SystemExit(0)
+          new = ("int n_real = 0, n_nan = 0;\n"
+                 "    for (size_t i = 0; i < a.size(); ++i) {\n"
+                 "        uint32_t ua, ub; memcpy(&ua, &a[i], 4); memcpy(&ub, &b[i], 4);\n"
+                 "        if (ua == ub) continue;\n"
+                 "        if (std::isnan(a[i]) && std::isnan(b[i])) { n_nan++; } else { n_real++;\n"
+                 "            if (n_real <= 3) printf(\"    real diff i %zu ref %08x fused %08x\\n\", i, ua, ub); }\n"
+                 "    }\n"
+                 "    if (n_real || n_nan) printf(\"    elems: %d non-NaN diffs, %d NaN-payload-only diffs\\n\", n_real, n_nan);\n"
+                 "    const int r = n_real != 0 ? 1 : 0;")
+          open('dflash2_diag.cpp', 'w').write(src.replace(old, new))
+          PY
+          if [ -f dflash2_skip ]; then echo "dflash2_diag: skipped (NaN-aware compare in tree)" >> ci-logs/summary.txt; exit 0; fi
+          c++ -O2 -std=c++17 -Iggml/include dflash2_diag.cpp -Lbuild/bin -lggml -lggml-base -Wl,-rpath,"$PWD/build/bin" -o dflash2_diag > ci-logs/dflash2_diag_build.log 2>&1 || { cat ci-logs/dflash2_diag_build.log; exit 0; }
+          ./dflash2_diag > ci-logs/dflash2_diag.txt 2>&1 || true
+          cat ci-logs/dflash2_diag.txt
+          grep -E "^test-dflash2|^(OK|FAIL)$" ci-logs/dflash2_diag.txt | sed 's/^/dflash2_diag: /' >> ci-logs/summary.txt || true
+
+      - name: test-llama-context without the BLAS backend (macOS CPU leg)
+        if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0' && matrix.leg == 'macos-15-arm64-cpu'
+        shell: bash
+        run: |
+          rc=0
+          cmake -B build-noblas -DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=ON -DGGML_METAL=OFF -DGGML_BLAS=OFF > ci-logs/noblas_configure.log 2>&1 || rc=$?
+          [ "$rc" = 0 ] && { cmake --build build-noblas --config Release -j "$(sysctl -n hw.logicalcpu)" --target test-llama-context test-llama-archs > ci-logs/noblas_build.log 2>&1 || rc=$?; }
+          if [ "$rc" = 0 ]; then
+            (cd build-noblas && ctest -R "test-generate-models|test-llama-context" --timeout 1800 --output-on-failure > ../ci-logs/noblas_llctx.log 2>&1) || rc=$?
+          fi
+          grep -E "tests passed|tests failed" ci-logs/noblas_llctx.log | sed 's/^/noblas_llctx: /' | tee -a ci-logs/summary.txt || true
+          echo "noblas_llctx_rc=$rc" | tee -a ci-logs/summary.txt
+          # the main build (BLAS backend in) once more without the reallocation abort: does anything else fail?
+          rc2=0
+          if [ -x build/bin/test-llama-context ] && [ -d build/tests/test-models ]; then
+            build/bin/test-llama-context --models build/tests/test-models/ > ci-logs/llctx_norealloc.log 2>&1 || rc2=$?
+          else
+            rc2=97
+          fi
+          tail -5 ci-logs/llctx_norealloc.log
+          echo "llctx_blas_no_realloc_abort_rc=$rc2" | tee -a ci-logs/summary.txt
+
+      - name: Tiny model smoke
+        if: steps.gate.outputs.run == 'true' && steps.build.outputs.rc == '0'
+        shell: bash
+        run: |
+          set -u
+          M=models/stories15M-q4_0.gguf
+          mkdir -p models
+          curl -sSfL --retry 5 -o "$M" https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf
+          if [ "$(uname)" = "Darwin" ]; then md5cmd="md5 -q"; else md5cmd="md5sum"; fi
+          echo "model_md5=$($md5cmd "$M" | cut -d' ' -f1)" | tee -a ci-logs/summary.txt
+          if [ "${{ matrix.gpu }}" = "metal" ]; then NGLS="99 0"; else NGLS="0"; fi
+          CLI=build/bin/llama-completion
+          [ -x "$CLI" ] || CLI=build/bin/llama-cli
+          for ngl in $NGLS; do
+            rc=0
+            "$CLI" -m "$M" -p "Once upon a time" -n 48 --temp 0 --seed 1 -ngl "$ngl" -t 2 -no-cnv > "ci-logs/smoke_cli_ngl${ngl}.txt" 2> "ci-logs/smoke_cli_ngl${ngl}.log" < /dev/null || rc=$?
+            echo "smoke_cli_ngl${ngl}_rc=$rc md5=$($md5cmd ci-logs/smoke_cli_ngl${ngl}.txt | cut -d' ' -f1)" | tee -a ci-logs/summary.txt
+            head -c 400 "ci-logs/smoke_cli_ngl${ngl}.txt"; echo
+            grep -i -E "metal|offloaded" "ci-logs/smoke_cli_ngl${ngl}.log" | head -5 || true
+            rc=0
+            build/bin/llama-server -m "$M" -ngl "$ngl" -t 2 -c 512 --port 8091 > "ci-logs/server_ngl${ngl}.log" 2>&1 &
+            SP=$!
+            ok=0
+            for i in $(seq 1 120); do
+              if curl -sf http://127.0.0.1:8091/health > /dev/null 2>&1; then ok=1; break; fi
+              sleep 1
+            done
+            if [ "$ok" = 1 ]; then
+              curl -sf http://127.0.0.1:8091/completion -H 'Content-Type: application/json' \
+                -d '{"prompt":"Once upon a time","n_predict":48,"temperature":0,"seed":1,"cache_prompt":false}' > "ci-logs/smoke_server_ngl${ngl}.json" || rc=$?
+            else
+              rc=99
+            fi
+            kill "$SP" 2>/dev/null || true
+            wait "$SP" 2>/dev/null || true
+            python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['content'])" "ci-logs/smoke_server_ngl${ngl}.json" > "ci-logs/smoke_server_ngl${ngl}.txt" 2>/dev/null || { [ "$rc" = 0 ] && rc=98; }
+            echo "smoke_server_ngl${ngl}_rc=$rc md5=$($md5cmd ci-logs/smoke_server_ngl${ngl}.txt | cut -d' ' -f1)" | tee -a ci-logs/summary.txt
+            head -c 400 "ci-logs/smoke_server_ngl${ngl}.txt"; echo
+          done
+
+      - name: Summary
+        if: always() && steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          cat ci-logs/summary.txt || true
+          cat ci-logs/summary.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.leg }}
+          path: ci-logs/
+          retention-days: 30
+
+      - name: Verdict
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          grep -q '^build_rc=0' ci-logs/summary.txt || { echo "build failed"; exit 1; }
+          if ! grep -q '^ctest_rc=0' ci-logs/summary.txt; then echo "ctest failures:"; cat ci-logs/ctest_failed_rerun.txt 2>/dev/null || cat ci-logs/ctest_failed_first.txt; exit 1; fi
+          if grep -E '^smoke_.*_rc=[1-9]' ci-logs/summary.txt; then exit 1; fi
+          echo PASS
