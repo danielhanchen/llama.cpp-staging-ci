@@ -9743,6 +9743,17 @@ struct llama_moe_cache::impl {
         if (!force && (!hybrid || !hybrid_fixed)) {
             return;
         }
+        // the overlap rule starts again as at load: with the deferred admission (fetch_defer) its verdict picks whether the
+        // admitted experts of a single token are computed on the host or on the device, so it must not carry over either
+        // (LLAMA_MOE_FETCH_DEFER=0: the overlap does not change the output and its state carries over as before)
+        if (ov_rule && fetch_defer_mode() != 0) {
+            ov_live  = false;
+            ov_seen  = 0;
+            ov_win   = ov_rule_win;
+            ov_n1    = 0;
+            ov_have0 = false;
+            ov_m0    = 0;
+        }
         seed_counts.clear();
         for (group & g : groups) {
             if (g.n_slots == 0 || !g.dev_lookup || g.counts == nullptr || g.counts->data == nullptr) {

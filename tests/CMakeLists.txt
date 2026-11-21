@@ -609,6 +609,7 @@ llama_build_and_test(test-dflash-ev-auto.cpp)
 # the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
 llama_build_and_test(test-cal-build-id.cpp LINK ggml)
 llama_build_and_test(test-moe-trial-persist.cpp)   # CPU-miss trial verdicts in the calibration file
+llama_build_and_test(test-moe-overlap-reset.cpp)   # fetch overlap rule restarts with a fixed-share request
 if (NOT WIN32)
     target_link_libraries(test-cal-build-id PRIVATE ${CMAKE_DL_LIBS})
 endif()
