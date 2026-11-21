@@ -1976,6 +1976,12 @@ void llama_context::small_plan_free(uint32_t i) {
     }
 }
 
+// the tensors of the largest commit graph: per cell and recurrent layer at most 11 for the delta-net replay and 6 for the conv
+// histories (rs_commit_build), with room to spare; at least the earlier fixed 16384, which many sequence slots outgrew
+static size_t rs_commit_max_nodes(const llama_memory_recurrent * mem, size_t n_cells) {
+    return std::max<size_t>(16384, n_cells * mem->s_l.size() * 20 + 64);
+}
+
 // the backend the commit graphs run on, and (one backend) a fallback allocation of the largest commit graph reserved at
 // load. T4, Qwen3.6 3-bit quant + MTP at a 4 GB tier, 32k: the device was full by the 2k request (CUDA graph instances
 // out of memory too) and the 2.05 MiB allocation of a new commit graph aborted the server in 8 of 8 launches. A commit now drops the
@@ -1985,7 +1991,7 @@ void llama_context::rs_replay_setup() {
     if (mem == nullptr || rs_mode != 0) {
         return;
     }
-    const size_t max_nodes = 16384;
+    const size_t max_nodes = rs_commit_max_nodes(mem, mem->size);
     const bool sched_only = getenv("LLAMA_RS_REPLAY_SCHED") != nullptr && atoi(getenv("LLAMA_RS_REPLAY_SCHED")) != 0;
     bool one = !sched_only;
     auto chk = [&](const ggml_tensor * t) {
@@ -2155,7 +2161,7 @@ void llama_context::rs_replay_commit(bool sync) {
         return;
     }
     const int64_t t0 = ggml_time_us();
-    const size_t max_nodes = 16384;
+    const size_t max_nodes = rs_commit_max_nodes(mem, mem->size);
     if (rs_mode == 0) {
         rs_replay_setup();
     }
@@ -2326,10 +2332,12 @@ void llama_context::rs_replay_commit(bool sync) {
         rs_graphs.clear();
         rs_ga_bytes = 0;
     }
-    ggml_init_params ip = { ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true };
+    // this commit's cells only (five key entries each)
+    const size_t max_nodes_g = rs_commit_max_nodes(mem, key.size()/5);
+    ggml_init_params ip = { ggml_tensor_overhead()*max_nodes_g + ggml_graph_overhead_custom(max_nodes_g, false), nullptr, true };
     ggml_context_ptr ctx_own { ggml_init(ip) };
     ggml_context * ctx = ctx_own.get();
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes_g, false);
     rs_commit_build(ctx, gf, /*worst =*/ false);
     if (ggml_graph_n_nodes(gf) > 0) {
         rs_graph e;
