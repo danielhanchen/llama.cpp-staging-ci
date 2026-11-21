@@ -3834,6 +3834,18 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         // (the restored cells get ring slots from the blob, state_read_data, not from their positions)
+        // a lazy cache backs the restored cells first, with the MoE cache allowed to give memory back (apply_ubatch only
+        // checks them and aborts when they are not backed)
+        if (!lazy_bufs.empty() && !lazy_sim && !other) {
+            uint32_t mx = cells.used_max_p1();
+            for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+                mx = std::max<uint32_t>(mx, sinfo.idxs[0][ii] + 1);
+            }
+            if (!lazy_ensure(GGML_PAD(mx, 256), true)) {
+                LLAMA_LOG_ERROR("%s: lazy KV: no device memory for the %u cells of the state\n", __func__, mx);
+                return false;
+            }
+        }
         win_no_assign = true;
         apply_ubatch(sinfo, ubatch);
         win_no_assign = false;
