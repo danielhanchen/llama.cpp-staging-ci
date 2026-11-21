@@ -6790,7 +6790,7 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
                 GGML_ABORT("%s: failed to set the embedding of token %d at index %d\n", __func__, t.id, i);
             }
         } else {
-            idx = llama_batch_ext_add_embd(res, t.seq_id, t.embd);
+            idx = embd_ref ? llama_batch_ext_add_embd_ref(res, t.seq_id, t.embd) : llama_batch_ext_add_embd(res, t.seq_id, t.embd);
             if (idx < 0) {
                 GGML_ABORT("%s: failed to add embedding at index %d (error %d, n = %d)\n", __func__, i, idx, n);
             }

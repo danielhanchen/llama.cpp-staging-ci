@@ -1219,6 +1219,10 @@ struct common_batch {
 
     int32_t n_pos = 1; // positions per embedding entry, GGML_MROPE_SECTIONS for MROPE/IMROPE
 
+    // embedding-only entries are handed to the context by reference (llama_batch_ext_add_embd_ref): the views given to add_embd()
+    // must stay valid until the decode that takes the rendered batch has returned
+    bool embd_ref = false;
+
     common_batch() = default;
     common_batch(struct llama_context * ctx);
 
