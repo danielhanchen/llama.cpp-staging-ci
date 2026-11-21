@@ -4274,6 +4274,8 @@ struct llama_moe_cache::impl {
                 }
                 if (registered) {
                     mapped.emplace_back(unmap, key);
+                    // the pinned file pages stay in MemAvailable but are not reclaimable (llama_sysmem::available_reclaimable)
+                    file_pin_add(((r.second + page - 1) & ~(page - 1)) - (r.first & ~(page - 1)));
                 }
             }
             if (fail) {
