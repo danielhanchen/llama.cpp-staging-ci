@@ -436,7 +436,8 @@ gated_delta_net_tiled_cuda(const float * q,
     }
 }
 
-// GGML_CUDA_GDN_TILED: 0 = never, 1 = on every arch (tests / timing), unset = the per-arch default (RDNA3.5 at 1024+ tokens and 16+ heads)
+// GGML_CUDA_GDN_TILED: 0 = never, 1 = on every arch (tests / timing), unset = the per-arch default (RDNA3.5 and A100 at 1024+ tokens
+// and 16+ heads)
 static int ggml_cuda_gdn_tiled_env() {
     static const int value = []() {
         const char * env = getenv("GGML_CUDA_GDN_TILED");
@@ -467,8 +468,9 @@ static bool gdn_use_tiled(int device, int64_t S_v, int64_t n_heads, int64_t n_to
     if (env >= 0) {
         return env != 0;
     }
-    return GGML_CUDA_CC_IS_RDNA3_5(info.cc) && n_tokens >= gdn_tiled_rdna3_5_min_tokens &&
-        n_heads >= gdn_tiled_rdna3_5_min_heads;
+    // A100 (cc 8.0, no chunked mma kernel by default): the same thresholds; Flash-Next 4-bit 8k prompt -17..-19 ms on the full card
+    const bool arch = GGML_CUDA_CC_IS_RDNA3_5(info.cc) || (GGML_CUDA_CC_IS_NVIDIA(info.cc) && info.cc == GGML_CUDA_CC_AMPERE);
+    return arch && n_tokens >= gdn_tiled_rdna3_5_min_tokens && n_heads >= gdn_tiled_rdna3_5_min_heads;
 }
 
 template <int S_v, bool keep_rs_t, int num_warps>
