@@ -44,7 +44,7 @@ public:
     // (LLAMA_MOE_CACHE_MTP_MIB=N sets the MTP share); the same for both contexts, so --fit measures the same caches the contexts create
     static size_t budget(const llama_model & model, size_t size, layer_set set);
 
-    // k15-pp3: host bytes of the experts a cache of the trunk layers could hold (0: every expert is on a device)
+    // host bytes of the experts a cache of the trunk layers could hold (0: every expert is on a device)
     static size_t host_bytes(const llama_model & model);
 
     // the share of the host experts below which a mailbox cache skips its timing trials (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, 0.50)
@@ -58,7 +58,7 @@ public:
             layer_set set = layer_set::all, llama_weight_store * ws = nullptr, int64_t host_mib = -1);
     ~llama_moe_cache();
 
-    // k19-mgpu2: the layer of a cached expert weight, -1 if w is not one
+    // the layer of a cached expert weight, -1 if w is not one
     int32_t layer_of_weight(const ggml_tensor * w) const;
 
     // the device that caches layer il
@@ -75,7 +75,7 @@ public:
     // before computing a ubatch: moves the state of the cache between the host and the devices if the other side uses it
     void prepare(int64_t n_tokens);
 
-    // k15-pred: uploads ahead of the routing (LLAMA_MOE_UPLOAD_AHEAD): the copy callback of a prompt ubatch calls begin after it read
+    // uploads ahead of the routing (LLAMA_MOE_UPLOAD_AHEAD): the copy callback of a prompt ubatch calls begin after it read
     // the ids of expert tensor w (counts: tokens per expert) and before its copies, and end after its copies and seed
     void upload_ahead_begin(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * ids, const std::vector<int32_t> & counts);
     void upload_ahead_end(ggml_backend_t backend, const ggml_tensor * w);
@@ -95,7 +95,7 @@ public:
     ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host, bool prompt = false) const;
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool overlap) const;
 
-    // k19-g4pref cross-layer prefetch (LLAMA_MOE_PREFETCH=N on, 0 off, unset: the default rule, see the impl): whether a window of n_ubatch tokens prefetches layer il
+    // cross-layer prefetch (LLAMA_MOE_PREFETCH=N on, 0 off, unset: the default rule, see the impl): whether a window of n_ubatch tokens prefetches layer il
     // (il_prev: the cache layer before it, whose lookup is in the same graph, on the same device), and the op (see ggml_moe_cache_prefetch) that
     // admits the experts of the N largest logits of each token (a prediction of layer il's routing) and copies them beside the graph,
     // after dep; nullptr where it does not apply
@@ -107,58 +107,58 @@ public:
     // the missing experts run beside the experts already cached (see ggml_moe_cache_fetch); true if the graph of a ubatch of n_ubatch
     // tokens uses it now
     bool overlap(int64_t n_ubatch) const;
-    // k19-overlap: small multi-token ubatches (verify windows) copy their admitted experts beside the hits too (LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL)
+    // small multi-token ubatches (verify windows) copy their admitted experts beside the hits too (LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL)
     bool overlap_small(int64_t n_ubatch) const;
-    // k19-q4xcache: layer il takes the hybrid assign for a ubatch of n_ubatch tokens only for the overlap, in place of the plain lookup
+    // layer il takes the hybrid assign for a ubatch of n_ubatch tokens only for the overlap, in place of the plain lookup
     // (LLAMA_MOE_OVERLAP_SMALL_PLAIN): its graph keeps the plain lookup's other choices
     bool overlap_plain(int32_t il, int64_t n_ubatch) const;
-    // k19-l4c (LLAMA_MOE_FETCH_DEFER): an overlapped single token ubatch with the single-graph mailbox defers its admissions: the host
+    // (LLAMA_MOE_FETCH_DEFER): an overlapped single token ubatch with the single-graph mailbox defers its admissions: the host
     // computes the admitted experts, their copies finish beside the graph (see ggml_moe_cache_set_defer)
     bool fetch_defer(int64_t n_ubatch) const;
 
     // CPU misses [LLAMA_MOE_CPU_MISS]: the rule reads the device counters before the graph of some ubatches (synchronize the backends
     // first when cpu_miss_tick_sync), the tick goes before the graph of every ubatch
     bool cpu_miss_enabled() const; // LLAMA_MOE_CPU_MISS is on for this cache (until a failed calibration turns it off)
-    // k13: the host never computes an expert of this cache (no hybrid path, no CPU misses): every expert runs on the device from a slot
+    // the host never computes an expert of this cache (no hybrid path, no CPU misses): every expert runs on the device from a slot
     bool host_never() const;
-    // k13: frozen small batches (freeze_small): the host computes every miss of a small batch, nothing is fetched or admitted between
+    // frozen small batches (freeze_small): the host computes every miss of a small batch, nothing is fetched or admitted between
     // prompts (the assign is frozen, see ggml_moe_cache_assign_freeze), so which expert of a token the host computes depends on the
     // token's own ids and the cache as the prompts left it, the same in a verify window as in a single token decode
     bool host_split_frozen() const;
-    // k16: route tail skip [LLAMA_MOE_ROUTE_TAIL_SKIP]: in a decode or verify window of at most
+    // route tail skip [LLAMA_MOE_ROUTE_TAIL_SKIP]: in a decode or verify window of at most
     // tail_skip_max_tokens() tokens, a missing expert that every token routes at rank >= the threshold is neither fetched nor computed
     // (zero contribution, no renormalisation); sets it on the lookup / assign op of layer il when it applies to this cache
     void tail_skip(ggml_tensor * op, int32_t il, int64_t n_tokens) const;
-    // k19-l4full: the same rule for a host lookup (the slot map get_rows of a layer streamed through the weight store / RAM tier, which
+    // the same rule for a host lookup (the slot map get_rows of a layer streamed through the weight store / RAM tier, which
     // the device lookup never serves): marks the get_rows node, the copy callback then leaves the skipped experts out of its plan, so
     // their slot reads -1 (rows 0, as the device lookup's skip). LLAMA_MOE_ROUTE_TAIL_SKIP_HOST=0 off
     void tail_skip_host(ggml_tensor * get_rows, int32_t il, int64_t n_tokens) const;
-    // k19-fixB: the skip is the default rule (no LLAMA_MOE_ROUTE_TAIL_SKIP=N) and LLAMA_MOE_ROUTE_TAIL_SKIP_EXACT=1 does not keep it
+    // the skip is the default rule (no LLAMA_MOE_ROUTE_TAIL_SKIP=N) and LLAMA_MOE_ROUTE_TAIL_SKIP_EXACT=1 does not keep it
     // in the exact modes: exact verify set through llama_set_verify_exact turns it off as LLAMA_MTP_EXACT=1 does at init
     bool tail_skip_off_exact() const;
-    // k13: CPU misses: small batches (up to 8 tokens) fetch nothing and the host computes every miss, without trials; true if frozen
+    // CPU misses: small batches (up to 8 tokens) fetch nothing and the host computes every miss, without trials; true if frozen
     bool freeze_small();
-    // k13: CPU misses: small batches (up to 8 tokens) take the host path without trials or miss-rate windows, but still fetch their
+    // CPU misses: small batches (up to 8 tokens) take the host path without trials or miss-rate windows, but still fetch their
     // share and admit (the cache follows the decode; not exact under drafts); true if pinned
     bool pin_small();
-    // k15-lfm2: lift (false) / restore (true) that pin between requests; returns the pinned state (see llama_moe_pin_small_set)
+    // lift (false) / restore (true) that pin between requests; returns the pinned state (see llama_moe_pin_small_set)
     bool pin_small_set(bool on);
-    // k15-lfm2: a new request starts (LLAMA_MOE_CPU_MISS_PER_REQUEST=1): the CPU-miss rule's decisions restart from the launch's (see cm_request_begin)
+    // a new request starts (LLAMA_MOE_CPU_MISS_PER_REQUEST=1): the CPU-miss rule's decisions restart from the launch's (see cm_request_begin)
     bool request_begin(); // true if the cache was emptied
     bool request_resets() const; // request_begin() empties the cache (hybrid_reset): released banks have to come back first
-    // k15-lfm2: see llama_moe_cpu_miss_drop_slow
+    // see llama_moe_cpu_miss_drop_slow
     bool cpu_miss_drop_slow();
-    // k13: who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
+    // who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
     // share (the default gate of small caches, or LLAMA_MOE_CACHE_FETCH), 2 = the CPU-miss rule
     int host_mode() const;
     bool cpu_miss_tick_sync(int64_t n_tokens) const;
     void cpu_miss_tick(int64_t n_tokens);
-    // k19-tokcost: while on, small batches move no CPU-miss window (the server's verify-graph prewarm); off starts a fresh window
+    // while on, small batches move no CPU-miss window (the server's verify-graph prewarm); off starts a fresh window
     void cpu_miss_pause(bool on);
     // the ubatch of n_tokens is looked up on the device like a small batch: at most n_small_max tokens, or a short prompt whose missing
     // experts the host computes (the large batch path, its copies and its seed do not apply)
     bool small_batch(int64_t n_tokens) const;
-    // k15-pp2: while set, every ubatch is treated as a large one (no device lookup, slot map, host path or CPU misses): its MUL_MAT_ID
+    // while set, every ubatch is treated as a large one (no device lookup, slot map, host path or CPU misses): its MUL_MAT_ID
     // read the layer's host experts as the large ubatches do (the last ubatch of a prompt as a member of a layer-major group)
     void set_force_large(bool on);
     bool force_large() const;
@@ -176,7 +176,7 @@ public:
     ggml_tensor * single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const;
     // the graph builder tells whether layer il has the expert form the host plans compute (see single_weigh)
     void single_note_form(int32_t il, bool ok) const;
-    // k15: the context marks each decode: a prompt batch (tokens without outputs) keeps its ubatches off the CPU-miss host path while
+    // the context marks each decode: a prompt batch (tokens without outputs) keeps its ubatches off the CPU-miss host path while
     // the small batches are pinned (see cm_prompt_off)
     void set_prompt_batch(bool prompt, int64_t n_tokens_all = 0);
     // before the graph of every ubatch of n_tokens: wakes the host thread (batches that may publish), turns the path off after a failure
@@ -188,9 +188,9 @@ public:
     // the fetch share is measured once, before the first small batch: the host computes the experts of a layer with the decode threads
     bool hybrid_probe_pending() const;
     void hybrid_probe(ggml_backend_t backend_cpu);
-    // k13-fn: one re-calibration of the CPU-miss host timings after warm-up, run between requests (see cm_recal_wait)
+    // one re-calibration of the CPU-miss host timings after warm-up, run between requests (see cm_recal_wait)
     bool recal_pending() const;
-    // k15-idlewait: abort(abort_data) is polled between the timing repetitions; when it returns true the re-calibration stops, changes
+    // abort(abort_data) is polled between the timing repetitions; when it returns true the re-calibration stops, changes
     // nothing and stays pending (returns false)
     bool recal(ggml_backend_t backend_cpu, bool (*abort)(void *) = nullptr, void * abort_data = nullptr);
 
@@ -201,17 +201,17 @@ public:
     // fixed share (LLAMA_MOE_CACHE_FETCH, or from the threads): the cache, the use counters and the residual of the share are reset before a batch whose
     // sequences are all empty and after a state is read, so the same request gives the same output as in a new process
     bool hybrid_fixed() const;
-    // k13-small: the cached share of the host experts' bytes (-1 before the slots are sized)
+    // the cached share of the host experts' bytes (-1 before the slots are sized)
     double cache_frac() const;
-    // k19-widefix: bytes of the host experts the cache serves (cached or not, uncached groups whole; 0 before the slots are sized)
+    // bytes of the host experts the cache serves (cached or not, uncached groups whole; 0 before the slots are sized)
     double host_total_bytes() const;
-    // k17-small (lazy KV step 2): cache_frac of the slots the cache keeps for itself, its shrink floor (the rest is the KV cache's,
+    // (lazy KV step 2): cache_frac of the slots the cache keeps for itself, its shrink floor (the rest is the KV cache's,
     // see shrink): what the bank release of a layer-major prompt group is decided on (cache_frac where no floor is set)
     double release_frac() const;
     void hybrid_reset();
-    // k19-ptres (LLAMA_MOE_CORE=1): bytes of the core experts' host copies left out of the registration and dropped from the page cache
+    // (LLAMA_MOE_CORE=1): bytes of the core experts' host copies left out of the registration and dropped from the page cache
     size_t core_dropped_bytes() const;
-    // k19-ptres: LLAMA_MOE_CORE is set; core_request at each new request: checks the core and writes the routing profile
+    // LLAMA_MOE_CORE is set; core_request at each new request: checks the core and writes the routing profile
     bool core_wanted() const;
     void core_request();
 
@@ -222,7 +222,7 @@ public:
     bool hybrid_tick_sync() const;
     // CPU misses trial: the ubatch after the tick is timed; synchronize after its graph is computed, then hybrid_tick_end
     bool hybrid_tick_timed() const;
-    // k15-pred r22b (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=1): short-prompt host path timing, before the graph of a ubatch (timed with hybrid_tick_timed / hybrid_tick_end)
+    // (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=1): short-prompt host path timing, before the graph of a ubatch (timed with hybrid_tick_timed / hybrid_tick_end)
     bool prompt_auto_pending() const;
     void prompt_auto_tick(int64_t n_tokens);
     void hybrid_tick_end();
@@ -250,7 +250,7 @@ public:
     void devseed_prepare(ggml_cgraph * gf, bool enable);
     // ok = false (the graph failed): the groups it may have seeded in part are cleared
     void devseed_end(ggml_cgraph * gf, bool ok);
-    // k11 (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY): the device seed of a prefetched large ubatch that ran inside a merged layer-major graph, after
+    // (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY): the device seed of a prefetched large ubatch that ran inside a merged layer-major graph, after
     // that graph, from its routing (per layer in layer order: the routing outputs of the ubatch, still on the device where that graph left
     // them); the admitted experts are uploaded from host memory; bytes / ms: what it uploaded and its time; false if nothing is seeded
     bool devseed_replay(const std::vector<std::pair<int32_t, ggml_tensor *>> & rec, int64_t n_tokens, size_t & bytes, double & ms);
@@ -263,28 +263,28 @@ public:
 
     // the cache may lend slots (LLAMA_MOE_CACHE_LEND)
     bool lends() const;
-    // k11 (LLAMA_MOE_LM_LEND): while on, the cache also lends its slots to the graph allocation of the graphs allocated (a merged layer-major
+    // (LLAMA_MOE_LM_LEND): while on, the cache also lends its slots to the graph allocation of the graphs allocated (a merged layer-major
     // group whose compute buffers would grow past the free memory), not only to their staging copies
     void set_graph_lend(bool on);
-    // k13-small: the banks are freed for the graphs of a prompt (every slot emptied, its expert kept for the refill), restore allocates
+    // the banks are freed for the graphs of a prompt (every slot emptied, its expert kept for the refill), restore allocates
     // them again and refills the slots; nothing may look up or upload experts in between (the layer-major group does neither)
     bool release();
     void restore();
-    // k19-place8: a restore whose banks do not allocate leaves them released (released() stays true) instead of aborting
+    // a restore whose banks do not allocate leaves them released (released() stays true) instead of aborting
     void set_restore_soft(bool on);
     bool released() const;
-    // k17-small (lazy KV step 2, LLAMA_KV_LAZY=1, LLAMA_MOE_CACHE_SHRINK=0 off): give back at least bytes of the device memory of dev to a
+    // (lazy KV step 2, LLAMA_KV_LAZY=1, LLAMA_MOE_CACHE_SHRINK=0 off): give back at least bytes of the device memory of dev to a
     // KV cache that grows by retiring tail slots for good (down to the floor set_shrink_floor sets); returns the bytes freed (0: none,
     // e.g. no lazy banks, no floor set, at the floor, banks released). Between batches only (no graph of this cache may be pending)
     size_t shrink(ggml_backend_dev_t dev, size_t bytes);
-    // k19-t4small (decode extension, LLAMA_MOE_DECODE_EXT): the banks have room past the slots the fit sized (a lazy buffer, only the
+    // (decode extension, LLAMA_MOE_DECODE_EXT): the banks have room past the slots the fit sized (a lazy buffer, only the
     // fitted slots backed at load); between prompts the cache grows into device memory that is free while the decode runs (ext_grow)
     // and goes back to the fitted slots before a prompt ubatch (ext_park), so a prompt sees the memory the fit planned
     bool   ext_on() const;
     size_t ext_grow(ggml_backend_dev_t dev, size_t bytes); // the bytes of slots added
     size_t ext_park();                                      // the bytes given back
     size_t ext_bytes() const;                               // the bytes of slots above the fitted ones now
-    // k19-vramlend: whether shrink can give memory back on dev (lazy banks there)
+    // whether shrink can give memory back on dev (lazy banks there)
     bool can_shrink(ggml_backend_dev_t dev) const;
     // the bytes of slots shrink keeps on dev (not set: nothing is retired)
     void set_shrink_floor(ggml_backend_dev_t dev, size_t bytes);
@@ -294,16 +294,16 @@ public:
     bool take_graphs_stale();
     // the next restore refills the slots with the experts the recorded routing used most (set_refill_counts), as LLAMA_MOE_CACHE_REFILL_ROUTED=1
     void set_refill_routed_once(bool on);
-    // k19-kvsel: the next restore refills at most bytes of experts over every group (SIZE_MAX: all the slots that came back); the slots past
+    // the next restore refills at most bytes of experts over every group (SIZE_MAX: all the slots that came back); the slots past
     // it come back empty and misses fill them
     void set_refill_cap_once(size_t bytes);
     // the cache lends slots on some device (decided by the first large graph)
     bool lends_on_any() const;
-    // lends_on_any, or a device whose lending is off for the staging copies that still lends to a merged layer-major graph (k15-pp)
+    // lends_on_any, or a device whose lending is off for the staging copies that still lends to a merged layer-major graph
     bool lends_graph_any() const;
     // the cache lends slots on the device of backend (decided by the first large graph, see lend): the staging arena is not allocated there
     bool lends_on(ggml_backend_t backend) const;
-    // k15-fn: the most slots the cache can lend to a merged layer-major graph's allocation on the device of backend (0: none), for capping
+    // the most slots the cache can lend to a merged layer-major graph's allocation on the device of backend (0: none), for capping
     // a group before it is built; n_slots / expert_bytes (optional) get the size of the group it lends from. An upper bound: the staging
     // copies share the lent slots and the placement fits whole bank tails, so a graph of capacity*expert_bytes may still be refused
     int32_t graph_lend_capacity(ggml_backend_t backend, int32_t * n_slots = nullptr, size_t * expert_bytes = nullptr) const;
@@ -316,7 +316,7 @@ public:
 
     // the largest staging memory (the copies of large batches) a measurement asked the cache to lend, on any device (0 if none)
     size_t lend_need_max() const;
-    // k15-fn: the staging copies a measurement found the cache lends on the device of backend because lending frees memory there
+    // the staging copies a measurement found the cache lends on the device of backend because lending frees memory there
     // (LLAMA_MOE_CACHE_LEND=1, or unset and lend_saves), 0 if it does not
     size_t lend_save_need(ggml_backend_t backend) const;
 
@@ -345,7 +345,7 @@ public:
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
-    // k15-lfm2: in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1): the layer whose prompt map t is (-1 if none), its expert tensors, the copy of
+    // in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1): the layer whose prompt map t is (-1 if none), its expert tensors, the copy of
     // its prompt map (uploads the missing experts; counts: seed the layer after its product, nullptr: no seed), the pending seed, and a
     // context that runs layer-major prompts turns it off
     int32_t prompt_layer(const ggml_tensor * t) const;
@@ -361,17 +361,17 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache, -n if a run of n cached experts is too short to copy
     // with regions != nullptr, every cached run is appended to regions instead of being copied (and is not counted)
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions = nullptr);
-    // k19-l4ttft: the copy of a prompt ubatch that read the routing of expert tensor w (used: its routed experts) reads the routed experts
+    // the copy of a prompt ubatch that read the routing of expert tensor w (used: its routed experts) reads the routed experts
     // of w's layer that neither the device slots nor the RAM tier hold, every expert tensor of each, in one batch; the copies of the
     // layer's expert tensors upload them from there (LLAMA_MOE_PROMPT_LAYER_READ=0 off, LLAMA_MOE_PROMPT_DIAG=1 logs per prompt)
     void prompt_layer_read(ggml_backend_t backend, const ggml_tensor * w, const std::vector<bool> & used);
-    // k19-l4held (LLAMA_MOE_PROMPT_RANK=1, opt-in): a prompt ubatch of at least 256 tokens whose copies read the routing (not prefetched)
+    // (LLAMA_MOE_PROMPT_RANK=1, opt-in): a prompt ubatch of at least 256 tokens whose copies read the routing (not prefetched)
     // stages its routed experts plus the experts held nowhere that fit its layer's RAM quota, and its routed misses replace the RAM
     // tier's unrouted experts of the layer at its quota; used: routed in, staged out; true when it changed used
     bool prompt_rank_copy(const ggml_tensor * w, std::vector<bool> & used);
-    // k19-l4ttft (LLAMA_MOE_PROMPT_DIAG=1): host time of a prompt copy's routing read and of its copies' issue
+    // (LLAMA_MOE_PROMPT_DIAG=1): host time of a prompt copy's routing read and of its copies' issue
     void prompt_diag_time(int64_t sync_us, int64_t up_us);
-    // k19-l4held (LLAMA_MOE_PROMPT_DIAG=1): host time of a prompt's whole copy callbacks (k = 0), seeds (1), upload-ahead waits (2)
+    // (LLAMA_MOE_PROMPT_DIAG=1): host time of a prompt's whole copy callbacks (k = 0), seeds (1), upload-ahead waits (2)
     void prompt_diag_extra(int k, int64_t us);
 
     // for large batches: count the copies of a batch of the experts of w issued by the caller (copies from the cache and uploads)
@@ -406,13 +406,13 @@ public:
     bool host_disk_tier() const;
     bool host_exclusive() const; // the RAM tier is on with the exclusive policy
     int  host_min_cc() const;    // lowest compute capability (major*100 + minor*10) of the CUDA devices the RAM tier serves, -1 otherwise
-    // k19-mgpu2: resident mode swaps the experts a prompt's last large ubatch routed into each card's slots at the prompt end
+    // resident mode swaps the experts a prompt's last large ubatch routed into each card's slots at the prompt end
     // (LLAMA_MOE_RESIDENT_FILL=0 off); the context records the routing of every large ubatch with set_resident_counts
     bool resident_fill_wanted() const;
     void resident_fill();
     void set_resident_counts(int32_t il, const std::vector<int32_t> & counts);
     bool has_resident_counts() const;
-    // prompts never seed (llama_context, k18-lowram): no seed split in the lent memory either
+    // prompts never seed (llama_context): no seed split in the lent memory either
     void seeds_off();
 
     // LLAMA_MOE_CACHE_SEED_CHECK=1 (debug): after the seeding ubatch is synchronized, compare the seeded slots with the host experts
@@ -423,12 +423,12 @@ public:
     void set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
     // the routing of the last large ubatch of a prompt that did not seed: the lent slots that come back get its most used experts
     void set_refill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
-    // k19-l4fill: the exclusive RAM tier refills the slots it freed with the experts the last prompts routed most that neither tier holds
+    // the exclusive RAM tier refills the slots it freed with the experts the last prompts routed most that neither tier holds
     // (LLAMA_MOE_HOST_FILL=0 off): the routing counts of a prompt's last large ubatch, once per prompt (begin, then each expert tensor)
     bool fill_wants_counts() const;
     void fill_counts_begin();
     void fill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
-    // k19-autoprof (LLAMA_MOE_AUTOPROF): the routing of every large prompt ubatch is counted into the self-learned profile (begin, then
+    // (LLAMA_MOE_AUTOPROF): the routing of every large prompt ubatch is counted into the self-learned profile (begin, then
     // each expert tensor; the expert tensors of a layer share one routing)
     bool autoprof_wants_counts() const;
     void autoprof_counts_begin();
@@ -440,7 +440,7 @@ public:
     void clear_seed_counts();
     bool has_seed_counts() const;
 
-    // k19-prewexact: the server's verify-graph prewarm (dummy windows of one repeated token) leaves the cache as it found it.
+    // the server's verify-graph prewarm (dummy windows of one repeated token) leaves the cache as it found it.
     // prewarm_begin snapshots what a decode moves (slots, LRU / clock state, the device map / state / counters, seed and refill
     // bookkeeping) and quiets the rules (no CPU-miss window, timing trial, overlap rule or trial, prompt trial or probe moves);
     // prewarm_end copies back the expert of every slot that changed and restores the rest. false: refused (logged), the state stays
@@ -457,7 +457,7 @@ private:
 
 using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;
 
-// k19-ramprof: the routing profile file of the MoE cache ("moe-cache-profile 1 <n_layer>", then one "<layer> <expert> <heat>" line per
+// the routing profile file of the MoE cache ("moe-cache-profile 1 <n_layer>", then one "<layer> <expert> <heat>" line per
 // expert, written by LLAMA_MOE_CACHE_PROFILE_SAVE at exit). heat = decayed use, in uses.
 struct llama_moe_profile_entry {
     int32_t il;
@@ -475,7 +475,7 @@ bool llama_moe_profile_write(const std::string & path, size_t n_layer, const std
 // the order the RAM tier is filled in at load: the most used first over every layer (heat descending), ties in file order
 std::vector<llama_moe_profile_entry> llama_moe_profile_ram_order(const std::vector<llama_moe_profile_entry> & entries);
 
-// k19-mgpu2: the experts a group's n_avail device slots take at load from a routing profile: the hottest (layer, expert) pairs of the
+// the experts a group's n_avail device slots take at load from a routing profile: the hottest (layer, expert) pairs of the
 // group's layers (heat > 0, heat descending, ties in file order), then the lowest ids not taken, one layer after the other in turn.
 // [i] = the experts of layers[i] in id order; *n_prof / *n_pad (may be null) count the two kinds
 std::vector<std::vector<int32_t>> llama_moe_profile_pick(const std::vector<llama_moe_profile_entry> & entries, const std::vector<int32_t> & layers,

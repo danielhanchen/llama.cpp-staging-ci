@@ -15,10 +15,10 @@
 #include "ggml-alloc.h"
 #include "ggml-moe-mailbox.h"
 
-// k19-q4xcache: see ggml.c (declared here so that ggml.h stays unchanged)
+// see ggml.c (declared here so that ggml.h stays unchanged)
 extern "C" { GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op); }
 extern "C" { GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int32_t n_core); }
-// k19-g4pref: see ggml.c
+// see ggml.c
 extern "C" { GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_context * ctx, struct ggml_tensor * logits, struct ggml_tensor * map,
         struct ggml_tensor * state, struct ggml_tensor ** banks, const void ** host, int n_banks, int il, int n_top, int max_fill,
         int n_core, struct ggml_tensor * scores, struct ggml_tensor * dep); }
@@ -64,7 +64,7 @@ extern "C" { GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_c
 #include <fcntl.h>
 #endif
 
-// k19-l4b: the logical CPUs this process may run on (the affinity mask on Linux, else the hardware threads)
+// the logical CPUs this process may run on (the affinity mask on Linux, else the hardware threads)
 static int llama_moe_n_cpus() {
 #if defined(__linux__)
     cpu_set_t set;
@@ -106,7 +106,7 @@ static inline void llama_mb_spin_pause() {
 #endif
 }
 
-// k19-exactmtp: LLAMA_MTP_EXACT=1 (the drafted text equals the no-draft text) and LLAMA_MOE_EXACT_HOST unset or 0: the MoE cache never
+// LLAMA_MTP_EXACT=1 (the drafted text equals the no-draft text) and LLAMA_MOE_EXACT_HOST unset or 0: the MoE cache never
 // computes an expert on the host unless LLAMA_MOE_CACHE_HYBRID / LLAMA_MOE_CACHE_FETCH / LLAMA_MOE_CPU_MISS=1 asks for it
 static bool llama_moe_exact_host_off() {
     static const bool value = [] {
@@ -150,7 +150,7 @@ struct moe_cache_lru {
     uint64_t gen = 0; // incremented by each change of the slots, so the device copy of the state can be refreshed
 
     int32_t n_lent = 0; // the last n_lent slots are lent (see set_lent): they are not in the list and hold no expert
-    // k19-ptres: the first n_core slots are a core (see set_core): they hold their experts for good, are not in the list (never a
+    // the first n_core slots are a core (see set_core): they hold their experts for good, are not in the list (never a
     // victim) and keep their experts through clear and load
     int32_t n_core = 0;
 
@@ -208,7 +208,7 @@ struct moe_cache_lru {
         gen++;
     }
 
-    // k19-ptres: slots [0, n) become the core: each must hold an expert; they leave the list for good (n = 0: the core slots come back
+    // slots [0, n) become the core: each must hold an expert; they leave the list for good (n = 0: the core slots come back
     // to the list as the most recently used)
     bool set_core(int32_t n) {
         GGML_ASSERT(n >= 0 && n + n_lent < n_slots);
@@ -254,7 +254,7 @@ struct moe_cache_lru {
         next[s] = -1;
     }
 
-    // empty slot s (it stays in the list, k13-small release); never a core slot
+    // empty slot s (it stays in the list, release); never a core slot
     void evict(int32_t s) {
         GGML_ASSERT(s >= n_core);
         if (key_of[s] >= 0) {
@@ -288,10 +288,10 @@ struct moe_cache_lru {
         gen++;
     }
 
-    // k17-small (lazy KV step 2, see llama_moe_cache::shrink): the slots [n_new, n_slots) leave the cache for good (their experts are
+    // (lazy KV step 2, see llama_moe_cache::shrink): the slots [n_new, n_slots) leave the cache for good (their experts are
     // evicted, they leave the list); no slot may be lent
     void retire(int32_t n_new) {
-        GGML_ASSERT(n_lent == 0 && n_new > n_core && n_new <= n_slots); // (k19-ptres: never into the core)
+        GGML_ASSERT(n_lent == 0 && n_new > n_core && n_new <= n_slots); // (never into the core)
         for (int32_t s = n_new; s < n_slots; ++s) {
             if (key_of[s] >= 0) {
                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
@@ -309,7 +309,7 @@ struct moe_cache_lru {
         gen++;
     }
 
-    // k19-t4small (decode extension, see llama_moe_cache::ext_grow): the slots [n_slots, n_new) join the cache empty, as the least
+    // (decode extension, see llama_moe_cache::ext_grow): the slots [n_slots, n_new) join the cache empty, as the least
     // recently used (the next victims); no slot may be lent
     void unretire(int32_t n_new) {
         GGML_ASSERT(n_lent == 0 && n_new >= n_slots);
@@ -352,7 +352,7 @@ struct moe_cache_lru {
         tail = s;
     }
 
-    // move slot s to the head (the next to be evicted), k15-pred
+    // move slot s to the head (the next to be evicted)
     void to_head(int32_t s) {
         if (s == head || s < n_core) {
             return;
@@ -646,24 +646,24 @@ static size_t llama_moe_cache_set_bytes(const llama_model & model, llama_moe_cac
 }
 
 struct llama_moe_cache::impl {
-    bool force_large = false; // k15-pp2: see llama_moe_cache::set_force_large
+    bool force_large = false; // see llama_moe_cache::set_force_large
     llama_weight_store * wstore = nullptr;
-    // k11: the graph allocation of the graph allocated next may be lent too (a merged layer-major group, see llama_moe_cache::set_graph_lend)
+    // the graph allocation of the graph allocated next may be lent too (a merged layer-major group, see llama_moe_cache::set_graph_lend)
     bool graph_lend_scope = false;
-    int64_t n_releases = 0; // release (k13-small)
+    int64_t n_releases = 0; // release
 
-    // k17-small (lazy KV step 2, LLAMA_KV_LAZY=1 with LLAMA_MOE_CACHE_SHRINK unset or != 0): the banks of a device are a lazy buffer of the
+    // (lazy KV step 2, LLAMA_KV_LAZY=1 with LLAMA_MOE_CACHE_SHRINK unset or != 0): the banks of a device are a lazy buffer of the
     // CUDA backend (address range reserved whole, backed at load), so the cache can give memory back to a KV cache that grows (shrink)
     bool shrink_on = false;
     ggml_backend_buffer_t (*lazy_alloc_fn)(ggml_backend_buffer_type_t, size_t) = nullptr;
     bool   (*lazy_commit_fn)(ggml_backend_buffer_t, size_t, size_t)            = nullptr;
     size_t (*lazy_decommit_fn)(ggml_backend_buffer_t, size_t, size_t)          = nullptr;
-    bool   (*lazy_commit_run_fn)(ggml_backend_buffer_t, size_t, size_t)        = nullptr; // k19-t4small: one allocation per span
+    bool   (*lazy_commit_run_fn)(ggml_backend_buffer_t, size_t, size_t)        = nullptr; // one allocation per span
     int64_t n_shrinks     = 0; // shrink calls that gave memory back
     int64_t n_retired     = 0; // slots retired by them
     size_t  shrunk_bytes  = 0; // device memory they gave back
     bool    graphs_stale  = false; // a shrink changed the slot counts the graphs were built with (see take_graphs_stale)
-    // k19-t4small (decode extension, see llama_moe_cache::ext_grow): the banks are a lazy buffer with room for group::n_slots_cap slots
+    // (decode extension, see llama_moe_cache::ext_grow): the banks are a lazy buffer with room for group::n_slots_cap slots
     bool    ext_on        = false;
     int64_t n_ext_grows   = 0;
     int64_t n_ext_parks   = 0;
@@ -679,13 +679,13 @@ struct llama_moe_cache::impl {
     std::vector<bool> host_group; // [group] served by the RAM tier (host lookups, never mapped for the device)
     // exclusive with spare room (budget + device slots >= streamed experts): promoted experts keep their RAM copy as a duplicate (the
     // first to go) and RAM misses fill free slots; without spare room promotions free the RAM slot and misses go to the device only
-    // (V16 / R29 and the T4 at R31: keeping duplicates there cost the prompts their RAM admissions, decode -53% / -32%)
+    // (on two hosts and the T4: keeping duplicates there cost the prompts their RAM admissions, decode -53% / -32%)
     bool host_spare = false;
     // the RAM tier is on where the mapped host weights exceed the available RAM (the page cache cannot hold the streamed experts the
     // tier leaves out: its misses are read from the disk)
     bool host_disk = false;
     int  host_cc   = -1; // the lowest compute capability of the CUDA devices the RAM tier serves (major*100 + minor*10), -1: another device
-    // k19-copyback: a device eviction whose expert RAM still holds (a duplicate kept at promotion) needs no copy back: the weights are
+    // a device eviction whose expert RAM still holds (a duplicate kept at promotion) needs no copy back: the weights are
     // read-only, so the RAM bytes equal the device bytes. LLAMA_MOE_COPYBACK_SKIP=0 copies them back over that RAM copy anyway (same
     // bytes, same slot, the slot waits for the copy as a real copy back does): the A/B arm for the skip, cache decisions unchanged
     bool copyback_skip = [] {
@@ -775,15 +775,15 @@ struct llama_moe_cache::impl {
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
         size_t buf_size = 0;
-        bool released = false; // k13-small: the banks are freed for a prompt (release / restore)
+        bool released = false; // the banks are freed for a prompt (release / restore)
 
         int lend_auto = -1; // automatic lending (LLAMA_MOE_CACHE_LEND unset): -1 not decided yet, 0 off, 1 on
         size_t dry_need = 0; // the largest staging need a measurement (dry lend) asked for, see lend_need_max
-        size_t dry_save = 0; // k15-fn: the staging copies a measurement found the device would lend (lend_saves), see lend_save_need
-        bool lend_saving = false; // k15-fn: lending is on for the memory it frees (lend_saves), see unlend
+        size_t dry_save = 0; // the staging copies a measurement found the device would lend (lend_saves), see lend_save_need
+        bool lend_saving = false; // lending is on for the memory it frees (lend_saves), see unlend
         size_t mem_reserve = 0; // device memory kept free for a later model or context (set_mem_reserve), not free for lend_decide
-        bool   bank_lazy    = false; // k17-small: buf_bank is a lazy buffer (shrink_on), see alloc_banks
-        size_t shrink_floor = SIZE_MAX; // k17-small: shrink keeps at least this many bytes of slots on the device (set_shrink_floor)
+        bool   bank_lazy    = false; // buf_bank is a lazy buffer (shrink_on), see alloc_banks
+        size_t shrink_floor = SIZE_MAX; // shrink keeps at least this many bytes of slots on the device (set_shrink_floor)
     };
 
     // LLAMA_MOE_CACHE_SEED_CHECK=1: after each seeding ubatch, compare the seeded slots with the host experts (debug)
@@ -821,16 +821,16 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
         int32_t n_slots = 0;
-        int32_t n_slots_load = 0; // k17-small: n_slots at load (the banks keep that size, shrink retires the tail slots)
-        int32_t n_slots_min  = 0; // k17-small: shrink keeps at least this many (set_shrink_floor; 0: not set, nothing is retired)
-        int32_t n_slots_fit  = 0; // k19-t4small: the slots the budget gave (ext_park goes back to them)
-        int32_t n_slots_cap  = 0; // k19-t4small: the slots the banks have room for (n_slots_fit + the decode extension, see ext_grow)
-        // k17-small: once slots are retired, views of the banks over the slots left and the spare slot ([ne0, ne1, n_slots + 1], the
+        int32_t n_slots_load = 0; // n_slots at load (the banks keep that size, shrink retires the tail slots)
+        int32_t n_slots_min  = 0; // shrink keeps at least this many (set_shrink_floor; 0: not set, nothing is retired)
+        int32_t n_slots_fit  = 0; // the slots the budget gave (ext_park goes back to them)
+        int32_t n_slots_cap  = 0; // the slots the banks have room for (n_slots_fit + the decode extension, see ext_grow)
+        // once slots are retired, views of the banks over the slots left and the spare slot ([ne0, ne1, n_slots + 1], the
         // shape the lookup ops require), passed to the device lookup / fetch ops instead of the banks (see op_banks); empty before
         std::vector<ggml_tensor *> banks_op;
         moe_cache_lru lru;
         seed_state sd;
-        // k15-pred r19: the key each slot held when the device lookups of the last small ubatches had used it (-1: not used); the
+        // the key each slot held when the device lookups of the last small ubatches had used it (-1: not used); the
         // uploads ahead take none of these slots while they still hold that key (LLAMA_MOE_UPLOAD_AHEAD_KEEP_DECODE)
         std::vector<int32_t> ua_dec_key;
 
@@ -858,7 +858,7 @@ struct llama_moe_cache::impl {
     struct layer {
         int32_t ig = -1;                    // -1 if the layer is not cached
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
-        ggml_tensor * prompt_map = nullptr; // k15-lfm2: I32 [1, n_expert] in host memory, the slots a large batch reads in place (see prompt_copy)
+        ggml_tensor * prompt_map = nullptr; // I32 [1, n_expert] in host memory, the slots a large batch reads in place (see prompt_copy)
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
         std::vector<const void *> host_dev; // device-accessible pointers to their data, for the device lookup
     };
@@ -899,8 +899,8 @@ struct llama_moe_cache::impl {
     std::vector<std::vector<int32_t>> refill_counts; // [n_layer]
     bool   refill_routed   = false; // LLAMA_MOE_CACHE_REFILL_ROUTED=1 (opt-in): else the slots get back the experts they held before they were lent
     size_t n_refill_routed = 0;    // refills that used the routing of a prompt
-    bool   refill_routed_once = false; // k13-small: the next restore refills by the routing (set_refill_routed_once)
-    size_t refill_cap_once    = SIZE_MAX; // k19-kvsel: bytes the next restore refills at most (set_refill_cap_once)
+    bool   refill_routed_once = false; // the next restore refills by the routing (set_refill_routed_once)
+    size_t refill_cap_once    = SIZE_MAX; // bytes the next restore refills at most (set_refill_cap_once)
     bool  verify_enabled = false; // LLAMA_MOE_CACHE_VERIFY=1 (debug): compare the cached experts with host memory
     stats stats_refill;
     std::vector<std::vector<int32_t>> seed_counts; // [n_layer] routing of an earlier ubatch of the prompt, see set_seed_counts
@@ -943,10 +943,10 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    // k15-lfm2: in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1). A large batch reads the experts of its layer in place: the graph looks up
+    // in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1). A large batch reads the experts of its layer in place: the graph looks up
     // their slots in a prompt map (a host tensor, copied by prompt_copy as the scheduler copies a weight) and the product reads the bank of
     // the group; the missing experts are uploaded into lent slots of the bank, at lent base + expert, so nothing stages the cached experts
-    // (Kaggle T4 LFM2.5-24B-A2B 16 GB, 8k prompt: 442 ms of copy_regions copying every cached expert into the staging copy per ubatch).
+    // (T4 LFM2.5-24B-A2B 16 GB, 8k prompt: 442 ms of copy_regions copying every cached expert into the staging copy per ubatch).
     // Only where every small batch runs on the device from the slots (no CPU-miss rule, no hybrid gate): the slots then decide nothing
     // about the text, the prompt reads the same expert bytes with the same product. The group with lent slots is the largest of the device;
     // a group that holds every expert of its layers admits its misses instead. A seed of a layer is issued after the layer's product, from
@@ -974,7 +974,7 @@ struct llama_moe_cache::impl {
     bool   lend_auto    = true;  // LLAMA_MOE_CACHE_LEND unset: lend only if the staging copies are a large share of the cache, see lend
     bool   seed_own     = false; // prompts seed from their own ids by default (LLAMA_MOE_CACHE_SEED unset or 2), see lend
     double lend_min_frac = 0.08; // LLAMA_MOE_CACHE_LEND_MIN_FRAC: that share
-    bool   lend_save     = false; // k15-fn LLAMA_MOE_CACHE_LEND_SAVE=1 (opt-in): also lend where it frees lend_save_min bytes, see lend_saves
+    bool   lend_save     = false; // LLAMA_MOE_CACHE_LEND_SAVE=1 (opt-in): also lend where it frees lend_save_min bytes, see lend_saves
     size_t lend_save_min = 256ull*1024*1024; // LLAMA_MOE_CACHE_LEND_SAVE_MIB
     bool   lend_save_refill = true; // LLAMA_MOE_CACHE_LEND_SAVE_REFILL=0: slots lent for lend_saves come back empty (lazy), see unlend
     bool   lend_multi   = false; // LLAMA_MOE_CACHE_LEND_MULTI=1: also with the cache on several devices (not validated)
@@ -988,7 +988,7 @@ struct llama_moe_cache::impl {
     // eviction policy (LLAMA_MOE_CACHE_POLICY): decay (default) = decayed use counters of every expert, the misses evict the lowest
     // ones (see moe_cache_lru and ggml_moe_cache_set_scores), for the groups that cache less than decay_max_share of their experts, the
     // others keep clock; clock = CLOCK on the device, LRU on the host for every group (measured decode vs clock: gemma-4 8 GB 1.084x
-    // on a G4 and 1.051x on a T4, Qwen3.6 8 GB 1.04x on a G4, neutral at 38-44% cached, 0.986x with more misses at 41% on
+    // on a RTX PRO 6000 and 1.051x on a T4, Qwen3.6 8 GB 1.04x on a RTX PRO 6000, neutral at 38-44% cached, 0.986x with more misses at 41% on
     // Qwen3.8-Flash-Next, which the 30% gate keeps on clock; greedy outputs identical)
     bool   policy_decay    = true;
     double half_life       = 0.0; // LLAMA_MOE_CACHE_HALF_LIFE, in tokens; 0 = clamp(64 x cached share, 8, 64)
@@ -1004,12 +1004,12 @@ struct llama_moe_cache::impl {
     // deterministic share (LLAMA_MOE_CACHE_HYBRID unset or 2): set from the decode threads by hybrid_set_threads, not measured
     bool  hybrid_det   = false;
     // default gate (LLAMA_MOE_CACHE_HYBRID unset): on only while the cache holds at most hybrid_max_frac of the host experts' bytes;
-    // measured on Qwen3.8-Flash-Next UD-IQ1_S: +27% decode at 3% of the experts, a tie at 14%, -13% at 24%, -20% at 68%
+    // measured on Qwen3.8-Flash-Next at 1 bit: +27% decode at 3% of the experts, a tie at 14%, -13% at 24%, -20% at 68%
     bool   hybrid_gate     = false;
     double hybrid_max_frac = 0.10; // LLAMA_MOE_CACHE_HYBRID_MAX_FRAC
     double cache_frac      = -1.0; // cached share of the host experts' bytes, -1 before the slots are sized
     double host_uncached   = 0.0;  // bytes of the host experts the slots cannot hold (host experts minus slots, uncached groups count whole)
-    double host_total      = 0.0;  // k19-widefix: bytes of the host experts (cache_frac's denominator)
+    double host_total      = 0.0;  // bytes of the host experts (cache_frac's denominator)
     static constexpr double hybrid_k = 6.0; // see set_threads
     bool  overlap      = false; // LLAMA_MOE_CACHE_FETCH_OVERLAP: single token ubatches compute the hits while the missing experts are copied
 
@@ -1074,41 +1074,41 @@ struct llama_moe_cache::impl {
 
     // CPU computes the misses [LLAMA_MOE_CPU_MISS] (see cm_calibrate and cm_rule): per batch size n (1..cm_max tokens), the host computes
     // the missing experts that are not fetched when a measured cost model says it is faster than fetching them all
-    //   t_cpu(n) = cm_t1 + (tbar(n) - 1)*cm_dt   host time per missing expert, tbar(n) = tokens per distinct expert of a batch of n
+    //   t_cpu(n) = cm_t1 + (tbar(n) - 1)*cm_dt host time per missing expert, tbar(n) = tokens per distinct expert of a batch of n
     //   share(n) = t_cpu/(t_cpu + cm_tup), on log levels 1/8, 1/4, 1/2, 3/4 (the device fetches that share, the host computes the rest)
     //   on(n): m(n)*(cm_tup - max(share*cm_tup, (1 - share)*t_cpu)) > cm_margin*cm_split, m(n) = missing experts per layer of a batch of n,
     //          from the measured miss rate of the distinct experts looked up (device counters: the same inputs give the same decisions)
     // the cache state carries over between requests (no reset as with a fixed share), so layer-major prompts keep running
-    static constexpr int64_t cm_max_limit = 255; // below the default prefetch threshold (256): prefetched prompts keep the k9 path
+    static constexpr int64_t cm_max_limit = 255; // below the default prefetch threshold (256): prefetched prompts keep the path
     bool    cm      = false;
     bool    cm_dbg  = false;  // LLAMA_MOE_CPU_MISS_LOG=1: every rule window
     bool    cm_force = false; // LLAMA_MOE_CPU_MISS=2: on for every batch size, no rule
-    // k16 route tail skip (LLAMA_MOE_ROUTE_TAIL_SKIP, see tail_skip): the rank threshold (0 = off), whether it is the default (the
+    // route tail skip (LLAMA_MOE_ROUTE_TAIL_SKIP, see tail_skip): the rank threshold (0 = off), whether it is the default (the
     // backend may decline a default, see ggml_moe_cache_set_tail_skip), and the largest window it applies to
     int32_t tail_rank       = 0;
     bool    tail_dflt       = false;
     int64_t tail_max_tokens = 8;
-    // k19-hostrow: wide hybrid windows (LLAMA_MOE_HYBRID_WIDE, see use_device): a hybrid small batch of up to wide_max tokens takes the
+    // wide hybrid windows (LLAMA_MOE_HYBRID_WIDE, see use_device): a hybrid small batch of up to wide_max tokens takes the
     // assign path even when its routed experts may outnumber the slots (the assign admits at most the unpinned slots, the host computes
     // the rest), instead of every expert of the window on the CPU
     bool    hybrid_wide     = false;
     int64_t wide_max        = 8;
-    // k19-place8 (LLAMA_MOE_PLACE8_UB set by common's fit, see common_fit_place8): a hybrid group's small batch of 2+ tokens takes the
+    // (LLAMA_MOE_PLACE8_UB set by common's fit, see common_fit_place8): a hybrid group's small batch of 2+ tokens takes the
     // CPU path of a batch whose experts do not fit the slots (every expert of the batch on the host), as with the few dozen slots of the
     // placement before, not the hybrid assign. The decode-sized cache holds the experts of tens of tokens, so the prompt's short tail
-    // batches would take the multi-token hybrid assign, which writes non-finite values at fn4 8 GB (
-    // fixed on k19-nanfix); LLAMA_MOE_PLACE8_SINGLE=0 lets them take it
+    // batches would take the multi-token hybrid assign, which writes non-finite values at Flash-Next at 4 bits 8 GB (
+    // fixed on by the NaN fix); LLAMA_MOE_PLACE8_SINGLE=0 lets them take it
     bool    place8_single   = false;
-    bool    restore_soft    = false; // k19-place8: restore leaves the banks released when they do not allocate (set_restore_soft)
+    bool    restore_soft    = false; // restore leaves the banks released when they do not allocate (set_restore_soft)
     int     n_restore_fail  = 0;
-    // k11 LLAMA_MOE_CPU_MISS_PROMPT=N (opt-in, default 0 = off): prompt ubatches of max_batch + 1 .. N tokens always take the host path
+    // LLAMA_MOE_CPU_MISS_PROMPT=N (opt-in, default 0 = off): prompt ubatches of max_batch + 1 .. N tokens always take the host path
     // once calibrated, at the rule's fetch share but at most 1/4 (the host computes at least three quarters of the misses, the experts
-    // with the fewest uses), without waiting for a trial on the small batches. G4, LFM2.5-24B-A2B 8 GB, a 38-token prompt: 6.1 GB of uploads
+    // with the fewest uses), without waiting for a trial on the small batches. RTX PRO 6000, LFM2.5-24B-A2B 8 GB, a 38-token prompt: 6.1 GB of uploads
     // (PCIe-bound) -> 0.4 GB. The host's expert products are not the device's bit for bit: other text, KLD-gated
     int64_t cm_prompt_force = 0;
     // LLAMA_MOE_CPU_MISS_PROMPT_SHARE=f: the fetch share of those ubatches instead of the rule's (0 < f <= 1; the host computes the rest)
     float   cm_prompt_share = -1.0f;
-    // k10: with LLAMA_MOE_CACHE_HYBRID unset, a cache that holds at most hybrid_max_frac of the host experts keeps k9's default hybrid gate
+    // with LLAMA_MOE_CACHE_HYBRID unset, a cache that holds at most hybrid_max_frac of the host experts keeps the earlier default hybrid gate
     // (deterministic share) instead of the CPU-miss rule [LLAMA_MOE_CPU_MISS_GATE=0: the rule there too]
     bool    cm_gate  = false;
     size_t  cm_n_prompt = 0;  // batches above max_batch served by the host path
@@ -1129,22 +1129,22 @@ struct llama_moe_cache::impl {
     static constexpr int cm_win1 = 8;
     static constexpr int cm_win2 = 128;
     int      cm_seen  = 0;
-    // k13-fn: one re-calibration of the host timings after cm_recal_after small batches (LLAMA_MOE_CPU_MISS_RECAL=N, 0 = off), kept
+    // one re-calibration of the host timings after cm_recal_after small batches (LLAMA_MOE_CPU_MISS_RECAL=N, 0 = off), kept
     // only if it disagrees with the start-up one by more than cm_recal_tol (then the faster host time wins)
     int      cm_recal_after = 64;
     int      cm_recal_wait  = -1;
     static constexpr double cm_recal_tol = 0.20;
-    // k15-lfm2 LLAMA_MOE_CPU_MISS_STABLE (default 1; =0 = the k15 rule: on the v2 prompts all 8
-    // stable launches gave the k15 rule's text, KLD 0 between them): one decision per launch, not one of two modes drawn from a noisy timing
+    // LLAMA_MOE_CPU_MISS_STABLE (default 1; =0 = the rule: on the v2 prompts all 8
+    // stable launches gave the rule's text, KLD 0 between them): one decision per launch, not one of two modes drawn from a noisy timing
     // sample. The fetch share of a small batch sat on the 1/4 - 1/2 level boundary (raw share 0.354, the geometric midpoint) in the
-    // cells whose calibrated raw share is 0.33-0.43 (G4: Qwen3.8-Flash-Next UD-IQ4_XS 32 GB host 22.6-34.5 us per expert against an
-    // upload of 46 us, Qwen3.6 UD-Q3_K_M 8 GB 14.5-18.6 against 29): launches that drew a fast start-up sample fetched 1/4 and computed
-    // twice the host rows (45435 vs 22865 per run, fn4) at 28.6-30.5 us per row in the decode (not the 23 us of the sample), and decoded
+    // cells whose calibrated raw share is 0.33-0.43 (RTX PRO 6000: Qwen3.8-Flash-Next at 4 bits 32 GB host 22.6-34.5 us per expert against an
+    // upload of 46 us, Qwen3.6 at 3 bits 8 GB 14.5-18.6 against 29): launches that drew a fast start-up sample fetched 1/4 and computed
+    // twice the host rows (45435 vs 22865 per run, Flash-Next at 4 bits) at 28.6-30.5 us per row in the decode (not the 23 us of the sample), and decoded
     // 7-9% faster than the launches at 1/2. The balance the share comes from treats a fetch as running beside the device work, while
     // the fetch reads host memory in the device stream and the host experts run beside it: small batches take 1/4 up to a raw share of
-    // cm_small_half (LLAMA_MOE_CPU_MISS_SMALL_HALF, default 0.47; 0.354 = k15), which holds a host up to 0.89x the upload time per
-    // expert at 1/4. Of 3500 start-up calibrations in this workspace's G4 / L4 / T4 logs, the ones in 0.354-0.472 (Flash-Next, q3m,
-    // a few gemma-4 / q4x launches) are the minority mode of their cell; the other levels are unchanged. Also an agreeing re-calibration
+    // cm_small_half (LLAMA_MOE_CPU_MISS_SMALL_HALF, default 0.47; 0.354 earlier), which holds a host up to 0.89x the upload time per
+    // expert at 1/4. Of 3500 start-up calibrations in this workspace's RTX PRO 6000 / L4 / T4 logs, the ones in 0.354-0.472 (Flash-Next, the 3-bit Qwen3.6,
+    // a few gemma-4 / the 4-bit Qwen3.6 launches) are the minority mode of their cell; the other levels are unchanged. Also an agreeing re-calibration
     // keeps the faster host time and decides again (see cm_calibrate)
     const bool cm_stable = [] {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_STABLE");
@@ -1154,23 +1154,23 @@ struct llama_moe_cache::impl {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF");
         return !cm_stable ? 0.354 : e != nullptr ? std::min(0.612, std::max(0.177, atof(e))) : 0.47;
     }();
-    // k19-l4poly (LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM, default 0.6): on a host whose host experts run on the host team (single_team_host,
-    // a small host), small batches take 1/4 up to a raw share of 0.6 (a host up to 1.5x the upload time per expert). Colab L4 Flint 16 GB
+    // (LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM, default 0.6): on a host whose host experts run on the host team (single_team_host,
+    // a small host), small batches take 1/4 up to a raw share of 0.6 (a host up to 1.5x the upload time per expert). L4 Flint 16 GB
     // sits on the 0.47 boundary: start-up / persisted calibrations of 116-121 us per expert (raw 0.45) fetched 1/4, those of 158-160 us
     // (raw 0.53, a cold first launch, then persisted for the bin) fetched 1/2 and lost their trials (chat 54.7 vs 57.5 tok/s, same head);
-    // a fixed 1/4 decoded +13% (k19-flint), 1/8 +10%, every miss on the host -12% at 2k. Unchanged where LLAMA_MOE_CPU_MISS_SMALL_HALF
-    // is set, without cm_stable, and on hosts without the team (G4, 4-vCPU T4)
+    // a fixed 1/4 decoded +13%, 1/8 +10%, every miss on the host -12% at 2k. Unchanged where LLAMA_MOE_CPU_MISS_SMALL_HALF
+    // is set, without cm_stable, and on hosts without the team (RTX PRO 6000, 4-vCPU T4)
     //
     // LLAMA_MOE_CPU_MISS_TEAM_MID (default 1; 0 = the 0.6 level at every cache share): on such a host, a cache that holds less than the
     // trial share (cm_team_mid: no timing trials, the cost model alone decides) takes 1/2 above the geometric midpoint 0.354 of the two
     // levels, the boundary of every other batch size. There the host experts are the critical path of a small batch and the link is
-    // not: Colab A100 40 GB VM (12 vCPU, 6 cores), Qwen3.8-Flash-Next UD-IQ4_XS at 16 / 32 GB (15 / 42% cached), the VM's own
+    // not: an A100 40 GB host (12 vCPU, 6 cores), Qwen3.8-Flash-Next at 4 bits at 16 / 32 GB (15 / 42% cached), the VM's own
     // calibration 137.8-140.5 us per expert against an upload of 205-206 us (raw 0.40): at 1/4 a host batch took 1.97 ms per layer
     // beside 0.81 ms of device work and the device waited 1.19 ms of it; at 1/2 1.30 ms beside 1.58 ms, 0.08 ms of waiting. A host
-    // that is cheap per expert against the link keeps 1/4: Colab L4 Qwen3.6-35B-A3B UD-Q4_K_XL at 8 GB, 51 us against 162 us (raw
+    // that is cheap per expert against the link keeps 1/4: L4 Qwen3.6-35B-A3B at 4 bits at 8 GB, 51 us against 162 us (raw
     // 0.24), loses 29% at 1/2 (the extra uploads run in the device's own stream). The 0.6 level stays where the trials run (Flint
-    // 16 GB, 56% cached) and on hosts of fewer than 12 usable CPUs (the small-host team, e.g. a Colab T4 VM's 8 vCPUs):
-    // there a slow start-up sample is the usual way to land above the midpoint (Colab T4 q4x calibrations 82-85 us per expert, a few
+    // 16 GB, 56% cached) and on hosts of fewer than 12 usable CPUs (the small-host team, e.g. a T4 VM's 8 vCPUs):
+    // there a slow start-up sample is the usual way to land above the midpoint (T4 with the 4-bit Qwen3.6 calibrations 82-85 us per expert, a few
     // 128-141), and 8 GB pinned at such a sample (127.6 us, raw 0.40) decoded 17% slower at 1/2 (chat 66.6 -> 55.4 tok/s)
     bool cm_team_mid() const {
         static const bool on = [] {
@@ -1189,12 +1189,12 @@ struct llama_moe_cache::impl {
         }
         return cm_team_mid() ? 0.354 : std::max(cm_small_half, team_half);
     }
-    bool     cm_recal_pending = false; // (timed only between requests: 2 x ~40 ms inside a reply cost chat decode 2% on G4)
+    bool     cm_recal_pending = false; // (timed only between requests: 2 x ~40 ms inside a reply cost chat decode 2% on RTX PRO 6000)
     int      cm_nb    = 0;     // batches in the window
     int      cm_win   = cm_win1;
     bool     cm_have0 = false;
-    // k19-tokcost: the server's verify-graph prewarm (dummy windows of one repeated token) is not a decode: while paused, its batches
-    // count in no miss-rate window (one such window measured 0.7% and turned the host path off for the next request: fn4 24 GB)
+    // the server's verify-graph prewarm (dummy windows of one repeated token) is not a decode: while paused, its batches
+    // count in no miss-rate window (one such window measured 0.7% and turned the host path off for the next request: Flash-Next at 4 bits 24 GB)
     bool     cm_paused = false;
     uint64_t cm_c0[3] = { 0, 0, 0 }; // hits, fetched, left to the host at the start of the window
     int      cm_nwin  = 0;
@@ -1202,7 +1202,7 @@ struct llama_moe_cache::impl {
     bool     cm_measured = false; // the decisions come from a measured miss rate (before: the prior, see cm_calibrate)
     // small batches (at most max_batch tokens): the cost model gives the candidate sizes and the share, a timing trial keeps the host path only
     // where it is faster: the time of a split boundary (device sync, host threads, copies, the CUDA graph cut in two) is not something the
-    // calibration sees (G4: modelled 25 us per layer, measured 60-70 us: Qwen3.6 UD-Q4_K_XL 12 GB without a draft -20% decode with the model
+    // calibration sees (RTX PRO 6000: modelled 25 us per layer, measured 60-70 us: Qwen3.6 at 4 bits 12 GB without a draft -20% decode with the model
     // alone). Trial = 5 blocks of cmt_block small batches: host path off (warm-up, not counted), off, on, on, off; each counted small batch is
     // timed from before its graph to its end (synchronized), the first cmt_skip of a block are not counted (graphs rebuilt); on if the median is at least
     // cmt_margin faster; trials again after cmt_gap small batches (doubled each time, at most cmt_gap_max) since the misses change with the
@@ -1212,7 +1212,7 @@ struct llama_moe_cache::impl {
     static constexpr double cmt_margin  = 0.03;
     static constexpr int    cmt_gap_max = 4096;
     bool     cm_trial      = true;
-    // k13: frozen small batches (cm_freeze): batches of at most cm_frozen_max tokens fetch nothing, the host computes every miss, no
+    // frozen small batches (cm_freeze): batches of at most cm_frozen_max tokens fetch nothing, the host computes every miss, no
     // timing trial or miss-rate window changes that; which expert of a token the host computes then depends only on its own ids and
     // the cache the prompts left, so a verify window splits each token as its single token decode does
     static constexpr int64_t cm_frozen_max = 8;
@@ -1220,11 +1220,11 @@ struct llama_moe_cache::impl {
     // LLAMA_MOE_CPU_MISS_FROZEN_FETCH=1: the freeze pins only the decisions (host path on for the frozen sizes, no trials or windows);
     // small batches still fetch their share and the assign still admits, so the cache follows the decode (not exact under drafts)
     bool     cm_frozen_fetch = false;
-    // k19-flint LLAMA_MOE_CPU_MISS_DECODE (default 0 = off; 1 = on): decode batches of 1..LLAMA_MOE_CPU_MISS_DECODE_MAX tokens (default
+    // LLAMA_MOE_CPU_MISS_DECODE (default 0 = off; 1 = on): decode batches of 1..LLAMA_MOE_CPU_MISS_DECODE_MAX tokens (default
     // and at most the mailbox's single-graph sizes) take the host path at the fixed fetch share LLAMA_MOE_CPU_MISS_DECODE_SHARE (default
     // 1/8) once calibrated, with no cost-model or timing-trial verdict: the device fetches the misses with the highest use counters
     // (staged, they become hits) and the host team computes the rest through the mailbox while the device computes the hits. Where the
-    // cache holds a large share of the experts (Colab L4 Flint 16 GB, 55.8%) the timing trials only count batches of the sizes the rule
+    // cache holds a large share of the experts (L4 Flint 16 GB, 55.8%) the timing trials only count batches of the sizes the rule
     // turned on (3 and more there), n-gram verify windows are too rare to fill one, so the warm phase's "host path off" stays for the
     // whole launch (0 host experts) and every single-token miss is read over PCIe (~44 experts, 80 MiB per pass). Only with the mailbox
     // (no per-layer graph split) and not with frozen small batches. The host's expert products are not the device's bit for bit (int8
@@ -1247,17 +1247,17 @@ struct llama_moe_cache::impl {
     // short prompts do not take it either
     static constexpr double cmt_host_bad = 1.25;
     bool     cmt_host_ok = true;
-    // k19-cmtpersist (LLAMA_MOE_CPU_MISS_PERSIST, default 1; =0 off): the trials' verdicts in the calibration file, replayed by later
+    // (LLAMA_MOE_CPU_MISS_PERSIST, default 1; =0 off): the trials' verdicts in the calibration file, replayed by later
     // launches with the same file and tag (see src/llama-moe-trial-persist.h); hysteresis LLAMA_MOE_CPU_MISS_TRIAL_HYST (default 0.03)
     // on the trials a launch times after its first verdict
     int      cmt_ps_state = -1;           // -1 not set up yet, 0 off, 1 on
     std::vector<llama_moe_tp::rec> cmt_rec;   // replayed and appended verdicts, in trial order
     size_t   cmt_rec_file = 0;            // how many of them came from the file
     bool     cmt_rec_dirty = false;       // timed verdicts not in the file yet
-    bool     cmt_ps_warned = false;       // k19-calvpersist: a failed verdict write was logged
+    bool     cmt_ps_warned = false;       // a failed verdict write was logged
     std::string cmt_ps_path, cmt_ps_key, cmt_ps_tag;
     int      cmt_len_now = 0;             // counted small batches of the running trial (cmt_done before an early end)
-    // k15-pred r22b, short prompts (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=1, opt-in; 2 = every size a candidate, diagnostic): a prompt ubatch of max_batch + 1 .. cm_max
+    // , short prompts (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=1, opt-in; 2 = every size a candidate, diagnostic): a prompt ubatch of max_batch + 1 .. cm_max
     // tokens that the cost model puts on the host path (cm_on, from the calibration and the measured miss rate) takes it without the
     // small-batch trials, but only while timing says it pays: the first such ubatches
     // alternate with and without it (pt_need of each), timed to their end per token, and the host path is kept only if its median is at
@@ -1266,7 +1266,7 @@ struct llama_moe_cache::impl {
     static constexpr int pt_need  = 3;
     static constexpr int pt_keep  = 5;
     static constexpr int pt_every = 29;
-    bool     pt_auto    = false;  // r22b G4 t17p: opt-in (decided off on 6 of 7 cells, RSS +20..81 MiB)
+    bool     pt_auto    = false;  // RTX PRO 6000: opt-in (decided off on 6 of 7 cells, RSS +20..81 MiB)
     bool     pt_any     = false;  // LLAMA_MOE_CPU_MISS_PROMPT_AUTO=2 (diagnostic): every prompt size in range is a candidate, the timing still decides
     int      pt_state   = -1;     // -1 trial, 0 off, 1 on
     int      pt_arm     = 1;      // the path of the current / next counted prompt ubatch
@@ -1276,7 +1276,7 @@ struct llama_moe_cache::impl {
     int      pt_n_dec   = 0;
     std::vector<double> pt_t[2];  // us per token
     // warm phase: a trial in a cache that is still filling compares the paths at a miss rate that is about to fall, and the host path
-    // admits fewer experts, so it fills slower (G4 Qwen3.6 UD-Q4_K_XL 12 GB MTP: trial 1 on at a 41.6% miss rate, then off at 15.2%,
+    // admits fewer experts, so it fills slower (RTX PRO 6000 Qwen3.6 at 4 bits 12 GB MTP: trial 1 on at a 41.6% miss rate, then off at 15.2%,
     // chat decode -10%): small batches fetch every miss and windows of cm_win1 batches measure the miss rate until it stops falling (a
     // window at least cmw_flat of the one before) or cmw_max batches, then the first trial starts
     static constexpr double cmw_flat = 0.85;
@@ -1286,15 +1286,15 @@ struct llama_moe_cache::impl {
     int      cmw_n    = 0;
     // short prompts (above max_batch): the plain cache pipelines the copies of their spilled experts with the compute of the layers
     // before (prefetch), which the cost model of the per layer fetch does not see, and each split moves the activations of the batch
-    // both ways (G4 gpt-oss-20b Q2_K 8 GB, 95-token prompt: -19% with the margin of the small batches): the gain must beat
+    // both ways (RTX PRO 6000 gpt-oss-20b Q2_K 8 GB, 95-token prompt: -19% with the margin of the small batches): the gain must beat
     // cm_margin_p*(cm_split + n*cm_act)
     static constexpr double cm_margin_p = 4.0;
-    // small batches: the split boundary costs more than the calibration sees (G4 trials: modelled 25-50 us per layer, measured 60-70 us),
+    // small batches: the split boundary costs more than the calibration sees (RTX PRO 6000 trials: modelled 25-50 us per layer, measured 60-70 us),
     // and a trial is not free (2 of its 5 blocks run the slower path, every counted batch is synchronized): the model makes a size a
-    // candidate (and so a trial possible) only if its gain beats cm_split_scale times the calibrated split (G4 Qwen3.6 UD-Q3_K_M 12 GB
+    // candidate (and so a trial possible) only if its gain beats cm_split_scale times the calibrated split (RTX PRO 6000 Qwen3.6 at 3 bits 12 GB
     // MTP: 14 host batches per launch, every trial off, -7% decode from the trials alone). LLAMA_MOE_CPU_MISS_SPLIT_SCALE (3)
     double   cm_split_scale = 3.0;
-    bool     cm_split_scale_env = false; // LLAMA_MOE_CPU_MISS_SPLIT_SCALE set: it applies to every size (k19-l4poly)
+    bool     cm_split_scale_env = false; // LLAMA_MOE_CPU_MISS_SPLIT_SCALE set: it applies to every size
     static double cm_split_scale_team() {
         static const double s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM") != nullptr ?
             std::max(0.0, atof(getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM"))) : 0.5;
@@ -1305,7 +1305,7 @@ struct llama_moe_cache::impl {
     // " (mtp)" for the cache of an MTP context, in its log lines
     const char * tag = "";
 
-    // warm start from a routing profile (k11, opt-in): LLAMA_MOE_CACHE_PROFILE=<path> fills the device slots at load from the ranked
+    // warm start from a routing profile (opt-in): LLAMA_MOE_CACHE_PROFILE=<path> fills the device slots at load from the ranked
     // (layer, expert) list a run saved with LLAMA_MOE_CACHE_PROFILE_SAVE=<path> (its resident experts by decayed use, then the other used
     // ones), the most routed first over the whole group instead of an equal share per layer. The file is
     // <path>.<n_layer>.<n_expert>[.mtp], so a draft model or an MTP context keeps its own. Only where experts sit changes: a cached and a
@@ -1319,10 +1319,10 @@ struct llama_moe_cache::impl {
     bool   profile_loaded = false;
     double profile_seed   = 1.0;
     size_t profile_filled = 0;
-    // k19-ramprof: LLAMA_MOE_HOST_PROFILE=<path> (a file of the format above, <path>.<n_layer>.<n_expert>[.mtp]) fills the RAM tier at load
+    // LLAMA_MOE_HOST_PROFILE=<path> (a file of the format above, <path>.<n_layer>.<n_expert>[.mtp]) fills the RAM tier at load
     // in its order (llama_moe_profile_ram_order) before the page-cache fill (prefill_resident); unset or 0 = off (the page-cache fill alone)
     std::string host_profile_file;
-    // k19-ramprof2 (see prepare): the profile is read at load (hprof_order), its experts in the page cache are copied at the first batch
+    // (see prepare): the profile is read at load (hprof_order), its experts in the page cache are copied at the first batch
     // (the warmup run, after the device prefill: the load pins no more than the page-cache fill it replaces, the device prefill reads as
     // before), the others are read by the weight store in the background (read_host_async: behind every demand read) from the first small
     // batch after a prompt on (not during the load), into free slots in heat order. A large batch cancels the reads that did not start
@@ -1339,7 +1339,7 @@ struct llama_moe_cache::impl {
     bool   hprof_pinned    = false;        // the slots of the background reads were allocated (one pass)
     int    hprof_inflight_max = 1024;      // background reads in flight at most (experts), topped up at each small batch
     size_t hprof_load_read = (size_t) 6144 << 20; // LLAMA_MOE_HOST_PROFILE_LOAD_READ_MIB: background reads issued at the first batch (during the load)
-    // k19-ramprof2 (inclusive tier): the share of each layout's slots the profile fill leaves free (LLAMA_MOE_HOST_PROFILE_ROOM, default 0.15
+    // (inclusive tier): the share of each layout's slots the profile fill leaves free (LLAMA_MOE_HOST_PROFILE_ROOM, default 0.15
     // there, 0 on the exclusive tier, whose promotions free slots): the misses of the first requests are read into RAM by the CLOCK once no
     // slot is free, and a slot read once is as likely a victim as a guess (12 GB: the repeated chat re-read the first chat's experts)
     double hprof_room = 0.0;
@@ -1351,16 +1351,16 @@ struct llama_moe_cache::impl {
         uint64_t issued = 0, issued_bytes = 0, done = 0, waited = 0, waited_us = 0, cancelled = 0, rounds = 0, no_slot = 0, failed = 0, dup = 0;
         uint64_t load_copied = 0, load_copied_bytes = 0, load_skipped_uncached = 0, dropped = 0, requests = 0;
     } hps;
-    // per request (k19-ramprof2 diagnostics): the counters at the start of the last request
+    // per request (diagnostics): the counters at the start of the last request
     struct hprof_snap {
         uint64_t hits = 0, misses = 0, read = 0, admitted = 0, evicted = 0, no_slot = 0, spec_taken = 0, spec_used = 0, spec_dropped = 0, done = 0;
     } hprof_last;
 
-    // k19-l4fill: the exclusive RAM tier refills the slots it freed with the experts the last prompts routed most that neither tier holds.
+    // the exclusive RAM tier refills the slots it freed with the experts the last prompts routed most that neither tier holds.
     // On the exclusive tier a device admission from RAM (a promotion) frees its RAM slot, and only a device eviction copied back (a demotion)
     // or a prompt's uploads (free slots only) fill one again: the slots the device takes back empty after a prompt (the lent slots) and
-    // the evictions RAM still held a copy of are filled by promotions with no demotion beside them. Colab L4 full card, Qwen3.8-Flash-Next
-    // UD-IQ4_XS from the VM disk: the 640-token request fills the tier (16692 slots), the chat after it starts with 1.3-1.4k free and
+    // the evictions RAM still held a copy of are filled by promotions with no demotion beside them. L4 full card, Qwen3.8-Flash-Next
+    // (4-bit) from the VM disk: the 640-token request fills the tier (16692 slots), the chat after it starts with 1.3-1.4k free and
     // 13.1-13.5% of the experts held nowhere instead of ~8%, and misses that share of its routing. The routing of each prompt's last large
     // ubatch is counted (llama_context reads its recorded ids at the end of the prompt, fill_counts; older prompts halved); when the server
     // goes idle (llama_moe_host_fill_idle), the experts with a count that are neither on the device nor in RAM are read by the weight store
@@ -1392,7 +1392,7 @@ struct llama_moe_cache::impl {
     struct fill_stats {
         uint64_t issued = 0, issued_bytes = 0, done = 0, dup = 0, cancelled = 0, waited = 0, waited_us = 0, rounds = 0, failed = 0, prompts = 0, idle_rounds = 0, dup_marked = 0;
     } fls;
-    // k19-l4fill diagnostics: where the free slots come from (exclusive tier)
+    // diagnostics: where the free slots come from (exclusive tier)
     struct slot_src_stats {
         uint64_t prom_ev = 0;      // promotions by uploads with device evictions beside them (small batches)
         uint64_t prom_noev = 0;    // ... without (the refill of slots that came back, uploads into empty slots)
@@ -1404,7 +1404,7 @@ struct llama_moe_cache::impl {
         uint64_t empty_fills = 0;  // experts uploaded into device slots that held nothing (no eviction)
     } sss;
 
-    // k19-ptres (LLAMA_MOE_CORE=1, opt-in): a never-evicted core of the device cache whose host copies are given back to the OS. With a
+    // (LLAMA_MOE_CORE=1, opt-in): a never-evicted core of the device cache whose host copies are given back to the OS. With a
     // routing profile (LLAMA_MOE_CACHE_PROFILE, or kept by the cache itself in the calibration directory), the hottest experts of each
     // group are placed in its first slots at load and no lookup, assign, seed or lend ever evicts them (moe_cache_lru::set_core,
     // ggml_moe_cache_set_core); their pages of the model file are left out of the device registration and dropped from the page cache,
@@ -1440,7 +1440,7 @@ struct llama_moe_cache::impl {
             if (const char * e = getenv("LLAMA_MOE_CACHE_PROFILE_SEED")) {
                 profile_seed = std::min(1.0, std::max(0.0, atof(e)));
             }
-            // k19-ptres: the core needs a profile; without one given, the cache keeps its own (read at load, written at each new request)
+            // the core needs a profile; without one given, the cache keeps its own (read at load, written at each new request)
             if (const char * e = getenv("LLAMA_MOE_CORE"); e != nullptr && atoi(e) != 0 && set != layer_set::nextn && !model.hparams.no_alloc) {
                 core_mode = atoi(e);
                 if (profile_file.empty() && profile_save_file.empty()) {
@@ -1464,7 +1464,7 @@ struct llama_moe_cache::impl {
             if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE"); e != nullptr && *e && strcmp(e, "0") != 0 && !model.hparams.no_alloc) {
                 host_profile_file = e + sfx;
             }
-            // k19-autoprof: the self-learned routing profile (main cache only; an explicit LLAMA_MOE_HOST_PROFILE wins)
+            // the self-learned routing profile (main cache only; an explicit LLAMA_MOE_HOST_PROFILE wins)
             if (set != layer_set::nextn && !model.hparams.no_alloc && host_profile_file.empty()) {
                 ap_mode = llama_autoprof::mode();
                 if (ap_mode != 0) {
@@ -1490,12 +1490,12 @@ struct llama_moe_cache::impl {
             single_req = false; // the default single-graph host misses: one GPU only (multi-GPU is untested)
         }
         // and at least LLAMA_MOE_SINGLE_MIN_CPUS (12) usable CPUs: the host thread waits beside a team of the decode threads - 1, which
-        // on a small VM computes slower than the split's full team (Colab T4, 8 vCPUs, 4 decode threads: -2..-5% decode against the
-        // split, the same host experts; Colab L4, 12 vCPUs: +3..+5%)
-        // k19-hostovl (LLAMA_MOE_SINGLE_SMALL_HOST, default 1; 0 = the 12-CPU gate everywhere): a host of 8-11 usable CPUs keeps the
+        // on a small VM computes slower than the split's full team (T4, 8 vCPUs, 4 decode threads: -2..-5% decode against the
+        // split, the same host experts; L4, 12 vCPUs: +3..+5%)
+        // (LLAMA_MOE_SINGLE_SMALL_HOST, default 1; 0 = the 12-CPU gate everywhere): a host of 8-11 usable CPUs keeps the
         // default single-graph host misses where their batches run on the CPU backend's host team (the hybrid host path, see
         // single_register: decode threads + two thirds while the device wait blocks), not on the old team of the decode threads - 1 that
-        // lost the -2..-5% above. Colab T4 (8 vCPUs, 4 decode threads, team of 6) q4x 8 GB + MTP n2: chat 60.0 -> 65.6 tok/s, 8k 55.2 ->
+        // lost the -2..-5% above. T4 (8 vCPUs, 4 decode threads, team of 6) the 4-bit Qwen3.6 8 GB + MTP n2: chat 60.0 -> 65.6 tok/s, 8k 55.2 ->
         // 59.6 (the split cuts the CUDA graph and syncs at every MoE layer: the device idled 31-38% of each verify while the host
         // computed). An explicit LLAMA_MOE_SINGLE_MIN_CPUS keeps its meaning
         if (single_auto && single_req) {
@@ -1556,10 +1556,10 @@ struct llama_moe_cache::impl {
             }
             // LLAMA_MOE_CACHE_HYBRID=0 turns it off even with LLAMA_MOE_CACHE_FETCH set
             hybrid = device_lookup && mode != 0 && model.hparams.n_expert >= 4;
-            // k19-exactmtp: with LLAMA_MTP_EXACT=1 the host never computes an expert by default (no CPU-miss rule, no hybrid gate), as
+            // with LLAMA_MTP_EXACT=1 the host never computes an expert by default (no CPU-miss rule, no hybrid gate), as
             // LLAMA_MOE_CPU_MISS=0 LLAMA_MOE_CACHE_HYBRID=0 would. A missing expert computed on the host runs CPU kernels where the device
             // runs MMVQ, and which experts miss follows the residency (drafts touch the experts of rejected tokens) and the timed rule, so
-            // the drafted text left the no-draft text (L4 full card, q4x + MTP chat: 82 experts on the host in the drafted launch, none in
+            // the drafted text left the no-draft text (L4 full card, the 4-bit Qwen3.6 + MTP chat: 82 experts on the host in the drafted launch, none in
             // the no-draft one, other text after token 64). LLAMA_MOE_CACHE_HYBRID / _FETCH / LLAMA_MOE_CPU_MISS set by hand keep their
             // meaning; LLAMA_MOE_EXACT_HOST=1 keeps the default rules under LLAMA_MTP_EXACT=1 (the old behaviour)
             const char * env_cm0 = getenv("LLAMA_MOE_CPU_MISS");
@@ -1574,7 +1574,7 @@ struct llama_moe_cache::impl {
             // the missing experts per batch size where a calibration at the first small batch says it is faster (see cm_calibrate, cm_rule)
             {
                 const char * env_cm = getenv("LLAMA_MOE_CPU_MISS");
-                // k19-uma: unset = off where every cache device is an integrated GPU (unified memory, e.g. Strix Halo gfx1151): a fetch there
+                // unset = off where every cache device is an integrated GPU (unified memory, e.g. Strix Halo gfx1151): a fetch there
                 // is a copy within the same DRAM, not over PCIe, so the rule's calibration prices the host path against a transfer that does
                 // not exist (gfx1151 Qwen3.6-35B-A3B at an 8 GiB budget and LFM2.5-24B-A2B at 4 GiB: LLAMA_MOE_CPU_MISS=0 decodes 3-8% faster,
                 // Linux and Windows). Discrete GPUs (GGML_BACKEND_DEVICE_TYPE_GPU) are unchanged; LLAMA_MOE_CPU_MISS=1 turns it on there too
@@ -1612,8 +1612,8 @@ struct llama_moe_cache::impl {
                     cm_recal_after = std::max(0, atoi(env_r));
                 }
             }
-            // k10: k9's default gate (below) keeps its own domain, a cache of at most hybrid_max_frac of the host experts (decided once the
-            // slots are sized): G4, Qwen3.8-Flash-Next UD-IQ1_S at 8 GB (2.2% cached), the rule kept batch size 1 off in some launches and
+            // the earlier default gate (below) keeps its own domain, a cache of at most hybrid_max_frac of the host experts (decided once the
+            // slots are sized): RTX PRO 6000, Qwen3.8-Flash-Next at 1 bit at 8 GB (2.2% cached), the rule kept batch size 1 off in some launches and
             // fetched every miss, decode 65.7 -> 49.6 tok/s against the gate's fixed share
             cm_gate = cm && !cm_force && mode < 0 && (getenv("LLAMA_MOE_CPU_MISS_GATE") == nullptr || atoi(getenv("LLAMA_MOE_CPU_MISS_GATE")) != 0);
             if (cm) {
@@ -1647,9 +1647,9 @@ struct llama_moe_cache::impl {
             }
             env = getenv("LLAMA_MOE_CACHE_LEND_MULTI");
             lend_multi = env != nullptr && atoi(env) != 0;
-            // opt-in: G4 k15gm_g4, Qwen3.8-Flash-Next UD-IQ4_XS + MTP at 32 GB: cache 18719 -> 19988 MiB with the same device memory, pinned
+            // opt-in: RTX PRO 6000, Qwen3.8-Flash-Next at 4 bits + MTP at 32 GB: cache 18719 -> 19988 MiB with the same device memory, pinned
             // decode +5.1 / +1.9 / +3.1% (chat / 2k / 8k, same text), but prompts pay the refill of the lent slots: 2k 2441 -> 2313 tok/s
-            // (TTFT 935 -> 986 ms), 8k -2..-3.5%; Qwen3.6 UD-Q4_K_XL 12 / 16 GB, Flash-Next 16 GB and LFM2.5 16 GB unchanged
+            // (TTFT 935 -> 986 ms), 8k -2..-3.5%; Qwen3.6 at 4 bits 12 / 16 GB, Flash-Next 16 GB and LFM2.5 16 GB unchanged
             env = getenv("LLAMA_MOE_CACHE_LEND_SAVE");
             lend_save = env != nullptr && atoi(env) != 0;
             env = getenv("LLAMA_MOE_CACHE_LEND_SAVE_REFILL");
@@ -1863,7 +1863,7 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // k19-t4small (decode extension, LLAMA_MOE_DECODE_EXT=1: on where it can be; unset or 0 off, opt-in until it is measured beyond
+        // (decode extension, LLAMA_MOE_DECODE_EXT=1: on where it can be; unset or 0 off, opt-in until it is measured beyond
         // the T4 12 / 8 GB caps and its long48 max outliers are decided): the banks of the cache of the main
         // model (not an MTP context's) on a single device with CUDA VMM get room for LLAMA_MOE_DECODE_EXT_MAX_FRAC (0.6) more slots per
         // group, unbacked at load; the context grows the cache into the device memory the decode leaves free (llama_context::ext_unpark).
@@ -1934,14 +1934,14 @@ struct llama_moe_cache::impl {
             host_total    = host;
         }
         tail_skip_init(model, set);
-        // k13-small: the default single-graph host misses need a cache that holds a real share of the experts. With almost every expert
-        // on the host (G4 at 4 GB, Qwen3.6 Q3_K_M + MTP, 0.7% cached) the split decodes faster: 155 / 131 tok/s chat / 2k against 129 /
+        // the default single-graph host misses need a cache that holds a real share of the experts. With almost every expert
+        // on the host (RTX PRO 6000 at 4 GB, Qwen3.6 Q3_K_M + MTP, 0.7% cached) the split decodes faster: 155 / 131 tok/s chat / 2k against 129 /
         // 120 with single-graph, same text (LLAMA_MOE_SINGLE=0 vs default at -fitt 256). The 8 GB tiers it was built for cache 17-38%.
         // LLAMA_MOE_SINGLE_MIN_FRAC (0.015) is that share; an explicit LLAMA_MOE_SINGLE keeps its meaning. 5% (the first value) lost
-        // where more is cached: G4, single-graph on vs off, same text: Qwen3.6 Q3_K_M no draft 4 GB (4.7% cached) 137.1 / 133.0 / 132.6 vs
-        // 118.7 / 115.1 / 114.7 tok/s, LFM2.5 4 GB (4.0%) 118.0 / 119.8 / 119.0 vs 103.1 / 104.3 / 102.9, Flash-Next UD-IQ1_S 8 GB (2.2%,
-        // k14 re-bench) 78.1 / 78.2 / 76.8 vs 65.5 / 65.7 / 65.0, gpt-oss 4 GB (4.4%) equal; at 0.7% (Q3_K_M + MTP 4 GB) the split still
-        // wins, 154.6 / 136.7 / 149.4 vs 138.9 / 112.7 / 131.0 (chat / 2k / 8k, G4 run k13r7a)
+        // where more is cached: RTX PRO 6000, single-graph on vs off, same text: Qwen3.6 Q3_K_M no draft 4 GB (4.7% cached) 137.1 / 133.0 / 132.6 vs
+        // 118.7 / 115.1 / 114.7 tok/s, LFM2.5 4 GB (4.0%) 118.0 / 119.8 / 119.0 vs 103.1 / 104.3 / 102.9, Flash-Next at 1 bit 8 GB (2.2%,
+        // re-bench) 78.1 / 78.2 / 76.8 vs 65.5 / 65.7 / 65.0, gpt-oss 4 GB (4.4%) equal; at 0.7% (Q3_K_M + MTP 4 GB) the split still
+        // wins, 154.6 / 136.7 / 149.4 vs 138.9 / 112.7 / 131.0 (chat / 2k / 8k, RTX PRO 6000 run)
         if (single_auto && single_req) {
             const char * e = getenv("LLAMA_MOE_SINGLE_MIN_FRAC");
             const double min_frac = e != nullptr ? std::max(0.0, atof(e)) : 0.015;
@@ -1954,7 +1954,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (hybrid && cm && cm_gate && cache_frac <= hybrid_max_frac) {
-            // the cache holds a small share of the experts: k9's default hybrid gate, deterministic share from the decode threads
+            // the cache holds a small share of the experts: the earlier default hybrid gate, deterministic share from the decode threads
             cm           = false;
             hybrid_probe = false;
             hybrid_auto  = false;
@@ -1979,9 +1979,9 @@ struct llama_moe_cache::impl {
 
         auto init_ctx = [](size_t n_tensors) {
             ggml_init_params params = {
-                /*.mem_size   =*/ n_tensors*ggml_tensor_overhead(),
+                /*.mem_size =*/ n_tensors*ggml_tensor_overhead(),
                 /*.mem_buffer =*/ nullptr,
-                /*.no_alloc   =*/ true,
+                /*.no_alloc =*/ true,
             };
             ggml_context_ptr res(ggml_init(params));
             if (!res) {
@@ -2010,7 +2010,7 @@ struct llama_moe_cache::impl {
             ggml_context * ctx = devices[g.id].ctx.get();
             ggml_context * ctx_bank = devices[g.id].ctx_bank.get();
             for (const ggml_tensor * t : g.ref) {
-                // (k19-t4small: room for n_slots_cap slots, = n_slots without the decode extension)
+                // (room for n_slots_cap slots, = n_slots without the decode extension)
                 ggml_tensor * bank = ggml_new_tensor_3d(ctx_bank, t->type, t->ne[0], t->ne[1], g.n_slots_cap + 1);
                 GGML_ASSERT(bank->nb[2] == t->nb[2]);
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
@@ -2091,10 +2091,10 @@ struct llama_moe_cache::impl {
                 t->buffer = buf_host.get();
             }
         } else {
-            // k17-small (lazy KV step 2): with LLAMA_KV_LAZY=1 the banks can give memory back to the KV cache as it grows (shrink);
+            // (lazy KV step 2): with LLAMA_KV_LAZY=1 the banks can give memory back to the KV cache as it grows (shrink);
             // LLAMA_MOE_CACHE_SHRINK=0 keeps them plain buffers (step 1: the KV cache only backs its cells lazily)
             {
-                // (k19-vramlend: the banks are lazy where a KV cache allocated now would be, llama_kv_lazy_alloc_on: LLAMA_KV_LAZY=1, or
+                // (the banks are lazy where a KV cache allocated now would be, llama_kv_lazy_alloc_on: LLAMA_KV_LAZY=1, or
                 // unset with the fit's grant; a drafter kept by --fit: plain banks, as without LLAMA_KV_LAZY)
                 const char * e_sh = getenv("LLAMA_MOE_CACHE_SHRINK");
                 shrink_on = llama_kv_lazy_alloc_on() && (e_sh == nullptr || atoi(e_sh) != 0);
@@ -2118,7 +2118,7 @@ struct llama_moe_cache::impl {
                     d.buf_size += ggml_backend_buffer_get_size(d.buf.get());
                 }
             }
-            // k19-t4small: the banks have room for n_slots_cap slots, the cache starts with the fitted ones (as after a shrink to them)
+            // the banks have room for n_slots_cap slots, the cache starts with the fitted ones (as after a shrink to them)
             for (group & g : groups) {
                 if (g.n_slots > 0 && g.n_slots_cap > g.n_slots) {
                     set_slot_count(g, g.n_slots);
@@ -2158,10 +2158,10 @@ struct llama_moe_cache::impl {
         if (!model.hparams.no_alloc) {
             const char * env  = getenv("LLAMA_MOE_CACHE_PREFILL");
             const int    seed = seed_mode();
-            // k19-ptres: the core (LLAMA_MOE_CORE=1) takes the first slots before the rest of the profile fills the others
-            // k19-core2: the profile LLAMA_MOE_CORE keeps by itself warm-starts the cache only where a core was placed
+            // the core (LLAMA_MOE_CORE=1) takes the first slots before the rest of the profile fills the others
+            // the profile LLAMA_MOE_CORE keeps by itself warm-starts the cache only where a core was placed
             // (LLAMA_MOE_CORE_WARM: unset = so, 1 = also without a core, 0 = never); without a core the warm start alone changed the text
-            // and cost decode on Colab L4 fn4nd full card (8k decode 15.5 -> 13.9 tok/s) and A100 16 GB (8k 50.1 -> 47.5 tok/s), so
+            // and cost decode on L4 Flash-Next at 4 bits full card (8k decode 15.5 -> 13.9 tok/s) and A100 16 GB (8k 50.1 -> 47.5 tok/s), so
             // those tiers keep the cold start of LLAMA_MOE_CORE unset. An explicit LLAMA_MOE_CACHE_PROFILE always warm-starts.
             if (!profile_file.empty() && profile_read() && (core_place(model) || true) && core_warm_ok() && prefill_profile()) {
                 profile_loaded = true;
@@ -2346,7 +2346,7 @@ struct llama_moe_cache::impl {
             const int32_t n_expert = g.lru.n_expert;
             const size_t  n_layer  = g.layers.size();
             // a late prefill (see seed_unavailable) leaves the lent slots to the staging copies
-            const int32_t n_slots  = g.n_slots - g.lru.n_lent - g.lru.n_core; // (k19-ptres: not into the core)
+            const int32_t n_slots  = g.n_slots - g.lru.n_lent - g.lru.n_core; // (not into the core)
             for (size_t i = 0; i < n_layer; ++i) {
                 const int32_t il = g.layers[i];
                 const int32_t n  = std::min<int32_t>(n_expert, n_slots/n_layer + (i < n_slots % n_layer ? 1 : 0));
@@ -2373,9 +2373,9 @@ struct llama_moe_cache::impl {
                     }
                 }
                 n_fill += fills.size();
-                // k19-l4held: on an exclusive tier the RAM copies of the experts the device now holds (the page-cache fill at load runs
+                // on an exclusive tier the RAM copies of the experts the device now holds (the page-cache fill at load runs
                 // first) are duplicates, the first slots a reservation takes (the layer quota counts them; LLAMA_MOE_HOST_LAYER_QUOTA=0 off)
-                // k19-l4fill: also with the refill of freed slots (LLAMA_MOE_HOST_FILL, default on): where the bench's warm read left more
+                // also with the refill of freed slots (LLAMA_MOE_HOST_FILL, default on): where the bench's warm read left more
                 // of the model in the page cache, 761-1254 such copies stayed in the tier to the chat after the 640-token request
                 if (host && host->exclusive() && (host_quota_mode != 0 || fill_mode != 0) && host_layer(il)) {
                     for (const auto & f : fills) {
@@ -2405,7 +2405,7 @@ struct llama_moe_cache::impl {
         return true;
     }
 
-    // k19-ptres: the bytes the core should hold (0: no core), see core_mode
+    // the bytes the core should hold (0: no core), see core_mode
     size_t core_target(const llama_model & model) const {
         if (const char * e = getenv("LLAMA_MOE_CORE_MIB")) {
             return (size_t) std::max<int64_t>(0, atoll(e)) << 20;
@@ -2426,7 +2426,7 @@ struct llama_moe_cache::impl {
         return avail > 0 && need > avail ? (size_t) (need - avail) : 0;
     }
 
-    // k19-core2: whether the auto profile of LLAMA_MOE_CORE warm-starts the cache (see the load)
+    // whether the auto profile of LLAMA_MOE_CORE warm-starts the cache (see the load)
     bool core_warm_ok() const {
         if (!core_profile_auto) {
             return true;
@@ -2440,14 +2440,14 @@ struct llama_moe_cache::impl {
         return ok;
     }
 
-    // k19-core2: the smallest share of the host experts the device cache must hold for a core (LLAMA_MOE_CORE_MIN_FRAC, default 0.25):
+    // the smallest share of the host experts the device cache must hold for a core (LLAMA_MOE_CORE_MIN_FRAC, default 0.25):
     // smaller caches release their banks for prompts, which a core refuses
     static double core_min_frac() {
         static const double f = getenv("LLAMA_MOE_CORE_MIN_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_CORE_MIN_FRAC"))) : 0.25;
         return f;
     }
 
-    // k19-ptres: places the core of each group (the first profile entries of its layers) in its first slots; false if no core
+    // places the core of each group (the first profile entries of its layers) in its first slots; false if no core
     bool core_place(const llama_model & model) {
         if (core_mode == 0 || profile.empty()) {
             return false;
@@ -2569,7 +2569,7 @@ struct llama_moe_cache::impl {
         return core_on;
     }
 
-    // k19-ptres: the core holes inside [base, base + size)
+    // the core holes inside [base, base + size)
     bool core_holes_in(uintptr_t base, size_t size) const {
         auto it = std::lower_bound(core_holes.begin(), core_holes.end(), std::make_pair(base, (uintptr_t) 0));
         if (it != core_holes.begin() && std::prev(it)->second > base) {
@@ -2578,7 +2578,7 @@ struct llama_moe_cache::impl {
         return it != core_holes.end() && it->first < base + size;
     }
 
-    // k19-ptres: registers [base, base + size) except the core holes, one mapping per run between them; the device reads registered
+    // registers [base, base + size) except the core holes, one mapping per run between them; the device reads registered
     // memory at its host address, so the runs together stand for the buffer (nullptr if a run fails or the device maps it elsewhere)
     void * core_map_buffer(ggml_backend_dev_t dev, void * (*host_map)(ggml_backend_dev_t, void *, size_t, bool *), void (*host_unmap)(void *),
             void * base, size_t size) {
@@ -2622,7 +2622,7 @@ struct llama_moe_cache::impl {
         return base;
     }
 
-    // k19-ptres: drops the pages of the core holes from this process and the page cache (they are only read again if something reads
+    // drops the pages of the core holes from this process and the page cache (they are only read again if something reads
     // the core experts on the host); core_dropped = the bytes found not resident afterwards
     void core_drop() {
 #if defined(__linux__)
@@ -2791,7 +2791,7 @@ struct llama_moe_cache::impl {
                 }
             }
             const bool decay = !sc.empty() && w > 0;
-            // k19-ptres (LLAMA_MOE_CORE): without decayed counts the use counters of the assign rank the experts (resident or not, one list):
+            // (LLAMA_MOE_CORE): without decayed counts the use counters of the assign rank the experts (resident or not, one list):
             // the core takes the first entries of each group
             if (core_mode != 0 && !decay && g.counts != nullptr && g.counts->data != nullptr) {
                 std::vector<int32_t> cnt((size_t) g.counts->ne[0]*g.counts->ne[1]);
@@ -2829,7 +2829,7 @@ struct llama_moe_cache::impl {
         };
         std::sort(out_res.begin(), out_res.end(), by_heat);
         std::sort(out_rest.begin(), out_rest.end(), by_heat);
-        // k19-ptres: a request boundary early in a launch (few experts used yet) keeps the profile of the earlier launch
+        // a request boundary early in a launch (few experts used yet) keeps the profile of the earlier launch
         if (quiet && out_res.size() + out_rest.size() < (size_t) std::max<int64_t>(1, (int64_t) profile.size()/2)) {
             return;
         }
@@ -2842,7 +2842,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k19-ptres: at each new request (llama_context, before its first batch): the core still in its slots on the device (a slot that lost
+    // at each new request (llama_context, before its first batch): the core still in its slots on the device (a slot that lost
     // its expert would make the device read a host copy that is no longer registered), and the profile written for the next load
     uint64_t core_checks = 0;
     uint64_t core_bad    = 0;
@@ -2879,7 +2879,7 @@ struct llama_moe_cache::impl {
         profile_save(true);
     }
 
-    // single-graph host misses (k11, LLAMA_MOE_SINGLE=1, opt-in): batches of up to GGML_MOE_MAILBOX_MAX_TOKENS tokens publish the host ids
+    // single-graph host misses (LLAMA_MOE_SINGLE=1, opt-in): batches of up to GGML_MOE_MAILBOX_MAX_TOKENS tokens publish the host ids
     // and activations of each layer to a mailbox in mapped host memory (ggml_moe_mailbox_publish) instead of a graph split; a host
     // thread (single_service) computes those experts with the ops of the split path (mul_mat_id up / gate, swiglu, mul_mat_id down), on
     // a CPU backend of single_threads threads, so the results are the ones of the split; the merge waits for it on the device. A merge
@@ -2901,7 +2901,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * w_down = nullptr;
         ggml_backend_buffer_ptr buf; // the mailbox as a CPU buffer (the inputs and output of the plans)
         uint32_t done = 0;
-        int64_t  h_us = 0; // k19-overlap GGML_MOE_MAILBOX_TIMING: host time of this mailbox's batches
+        int64_t  h_us = 0; // GGML_MOE_MAILBOX_TIMING: host time of this mailbox's batches
         int64_t  h_n  = 0;
         int64_t  h_pick_ns  = 0; // sum of (host CLOCK_REALTIME at the pickup - the publish's globaltimer stamp), signed
         int64_t  h_pick_n   = 0;
@@ -2912,7 +2912,7 @@ struct llama_moe_cache::impl {
         std::array<int32_t, GGML_MOE_MAILBOX_MAX_TOKENS*16> pf_list{}; // GGML_MOE_HOST_PF: the experts read ahead for the next batch
         int pf_n = 0;
     };
-    // LLAMA_MOE_SINGLE unset: on where it was tested (k11 round 16): CUDA (the backend has mapped mailboxes: not HIP / MUSA), one GPU
+    // LLAMA_MOE_SINGLE unset: on where it was tested: CUDA (the backend has mapped mailboxes: not HIP / MUSA), one GPU
     // in the context, not Windows, and only the expert form the host plans compute (separate gate / up, SiLU: see build_moe_ffn);
     // everything else keeps the split. LLAMA_MOE_SINGLE=0 off, =1 forces the request on any device with mailboxes
     const bool single_auto = getenv("LLAMA_MOE_SINGLE") == nullptr;
@@ -2925,7 +2925,7 @@ struct llama_moe_cache::impl {
 #endif
     }();
     // LLAMA_MOE_SINGLE_TIMEOUT_MS (default 1000): only a warning. The merges never give up: they wait for the host thread as long as it
-    // computes, like the split path waits for its host graph, so the result is always the split's (k12 report: a 1000 ms timeout on a
+    // computes, like the split path waits for its host graph, so the result is always the split's (report: a 1000 ms timeout on a
     // host at load 500-1100 wrote NaN rows into the ubatch it gave up on, and into the KV cells later requests read). The host thread
     // logs a batch that took longer than this; a host graph that fails is computed again, and a second failure aborts
     const int single_timeout_ms = [] {
@@ -2933,14 +2933,14 @@ struct llama_moe_cache::impl {
         return e != nullptr ? std::max(0, atoi(e)) : 1000;
     }();
     // the split the rule weighs for these batches: a publish and a merge instead of a graph split (LLAMA_MOE_SINGLE_SPLIT_FRAC), only
-    // once this cache has a mailbox (a form the host thread computes: G4 gpt-oss-20b Q2_K, with biases, kept the split and lost 18-20%
+    // once this cache has a mailbox (a form the host thread computes: RTX PRO 6000 gpt-oss-20b Q2_K, with biases, kept the split and lost 18-20%
     // decode when the rule weighed it as a mailbox)
     const double single_split_frac = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_SPLIT_FRAC");
         return e != nullptr ? std::max(0.0, atof(e)) : 0.2;
     }();
     bool single_off     = false;  // a mailbox failed: back to the split for good
-    bool single_small   = false;  // k19-hostovl: on only because the host team serves it (8-11 usable CPUs, see the constructor)
+    bool single_small   = false;  // on only because the host team serves it (8-11 usable CPUs, see the constructor)
     int  single_warned  = 0;      // slow host batches logged
     bool single_no_alloc = false; // a context that only measures memory: no mailboxes
     int  single_threads = 0;
@@ -2968,10 +2968,10 @@ struct llama_moe_cache::impl {
         std::atomic<bool>    stop{false};
         ggml_backend_ptr     cpu;
         int                  threads = 1;
-        void               (*team_stop)(void) = nullptr; // k19-l4b: joins the CPU backend's host team (the last owner's stop)
-        bool                 team = false;                // k19-l4b: the batches run on that team (LLAMA_MOE_SINGLE_THREADS_WIDE)
-        bool                 blocking = false;            // k19-l4poly: the CUDA device wait blocks while this team runs
-        // k18 (LLAMA_MOE_SINGLE_FUSED, default on; =0 the graph of each batch as before): the CPU backend's one-region form of the batch's
+        void               (*team_stop)(void) = nullptr; // joins the CPU backend's host team (the last owner's stop)
+        bool                 team = false;                // the batches run on that team (LLAMA_MOE_SINGLE_THREADS_WIDE)
+        bool                 blocking = false;            // the CUDA device wait blocks while this team runs
+        // (LLAMA_MOE_SINGLE_FUSED, default on; =0 the graph of each batch as before): the CPU backend's one-region form of the batch's
         // host experts (ggml_cpu_moe_host_ffn: one barrier instead of the graph's seven, no plan; bit-identical to the graph), with
         // its scratch; null when the CPU backend has none (the graph then)
         bool (*fused)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const float *, const int32_t *, float *, int, int, int,
@@ -2991,7 +2991,7 @@ struct llama_moe_cache::impl {
         uint64_t pf_exps   = 0;    // experts read ahead
         uint64_t pf_used   = 0;    // host experts of a batch that its mailbox's read-ahead covered
         uint64_t pf_all    = 0;    // host experts of the batches after a read-ahead of their mailbox
-        // k19-hostadapt: the small-host team's size follows the CPU time of other processes (see single_adapt_threads); read and
+        // the small-host team's size follows the CPU time of other processes (see single_adapt_threads); read and
         // written by the host thread only
         bool     adapt       = false;
         int      adapt_level = 0;     // threads taken off the team
@@ -3037,12 +3037,12 @@ struct llama_moe_cache::impl {
 
     // the rule weighs the cheaper split once this cache has a mailbox, or before the first one when every MoE layer the graphs built
     // has the form the host plans compute and the device can map mailboxes: a decode of one token at a time (no draft) only gets a
-    // mailbox once the rule turns the host path on for it, which it did not while it weighed a full split (G4 LFM2.5 8 GB: 0 host
+    // mailbox once the rule turns the host path on for it, which it did not while it weighed a full split (RTX PRO 6000 LFM2.5 8 GB: 0 host
     // experts, while a fixed share with the mailbox gave +46..+69% decode)
     int  single_form_state = 0; // 0: no MoE layer seen, 1: every one has the form, -1: one does not (or no mailboxes on its device)
     void single_note_form(int32_t il, bool ok) {
         if (!ok) {
-            cm_gen += single_form_state != -1 && cm_dec_on > 0 ? 1 : 0; // k19-flint: the decode host path is off from now on
+            cm_gen += single_form_state != -1 && cm_dec_on > 0 ? 1 : 0; // the decode host path is off from now on
             single_form_state = -1;
         } else if (single_form_state == 0) {
             ggml_backend_dev_t dev = il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0 ? ggml_backend_get_device(backend(il)) : nullptr;
@@ -3056,7 +3056,7 @@ struct llama_moe_cache::impl {
             }
         }
     }
-    // LLAMA_MOE_SINGLE_KICK_GATE=0: kick the host thread for every small graph (k11 round 16-19 behaviour)
+    // LLAMA_MOE_SINGLE_KICK_GATE=0: kick the host thread for every small graph (earlier behaviour)
     const bool single_kick_gate = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_KICK_GATE");
         return e == nullptr || atoi(e) != 0;
@@ -3064,25 +3064,25 @@ struct llama_moe_cache::impl {
     bool single_weigh() const {
         return single_reg || (single_weigh_early && single_form_state == 1 && single_req && !single_off && !single_no_alloc);
     }
-    // LLAMA_MOE_SINGLE_WEIGH_EARLY=0: weigh the cheaper split only once a mailbox exists (k11 round 16 behaviour)
+    // LLAMA_MOE_SINGLE_WEIGH_EARLY=0: weigh the cheaper split only once a mailbox exists (earlier behaviour)
     const bool single_weigh_early = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_WEIGH_EARLY");
         return e == nullptr || atoi(e) != 0;
     }();
 
-    // k17-models LLAMA_MOE_SINGLE_MAX_TOKENS (1..GGML_MOE_MAILBOX_MAX_TOKENS, default 4 = k15; 8 = opt-in): the largest batch that
+    // LLAMA_MOE_SINGLE_MAX_TOKENS (1..GGML_MOE_MAILBOX_MAX_TOKENS, default 4 = ; 8 = opt-in): the largest batch that
     // publishes to the mailbox. Above it a batch takes the graph split per MoE layer (device sync, host threads, the CUDA graph cut). The
     // host plans are the split's ops on the same rows, so 5-8 row batches on the mailbox are exact (cloud gate:
-    // md5 equal, 4.7x the host batches). Opt-in because it does not pay: Colab L4 (6 host threads) LFM2.5 8 GB with the same drafts in
-    // both arms, 2k 84.9 vs 90.2 tok/s, 8k (LONG_CM=3) 74.5 vs 78.1; G4 Flint long48 within 1%
-    // k19-miss48: on a many-core host (LLAMA_MOE_SINGLE_WIDE_MIN_CPUS, default 32 logical CPUs; LLAMA_MOE_SINGLE_WIDE=0 off) the default
+    // md5 equal, 4.7x the host batches). Opt-in because it does not pay: L4 (6 host threads) LFM2.5 8 GB with the same drafts in
+    // both arms, 2k 84.9 vs 90.2 tok/s, 8k (LONG_CM=3) 74.5 vs 78.1; RTX PRO 6000 Flint long48 within 1%
+    // on a many-core host (LLAMA_MOE_SINGLE_WIDE_MIN_CPUS, default 32 logical CPUs; LLAMA_MOE_SINGLE_WIDE=0 off) the default
     // is GGML_MOE_MAILBOX_MAX_TOKENS (8), so a DFlash2 7-row verify publishes its host experts to the mailbox instead of taking the
-    // eager graph split of each MoE layer (device sync, host graph, CUDA graph cut). Colab G4 (48 vCPU, 23 decode threads), Flash-Next
-    // UD-IQ4_XS DFlash2 n6, same text (md5 equal): 32 GB chat 193.8 / 191.3 -> 205.3 / 205.8 tok/s, 8k 127.2 / 126.9 -> 135.1 / 135.9.
+    // eager graph split of each MoE layer (device sync, host graph, CUDA graph cut). RTX PRO 6000 (48 vCPU, 23 decode threads), Flash-Next
+    // (4-bit) DFlash2 n6, same text (md5 equal): 32 GB chat 193.8 / 191.3 -> 205.3 / 205.8 tok/s, 8k 127.2 / 126.9 -> 135.1 / 135.9.
     // Only where the cache holds at least LLAMA_MOE_SINGLE_WIDE_MIN_FRAC of the host experts (see single_max).
-    // The 12-vCPU hosts of the k17 / k19-ampere measurements (Colab L4 / A100: 8 rows did not pay) keep 4. Above the k15-np share (0.50,
+    // The 12-vCPU hosts of the earlier measurements (L4 / A100: 8 rows did not pay) keep 4. Above the share (0.50,
     // LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC) the rule still weighs the full split, so a 48 GB tier (70.8% cached) keeps fetching its
-    // misses: there the host path was level per pass and cost MTP 6% (round 1)
+    // misses: there the host path was level per pass and cost MTP 6%
     static bool single_wide_host() {
         static const bool v = [] {
             return llama_moe_tp::wide_host(llama_moe_n_cpus(), getenv("LLAMA_MOE_SINGLE_WIDE"), getenv("LLAMA_MOE_SINGLE_WIDE_MIN_CPUS"));
@@ -3092,8 +3092,8 @@ struct llama_moe_cache::impl {
     // On a host with LLAMA_MOE_SINGLE_WIDE_MID_CPUS (default 12) to 31 logical CPUs (LLAMA_MOE_SINGLE_WIDE_MID=0 off) the mailbox takes
     // 5..8-row windows too; only the mailbox width changes (the wide-cache band of dec_band keeps the many-core rule). Since the host
     // batches reuse one activation quantization per window and the copy overlap runs beside the hits, a 7-row DFlash2 verify on the
-    // eager split of every MoE layer costs more than the same rows on the mailbox on these hosts as well: Colab A100 40 GB (12 vCPU,
-    // 10 host threads), Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6 at 32 GB (42.1% cached), same text: chat 54.9 -> 64.1 tok/s, 8k 55.4 ->
+    // eager split of every MoE layer costs more than the same rows on the mailbox on these hosts as well: an A100 40 GB host (12 vCPU,
+    // 10 host threads), Qwen3.8-Flash-Next at 4 bits DFlash2 n6 at 32 GB (42.1% cached), same text: chat 54.9 -> 64.1 tok/s, 8k 55.4 ->
     // 61.5. The cached-share floor of single_max still applies, and the rule stops at the share of the small-batch timing trials (see single_max)
     static bool single_wide_mid_host() {
         static const bool v = [] {
@@ -3119,17 +3119,17 @@ struct llama_moe_cache::impl {
     // host experts (cache_frac is known after the slots are sized; before that the wide default counts)
     int single_max() const {
         // LLAMA_MOE_SINGLE_WIDE_MIN_FRAC (default 0.20): below it the host expert compute of a 5..8-row batch is the critical path and
-        // the eager split (which overlaps a little device work per layer) is level or better: G4 fn4 16 GB (14.8% cached) chat -0.6%, 8k
+        // the eager split (which overlaps a little device work per layer) is level or better: RTX PRO 6000 Flash-Next at 4 bits 16 GB (14.8% cached) chat -0.6%, 8k
         // -4.5% (same text), 12 GB DFlash2 admitted -4% (prof_1105_small 2d, w7 37-41 -> 47.8 ms); 24 GB (27.5%) +6 / +3.5%, 32 GB (42%)
         // +6.7%
-        // k19-g4pass: default 0.12 (LLAMA_MOE_G4PASS=0: 0.20). Since k19-overlap (one activation quantization, no id -1 rows) the mailbox
-        // wins at 16 GB too: Colab G4 Flash-Next UD-IQ4_XS DFlash2 n6, 16 GB (15.5% cached), same text, w7 27.1 -> 24.9 ms, chat 161.9 ->
-        // 179.1 tok/s, 8k 120.9 -> 126.9 (gp_p1, 2 launches). nsys (node trace, ms per w7 pass): eager split 33.5 wall = 25.0 busy + 7.7 idle
+        // default 0.12 (LLAMA_MOE_G4PASS=0: 0.20). Since (one activation quantization, no id -1 rows) the mailbox
+        // wins at 16 GB too: RTX PRO 6000 Flash-Next at 4 bits DFlash2 n6, 16 GB (15.5% cached), same text, w7 27.1 -> 24.9 ms, chat 161.9 ->
+        // 179.1 tok/s, 8k 120.9 -> 126.9 (2 launches). nsys (node trace, ms per w7 pass): eager split 33.5 wall = 25.0 busy + 7.7 idle
         // inside the verify (111 launches, the device waiting on each layer's host split) vs the mailbox 29.8 = 27.3 + 1.6 (29 launches,
         // host-expert wait + merge 3.6). 12 GB (about 9% cached, DFlash2 not admitted by default then) kept the split.
         // LLAMA_MOE_SINGLE_WIDE_LOW=0 keeps 0.12; default 0.05 (the floor of the fixed-cost DFlash2 window band, below
         // which the whole draft is rarely verified). Now that the DFlash2 drafter is kept at 12 GB its 7-row windows run on the mailbox there
-        // too: Colab G4 Flash-Next UD-IQ4_XS DFlash2 n6, 12 GB / 131K (8.3% cached), same text: chat 136.1 -> 142.9 tok/s, 8k 113.4 ->
+        // too: RTX PRO 6000 Flash-Next at 4 bits DFlash2 n6, 12 GB / 131K (8.3% cached), same text: chat 136.1 -> 142.9 tok/s, 8k 113.4 ->
         // 114.8 (3 interleaved launches)
         static const double min_frac = getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC")) :
             !g4pass_on() ? 0.20 : single_wide_low_on() ? 0.05 : 0.12;
@@ -3144,7 +3144,7 @@ struct llama_moe_cache::impl {
         // on a 12..31-CPU host only below the share where the small-batch timing trials start (trial_frac_single, 50%): there the
         // host computes the missing experts of a 5..8-row window on the eager split as well, so the mailbox runs the same rows (same
         // text); from that share the trials may send small batches' misses to the device, and the wider mailbox would compute them on
-        // the host instead (Colab A100 40 GB full card, 55.4% cached: other DFlash2 drafts and another MTP 8k text)
+        // the host instead (an A100 40 GB host full card, 55.4% cached: other DFlash2 drafts and another MTP 8k text)
         const bool mid_off = !single_max_env && !single_wide_host() && single_wide_mid_host() && cache_frac >= llama_moe_cache::trial_frac_single();
         const int n = !single_max_env && single_max_tok > 4 && cache_frac >= 0.0 && (cache_frac < min_frac || mid_off) ? 4 : single_max_tok;
         if (n > 4 && !single_max_env && single_wide_mid_host() && cache_frac >= 0.0) {
@@ -3158,7 +3158,7 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    // k19-l4poly: the CPU backend's host team serves (or, before the first mailbox, would serve) this cache's host batches: a small
+    // the CPU backend's host team serves (or, before the first mailbox, would serve) this cache's host batches: a small
     // host whose expert compute is the critical path (the rule of single_register: decode threads + a third, more than the old team)
     bool single_team_host() const {
         if (single_reg) {
@@ -3175,7 +3175,7 @@ struct llama_moe_cache::impl {
         const int wmax = em != nullptr && atoi(em) > 0 ? atoi(em) : 16;
         return single_team_size(wmax) > std::max(1, single_threads - 1);
     }
-    // k19-hostovl: the single-graph host misses on 8-11 usable CPUs (LLAMA_MOE_SINGLE_SMALL_HOST=0: off, the 12-CPU gate)
+    // the single-graph host misses on 8-11 usable CPUs (LLAMA_MOE_SINGLE_SMALL_HOST=0: off, the 12-CPU gate)
     static bool single_small_host_on() {
         static const bool v = [] {
             const char * e = getenv("LLAMA_MOE_SINGLE_SMALL_HOST");
@@ -3183,23 +3183,23 @@ struct llama_moe_cache::impl {
         }();
         return v;
     }
-    // k19-hostovl: no setting keeps the batches off the host team (the conditions of single_register that do not depend on the cache)
+    // no setting keeps the batches off the host team (the conditions of single_register that do not depend on the cache)
     static bool single_team_envs_ok() {
         const char * e  = getenv("LLAMA_MOE_SINGLE_THREADS");
         const char * ew = getenv("LLAMA_MOE_SINGLE_THREADS_WIDE");
         const char * et = getenv("GGML_MOE_HOST_TEAM");
         return !(e != nullptr && atoi(e) > 0) && !(ew != nullptr && atoi(ew) == 0) && !(et != nullptr && atoi(et) == 0);
     }
-    // the host team's size: the decode threads + a third, at most the CPUs - 4 and wmax; k19-l4poly LLAMA_MOE_SINGLE_THREADS_TEAM=N (test
+    // the host team's size: the decode threads + a third, at most the CPUs - 4 and wmax; LLAMA_MOE_SINGLE_THREADS_TEAM=N (test
     // knob): N threads, at most the CPUs - 1
     int single_team_size(int wmax) const {
         static const int team_env = getenv("LLAMA_MOE_SINGLE_THREADS_TEAM") != nullptr ? atoi(getenv("LLAMA_MOE_SINGLE_THREADS_TEAM")) : 0;
         if (team_env > 0) {
             return std::max(1, std::min(team_env, llama_moe_n_cpus() - 1));
         }
-        // k19-hostovl LLAMA_MOE_SINGLE_SMALL_HOST_FREE (default 2 = the rule below, no cap): on 8-11 usable CPUs (single_small) the
+        // LLAMA_MOE_SINGLE_SMALL_HOST_FREE (default 2 = the rule below, no cap): on 8-11 usable CPUs (single_small) the
         // team leaves that many CPUs to the server, the drafter and other programs (a laptop of 4 cores / 8 threads with a browser).
-        // 3 frees one more CPU on 8 (team 5, 4.7 instead of 5.6 CPUs busy) at a cost: Colab T4 q4x 8 GB + MTP n2, same text, chat
+        // 3 frees one more CPU on 8 (team 5, 4.7 instead of 5.6 CPUs busy) at a cost: T4 with the 4-bit Qwen3.6 8 GB + MTP n2, same text, chat
         // 63.7 vs 65.9 tok/s, 2k 53.5 vs 53.9, 8k 58.6 vs 59.3
         static const int small_free = getenv("LLAMA_MOE_SINGLE_SMALL_HOST_FREE") != nullptr ?
             std::max(1, atoi(getenv("LLAMA_MOE_SINGLE_SMALL_HOST_FREE"))) : 2;
@@ -3209,24 +3209,24 @@ struct llama_moe_cache::impl {
         }
         return std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax, cap });
     }
-    // k19-l4poly (LLAMA_MOE_SINGLE_WAIT_BLOCKING, default 1; 0 = off): the CUDA backend's blocking device wait. With it the thread that waits
+    // (LLAMA_MOE_SINGLE_WAIT_BLOCKING, default 1; 0 = off): the CUDA backend's blocking device wait. With it the thread that waits
     // for the graph sleeps instead of spinning, so the host team takes the decode threads + two thirds (at most the CPUs - 2) instead
-    // of + a third (CPUs - 4). Colab L4 (6 decode threads, 12 vCPUs) LFM2.5 4 GB chat: 10 threads blocking 45.2 tok/s, 10 spinning
-    // 41.9, 11 blocking 43.0, 11 yielding 33.5 (bimodal), 8 spinning (k19-l4b) 42.0 (l4p_g5a)
-    // only where the cache holds at most LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC (0.25) of the host experts: Colab L4 Flint 16 GB
+    // of + a third (CPUs - 4). L4 (6 decode threads, 12 vCPUs) LFM2.5 4 GB chat: 10 threads blocking 45.2 tok/s, 10 spinning
+    // 41.9, 11 blocking 43.0, 11 yielding 33.5 (bimodal), 8 spinning 42.0
+    // only where the cache holds at most LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC (0.25) of the host experts: L4 Flint 16 GB
     // (55.8% cached) with a team of 10 waiting blocked: chat 57.6 [50.0-57.6] vs 58.3, 2k 66.1 vs 73.3; LFM2.5 8 GB (40%) on the base's
-    // own texts chat +4%, 2k -3%, 8k -4% (l4p_f1; l4p_g5a +3.0 / -5.8 / -1.9%, l4p_a7 +8 / +9 / +13% on a slower VM)
-    // k19-l4c: also where the deferred admission takes the cache (fetch_defer_frac: more than a quarter of the host experts cached): it
-    // moves the admitted experts to the host, so the host team is the critical path there too. Colab L4 LFM2.5 8 GB (40% cached), ms per
+    // own texts chat +4%, 2k -3%, 8k -4% (other runs +3.0 / -5.8 / -1.9%, +8 / +9 / +13% on a slower VM)
+    // also where the deferred admission takes the cache (fetch_defer_frac: more than a quarter of the host experts cached): it
+    // moves the admitted experts to the host, so the host team is the critical path there too. L4 LFM2.5 8 GB (40% cached), ms per
     // pass at chat: base 18.7, deferral 18.2, deferral + team of 10 waiting blocked 17.3; at 2k / 8k the same text
-    // costs the same per pass with either team (39.7 vs 39.8 / 37.9 ms at 3.61 tokens per pass, 28.1 vs 27.9 / 27.7 at 2.39) (l4c_a3).
+    // costs the same per pass with either team (39.7 vs 39.8 / 37.9 ms at 3.61 tokens per pass, 28.1 vs 27.9 / 27.7 at 2.39).
     // An explicit LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC keeps its meaning
     bool single_wait_blocking_here() const {
         static const bool user_frac = getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC") != nullptr;
         static const double max_frac = user_frac ? std::max(0.0, atof(getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC"))) : 0.25;
         return single_wait_blocking() != nullptr && cache_frac >= 0.0 && (cache_frac <= max_frac || (!user_frac && fetch_defer_frac()));
     }
-    // k19-l4c: the deferred admission's own gate without the host-team test (LLAMA_MOE_FETCH_DEFER on, more than
+    // the deferred admission's own gate without the host-team test (LLAMA_MOE_FETCH_DEFER on, more than
     // LLAMA_MOE_FETCH_DEFER_MIN_FRAC of the host experts cached); fetch_defer adds the team, the batch size and the mailbox
     static int fetch_defer_mode() {
         static const int mode = [] {
@@ -3235,10 +3235,10 @@ struct llama_moe_cache::impl {
         }();
         return mode;
     }
-    // and at most LLAMA_MOE_FETCH_DEFER_MAX_FRAC (0.5): Colab L4 Flint 16 GB (56% cached) gained only on chat (59.9 vs 59.1 tok/s)
+    // and at most LLAMA_MOE_FETCH_DEFER_MAX_FRAC (0.5): L4 Flint 16 GB (56% cached) gained only on chat (59.9 vs 59.1 tok/s)
     // while its 2k cell lost 19% (59.6 vs 73.4: the cheaper single token steps price the n-gram windows out, 27 vs 90 accepted
-    // drafts per 256, the same text in 3 of 3 launches), and with its host path off (the stack's k19-l4poly levers off) the blocking
-    // wait alone cost 2.4% (52.7 vs 54.0, same text) (l4c_f4)
+    // drafts per 256, the same text in 3 of 3 launches), and with its host path off (the stack's levers off) the blocking
+    // wait alone cost 2.4% (52.7 vs 54.0, same text)
     bool fetch_defer_frac() const {
         static const double min_frac = getenv("LLAMA_MOE_FETCH_DEFER_MIN_FRAC") != nullptr ?
             std::max(0.0, atof(getenv("LLAMA_MOE_FETCH_DEFER_MIN_FRAC"))) : 0.25;
@@ -3262,7 +3262,7 @@ struct llama_moe_cache::impl {
         return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= single_max();
     }
 
-    // k19-hostadapt: CPU ticks of the machine (busy: user, nice, system, irq, softirq, steal) and of this process (utime + stime)
+    // CPU ticks of the machine (busy: user, nice, system, irq, softirq, steal) and of this process (utime + stime)
     static bool single_adapt_ticks(uint64_t & busy, uint64_t & self) {
 #if !defined(__linux__)
         GGML_UNUSED(busy);
@@ -3313,7 +3313,7 @@ struct llama_moe_cache::impl {
 #endif
     }
 
-    // k19-hostadapt: the threads of the next host batch. On a small host (8-11 usable CPUs, the team of single_register, no fixed
+    // the threads of the next host batch. On a small host (8-11 usable CPUs, the team of single_register, no fixed
     // LLAMA_MOE_SINGLE_SMALL_HOST_FREE) the team gives up one thread, or two, while other processes keep the CPUs it leaves busy, and
     // takes them back when they go quiet. At most every LLAMA_MOE_SINGLE_SMALL_HOST_ADAPT_MS (500, at least 500) the host thread reads
     // /proc/stat and /proc/self/stat: f = the CPUs other processes kept busy over the window (machine busy - this process). With s the
@@ -3383,23 +3383,23 @@ struct llama_moe_cache::impl {
             // so a team as large as the decode threads puts two threads on one core
             const char * e = getenv("LLAMA_MOE_SINGLE_THREADS");
             h.threads = e != nullptr && atoi(e) > 0 ? atoi(e) : std::max(1, single_threads - 1);
-            // k19-l4b LLAMA_MOE_SINGLE_THREADS_WIDE (default 1; 0 = off, 2 = on every placement): where the host computes most of the
+            // LLAMA_MOE_SINGLE_THREADS_WIDE (default 1; 0 = off, 2 = on every placement): where the host computes most of the
             // misses (the hybrid gate: a cache of at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts), the host experts are the
             // critical path of a decode step, so the batch runs on the CPU backend's own team (ggml_cpu_moe_host_ffn_team,
             // GGML_MOE_HOST_TEAM=0 off) of the decode threads + max(1, the decode threads / 3) threads, at most the logical CPUs of the
             // process - 4 (the caller of the graph waits on the device, the server and the drafter keep a few) and
             // LLAMA_MOE_SINGLE_THREADS_MAX (16); only where that is more than the decode threads - 1. Elsewhere the OpenMP region and
             // the team size of before.
-            // Colab L4 (6 decode threads, 12 vCPUs, LFM2.5 4 GB, k19l4b_l4): 5 -> 8 threads, chat decode +8.9% (36.3-36.9 vs 33.6-35.4
+            // L4 (6 decode threads, 12 vCPUs, LFM2.5 4 GB): 5 -> 8 threads, chat decode +8.9% (36.3-36.9 vs 33.6-35.4
             // tok/s), 2k within the spread; a team of 11 (every vCPU but the caller's) was bimodal (27.6-38.5) and slower on median.
-            // Colab G4 q4x 12 GB (CPU-miss rule, not hybrid): the team on every placement cost 0.8% (p1103_g4l4b), so it stays off there.
+            // RTX PRO 6000 with the 4-bit Qwen3.6 12 GB (CPU-miss rule, not hybrid): the team on every placement cost 0.8%, so it stays off there.
             // The team and its size do not change a result (each row is computed once with the same kernel) and the hybrid fetch share
             // is set from the decode threads, so the text is the same (md5 equal in every launch).
             h.team_stop = (void (*)(void)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_stop");
             auto team_on = (bool (*)(void)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_on");
-            // k19-hostovl (LLAMA_MOE_SINGLE_SMALL_HOST_SPIN_US, default 500; GGML_MOE_HOST_TEAM_SPIN_US wins): on 8-11 usable CPUs the
+            // (LLAMA_MOE_SINGLE_SMALL_HOST_SPIN_US, default 500; GGML_MOE_HOST_TEAM_SPIN_US wins): on 8-11 usable CPUs the
             // idle team workers sleep after 500 us instead of 2 ms, so between the batches they leave the CPUs to the other programs.
-            // Colab T4 q4x 8 GB + MTP n2, team of 6, same text: chat 65.0 vs 64.4 tok/s, 8k 58.5 vs 58.4, CPUs busy in the decode 5.2
+            // T4 with the 4-bit Qwen3.6 8 GB + MTP n2, team of 6, same text: chat 65.0 vs 64.4 tok/s, 8k 58.5 vs 58.4, CPUs busy in the decode 5.2
             // vs 5.6 (200 us: 4.3, but chat 63.2 and 8k 56.8)
             if (single_small) {
                 const char * es = getenv("LLAMA_MOE_SINGLE_SMALL_HOST_SPIN_US");
@@ -3439,9 +3439,9 @@ struct llama_moe_cache::impl {
                 // mailbox computed in its last batch while the device runs that layer's attention, and each batch computes the same row
                 // slices of every expert on every thread, so they find those rows in their caches. Only the reads and which thread
                 // computes which row change: every output is the same kernel on the same bytes. On by default for batches of 6+ tokens
-                // (a block drafter's verify windows) where they run in an OpenMP region of at least 16 threads (no host team: G4 hosts,
-                // 23 threads); every batch size, the team form (small hosts) and smaller regions with =1; =0 off. Colab G4,
-                // Qwen3.8-Flash-Next UD-IQ4_XS + its DFlash2 drafter, 16 / 32 GB: chat +2..+7%, 8k +3% (same text); with the MTP drafter's
+                // (a block drafter's verify windows) where they run in an OpenMP region of at least 16 threads (no host team: RTX PRO 6000 hosts,
+                // 23 threads); every batch size, the team form (small hosts) and smaller regions with =1; =0 off. RTX PRO 6000,
+                // Qwen3.8-Flash-Next at 4 bits + its DFlash2 drafter, 16 / 32 GB: chat +2..+7%, 8k +3% (same text); with the MTP drafter's
                 // 5-row windows -6..+2% by host (not by default)
                 const char * epf = getenv("GGML_MOE_HOST_PF");
                 const int pf_mode = epf != nullptr ? (atoi(epf) != 0 ? 1 : 0) : -1;
@@ -3458,13 +3458,13 @@ struct llama_moe_cache::impl {
                 }
             }
         }
-        // k19-hostovl: on 8-11 CPUs the mailbox only pays with the host team (the hub's team is set by its first cache)
+        // on 8-11 CPUs the mailbox only pays with the host team (the hub's team is set by its first cache)
         if (single_small && (!h.team || h.fused == nullptr)) {
             LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses off on %u usable CPUs: no host team for the batches, the split "
                 "computes them\n", tag, llama_sysmem::usable_cpus());
             return false;
         }
-        // k19-hostadapt: the adaptive team (LLAMA_MOE_SINGLE_SMALL_HOST_ADAPT=0 off; a fixed LLAMA_MOE_SINGLE_SMALL_HOST_FREE wins), only
+        // the adaptive team (LLAMA_MOE_SINGLE_SMALL_HOST_ADAPT=0 off; a fixed LLAMA_MOE_SINGLE_SMALL_HOST_FREE wins), only
         // where /proc/stat counts the CPUs this process may use (no affinity mask or CPU quota below the online CPUs)
         if (single_small && h.team && !h.adapt && h.adapt_t_us == 0) {
             const char * ea = getenv("LLAMA_MOE_SINGLE_SMALL_HOST_ADAPT");
@@ -3570,7 +3570,7 @@ struct llama_moe_cache::impl {
         return mboxes[il].get();
     }
 
-    // k19-overlap GGML_MOE_MAILBOX_TIMING=1 (diagnostic): per layer, the device work between the publish and the merge, the merge's wait
+    // GGML_MOE_MAILBOX_TIMING=1 (diagnostic): per layer, the device work between the publish and the merge, the merge's wait
     // for the host (device clock, see moe_mailbox_merge) and the host time of the batches (host clock), totals and by bands of layers
     void single_timing_report() {
         const char * e = getenv("GGML_MOE_MAILBOX_TIMING");
@@ -3750,7 +3750,7 @@ struct llama_moe_cache::impl {
             bool ok = false;
             const int n_tokens = hdr->n_tokens;
             single_plan * p = nullptr;
-            // k19-overlap GGML_MOE_MAILBOX_TIMING: the pickup against the publish's device stamp (both clocks in ns since the epoch)
+            // GGML_MOE_MAILBOX_TIMING: the pickup against the publish's device stamp (both clocks in ns since the epoch)
             static const bool tm_on = [] { const char * e = getenv("GGML_MOE_MAILBOX_TIMING"); return e != nullptr && atoi(e) != 0; }();
             const int64_t t_pick = tm_on ? single_steady_ns() : 0;
             int64_t t_end = 0;
@@ -3789,7 +3789,7 @@ struct llama_moe_cache::impl {
                     mb.pf_n = 0;
                 }
                 if (hub.fused != nullptr) {
-                    const int n_thr = single_adapt_threads(hub); // k19-hostadapt
+                    const int n_thr = single_adapt_threads(hub); //
                     const size_t ws = hub.fused_wsize(mb.w_up, mb.w_gate, mb.w_down, mb.n_used, n_tokens, n_thr);
                     if (ws > 0 && hub.fused_buf.size() < ws) {
                         hub.fused_buf.resize(ws);
@@ -3852,7 +3852,7 @@ struct llama_moe_cache::impl {
     // nonzero busy in every mailbox of the process while the host thread computes one batch: merges waiting on another mailbox
     // (an MTP context) do not time out behind it. Called by the host thread with reg_mtx held
     static void single_hub_busy(bool on) {
-        // k18 (GGML_MOE_MAILBOX_FAST, default on): the merges of this process never time out (single_merge passes 0), and only a merge
+        // (GGML_MOE_MAILBOX_FAST, default on): the merges of this process never time out (single_merge passes 0), and only a merge
         // with a timeout reads busy, so the stores (two per mailbox of every cache per host batch, on lines the device polls) are skipped
         static const bool fast = [] {
             const char * e = getenv("GGML_MOE_MAILBOX_FAST");
@@ -3944,7 +3944,7 @@ struct llama_moe_cache::impl {
                 last_work = now;
             } else if (now - std::max(last_work, h.kick_us.load(std::memory_order_relaxed)) > 20000) {
                 // no decode graph started for 20 ms: sleep until the next one (single_kick), at most 1 ms at a time, since a graph
-                // that publishes without a kick (layer-major, a draft context's first graph) would wait for this sleep (G4 nsys: the
+                // that publishes without a kick (layer-major, a draft context's first graph) would wait for this sleep (RTX PRO 6000 nsys: the
                 // first decode forward after an 8k prompt waited 100 ms in the merges with a 100 ms sleep, -8.6% prompt)
                 std::unique_lock<std::mutex> lock(h.mtx);
                 h.cv.wait_for(lock, std::chrono::milliseconds(1), [&h] { return h.run_state.load(std::memory_order_acquire) == 1; });
@@ -3975,7 +3975,7 @@ struct llama_moe_cache::impl {
             return;
         }
         // no publish while the CPU-miss rule has the host path off for this batch size: the host thread sleeps instead of polling
-        // (G4 Flash-Next UD-IQ4_XS 32 GB, trials turned small batches off: 8k decode -3.5% against LLAMA_MOE_SINGLE=0 in 6 of 6 launches)
+        // (RTX PRO 6000 Flash-Next at 4 bits 32 GB, trials turned small batches off: 8k decode -3.5% against LLAMA_MOE_SINGLE=0 in 6 of 6 launches)
         if (cm && single_kick_gate && cm_share_of(n_tokens) >= 1.0f) {
             return;
         }
@@ -4158,7 +4158,7 @@ struct llama_moe_cache::impl {
         llama_sysmem::pinned_file_add(-file_pinned);
     }
 
-    // k19-core2: file-backed (model file) bytes this cache registered, published to llama_sysmem::pinned_file_bytes
+    // file-backed (model file) bytes this cache registered, published to llama_sysmem::pinned_file_bytes
     int64_t file_pinned = 0;
     void file_pin_add(size_t bytes) {
         file_pinned += (int64_t) bytes;
@@ -4176,7 +4176,7 @@ struct llama_moe_cache::impl {
     // pinned already (every mapping of the backend, both contexts, and the slots of the RAM tier), available - margin), or
     // LLAMA_MOE_PIN_MAX_MIB. A group whose layers are all pinned gets the device lookups; with only some layers pinned its misses and the
     // copies of prompts still read those layers at pinned speed. Each range holds whole tensors, so a copy of experts lies in one mapping.
-    // LLAMA_MOE_PIN_RANGES: unset/1 = as the fallback, 2 = instead of the whole buffers (diagnostic), 0 = off (k9: host lookups, pageable)
+    // LLAMA_MOE_PIN_RANGES: unset/1 = as the fallback, 2 = instead of the whole buffers (diagnostic), 0 = off (host lookups, pageable)
     int    pin_mode = 1;
     size_t pin_bytes = 0;      // registered by the ranges of this cache
     size_t pin_layers = 0;     // layers pinned by ranges
@@ -4378,7 +4378,7 @@ struct llama_moe_cache::impl {
             policy_env = strcmp(env_p, "inclusive") == 0 ? LLAMA_MOE_HOST_INCLUSIVE : LLAMA_MOE_HOST_EXCLUSIVE;
         }
         const bool force = env != nullptr && atoi(env) > 0;
-        // k19-disktier: below the device minimum on a disk tier the tier goes on inclusive (see LLAMA_MOE_HOST_MIN_TOKENS);
+        // below the device minimum on a disk tier the tier goes on inclusive (see LLAMA_MOE_HOST_MIN_TOKENS);
         // LLAMA_MOE_HOST_DISK_INCLUSIVE=0: off there, as before
         const char * env_di = getenv("LLAMA_MOE_HOST_DISK_INCLUSIVE");
         const bool disk_incl = env_di == nullptr || atoi(env_di) != 0;
@@ -4386,9 +4386,9 @@ struct llama_moe_cache::impl {
         if (const char * e = getenv("LLAMA_MOE_HOST_DISK_MIN_FRAC")) {
             disk_frac = std::max(0.0, atof(e));
         }
-        // k18-lowram: the tier never plans into a host reserve kept for the rest of the machine (a Studio user's desktop, browser and the
+        // the tier never plans into a host reserve kept for the rest of the machine (a Studio user's desktop, browser and the
         // backend live there): LLAMA_MOE_HOST_RESERVE_MIB (default 6144, 0 = the auto budget as before). Only this path reaches it: the tier
-        // exists where the weight store streams the experts, so every host that pins them loads as before. G4 Flash-Next UD-IQ4_XS 32 GB
+        // exists where the weight store streams the experts, so every host that pins them loads as before. RTX PRO 6000 Flash-Next at 4 bits 32 GB
         // at 48 GiB RAM without it: 39.7 GB of slots and MemAvailable down to 2.5 GiB during the run
         size_t reserve = (size_t) 6144 << 20;
         if (const char * e = getenv("LLAMA_MOE_HOST_RESERVE_MIB")) {
@@ -4398,7 +4398,7 @@ struct llama_moe_cache::impl {
         llama_moe_host_plan plan = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail_plan, token_bytes, host_mib, policy_env, force, disk_incl, disk_frac);
         // where the whole reserve would cost the union of RAM and the device slots (the experts the device does not hold no longer fit),
         // but the budget without it holds them: the budget is that complement + 1 GiB, so resident mode stays and the reserve gets the
-        // rest. G4 Flash-Next 32 GB at 48 GiB: the full 6 GiB reserve left 35.4 GB for 35.4 GB of complement, resident mode was lost and
+        // rest. RTX PRO 6000 Flash-Next 32 GB at 48 GiB: the full 6 GiB reserve left 35.4 GB for 35.4 GB of complement, resident mode was lost and
         // the 8k / 16k cells read 12.0 / 18.3 GB from disk (TTFT 85 / 147 s, decode 25 / 34 tok/s against 63 / 96 s, 55 / 59 tok/s)
         // LLAMA_MOE_HOST_RESERVE_STRICT=1: the whole reserve even where it costs resident mode (the misses then come from the files:
         // with --weight-stream-io buffered from the page cache, which the host can reclaim)
@@ -4417,7 +4417,7 @@ struct llama_moe_cache::impl {
         // below the device minimum on a disk tier (the inclusive rule above), the tier is exclusive where the copies back of the device's
         // evictions go out on a side stream of the device (CUDA, LLAMA_MOE_D2H_STREAM): RAM and the device slots then hold distinct
         // experts, and the copies back run beside the disk reads the pass waits for. The inclusive policy was chosen when the copies back
-        // ran on the compute stream. L4 12 GB, Flash-Next UD-IQ4_XS from the disk, same VM, same text: inclusive 87.4% RAM hits, exclusive
+        // ran on the compute stream. L4 12 GB, Flash-Next at 4 bits from the disk, same VM, same text: inclusive 87.4% RAM hits, exclusive
         // (lean budget below) 91.4%, -32% experts read from the disk. LLAMA_MOE_HOST_DISK_EXCLUSIVE=0 keeps the inclusive tier
         if (plan.on && plan.disk && policy_env < 0 && d2h_on) {
             const char * e_dx = getenv("LLAMA_MOE_HOST_DISK_EXCLUSIVE");
@@ -4437,12 +4437,12 @@ struct llama_moe_cache::impl {
                 plan.why    = "auto, disk tier below the device minimum: exclusive, copies back on a side stream (LLAMA_MOE_HOST_DISK_EXCLUSIVE=0: inclusive)";
             }
         }
-        // k19-l4df2: on a disk tier (the mapped host weights exceed what is available, so the page cache cannot hold the streamed experts
+        // on a disk tier (the mapped host weights exceed what is available, so the page cache cannot hold the streamed experts
         // the tier leaves out) the auto budget's planning room (max(4 GiB, 15%) + min(4 GiB, 1/16) of the available RAM, ~9.7 GB of a
         // 52 GB host) mostly buys page cache that cannot serve those experts: each device miss outside RAM is read from the disk. There
         // the exclusive tier plans into the available RAM minus the host reserve, the other mapped host weights and a fixed room
         // LLAMA_MOE_HOST_LEAN_ROOM_MIB (default 5632), up to the complement of the device slots + 1 GiB, filled on demand as before
-        // (resident mode only where the budget reaches it under its own rule). L4 full card, Flash-Next UD-IQ4_XS from the disk: auto
+        // (resident mode only where the budget reaches it under its own rule). L4 full card, Flash-Next at 4 bits from the disk: auto
         // 35.9 GB = 86% of the experts in RAM + device slots, 12% of device misses from the disk (~85% of a decode pass), 13.9 GB of
         // MemAvailable unused; the whole complement (44.9 GB, resident) froze the 54 GB VM at load, so the room stays.
         // LLAMA_MOE_HOST_LEAN=0 off
@@ -4467,7 +4467,7 @@ struct llama_moe_cache::impl {
                 plan.spare  = lean + v_bytes >= e_bytes;
             }
             // LLAMA_MOE_HOST_LEAN_INCLUSIVE=1: the inclusive tier of the disk-tier rule (where it stays inclusive, see above) plans the same
-            // way, capped at every streamed expert (it holds the device's experts too). L4 12 GB, Flash-Next UD-IQ4_XS from the disk:
+            // way, capped at every streamed expert (it holds the device's experts too). L4 12 GB, Flash-Next at 4 bits from the disk:
             // 35.6 -> 39.5 GiB, 87.4% -> 89.7% RAM hits. Measured on CUDA only, where the exclusive tier is the default; off by default
             const char * e_li = getenv("LLAMA_MOE_HOST_LEAN_INCLUSIVE");
             const size_t lean_incl = std::min(e_bytes + ((size_t) 64 << 20), avail_plan > keep ? avail_plan - keep : 0);
@@ -4541,11 +4541,11 @@ struct llama_moe_cache::impl {
         }
         tier.m = this;
         wstore->set_tier(&tier);
-        // k19-l4held: per-layer quota of the RAM tier (see llama_moe_host_cache::set_layer_quota): LLAMA_MOE_HOST_LAYER_QUOTA=1 =
+        // per-layer quota of the RAM tier (see llama_moe_host_cache::set_layer_quota): LLAMA_MOE_HOST_LAYER_QUOTA=1 =
         // the exclusive tier, 2 = also the inclusive one, 0 = off (also leaves the device prefill's RAM copies unmarked, see prefill)
         {
             const char * eq = getenv("LLAMA_MOE_HOST_LAYER_QUOTA");
-            // default off (k19-l4held job l4h_x1: the quota left ~2.6k RAM slots empty and the chat's misses follow the share of experts held
+            // default off (the quota left ~2.6k RAM slots empty and the chat's misses follow the share of experts held
             // nowhere, not how they spread over the layers: 1122-1190 misses vs 765-792 without it, chat TTFT 12.1 vs 7.0 s)
             const int    mq = eq != nullptr ? atoi(eq) : 0;
             host_quota_mode = mq;
@@ -4556,7 +4556,7 @@ struct llama_moe_cache::impl {
         // resident mode: when the RAM tier and the device slots can hold every streamed
         // expert (RAM slots + device slots), the device slots are prefilled at load (unless
         // LLAMA_MOE_CACHE_PREFILL=0) and the RAM tier is filled from the model files with every expert the device does not hold, so no
-        // prompt or decode step reads the files afterwards. Low-RAM G4 (32 GiB RAM, 24 GB VRAM, Flash-Next IQ2_XS 68 GB, 2k prompt / decode):
+        // prompt or decode step reads the files afterwards. Low-RAM RTX PRO 6000 (32 GiB RAM, 24 GB VRAM, Flash-Next IQ2_XS 68 GB, 2k prompt / decode):
         // 55.7 / 43.1 tok/s filled on demand vs 164.1 / 62.2 resident, +45 s of load.
         // Otherwise unchanged (the page-cache prefill below). LLAMA_MOE_RESIDENT=0 off, 1 forces it (fills what fits);
         // an explicit LLAMA_MOE_HOST_CACHE_PREFILL also leaves it off (0, 1 as before, 2 = the file fill without the device prefill rule)
@@ -4575,7 +4575,7 @@ struct llama_moe_cache::impl {
             const char * e_dp  = getenv("LLAMA_MOE_CACHE_PREFILL");
             const int    m_res = e_res != nullptr ? atoi(e_res) : -1;
             // "every expert" up to the slot rounding: the budget is split among the expert layouts in whole slots of 4 KiB-aligned areas,
-            // which loses ~1% of the slots a byte count gives (low-RAM G4: 18.7 GB of device slots + 15.1 GB of RAM budget for 33.8 GB of
+            // which loses ~1% of the slots a byte count gives (low-RAM RTX PRO 6000: 18.7 GB of device slots + 15.1 GB of RAM budget for 33.8 GB of
             // experts = 99.2% of the experts in slots; the few left are read on demand, 1.5 MiB in a whole run), so at least
             // LLAMA_MOE_RESIDENT_MIN_FRAC (0.98) of them
             double min_frac = 0.98;
@@ -4586,7 +4586,7 @@ struct llama_moe_cache::impl {
                 (m_res >= 1 || (double) n_hold >= min_frac*(double) n_streamed);
             if (resident_mode) {
                 if (!prefilled_dev && (e_dp == nullptr || atoi(e_dp) != 0)) {
-                    if (!rp_prefill()) { // k19-mgpu2: the hottest experts of the earlier launches' decodes (LLAMA_MOE_RESIDENT_PROF=1)
+                    if (!rp_prefill()) { // the hottest experts of the earlier launches' decodes (LLAMA_MOE_RESIDENT_PROF=1)
                         prefill();
                     }
                 }
@@ -4601,7 +4601,7 @@ struct llama_moe_cache::impl {
             }
         }
         ap_init();
-        rp_rec = resident_mode && rp_mode() != 0 && ap_rec && !ap_cnt.empty(); // k19-mgpu2: the decode routing goes into the profile
+        rp_rec = resident_mode && rp_mode() != 0 && ap_rec && !ap_cnt.empty(); // the decode routing goes into the profile
         prefill_resident();
         LLAMA_LOG_INFO("%s: MoE host cache on: %s, budget %.1f MiB (%s) for %.1f MiB of streamed experts (of %.1f MiB mapped), %.1f MiB in device slots, "
                 "the experts of %.1f tokens, MemAvailable %.1f MiB, pinned on first use (%s)%s (LLAMA_MOE_HOST_CACHE=0 off)\n", __func__,
@@ -4610,8 +4610,8 @@ struct llama_moe_cache::impl {
                 host->describe().c_str(), host_verify ? ", VERIFY" : "");
     }
 
-    // k19-ramprof: the routing profile host_profile_file (LLAMA_MOE_HOST_PROFILE) fills the RAM tier in its order, most used first over every
-    // layer (llama_moe_profile_ram_order). k19-ramprof2: read here (load), filled from the first batch on (see hprof_order). Returns the
+    // the routing profile host_profile_file (LLAMA_MOE_HOST_PROFILE) fills the RAM tier in its order, most used first over every
+    // layer (llama_moe_profile_ram_order). read here (load), filled from the first batch on (see hprof_order). Returns the
     // entries (0: no profile, the page-cache fill runs as before)
     size_t prefill_host_profile() {
         std::vector<prof_entry> prof;
@@ -4650,7 +4650,7 @@ struct llama_moe_cache::impl {
         return prof.size();
     }
 
-    // k19-ramprof2: the profile experts in the page cache are copied into free slots in heat order (an exclusive tier skips the experts the
+    // the profile experts in the page cache are copied into free slots in heat order (an exclusive tier skips the experts the
     // device slots hold); the others go to hprof_pending. Residency is checked per expert right before its copy (an answer taken earlier
     // goes stale while the slots being pinned evict file pages: the copies then faulted their experts back from the disk, 30 GB in
     // 107-124 s), and the pages of a copied expert are marked cold (MADV_COLD), so the kernel reclaims them, not the ones still to copy.
@@ -4734,7 +4734,7 @@ struct llama_moe_cache::impl {
 #endif
     }
 
-    // k19-ramprof2 diagnostics: the RAM-tier counters of the request that just ended (LLAMA_MOE_HOST_PROFILE only)
+    // diagnostics: the RAM-tier counters of the request that just ended (LLAMA_MOE_HOST_PROFILE only)
     void hprof_request_log(const char * when) {
         const auto & hs = host->st;
         hprof_snap now;
@@ -4751,7 +4751,7 @@ struct llama_moe_cache::impl {
         hprof_last = now;
     }
 
-    // k19-ramprof2: the batch hook (prepare): see hprof_order
+    // the batch hook (prepare): see hprof_order
     void hprof_prepare(int64_t n_tokens) {
         const bool large = n_tokens > n_small_max;
         if (!hprof_copied) {
@@ -4792,7 +4792,7 @@ struct llama_moe_cache::impl {
         return hprof_room <= 0.0 || host->n_free_of(il) > (int32_t) (hprof_room*host->n_slots_of(il));
     }
 
-    // k19-ramprof2: a background read of the profile is complete: the slot holds its expert (a guess, unless the device took the expert
+    // a background read of the profile is complete: the slot holds its expert (a guess, unless the device took the expert
     // meanwhile on an exclusive tier: then it is a duplicate, the first slot to go)
     void hprof_complete(int32_t s) {
         host->publish(s);
@@ -4956,8 +4956,8 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k19-autoprof (LLAMA_MOE_AUTOPROF, see llama-autoprof.h): a routing profile the cache learns itself. Recorded wherever a RAM tier
-    // exists: the routing of every large ubatch of every prompt (llama_context reads the recorded ids: the prompt end, as k19-l4fill,
+    // (LLAMA_MOE_AUTOPROF, see llama-autoprof.h): a routing profile the cache learns itself. Recorded wherever a RAM tier
+    // exists: the routing of every large ubatch of every prompt (llama_context reads the recorded ids: the prompt end, as the RAM fill does,
     // and the earlier ubatches at the start of the next one), counted per (layer, expert) on top of the previous launches' heats
     // (halved at load), written to <dir>/autoprof_moe_<model hash>.<n_layer>.<n_expert> (the moe-cache-profile format) at the
     // server's idle point when it changed and at exit. Used on the exclusive tier when the file was read at load:
@@ -4988,13 +4988,13 @@ struct llama_moe_cache::impl {
         uint64_t routings = 0, cold_refused = 0, cold_taken = 0, hot_taken = 0, pf_hot = 0, pf_cold = 0, pf_stale = 0;
     } aps;
 
-    // k19-mgpu2 (LLAMA_MOE_RESIDENT_PROF: unset / 0 = off, 2 = record only, 1 = record + use): the device slots of resident mode can
-    // start from the decode routing of earlier launches. Resident mode (the exclusive RAM tier and the device slots hold every streamed expert, e.g. Flash-Next UD-IQ1_S on
-    // Kaggle 2x T4) never seeds the device cache from prompts (k18-lowram) and filled each layer's lowest expert ids at load, so a decode
+    // (LLAMA_MOE_RESIDENT_PROF: unset / 0 = off, 2 = record only, 1 = record + use): the device slots of resident mode can
+    // start from the decode routing of earlier launches. Resident mode (the exclusive RAM tier and the device slots hold every streamed expert, e.g. Flash-Next at 1 bit on
+    // 2x T4) never seeds the device cache from prompts and filled each layer's lowest expert ids at load, so a decode
     // paid its working set one miss at a time: an upload from RAM plus the copy back of the victim, ~26 misses per token over the first
     // ~100 tokens of a chat (22 tok/s, then 33-34 once the CLOCK had converged). With it:
     //  - the host lookups of small batches (decode, verify windows; the host reads their routing anyway) add each routed expert to the
-    //    autoprof heat (k19-autoprof file, previous launches at half weight), written at the server's idle point and at exit;
+    //    autoprof heat (file, previous launches at half weight), written at the server's idle point and at exit;
     //  - at load, with that file, each group's slots take its hottest (layer, expert) pairs over all its layers (an --expert-profile
     //    order), the rest of the slots the lowest ids as before; the RAM tier takes every other expert (unchanged).
     // Placement only: every expert is computed by the same kernels wherever it was copied from; the text changes only through the route
@@ -5012,7 +5012,7 @@ struct llama_moe_cache::impl {
     static int rp_mode() {
         static const int m = [] {
             const char * e = getenv("LLAMA_MOE_RESIDENT_PROF");
-            // off unless asked: the held-out warm start gained nothing measurable (Kaggle 2x T4 fn1, inside the launch spread)
+            // off unless asked: the held-out warm start gained nothing measurable (2x T4 Flash-Next at 1 bit, inside the launch spread)
             const int v = e != nullptr && *e ? atoi(e) : 0;
             return v >= 0 && v <= 2 ? v : 0;
         }();
@@ -5093,10 +5093,10 @@ struct llama_moe_cache::impl {
         rps.lookups++;
     }
 
-    // k19-mgpu2 resident prompt fill (LLAMA_MOE_RESIDENT_FILL=1, opt-in). One GPU (not resident: the exclusive tier holds what
+    // resident prompt fill (LLAMA_MOE_RESIDENT_FILL=1, opt-in). One GPU (not resident: the exclusive tier holds what
     // the device does not, the rest is read from the files) admits the experts a prompt routes, so its decode starts on the request's
-    // working set (fn1 1x T4 chat: 5718 experts admitted, then no miss at all, 50 tok/s). Resident mode (every streamed expert in RAM or
-    // in a device slot, e.g. fn1 on 2x T4) never did: prompts do not seed there (k18-lowram: a seed's copies back found no RAM slot and
+    // working set (Flash-Next at 1 bit 1x T4 chat: 5718 experts admitted, then no miss at all, 50 tok/s). Resident mode (every streamed expert in RAM or
+    // in a device slot, e.g. Flash-Next at 1 bit on 2x T4) never did: prompts do not seed there (a seed's copies back found no RAM slot and
     // dropped experts from both tiers), so a chat decoded its first ~100 tokens at ~27 tok/s paying ~25 misses per token.
     // At the end of a prompt each card swaps the experts its layers routed in the prompt's last large ubatch (most routed first, at most
     // the group's slots per layer) into its own device slots, as a chain on its stream: the victim of a slot is copied back into the
@@ -5104,7 +5104,7 @@ struct llama_moe_cache::impl {
     // needs one free RAM slot however many it swaps and no expert ever leaves both tiers. Victims RAM still holds need no copy.
     // Placement only: every expert is computed by the same kernels wherever it came from; the text changes only through the route tail
     // skip (missing experts it drops follow the residency): with LLAMA_MOE_ROUTE_TAIL_SKIP=0 the text is the kill switch's.
-    // Opt-in (LLAMA_MOE_RESIDENT_FILL=1): Kaggle 2x T4, fn1, 3 launches with the PLE row profile on both sides: decode chat +11% / 8k
+    // Opt-in (LLAMA_MOE_RESIDENT_FILL=1): 2x T4, Flash-Next at 1 bit, 3 launches with the PLE row profile on both sides: decode chat +11% / 8k
     // +12% for +3 s chat / +6 s 8k first-token time (~6k experts moved per prompt); for a 256-token answer the wait costs more than
     // the decode saves. LLAMA_MOE_RESIDENT_FILL_DEFER=1 moves the swaps into decode (8k decode -15..-23%); a cap
     // (LLAMA_MOE_RESIDENT_FILL_MAX=1500) costs ~0.7 s and gains nothing measurable
@@ -5381,12 +5381,12 @@ struct llama_moe_cache::impl {
         return host->exclusive() && ap_on_dev(il, e);
     }
 
-    // k19-autoprof2 (LLAMA_MOE_AUTOPROF_INCL, opt-in =1): the inclusive RAM tier (a capped card whose device slots hold the experts of
-    // fewer than LLAMA_MOE_HOST_MIN_TOKENS tokens on a disk tier, e.g. Colab L4 @12 GB with MTP) also uses the profile: the page-cache
+    // (LLAMA_MOE_AUTOPROF_INCL, opt-in =1): the inclusive RAM tier (a capped card whose device slots hold the experts of
+    // fewer than LLAMA_MOE_HOST_MIN_TOKENS tokens on a disk tier, e.g. L4 @12 GB with MTP) also uses the profile: the page-cache
     // fill hottest first, the target set (hottest experts of each layout, as many as its slots, device-held ones included), cold
     // experts marked as guesses at each request's first large batch (a miss read or a prompt upload takes them before the CLOCK evicts
     // anything), a prompt's uploads take a free slot for a cold expert only while the layout keeps one per target expert held nowhere.
-    // Placement only (which RAM slot holds which expert's file bytes): exact. Opt-in: Colab L4 @12 GB fn4n MTP n2 against a base with
+    // Placement only (which RAM slot holds which expert's file bytes): exact. Opt-in: L4 @12 GB Flash-Next at 4 bits MTP n2 against a base with
     // its PLE profile, 3 interleaved launches: decode after 8k +19%, chat TTFT -3%, but 8k TTFT +11% (8k request level). Unset / 0: the
     // inclusive tier records only, as before
     static bool ap_incl_env() {
@@ -5450,7 +5450,7 @@ struct llama_moe_cache::impl {
         ap_use = have && llama_autoprof::uses(ap_mode) && (host->exclusive() || ap_incl_env()) && !resident_mode && wstore != nullptr;
         if (ap_use) {
             ap_rebuild_target();
-            // the refill of the free slots (k19-l4fill, exclusive tier) starts from the profile: one prompt's worth of counts per layer,
+            // the refill of the free slots (exclusive tier) starts from the profile: one prompt's worth of counts per layer,
             // halved per prompt
             if (fill_mode != 0 && host->exclusive()) {
                 fill_cnt.assign(layers.size(), {});
@@ -5591,7 +5591,7 @@ struct llama_moe_cache::impl {
             return true;
         }
         take_spec = false;
-        // k19-autoprof2 (LLAMA_MOE_AUTOPROF_REFUSE=0, diagnostic): a cold expert takes any free slot (as a guess, see tier_offer), the
+        // (LLAMA_MOE_AUTOPROF_REFUSE=0, diagnostic): a cold expert takes any free slot (as a guess, see tier_offer), the
         // target experts then take guesses like free slots
         static const bool refuse = [] { const char * e = getenv("LLAMA_MOE_AUTOPROF_REFUSE"); return e == nullptr || atoi(e) != 0; }();
         // (a duplicate of a device-held expert is as good as a free slot; counted per large batch)
@@ -5668,7 +5668,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k19-l4fill (see fill_mode): the refill of the slots the exclusive tier freed
+    // (see fill_mode): the refill of the slots the exclusive tier freed
     bool fill_active() const {
         return fill_mode != 0 && host && host->exclusive() && wstore != nullptr && hprof_ticket.empty() && !ahead_on();
     }
@@ -5810,7 +5810,7 @@ struct llama_moe_cache::impl {
         fls.rounds++;
         const int32_t ne = host->n_expert_of();
         // RAM copies of experts the device also holds that are not marked as duplicates (the page-cache fill at load copies whatever the
-        // page cache holds, also experts of the device prefill: Colab L4 VMs whose page cache kept more of the model after the drop started
+        // page cache holds, also experts of the device prefill: L4 VMs whose page cache kept more of the model after the drop started
         // the chat with 761-1254 of them instead of ~236, and missed 908-910 experts instead of ~780) are marked: they go first, like free slots
         for (int32_t il = 0; il < (int32_t) layers.size(); ++il) {
             if (!host_layer(il) || layers[il].experts.empty()) {
@@ -5927,7 +5927,7 @@ struct llama_moe_cache::impl {
 
     // the server is idle (no request runs, none waits): the freed slots are refilled now, the reads run until the next batch
     void fill_idle() {
-        ap_save(false); // k19-autoprof: the profile, when this launch counted something new since the last write
+        ap_save(false); // the profile, when this launch counted something new since the last write
         if (!fill_active()) {
             return;
         }
@@ -5946,14 +5946,14 @@ struct llama_moe_cache::impl {
     // otherwise evict those pages and the first prompt would read them again (LLAMA_MOE_HOST_CACHE_PREFILL=0 off)
     void prefill_resident() {
 #if defined(__linux__) || defined(__APPLE__)
-        // k19-ramprof: a routing profile fills the RAM tier first (the resident mode reads every expert anyway)
+        // a routing profile fills the RAM tier first (the resident mode reads every expert anyway)
         const size_t n_prof = !resident_mode && !host_profile_file.empty() ? prefill_host_profile() : 0;
-        hst.prefilled = 0; // k19-ramprof2: the profile copy at the first batch sets it
+        hst.prefilled = 0; // the profile copy at the first batch sets it
         const char * env_pf = getenv("LLAMA_MOE_HOST_CACHE_PREFILL");
         if (env_pf != nullptr && atoi(env_pf) == 0) {
             return;
         }
-        // k19-ramprof2: the profile's copy at the first batch replaces the page-cache fill (it would take the slots for experts in layer order)
+        // the profile's copy at the first batch replaces the page-cache fill (it would take the slots for experts in layer order)
         if (n_prof > 0) {
             return;
         }
@@ -5961,7 +5961,7 @@ struct llama_moe_cache::impl {
         // (readahead of each layer's expert tensors first), skipping the experts the device slots hold: with the device cache prefilled
         // (LLAMA_MOE_CACHE_PREFILL=1) the first prompt then reads nothing from the files when RAM + VRAM hold every expert (low-RAM boxes)
         const bool from_file = (env_pf != nullptr && atoi(env_pf) >= 2) || resident_mode;
-        // k19-l4ttft (LLAMA_MOE_HOST_PREFILL_GUESS=1, opt-in): what the page cache held at load is not a choice (whatever the load read),
+        // (LLAMA_MOE_HOST_PREFILL_GUESS=1, opt-in): what the page cache held at load is not a choice (whatever the load read),
         // so the experts copied from it are marked as unused guesses (set_spec, as the routing profile's): a prompt whose copies read
         // only the experts it routes (GGML_SCHED_PREFETCH_MIN_BATCH) then keeps its reads in the slots of the ones it did not use when
         // no slot is free. Placement only (what a slot holds is the expert's bytes); exclusive tier only
@@ -5975,7 +5975,7 @@ struct llama_moe_cache::impl {
         size_t n_fill = 0;
         size_t n_bytes = 0;
         bool full = false;
-        // k19-autoprof: with a profile the resident experts are collected over every layer and copied hottest first (below)
+        // with a profile the resident experts are collected over every layer and copied hottest first (below)
         const bool ap_order = ap_use && !from_file;
         std::vector<std::pair<float, int32_t>> ap_cand; // (heat, il*n_expert + e)
         auto copy_one = [&](int32_t il, int32_t e, int32_t s) {
@@ -6054,7 +6054,7 @@ struct llama_moe_cache::impl {
                     }
                     const int32_t s = host->reserve(il, e, false);
                     if (s < 0) {
-                        // k19-l4held: this layer is at its quota, the next layer may still take slots
+                        // this layer is at its quota, the next layer may still take slots
                         if (host->at_quota(il)) {
                             break;
                         }
@@ -6475,7 +6475,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k15-pred: upload ahead (LLAMA_MOE_UPLOAD_AHEAD, 0 = off). A prompt ubatch of n_small_max < n <= ua_max_tokens tokens copies the
+    // upload ahead (LLAMA_MOE_UPLOAD_AHEAD, 0 = off). A prompt ubatch of n_small_max < n <= ua_max_tokens tokens copies the
     // experts each layer routes after reading its ids, so the uploads of layer p wait for its router and the link idles while the
     // device computes. Here the router of layer p+1 is applied (on the device) to the router input of layer p as soon as the ids of p
     // are read; after the last expert tensor of p is copied, the predicted experts of p+1 that the cache lacks are admitted to slots of
@@ -7280,7 +7280,7 @@ struct llama_moe_cache::impl {
                 }
                 cls = 1;
             } else if (ua_victims >= 4 && key / n_expert != il) {
-                cls = 1; // r19 LLAMA_MOE_UPLOAD_AHEAD_VICTIMS=4: every other layer in one class, the policy's order alone (as a real miss)
+                cls = 1; // LLAMA_MOE_UPLOAD_AHEAD_VICTIMS=4: every other layer in one class, the policy's order alone (as a real miss)
             } else if (ua_victims >= 2 && ua_victims <= 3 && key / n_expert < il) {
                 cls = 1;
             } else if (ua_victims == 3 && key / n_expert > j + 1) {
@@ -7385,8 +7385,8 @@ struct llama_moe_cache::impl {
         }
     }
 
-    int    host_quota_mode = 1;   // k19-l4held: LLAMA_MOE_HOST_LAYER_QUOTA
-    size_t n_prefill_dup   = 0;   // k19-l4held: RAM copies of device-prefilled experts marked as duplicates
+    int    host_quota_mode = 1;   // LLAMA_MOE_HOST_LAYER_QUOTA
+    size_t n_prefill_dup   = 0;   // RAM copies of device-prefilled experts marked as duplicates
 
     static bool pad_zero_on() {
         static const bool on = [] { const char * e = getenv("LLAMA_MOE_PROMPT_PAD_ZERO"); return e == nullptr || atoi(e) != 0; }();
@@ -7408,7 +7408,7 @@ struct llama_moe_cache::impl {
             const int32_t e  = (int32_t) (o / nb);
             const size_t  e1 = std::min(end, (size_t) (e + 1)*nb);
             // planning (under the store lock) does not wait for copies back into RAM, the upload does
-            // k19-l4ttft: the experts the prompt layer read put in the scratch (uploads only)
+            // the experts the prompt layer read put in the scratch (uploads only)
             const uint8_t * pp = !lease && e < src->ne[2] ? plr_find(il, ip, e, o - (size_t) e*nb) : nullptr;
             if (pp != nullptr) {
                 // the RAM tier is offered these bytes as the upload of a demand read offered them (same call, same order)
@@ -7418,7 +7418,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             const int32_t sl = e >= src->ne[2] ? -1 : lease ? host->held(il, e) : host->find(il, e, false);
-            // k19-l4ttft (LLAMA_MOE_PROMPT_PAD_ZERO, default 1; 0 = read them): the copy of a run of routed experts ends with the first
+            // (LLAMA_MOE_PROMPT_PAD_ZERO, default 1; 0 = read them): the copy of a run of routed experts ends with the first
             // min(expert, 512) bytes of the next expert, which the prompt does not route, as padding for the CUDA MMQ kernels (they read
             // past the last row of an expert: the bytes only have to be finite). Where neither RAM nor the scratch holds that expert, the
             // upload read them from the file: one 4 KiB read per run end, ~3900 per 42-token chat on the L4 disk tier (~1.1 s of its TTFT).
@@ -7488,10 +7488,10 @@ struct llama_moe_cache::impl {
                 sl = host->find(il, e, false) >= 0 ? -1 : host->slot_of_key(il, e);
             } else if (ip == 0 && a == 0 && (e1 - o == nb || e1 - o > 512) && (!host->exclusive() || !in_device(il, e))) {
                 // not from the bytes of padding uploaded after a run of experts (min(expert, 512)): that expert is not uploaded
-                // k19-l4held rank mode: an expert the prompt routes may take the slot of an unrouted one of its layer at the quota
+                // rank mode: an expert the prompt routes may take the slot of an unrouted one of its layer at the quota
                 const std::vector<bool> * rk = rank_any && (size_t) il < rank_mask.size() && (int32_t) rank_mask[il].size() > e &&
                     rank_mask[il][e] ? &rank_mask[il] : nullptr;
-                // k19-autoprof: an expert outside the target set takes a free slot only while the layout keeps one per target expert
+                // an expert outside the target set takes a free slot only while the layout keeps one per target expert
                 // held nowhere, and never a guess
                 bool take_spec = true;
                 if (ap_offer_ok(il, e, take_spec)) {
@@ -7503,7 +7503,7 @@ struct llama_moe_cache::impl {
             }
             if (sl >= 0 && host->filling(sl) && host->fill_piece(sl, ip, a, p + (o - off), e1 - o)) {
                 hst.admitted++;
-                // k19-autoprof: a cold expert is a guess (the first a reservation takes)
+                // a cold expert is a guess (the first a reservation takes)
                 if (ap_use && !ap_target(il, e)) {
                     host->set_spec(sl);
                 }
@@ -7512,11 +7512,11 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k19-l4ttft: prompt layer reads (LLAMA_MOE_PROMPT_LAYER_READ=1, opt-in: measured no faster on the L4 disk tier, chat TTFT 8.32 vs 6.81 s
+    // prompt layer reads (LLAMA_MOE_PROMPT_LAYER_READ=1, opt-in: measured no faster on the L4 disk tier, chat TTFT 8.32 vs 6.81 s
     // median with it off, and its pinned scratch cost the 8k after it 103 vs 87 s; the per-byte read rate is the loop device's either way). A prompt ubatch whose expert copies read the routing (the copy callback's routed-only path, ubatches below the
     // prefetch size) used to read each expert tensor's misses on its own when its split started: the reads of the gate, up and down
-    // tensors of a layer were three waits with the device work between them, the disk idle in between. Colab L4 full card, Qwen3.8-Flash-Next
-    // UD-IQ4_XS from the VM disk (k19_l4ttft): the 42-token chat read 1.5-1.8 GB in 8.3-8.8 s with the disk busy 64-69% of it. Here
+    // tensors of a layer were three waits with the device work between them, the disk idle in between. L4 full card, Qwen3.8-Flash-Next
+    // (4-bit) from the VM disk: the 42-token chat read 1.5-1.8 GB in 8.3-8.8 s with the disk busy 64-69% of it. Here
     // the copy of the layer's first expert tensor (the one that reads the routing) reads the routed experts of the layer that neither the
     // device slots nor the RAM tier hold, every expert tensor of each, in one batch into a pinned scratch (unbuffered, the store's IO
     // threads); the copies of all of the layer's expert tensors then upload those experts from it (tier_runs returns the scratch as held
@@ -7540,7 +7540,7 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> p_miss_layer;
         int64_t  p_t0 = 0;
         uint64_t p_sync_us = 0, p_up_us = 0, p_ncopy = 0; // host time in the routing reads (device work before them) and the copies' issue
-        uint64_t p_x_us[3] = { 0, 0, 0 };                  // k19-l4held: whole copy callbacks, seeds, upload-ahead waits
+        uint64_t p_x_us[3] = { 0, 0, 0 };                  // whole copy callbacks, seeds, upload-ahead waits
         llama_weight_store::stats p_ws;                    // the store's counters at the first layer
         uint64_t layers = 0, experts = 0, bytes = 0, read_us = 0, over = 0, prompts = 0;
     } plr;
@@ -7615,7 +7615,7 @@ struct llama_moe_cache::impl {
         return plr.base + plr.off[ip][e] + a;
     }
 
-    // k19-l4held rank mode (see llama_moe_cache::prompt_rank_copy)
+    // rank mode (see llama_moe_cache::prompt_rank_copy)
     std::vector<std::vector<bool>> rank_mask; // [il] experts the current ubatch routes (empty: none)
     bool     rank_any = false;
     uint64_t rank_layers = 0, rank_routed = 0, rank_extra = 0, rank_skipped = 0;
@@ -7695,7 +7695,7 @@ struct llama_moe_cache::impl {
             plr.p_t0 = ggml_time_us();
             plr.p_ws = wstore->get_stats();
             plr.p_miss_layer.assign(layers.size(), -1);
-            // k19-l4held: the RAM tier as the prompt finds it (free slots, duplicates of device-held experts)
+            // the RAM tier as the prompt finds it (free slots, duplicates of device-held experts)
             if (diag && host) {
                 uint64_t n_dup = 0, n_held = 0;
                 for (size_t jl = 0; jl < layers.size(); ++jl) {
@@ -7991,12 +7991,12 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k19-d2hstream: the copies back of a host lookup (exclusive tier) go out on a second stream of the device, in chunks with an event
+    // the copies back of a host lookup (exclusive tier) go out on a second stream of the device, in chunks with an event
     // each, and the uploads into the evicted slots of a chunk wait for its event only: the D2H of chunk c+1 runs beside the H2D of chunk
     // c (PCIe is full duplex; on one stream every copy back finished before the first upload began). The side stream starts where the
     // compute stream is (event), every upload into a slot waits for that slot's copy back, and the compute stream has waited for every
     // chunk before the RAM tier commits, so the bytes, slots and their order per slot are unchanged: exact by construction.
-    // On by default on CUDA devices (k19-d2h3; LLAMA_MOE_D2H_STREAM=0: on the compute stream as before; =1: on any device whose backend
+    // On by default on CUDA devices (LLAMA_MOE_D2H_STREAM=0: on the compute stream as before; =1: on any device whose backend
     // gives a second instance and events, e.g. ROCm / Vulkan / Metal / SYCL, which keep the compute stream unless asked: not measured
     // there); LLAMA_MOE_D2H_STREAM_CHUNKS=N (default 4, 2..16)
     struct d2h_dev_t {
@@ -8006,9 +8006,9 @@ struct llama_moe_cache::impl {
         std::vector<ggml_backend_event_t> ev;
     };
     std::vector<d2h_dev_t> d2h_devs;
-    // (k19-d2h3: Colab L4 full card, Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk (exclusive RAM tier, ~150 GB copied back per run),
+    // (L4 full card, Qwen3.8-Flash-Next at 4 bits from the VM disk (exclusive RAM tier, ~150 GB copied back per run),
     // 3 interleaved launches: chat 12.5 -> 13.9 tok/s, 8k 11.0 -> 12.5, held-out text 12.4 -> 14.4 / 12.8 -> 14.2, md5 unchanged in
-    // every cell; L4 12 GB (inclusive tier) unchanged. No gain on Kaggle 2x T4 (k19-d2hstream))
+    // every cell; L4 12 GB (inclusive tier) unchanged. No gain on 2x T4)
     bool d2h_on = [] {
         const char * e = getenv("LLAMA_MOE_D2H_STREAM");
         return e == nullptr || atoi(e) != 0;
@@ -8104,7 +8104,7 @@ struct llama_moe_cache::impl {
                 }
                 continue;
             }
-            // k19-l4held rank mode: at the layer's quota the copy back takes an expert the prompt does not route first
+            // rank mode: at the layer's quota the copy back takes an expert the prompt does not route first
             const std::vector<bool> * rk = rank_any && (size_t) il < rank_mask.size() && (int32_t) rank_mask[il].size() > e ? &rank_mask[il] : nullptr;
             const uint64_t ev0 = host->st.evicted - host->st.dup_taken;
             const int32_t r = host->reserve(il, e, true, 0, true, rk);
@@ -8356,12 +8356,12 @@ struct llama_moe_cache::impl {
     }
 
     // the device slots that are lent (or overwritten by a seed) lose their experts: the RAM tier keeps a copy (synchronous, once per prompt)
-    // k19-l4held (LLAMA_MOE_SHADOW_ASYNC=1, opt-in; unset: synchronous, as before): the copies back are queued on backend (the stream that then writes
+    // (LLAMA_MOE_SHADOW_ASYNC=1, opt-in; unset: synchronous, as before): the copies back are queued on backend (the stream that then writes
     // the device slots, so each copy reads the slot before it is overwritten) and the RAM slots are published when they complete (mark_write
     // + commit, as demote does) instead of a device sync and one synchronous copy per expert tensor. A prompt that seeds the device slots
-    // of an exclusive tier (the 42-token chat on the Colab L4 full card: ~90 evictions per layer) waited for each layer's device work and
+    // of an exclusive tier (the 42-token chat on the L4 full card: ~90 evictions per layer) waited for each layer's device work and
     // then ~270 synchronous 2-3 MB copies per layer
-    // opt-in (LLAMA_MOE_SHADOW_ASYNC=1): Colab L4 full card, fn4nd chat after the 640-token request (job l4h_c2, 3 launches each, md5 equal):
+    // opt-in (LLAMA_MOE_SHADOW_ASYNC=1): L4 full card, Flash-Next at 4 bits chat after the 640-token request (3 launches each, md5 equal):
     // seeds 47-102 ms vs 1090-1103 ms synchronous, but chat TTFT 8.70 [7.40-9.43] vs 7.44 [7.34-9.03] s: in 2 of 3 launches the RAM tier
     // held 785-1004 duplicates of device experts at the chat's start (234-236 otherwise) and the chat missed 862-914 experts vs 777-787;
     // not explained, so not a default
@@ -8420,7 +8420,7 @@ struct llama_moe_cache::impl {
                 }
                 continue;
             }
-            // k19-l4held rank mode: at the layer's quota the copy back takes an expert the prompt does not route first
+            // rank mode: at the layer's quota the copy back takes an expert the prompt does not route first
             const std::vector<bool> * rk = rank_any && (size_t) il < rank_mask.size() && (int32_t) rank_mask[il].size() > e ? &rank_mask[il] : nullptr;
             const uint64_t ev0 = host->st.evicted - host->st.dup_taken;
             const int32_t r = host->reserve(il, e, true, 0, true, rk);
@@ -8453,9 +8453,9 @@ struct llama_moe_cache::impl {
             return false;
         }
         ggml_init_params params = {
-            /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+            /*.mem_size =*/ 4*ggml_tensor_overhead(),
             /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
+            /*.no_alloc =*/ true,
         };
         ggml_context_ptr ctx(ggml_init(params));
         // the largest batch whose experts fit in the slots (see use_device)
@@ -8558,7 +8558,7 @@ struct llama_moe_cache::impl {
                 for (const ggml_tensor * t : layers[g.layers[i]].experts) {
                     auto it = dev_base.find({ dev, t->buffer });
                     if (it == dev_base.end() && core_on && core_holes_in((uintptr_t) ggml_backend_buffer_get_base(t->buffer), ggml_backend_buffer_get_size(t->buffer))) {
-                        // k19-ptres: the pages of the core experts stay out of the registration (the device never reads them: they never leave the slots)
+                        // the pages of the core experts stay out of the registration (the device never reads them: they never leave the slots)
                         void * base = ggml_backend_buffer_get_base(t->buffer);
                         void * dev_ptr = core_map_buffer(dev, host_map, host_unmap, base, ggml_backend_buffer_get_size(t->buffer));
                         if (dev_ptr != nullptr) {
@@ -8630,8 +8630,8 @@ struct llama_moe_cache::impl {
         return std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots - g.lru.n_core;
     }
 
-    // k19-hostrow (LLAMA_MOE_HYBRID_WIDE=1, default off): a hybrid group's small batch of at most wide_max tokens whose experts do not
-    // fit the slots. fn4 UD-IQ4_XS at 8 GB on G4: 23 slots per group serve 2 tokens, so a verify window of 3-8 tokens read every one
+    // (LLAMA_MOE_HYBRID_WIDE=1, default off): a hybrid group's small batch of at most wide_max tokens whose experts do not
+    // fit the slots. Flash-Next at 4 bits at 8 GB on RTX PRO 6000: 23 slots per group serve 2 tokens, so a verify window of 3-8 tokens read every one
     // of its experts on the CPU (no fetch share over PCIe, no route tail skip): ~12 ms per extra row against ~16 ms for a whole token.
     // With it the window takes the hybrid assign like a single token (hits on the device, the fetch share of the misses copied into
     // the unpinned slots, the rest on the host). Not exact against the CPU path it replaces (another split of the experts between
@@ -8645,10 +8645,10 @@ struct llama_moe_cache::impl {
             (slots_fit(g, n_tokens) || wide_ok(g, n_tokens)) && !(place8_single && (hybrid || cm) && n_tokens > 1);
     }
 
-    // k15-lfm2: llama_moe_cpu_miss_drop_slow. Once calibrated: where the cache holds at least LLAMA_MOE_CPU_MISS_DROP_FRAC (0.75) of the
+    // llama_moe_cpu_miss_drop_slow. Once calibrated: where the cache holds at least LLAMA_MOE_CPU_MISS_DROP_FRAC (0.75) of the
     // host experts' bytes, the host has at most LLAMA_MOE_CPU_MISS_DROP_THREADS (4) small-batch threads and its time per expert is at
     // least LLAMA_MOE_CPU_MISS_DROP_RATIO (0.5) of an upload, the rule is turned off as a failed calibration does (the misses are
-    // fetched). Kaggle T4x2 LFM2.5 16 GB (2 threads, host 640-660 us per expert, upload 520-940 us, 86% cached): the rule itself
+    // fetched). T4x2 LFM2.5 16 GB (2 threads, host 640-660 us per expert, upload 520-940 us, 86% cached): the rule itself
     // computed nothing on the host there, while the pinned small-batch host path of the default drafts (spill mode 3) cost 2.5 ms
     // per token (62 vs 72 tok/s). LLAMA_MOE_CPU_MISS_DROP=0: never
     bool cm_drop_slow() {
@@ -8669,7 +8669,7 @@ struct llama_moe_cache::impl {
         return true;
     }
 
-    // k13: see cm_frozen; only once calibrated (the warm-up decode calibrates), returns false otherwise or without CPU misses
+    // see cm_frozen; only once calibrated (the warm-up decode calibrates), returns false otherwise or without CPU misses
     // keep_fetch (cm_frozen_fetch, llama_moe_pin_small): pin the decisions only
     bool cm_freeze(bool keep_fetch = false) {
         if (!cm || !cm_cal || cm_frozen) {
@@ -8688,7 +8688,7 @@ struct llama_moe_cache::impl {
         cmw_on        = false;
         cm_small_ok   = true;
         cm_small_live = true;
-        // k19-l4poly: on a host-team host the short prompts (k17-ttft, see cm_prompt_off) keep the cost model's verdict of the
+        // on a host-team host the short prompts (see cm_prompt_off) keep the cost model's verdict of the
         // calibration (persisted per build and host, so the same in every launch); LLAMA_MOE_PIN_PROMPT_SHORT=0 off
         const bool keep_short = cm_pin_short() && single_team_host();
         for (int64_t n = 1; n <= cm_max; ++n) {
@@ -8708,7 +8708,7 @@ struct llama_moe_cache::impl {
         return true;
     }
 
-    // k15-lfm2: lift / restore the pin of llama_moe_pin_small (cm_freeze(true)) between requests. Unpinned, the small batches follow
+    // lift / restore the pin of llama_moe_pin_small (cm_freeze(true)) between requests. Unpinned, the small batches follow
     // the rule again (cost model, the timing trials where this cache runs them, after cmt_gap small batches); pinned again, as at the
     // first pin. Only a cache the pin froze (cm_pinned) takes part. Returns the pinned state
     bool cm_pinned       = false; // frozen by pin_small (not by freeze_small)
@@ -8745,10 +8745,10 @@ struct llama_moe_cache::impl {
     }
     int pin_log_n = 0;
 
-    // k15-lfm2 LLAMA_MOE_CPU_MISS_PER_REQUEST (opt-in): the rule's decisions of a request do not depend on the requests before it. At each
+    // LLAMA_MOE_CPU_MISS_PER_REQUEST (opt-in): the rule's decisions of a request do not depend on the requests before it. At each
     // request the per-size decisions and the miss rate go back to those of the first request (the calibrated prior), the miss-rate
     // window starts over (its first window is the short one, so the request decides from its own small batches), and after the first
-    // timing trial no further one runs (one trial verdict per launch: later trials flip on differences of a few percent, G4 LFM2.5
+    // timing trial no further one runs (one trial verdict per launch: later trials flip on differences of a few percent, RTX PRO 6000 LFM2.5
     // 12 GB 16k 222 vs 291 tok/s from one 3.10 vs 3.01 ms trial). Without CPU misses (pinned, LLAMA_MOE_CPU_MISS=0) nothing changes
     bool cm_req_snap = false;
     std::vector<uint8_t> cm_on_snap;
@@ -8756,7 +8756,7 @@ struct llama_moe_cache::impl {
     bool   cm_measured_snap = false;
     int    cm_req_n = 0;
     // =1 also empties the cache at each request (hybrid_reset, as the fixed-share hybrid path does): which experts the host computes
-    // depends on what is cached, which the earlier requests left (G4 LFM2.5 8 GB 8k: 189 vs 221 tok/s and another text by the order
+    // depends on what is cached, which the earlier requests left (RTX PRO 6000 LFM2.5 8 GB 8k: 189 vs 221 tok/s and another text by the order
     // of the requests alone, with the same rule decisions); the prompt's seed fills it again. =2: the decisions only
     static int cm_per_request() {
         static const int on = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST"); return e != nullptr ? atoi(e) : 0; }();
@@ -8803,13 +8803,13 @@ struct llama_moe_cache::impl {
 
     // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
     // short prompts take the host path only once a trial found it faster for the small batches on this host and model (without a
-    // trial: the model alone). G4 gpt-oss-20b Q2_K 8 GB and T4 Qwen3.6 UD-Q4_K_XL 8 GB without a draft: trials off, the 95-token chat
-    // prompt -19% / -26% on the host path from the prior; where the trials kept it (Qwen3.6 8 GB MTP: G4 +18%, T4 +6%) it gained
-    // k11 (LLAMA_MOE_CPU_MISS_TRIAL_FRAC, default 0.20; 0 = the trials of k10 everywhere): a cache that holds less than this share of
-    // the host experts runs no warm phase and no timing trials (see cm_calibrate for the cells). Round 19
+    // trial: the model alone). RTX PRO 6000 gpt-oss-20b Q2_K 8 GB and T4 Qwen3.6 at 4 bits 8 GB without a draft: trials off, the 95-token chat
+    // prompt -19% / -26% on the host path from the prior; where the trials kept it (Qwen3.6 8 GB MTP: RTX PRO 6000 +18%, T4 +6%) it gained
+    // (LLAMA_MOE_CPU_MISS_TRIAL_FRAC, default 0.20; 0 = the trials of everywhere): a cache that holds less than this share of
+    // the host experts runs no warm phase and no timing trials (see cm_calibrate for the cells).
     // (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, default 0.50): a cache whose host misses go through the single-graph mailbox (see
-    // single_weigh) skips them up to this share, since the trials judged the graph split the mailbox replaces. G4 8 GB / 32 GB, k10 on
-    // the same VM: no trials below 50% gave Qwen3.6 UD-Q3_K_M 8 GB (23.8%) +17% decode over the 20% rule and Flash-Next UD-IQ4_XS 32 GB
+    // single_weigh) skips them up to this share, since the trials judged the graph split the mailbox replaces. RTX PRO 6000 8 GB / 32 GB, on
+    // the same VM: no trials below 50% gave Qwen3.6 at 3 bits 8 GB (23.8%) +17% decode over the 20% rule and Flash-Next at 4 bits 32 GB
     // (33.5%; "3 trials, small batches off") +9..+19% 2k / 8k, while gemma-4 8 GB (GELU experts: graph split, no mailbox) lost 3-12%
     // without its trials, so it keeps them. An explicit LLAMA_MOE_CPU_MISS_TRIAL_FRAC sets both. The mailbox form is known from the
     // first graph with the hybrid path, usually after the calibration: single_note_form calls this again (late) then, once, if no
@@ -8827,8 +8827,8 @@ struct llama_moe_cache::impl {
         }
         const bool mailbox = single_weigh() && single_usable(1);
         const double trial_frac = trial_frac_env >= 0.0 ? trial_frac_env : (mailbox ? std::max(0.20, trial_frac_single) : 0.20);
-        // k15-lfm2: with LLAMA_MOE_CPU_MISS_PER_REQUEST no timing trials (the cost model only), so no verdict depends on which request
-        // ran the first trial (G4 LFM2.5 12 GB: chat / 8k / 16k other texts by request order); LLAMA_MOE_CPU_MISS_PER_REQUEST_TRIALS=1
+        // with LLAMA_MOE_CPU_MISS_PER_REQUEST no timing trials (the cost model only), so no verdict depends on which request
+        // ran the first trial (RTX PRO 6000 LFM2.5 12 GB: chat / 8k / 16k other texts by request order); LLAMA_MOE_CPU_MISS_PER_REQUEST_TRIALS=1
         // keeps the first trial
         static const bool per_req_no_trials = [] {
             const char * e  = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST");
@@ -8840,7 +8840,7 @@ struct llama_moe_cache::impl {
         // (cmt_trust_marginal: cmt_trust_tries() timings, each on by less than the persist margin) runs no warm phase and no trials: those
         // timings already decided the host path for this machine, model and cache size, and re-running the trial's blocks with the host
         // path off costs most of a short request (LLAMA_MOE_CPU_MISS_FIRM_SKIP=0: the recorded trials replay as before). A clear "on" or
-        // any "off" replays as recorded. Colab L4 (12 vCPU), Qwen3.6-35B-A3B UD-Q4_K_XL with its MTP head capped at 16 GB (58% cached)
+        // any "off" replays as recorded. L4 (12 vCPU), Qwen3.6-35B-A3B at 4 bits with its MTP head capped at 16 GB (58% cached)
         bool skip_firm = false;
         if (!skip_share && cm_trial && !cm_force && cmt_n == 0 && cmt_done < 0) {
             skip_firm = llama_moe_tp::firm_skip(cmt_firm_skip_on(), cmt_trust_marginal(), [&]() -> const llama_moe_tp::rec * {
@@ -8881,22 +8881,22 @@ struct llama_moe_cache::impl {
         return cmt_host_ok && (!cm_trial || (cmt_n > 0 && cm_small_ok));
     }
 
-    // k15 (port of k11-spill arm P, 43a25ef811): the ubatches of a prompt batch (tokens without outputs, its last partial ubatch
+    // (port of 43a25ef811): the ubatches of a prompt batch (tokens without outputs, its last partial ubatch
     // included) stay off the CPU-miss host path, so the first token after a prompt carries no host-computed expert. On by default
-    // only while the small batches are pinned (llama_moe_pin_small, spill mode 3: G4 LFM2.5 8 GB first-token KLD came from the
+    // only while the small batches are pinned (llama_moe_pin_small, spill mode 3: RTX PRO 6000 LFM2.5 8 GB first-token KLD came from the
     // prompt's small checkpoint tail ubatch taking the pinned host path). LLAMA_MOE_PIN_PROMPT_DEV=0: off there;
     // LLAMA_MOE_CPU_MISS_PROMPT_DEV=1: also without the pin (test arm)
     bool cm_prompt_now = false; // set by the context around each decode (set_prompt_batch)
-    int64_t cm_prompt_all = 0;  // k17-ttft: tokens of that prompt batch (0 outside prompt batches)
+    int64_t cm_prompt_all = 0;  // tokens of that prompt batch (0 outside prompt batches)
 
-    // k17-ttft short prompts (LLAMA_MOE_CPU_MISS_SHORT, default 128; 0 = off, the k15 default): a prompt batch of max_batch + 1 ..
-    // cm_short_max tokens in all (a chat turn, not the tail of a long prompt: G4 r22b gemma-4 2k decode -18% after its last partial
+    // short prompts (LLAMA_MOE_CPU_MISS_SHORT, default 128; 0 = off, the default): a prompt batch of max_batch + 1 ..
+    // cm_short_max tokens in all (a chat turn, not the tail of a long prompt: RTX PRO 6000 gemma-4 2k decode -18% after its last partial
     // ubatch took the host path and admitted less) takes the host path in each ubatch the cost model turns on (cm_on: calibrated host
     // us per expert and per further token, upload us, the split and the activations at cm_margin_p, the measured miss rate), at the
-    // rule's fetch share but at most 1/4 as k11's prompt path; no timing trials, so no trial ubatch changes what the cache admits.
+    // rule's fetch share but at most 1/4 as the earlier prompt path; no timing trials, so no trial ubatch changes what the cache admits.
     // The host's expert products are ggml-cpu's
     // (Q8_K activations), not the device's bit for bit, so the text changes (KLD-gated). Before it, the small-batch trials (which
-    // never ran on these placements: "0 trials") kept every prompt above 32 tokens on the uploads (G4 q4x 12 GB: 4.8 GB for a
+    // never ran on these placements: "0 trials") kept every prompt above 32 tokens on the uploads (RTX PRO 6000 with the 4-bit Qwen3.6 12 GB: 4.8 GB for a
     // 42-token chat prompt, 90 ms of H2D at the link ceiling)
     const int64_t cm_short_max = [] {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT");
@@ -8906,13 +8906,13 @@ struct llama_moe_cache::impl {
         return cm_short_max > 0 && cm_prompt_now && cm_prompt_all > max_batch && cm_prompt_all <= cm_short_max;
     }
     // only where the small-batch timing trials were skipped (below LLAMA_MOE_CPU_MISS_TRIAL_FRAC of the host experts cached, 50% with the
-    // single-graph mailbox): where they run, their verdict already gates prompts (cm_prompt_ok). G4 k17g4a q4x 16 GB (61% cached, trials
+    // single-graph mailbox): where they run, their verdict already gates prompts (cm_prompt_ok). RTX PRO 6000 with the 4-bit Qwen3.6 16 GB (61% cached, trials
     // run): the rule without this gate took chat_s onto the host path at 358 vs 550 tok/s and the 2k decode after it fell 342 -> 306 tok/s;
     // at 8 / 12 GB (trials skipped) chat +18% / +30%
     // and only where the host is clearly faster than the uploads at the batch's tokens per expert: host us per missing expert
     // t_cpu(n) = cm_t1 + (tbar(n) - 1)*cm_dt at most cm_short_ratio (LLAMA_MOE_CPU_MISS_SHORT_RATIO, 0.67) of an upload, so the host's 3/4
-    // of the misses take at most half the time their uploads would. The cost model alone (cm_on) put these G4 cells on the host path:
-    // Qwen3.6 UD-Q4_K_XL 8 / 12 GB (t_cpu / t_up 0.60: TTFT -15% / -23%) but also Flash-Next UD-IQ1_S 24 GB (0.75: TTFT +11%, 2k decode
+    // of the misses take at most half the time their uploads would. The cost model alone (cm_on) put these RTX PRO 6000 cells on the host path:
+    // Qwen3.6 at 4 bits 8 / 12 GB (t_cpu / t_up 0.60: TTFT -15% / -23%) but also Flash-Next at 1 bit 24 GB (0.75: TTFT +11%, 2k decode
     // -8%; its re-calibration measured the host 46% slower than at start-up) and gemma-4 Q3_K_M 8 GB (1.3: TTFT +29%, 2k decode -20%)
     const double cm_short_ratio = [] {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT_RATIO");
@@ -8935,7 +8935,7 @@ struct llama_moe_cache::impl {
             n_tokens > cm_prompt_force && cm_on[n_tokens] != 0 && cmt_host_ok && !cm_prompt_off();
     }
     // only where the cache holds at most LLAMA_MOE_PIN_PROMPT_SHORT_MAX_FRAC (0.25) of the host experts: srv_kld short192 against the
-    // base (l4p_f3), LFM2.5 4 GB (14.6% cached) first-token KLD mean / p99 / top-1 0.099 / 0.84 / 0.885 inside the -fa off band
+    // base, LFM2.5 4 GB (14.6% cached) first-token KLD mean / p99 / top-1 0.099 / 0.84 / 0.885 inside the -fa off band
     // (0.154 / 1.32 / 0.854); 8 GB (40%) 0.144 / 1.53 / 0.849, p99 and top-1 just outside it (1.16 / 0.854)
     bool cm_pin_short() const {
         static const bool pin_short = [] {
@@ -8955,15 +8955,15 @@ struct llama_moe_cache::impl {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_PROMPT_DEV");
             return e != nullptr && atoi(e) != 0;
         }();
-        // k19-l4poly (LLAMA_MOE_PIN_PROMPT_SHORT, default 1; 0 = off): on a host-team host (single_team_host) a short prompt (the k17-ttft
+        // (LLAMA_MOE_PIN_PROMPT_SHORT, default 1; 0 = off): on a host-team host (single_team_host) a short prompt (the
         // rule, at most LLAMA_MOE_CPU_MISS_SHORT tokens in all) keeps its host path beside the pinned small batches: the pin is for the
-        // small checkpoint tail of a long prompt (k15), while a chat turn's prompt otherwise uploads the misses of every layer. Colab L4
+        // small checkpoint tail of a long prompt, while a chat turn's prompt otherwise uploads the misses of every layer. L4
         // LFM2.5 4 / 8 GB with n-gram drafting (pinned): a 38-token prompt 875 / 739 ms, 498 ms at 8 GB without drafting (not pinned)
         const bool pinned = cm_frozen && cm_frozen_fetch && pin_dev && !(cm_pin_short() && short_live() && single_team_host());
         return cm_prompt_now && cm && (pinned || all_dev);
     }
 
-    // r22b: a prompt ubatch the cost model puts on the host path, outside the forced and the trial-gated rules
+    // a prompt ubatch the cost model puts on the host path, outside the forced and the trial-gated rules
     bool pt_eligible(int64_t n_tokens) const {
         return pt_auto && cm && cm_cal && !cm_force && n_tokens > max_batch && n_tokens <= cm_max && n_tokens > cm_prompt_force &&
             (cm_on[n_tokens] != 0 || pt_any) && cmt_host_ok && !cm_prompt_ok();
@@ -9004,8 +9004,8 @@ struct llama_moe_cache::impl {
     // are copied into their slots beside the rest of the graph for later windows. Before, every miss of a window was fetched by the
     // zero-copy gather before the layer's admitted experts could run (~84 experts, ~194 MiB per DFlash2 verify pass at a 48 GB cap on an
     // RTX PRO 6000, pass wall = 11.5 + 1.09 x the fetch kernels' ms), and the host path without the admission (the rule's share, copied in
-    // the stream) left the computed experts out of the cache: hit rate 96.75% -> 94.5%, twice the misses per window, slower. Colab G4
-    // (48 vCPU, AMD EPYC 9B45), Qwen3.8-Flash-Next UD-IQ4_XS, 48 GB, 3 launches: DFlash2 n6 chat 277.0 -> 288.4 tok/s, MTP chat 233.8 ->
+    // the stream) left the computed experts out of the cache: hit rate 96.75% -> 94.5%, twice the misses per window, slower. RTX PRO 6000
+    // (48 vCPU, AMD EPYC 9B45), Qwen3.8-Flash-Next at 4 bits, 48 GB, 3 launches: DFlash2 n6 chat 277.0 -> 288.4 tok/s, MTP chat 233.8 ->
     // 252.8, 8k 207.5 -> 212.0; ~15.6 ms per DFlash2 pass, hit rate with the host's experts 95.4-95.9%. Not bit for bit the device's (int8
     // activations): KLD-gated
     bool dec_band() const {
@@ -9017,7 +9017,7 @@ struct llama_moe_cache::impl {
         static const double hi = getenv("LLAMA_MOE_WIDE_HOST_MAX_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_WIDE_HOST_MAX_FRAC")) : 0.85;
         return on && single_wide_host() && !single_max_env && cache_frac >= lo && cache_frac < hi;
     }
-    // k19-flint: a decode batch of n_tokens on the fixed-share host path (LLAMA_MOE_CPU_MISS_DECODE)
+    // a decode batch of n_tokens on the fixed-share host path (LLAMA_MOE_CPU_MISS_DECODE)
     bool cm_decode(int64_t n_tokens) const {
         return cm_dec_on > 0 && !(cm_dec_band && cm_prompt_now) && cm && cm_cal && !cm_force && !cm_frozen && n_tokens >= 1 && n_tokens <= cm_dec_max && n_tokens <= max_batch &&
             n_tokens <= cm_max && single_form_state >= 0 && single_usable(n_tokens);
@@ -9036,15 +9036,15 @@ struct llama_moe_cache::impl {
         }
         if (cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_prompt_force) {
             // default: at most 1/4 fetched. The rule's share (capped at 3/4) left 71 ms of zero-copy fetch kernels in a 38-token LFM2.5 8 GB
-            // prompt of 122 ms; G4 k11pgW at 1/4: LFM2.5 chat 444 tok/s (339 at the rule's share), Qwen3.6 360 (329); 1/8: LFM2.5 415
+            // prompt of 122 ms; RTX PRO 6000 at 1/4: LFM2.5 chat 444 tok/s (339 at the rule's share), Qwen3.6 360 (329); 1/8: LFM2.5 415
             return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
         }
         if (short_eligible(n_tokens) && !cm_prompt_ok()) {
             return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
         }
         if (pt_eligible(n_tokens)) {
-            // the fetch share of k11's prompt path: at most 1/4 (its fetched misses are read by the zero-copy kernel, slower than the DMA
-            // the model prices: G4 LFM2.5 8 GB chat 444 tok/s at 1/4 vs 339 at the rule's share)
+            // the fetch share of the earlier prompt path: at most 1/4 (its fetched misses are read by the zero-copy kernel, slower than the DMA
+            // the model prices: RTX PRO 6000 LFM2.5 8 GB chat 444 tok/s at 1/4 vs 339 at the rule's share)
             return pt_arm == 0 ? 1.0f : (cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f));
         }
         if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0 || (n_tokens <= max_batch ? !cm_small_live : !cm_prompt_ok())) {
@@ -9098,11 +9098,11 @@ struct llama_moe_cache::impl {
         return op;
     }
 
-    // k19-q4xcache LLAMA_MOE_OVERLAP_SMALL_PLAIN (default 1; 0 = off, the plain lookup as before): a verify window of 2..N tokens
+    // LLAMA_MOE_OVERLAP_SMALL_PLAIN (default 1; 0 = off, the plain lookup as before): a verify window of 2..N tokens
     // (N = LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL, default 4) whose host path is off took the plain lookup, which copies its missing
-    // experts in the compute stream before any expert of the layer is computed (Kaggle T4 Qwen3.6-35B-A3B UD-Q4_K_XL, MTP n2, nsys:
+    // experts in the compute stream before any expert of the layer is computed (T4 Qwen3.6-35B-A3B at 4 bits, MTP n2, nsys:
     // moe_cache_fetch 10.8 ms of a 42.0 ms pass at full card, 16.5 of 47.7 at 12 GB, serial). It now takes the hybrid assign at fetch
-    // share 1 with the overlap of k19-overlap: the copies run on the side stream beside the hits (cached before the lookup), then the
+    // share 1 with the overlap of the copies run on the side stream beside the hits (cached before the lookup), then the
     // fetched experts are computed. Exact: the assign at share 1 picks the lookup's slots and victims, admits every miss and leaves the
     // use counters unwritten as the lookup does (ggml_moe_cache_assign_lookup_counts), the CPU-miss rule sees the same counters, and the
     // multi-token mmvq kernels give each (token, slot) entry its own sums (each entry is computed once, by one side; the other side's
@@ -9118,9 +9118,9 @@ struct llama_moe_cache::impl {
         return overlap_plain_on() && overlap_small_batch(n_ubatch);
     }
     mutable uint64_t n_ov_plain = 0; // layer graphs built with it (engagement)
-    mutable uint64_t n_ov_plain_wide = 0; // k19-bigverify: of them, windows of 5+ tokens (overlap_plain_wide)
+    mutable uint64_t n_ov_plain_wide = 0; // of them, windows of 5+ tokens (overlap_plain_wide)
 
-    // the layer can use the hybrid lookup for a ubatch of this size; plain (k19-q4xcache): only for the overlap, in place of the plain lookup
+    // the layer can use the hybrid lookup for a ubatch of this size; plain: only for the overlap, in place of the plain lookup
     bool hybrid_layer(int32_t il, int64_t n_ubatch, bool * plain = nullptr) const {
         if (plain != nullptr) {
             *plain = false;
@@ -9129,7 +9129,7 @@ struct llama_moe_cache::impl {
         if (force_large || (widened && !overlap_plain_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return false;
         }
-        // CPU misses off for this batch size: the graph of k9 (plain lookup, or the fetch overlap of single tokens)
+        // CPU misses off for this batch size: the graph of (plain lookup, or the fetch overlap of single tokens)
         if (cm && cm_share_of(n_ubatch) >= 1.0f && !overlap_batch(n_ubatch)) {
             if (!overlap_plain_batch(n_ubatch)) {
                 return false;
@@ -9148,7 +9148,7 @@ struct llama_moe_cache::impl {
     // as ggml_moe_cache_lookup) and keeps the use counters up to date
     // a prompt ubatch small enough for the hybrid lookup (the server's last few prompt tokens, which give the first generated token)
     // fetches every missing expert: the host-computed misses moved the first token beyond the -fa off band against a whole-card
-    // reference (G4 Qwen3.8-Flash-Next UD-IQ4_XS 12 GB ctx 262144, fetch share 0.25: first-token KLD 0.0137 / top-1 0.938, band 0.0067 /
+    // reference (RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits 12 GB ctx 262144, fetch share 0.25: first-token KLD 0.0137 / top-1 0.938, band 0.0067 /
     // 0.979; every miss fetched 0.0087 / 0.979), and such a ubatch runs once per prompt, so the copies cost little. Decode and verify
     // windows keep the hybrid share. LLAMA_MOE_HYBRID_PROMPT_FETCH=0: off
     static bool hybrid_prompt_fetch_on() {
@@ -9168,7 +9168,7 @@ struct llama_moe_cache::impl {
         }
         float share = 1.0f;
         if (plain) {
-            // k19-q4xcache: in place of the plain lookup (see overlap_plain_batch): every miss is fetched, nothing goes to the host
+            // in place of the plain lookup (see overlap_plain_batch): every miss is fetched, nothing goes to the host
         } else if (cm) {
             share = cm_share_of(n_ubatch);
             host  = share < 1.0f;
@@ -9212,7 +9212,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (host && split_frozen()) {
-            // k13: frozen small batches admit nothing between prompts, not even to the empty slots a lent graph left: the n-gram
+            // frozen small batches admit nothing between prompts, not even to the empty slots a lent graph left: the n-gram
             // drafts of a verify window (rejected ones too) would admit experts a single token decode never sees
             ggml_moe_cache_assign_freeze(op);
         } else if (g.scores != nullptr) {
@@ -9221,9 +9221,9 @@ struct llama_moe_cache::impl {
         return op;
     }
 
-    // k16: route tail skip: a missing
+    // route tail skip: a missing
     // expert that every token of a decode / verify window routes at rank >= 7 (of the router's top k, in routing order) is neither copied
-    // nor computed; its contribution is zero and the other experts keep their router weights. Off by default since k19-tailskip-off (see
+    // nor computed; its contribution is zero and the other experts keep their router weights. Off by default (see
     // the end of tail_skip_init); LLAMA_MOE_ROUTE_TAIL_SKIP=N opts in. The previous default (rank 7) applied on
     // CUDA (and HIP RDNA4, decided by the backend), unless every expert is on the device (no cache, nothing to skip), 90% or
     // more of the experts are on the device (resident layers + cache slots, LLAMA_MOE_ROUTE_TAIL_SKIP_MAX_CACHED=<percent>), or the
@@ -9232,7 +9232,7 @@ struct llama_moe_cache::impl {
     // biases (the bias would still be added). LLAMA_MOE_ROUTE_TAIL_SKIP=0: off (the exact path); =N: rank N, also where the default is off.
     // Changes the output (KLD-gated)
     void tail_skip_init(const llama_model & model, layer_set set) {
-        pf_quiet = model.hparams.no_alloc; // k19-g4pref: the fit's dry instances do not log the prefetch decision
+        pf_quiet = model.hparams.no_alloc; // the fit's dry instances do not log the prefetch decision
         {
             const char * e       = getenv("LLAMA_MOE_HYBRID_WIDE");
             const char * e_exact = getenv("LLAMA_MTP_EXACT");
@@ -9243,7 +9243,7 @@ struct llama_moe_cache::impl {
             wide_max    = v > 1 ? std::min<int64_t>(n_small_max, v) : 8;
             const char * e8  = getenv("LLAMA_MOE_PLACE8_UB");
             const char * e8s = getenv("LLAMA_MOE_PLACE8_SINGLE");
-            const char * e8m = getenv("LLAMA_MOE_PLACE8_MID"); // k19-placemid: the 8 GB guard only (k19-nanfix is merged)
+            const char * e8m = getenv("LLAMA_MOE_PLACE8_MID"); // the 8 GB guard only (merged)
             place8_single = e8 != nullptr && atoi(e8) > 0 && (e8s == nullptr || atoi(e8s) != 0) && (e8m == nullptr || atoi(e8m) == 0);
             if (hybrid_wide && !model.hparams.no_alloc) {
                 LLAMA_LOG_INFO("%s: hybrid small batches of up to %" PRId64 " tokens may outnumber the slots (LLAMA_MOE_HYBRID_WIDE)\n",
@@ -9269,12 +9269,12 @@ struct llama_moe_cache::impl {
             }
             return;
         }
-        // k15-pp: off by default in the exact modes, where the text must not depend on what the cache holds: batch-invariant verify
-        // (LLAMA_MTP_EXACT=1) or the miss path pinned to uploads (LLAMA_MOE_CPU_MISS=0). G4 fn4 24 GB and local fn1, pinned + strict
+        // off by default in the exact modes, where the text must not depend on what the cache holds: batch-invariant verify
+        // (LLAMA_MTP_EXACT=1) or the miss path pinned to uploads (LLAMA_MOE_CPU_MISS=0). RTX PRO 6000 Flash-Next at 4 bits 24 GB and local Flash-Next at 1 bit, pinned + strict
         // exact: with the default rank-7 skip the text followed the cache size, the drafter and the prefetch depth (a verify window
         // skips only where every token routes the expert at rank >= 7, a decode decides per token); with it off, drafter = no draft
         // and one md5 at every cache size. LLAMA_MOE_ROUTE_TAIL_SKIP=N still sets it; LLAMA_MOE_ROUTE_TAIL_SKIP_EXACT=1 keeps the default
-        // rule in the exact modes (the kill switch of k15-fn's ab146924b36, which this replaces)
+        // rule in the exact modes (the kill switch of of ab146924b36, which this replaces)
         {
             const char * e_exact = getenv("LLAMA_MTP_EXACT");
             const char * e_miss  = getenv("LLAMA_MOE_CPU_MISS");
@@ -9326,8 +9326,8 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("%s: route tail skip off by default: %.1f%% of the experts are on the device (at least %.0f%%, "
                 "LLAMA_MOE_ROUTE_TAIL_SKIP_MAX_CACHED; LLAMA_MOE_ROUTE_TAIL_SKIP=%d turns it on)\n", __func__, 100.0*frac, 100.0*max_frac, rank);
         } else {
-            // k19-tailskip-off: off by default. The rule drops routed experts without renormalising, and its output error grows with
-            // context: fn1 1x T4 long48 decode KLD 0.0268 vs a 0.0182 band (top-1 -1 pt), G4 Flash-Next 12 GB ctx 262144 on the
+            // off by default. The rule drops routed experts without renormalising, and its output error grows with
+            // context: Flash-Next at 1 bit 1x T4 long48 decode KLD 0.0268 vs a 0.0182 band (top-1 -1 pt), RTX PRO 6000 Flash-Next 12 GB ctx 262144 on the
             // shipping q8_0 placement 0.0211 with it vs 0.0050 without (band 0.0043). It stays available as an explicit opt-in
             // (LLAMA_MOE_ROUTE_TAIL_SKIP=N); the exact path is the default
             LLAMA_LOG_INFO("%s: route tail skip off by default (%.1f%% of the experts on the device; approximate, changes the output: "
@@ -9346,9 +9346,9 @@ struct llama_moe_cache::impl {
         ggml_moe_cache_set_tail_skip(op, tail_rank, tail_dflt, stat);
     }
 
-    // k19-l4full: route tail skip for host lookups (see llama_moe_cache::tail_skip_host). A layer streamed through the weight store
-    // (and the RAM tier) is looked up by the copy callback of its slot map get_rows, not by the device op, so the k16 rule announced
-    // at init ("rank 7 by default") never ran there: full Colab L4 + fn4nd on the VM disk (dt_l6) skipped 0 experts.
+    // route tail skip for host lookups (see llama_moe_cache::tail_skip_host). A layer streamed through the weight store
+    // (and the RAM tier) is looked up by the copy callback of its slot map get_rows, not by the device op, so the rule announced
+    // at init ("rank 7 by default") never ran there: full L4 + Flash-Next at 4 bits on the VM disk skipped 0 experts.
     // The rule is the device op's (moe_cache_tail_skip): an entry at rank >= the
     // threshold whose expert is not in a device slot before this lookup and that no entry of the window routes at a lower rank is
     // left out of the plan (not admitted, not fetched, no copy back), its slot stays -1 and the product's rows are 0. The default is
@@ -9442,7 +9442,7 @@ struct llama_moe_cache::impl {
         n_out = ids_kept.size();
     }
 
-    // k19-l4full LLAMA_MOE_HOST_PROF (diagnostic, default 0 = off; 1 = host timers of the small-batch host lookups, 2 = also waits for
+    // LLAMA_MOE_HOST_PROF (diagnostic, default 0 = off; 1 = host timers of the small-batch host lookups, 2 = also waits for
     // the lookup's copies before the device computes the layer, which splits the next lookup's sync into compute and copies; 2 changes
     // timing, never what is computed)
     static int host_prof_mode() {
@@ -9457,7 +9457,7 @@ struct llama_moe_cache::impl {
         uint64_t n_disk = 0, n_skip_lookups = 0;
     } hprof;
 
-    // k19-ramevict: missing experts the hybrid assign left to the host because of its admission margin (LLAMA_MOE_CACHE_ADMIT_MARGIN)
+    // missing experts the hybrid assign left to the host because of its admission margin (LLAMA_MOE_CACHE_ADMIT_MARGIN)
     uint64_t admit_rejected() const {
         uint64_t n = 0;
         for (const group & g : groups) {
@@ -9484,14 +9484,14 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    // k13: frozen small batches of the CPU-miss rule (cm_freeze): the host computes every missing expert of a small batch, nothing is
-    // fetched and the assign admits nothing, not even to free slots (LLAMA_MOE_CACHE_FETCH=0 keeps its k12 behaviour: it fills free
+    // frozen small batches of the CPU-miss rule (cm_freeze): the host computes every missing expert of a small batch, nothing is
+    // fetched and the assign admits nothing, not even to free slots (LLAMA_MOE_CACHE_FETCH=0 keeps its behaviour: it fills free
     // slots, so it is not frozen)
     bool split_frozen() const {
         return cm && cm_frozen && !cm_frozen_fetch;
     }
 
-    // k19-g4pref cross-layer prefetch: in decode / verify windows of at most LLAMA_MOE_PREFETCH_MAX_TOKENS (default 8) tokens, a cache
+    // cross-layer prefetch: in decode / verify windows of at most LLAMA_MOE_PREFETCH_MAX_TOKENS (default 8) tokens, a cache
     // layer whose previous MoE layer is a cache layer on the same device (both on the device lookup) admits, beside the graph, the N
     // experts with the largest logits of its router run on the previous layer's MoE input, at most MAX per layer and window; its own
     // lookup waits for those copies. LLAMA_MOE_PREFETCH=N (1..32) on with N (MAX = LLAMA_MOE_PREFETCH_MAX, default 0 = no cap), =0 off.
@@ -9502,13 +9502,13 @@ struct llama_moe_cache::impl {
     // device of compute capability 12.0 and the cache holds at least LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC (0.60) of the host experts'
     // bytes, or from LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC (0.10) to less than LLAMA_MOE_PREFETCH_AUTO_LO_FRAC (0.20) of them (N =
     // LLAMA_MOE_PREFETCH_AUTO_LO, default 0 = not in that band; 10 was measured); 8 GB (3.7% cached, single-token decode) lost 1-3.5%.
-    // The 16 GB band is opt-in: with DFlash2 it passed (below), with the Studio MTP n2 drafter srv_kld long48 put the first token outside
+    // The 16 GB band is opt-in: with DFlash2 it passed (below), with the Studio MTP n2 drafter a long48 KLD run put the first token outside
     // the -fa off band (mean / p99 0.0040 / 0.049 vs 0.0034 / 0.022: the prompt's small tail batch takes the prefetch there). Off in between (32 GB: 41%, chat +7% but 8k -6..-15%) and on other devices (A100 80 GB at 48 GB: level).
-    // 16 GB (15.5% cached), G4: chat level / +4.5% (two VMs), 8k +7.7 / +7.9% (other texts: host path); srv_kld long48 inside the band
+    // 16 GB (15.5% cached), RTX PRO 6000: chat level / +4.5% (two VMs), 8k +7.7 / +7.9% (other texts: host path); srv_kld long48 inside the band
     // (first-token mean / p99 0.0030 / 0.017 vs 0.0044 / 0.022); reference-scored 1 glitch in 5120 tokens vs 3 with it off. 24 GB
-    // (27.1%) is left out: chat level, 8k +5.5..7.6% (other text), but srv_kld long48 put one position above the band's max (0.230 vs
+    // (27.1%) is left out: chat level, 8k +5.5..7.6% (other text), but a long48 KLD run put one position above the band's max (0.230 vs
     // 0.093; first-token stats inside)
-    // Colab G4 (RTX PRO 6000) Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6, 3 interleaved launches per arm: N=10 MAX=1 at 48 GB (70.7%
+    // an RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits DFlash2 n6, 3 interleaved launches per arm: N=10 MAX=1 at 48 GB (70.7%
     // cached) chat 278.4 -> 292.4 and 286.8 -> 303.5 tok/s on two VMs (same 256-token text), 8k 175.2 -> 197.1 (texts vary per launch
     // there in every arm); 16 GB chat +4.5%, 8k +7.9% (other texts: host path); 32 GB (41%) chat +7..9% but 8k -6..-15% (more 3-row
     // windows); A100 80 GB at 48 GB level. 78-91% of the prefetched experts are hit by the next layer. srv_kld long48 at 48 GB inside
@@ -9550,9 +9550,9 @@ struct llama_moe_cache::impl {
         if (cache_frac < 0.0) {
             return c; // the slots are not sized yet: decided later
         }
-        // (k19-g4pref-optin: the rule only with LLAMA_MOE_PREFETCH_AUTO=1; srv_kld long48 put one position of the 48 GB DFlash2 cell above
+        // (the rule only with LLAMA_MOE_PREFETCH_AUTO=1; a long48 KLD run put one position of the 48 GB DFlash2 cell above
         // the -fa off band's max in 2 of 3 runs, 0.135 / 0.159 vs 0.116, and the 512-token chat texts differ from it off after ~300 tokens)
-        // k19-g4tail: LLAMA_MOE_PREFETCH_AUTO=2 (set by the server beside an MTP drafter, see its k19-g4tail rule): only the band where
+        // LLAMA_MOE_PREFETCH_AUTO=2 (set by the server beside an MTP drafter, see its rule): only the band where
         // the placed cache holds LLAMA_MOE_G4TAIL_FRAC_LO .. _HI (0.10 .. 0.20) of the host experts, on compute capability 12.0
         // devices with device lookups: top 10 predicted experts, at most 1 copied per layer (generation and verify windows only)
         const char * ea_g4t = getenv("LLAMA_MOE_PREFETCH_AUTO");
@@ -9578,7 +9578,7 @@ struct llama_moe_cache::impl {
                 c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
             }
             if (!pf_quiet) {
-                // k19-g4tail2: the server reads the placed verdict after the load and keeps 2 drafts per window where the placed cache
+                // the server reads the placed verdict after the load and keeps 2 drafts per window where the placed cache
                 // is outside the band (its own rule only sees an estimate made before the fit, without the KV cache of n_ctx)
                 // (only "1" is written: another cache of the process, e.g. a drafter's, never clears the target's verdict)
                 if (on) {
@@ -9657,7 +9657,7 @@ struct llama_moe_cache::impl {
     }
     mutable uint64_t n_prefetch_ops = 0; // engagement: prefetch ops built
 
-    // k19-g4tail: this batch is a prompt's and the prefetch is on: no prefetch op (see prefetch_ok); also a graph key (hybrid_mode)
+    // this batch is a prompt's and the prefetch is on: no prefetch op (see prefetch_ok); also a graph key (hybrid_mode)
     bool pf_prompt_off() const {
         // (LLAMA_MOE_G4TAIL=0 too: the int3 behaviour of an explicit LLAMA_MOE_PREFETCH)
         static const bool pf_prompt = [] {
@@ -9685,12 +9685,12 @@ struct llama_moe_cache::impl {
                 !use_device(gp, n_ubatch) || layers[il_prev].host_dev.size() != gp.banks.size()) {
             return false;
         }
-        // frozen small batches admit nothing (k13), and the prefetch admits
+        // frozen small batches admit nothing, and the prefetch admits
         if (cm && cm_frozen) {
             return false;
         }
-        // k19-g4tail: generation and verify windows only (every token an output). A prompt's small tail batch took the prefetch and
-        // moved experts between the host and the device for the first generated token (G4 16 GB long48 first-token KLD outside the
+        // generation and verify windows only (every token an output). A prompt's small tail batch took the prefetch and
+        // moved experts between the host and the device for the first generated token (RTX PRO 6000 16 GB long48 first-token KLD outside the
         // band). LLAMA_MOE_PREFETCH_PROMPT=1: prompt tails too (as before). A prompt tail graph has fewer
         // outputs than tokens, so it is never reused for a verify window of the same size or the reverse
         if (pf_prompt_off()) {
@@ -9748,7 +9748,7 @@ struct llama_moe_cache::impl {
             if (g.n_slots == 0 || !g.dev_lookup || g.counts == nullptr || g.counts->data == nullptr) {
                 continue;
             }
-            // k19-fixB: released banks (llama_moe_cache::release, the tiny-ubatch rule) have no memory to clear; the caller restores
+            // released banks (llama_moe_cache::release, the tiny-ubatch rule) have no memory to clear; the caller restores
             // them first (llama_context::tiny_rel_leave), this only keeps a missed caller from a memset on a tensor without a buffer
             if (devices[g.id].released) {
                 LLAMA_LOG_WARN("%s: MoE cache banks of device %d are released: not reset\n", __func__, g.id);
@@ -9769,15 +9769,15 @@ struct llama_moe_cache::impl {
             }
             g.lru.clear();
             // the banks as allocated (cleared), kernels may read a little past the end of an expert
-            // (k17-small: the slots left and the spare slot; the rows shrink retired are not backed)
+            // (the slots left and the spare slot; the rows shrink retired are not backed)
             for (ggml_tensor * bank : g.banks) {
-                // (k17-small: the slots left and the spare slot, not the retired rows; k19-ptres: the core keeps its experts)
+                // (the slots left and the spare slot, not the retired rows; the core keeps its experts)
                 ggml_backend_tensor_memset(bank, 0, (size_t) g.lru.n_core*bank->nb[2], (size_t) (g.n_slots + 1 - g.lru.n_core)*bank->nb[2]);
             }
             // the use counters and the residual; the count of experts computed on the host (statistics, stat[0..1]) is kept
             const size_t n_cnt = (size_t) g.counts->ne[0]*(g.counts->ne[1] - 1);
             ggml_backend_tensor_memset(g.counts, 0, 0, n_cnt*sizeof(int32_t));
-            // (k16: the count of route tail skips, stat[4..5], is kept too)
+            // (the count of route tail skips, stat[4..5], is kept too)
             ggml_backend_tensor_memset(g.counts, 0, (n_cnt + 2)*sizeof(int32_t), 2*sizeof(int32_t));
             if (g.counts->ne[0] > 6) {
                 ggml_backend_tensor_memset(g.counts, 0, (n_cnt + 6)*sizeof(int32_t), ((size_t) g.counts->ne[0] - 6)*sizeof(int32_t));
@@ -9794,22 +9794,22 @@ struct llama_moe_cache::impl {
         return overlap && ov_live && n_ubatch == 1;
     }
 
-    // k19-overlap LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL=N (1..GGML_MOE_MAILBOX_MAX_TOKENS; default 4, 1 = off): ubatches of 2..N tokens that
+    // LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL=N (1..GGML_MOE_MAILBOX_MAX_TOKENS; default 4, 1 = off): ubatches of 2..N tokens that
     // take the hybrid path (the CPU-miss rule has the host path on for them, see hybrid_layer) copy their admitted experts on the side
     // stream beside the hits (cached before the lookup), then compute the admitted experts, as single tokens do. Every (token, slot) entry
     // is computed once by the multi-token mmvq kernels, which give each entry its own sums, so the output is the serial fetch's.
-    // Independent of the single-token rule (ov_live). Colab G4 Flash-Next UD-IQ4_XS MTP n2 (3-row windows; ov_r2, md5 equal): 32 GB
+    // Independent of the single-token rule (ov_live). RTX PRO 6000 Flash-Next at 4 bits MTP n2 (3-row windows; md5 equal): 32 GB
     // chat / 8k +5.1 / +5.8%, 24 GB +2.9 / +4.0% (device beside the host 100 -> 83 us per layer). DFlash2 7-row windows (N = 8): 32 GB
     // +3.6 / +5.9% but 24 GB -2.5 / -3.6%, so the default stops at 4. Ubatches whose host path is off (48 GB) keep the plain lookup:
-    // taking the hybrid lookup there for the overlap changed the text (ov_r2), so hybrid_layer does not widen for it
-    // k19-g4pass (default on; LLAMA_MOE_G4PASS=0 or an explicit LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL: off): a window of 5..8 rows that
+    // taking the hybrid lookup there for the overlap changed the text, so hybrid_layer does not widen for it
+    // (default on; LLAMA_MOE_G4PASS=0 or an explicit LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL: off): a window of 5..8 rows that
     // publishes its host experts to the single-graph mailbox (single_usable: a many-core host, see single_max) takes the overlap too.
-    // The 24 GB loss above was the k19-overlap round 2 bin (before LEAN, 2 launches). On the mailbox the admitted experts' copies
+    // The 24 GB loss above was an earlier build (before LEAN, 2 launches). On the mailbox the admitted experts' copies
     // (moe_cache_fetch, 8.0 of 29.8 ms per traced w7 pass at 16 GB) ran serially before the hits while the host computed; beside the
-    // hits they shorten the device side of every host layer. Colab G4 Flash-Next UD-IQ4_XS DFlash2 n6 16 GB, same text: w7 24.9 -> 23.8
-    // ms, chat 179.1 -> 186.6 tok/s, 8k 126.9 -> 136.5 (gp_p1, 2 launches). Windows on the eager split (fewer CPUs, smaller caches)
+    // hits they shorten the device side of every host layer. RTX PRO 6000 Flash-Next at 4 bits DFlash2 n6 16 GB, same text: w7 24.9 -> 23.8
+    // ms, chat 179.1 -> 186.6 tok/s, 8k 126.9 -> 136.5 (2 launches). Windows on the eager split (fewer CPUs, smaller caches)
     // keep the 4-token limit. Only below LLAMA_MOE_G4PASS_OV_MAX_FRAC (default 0.20) of the host experts cached, the share where the
-    // wide mailbox is new (see single_max) and the copies are largest. gp_ab1 / gp_ab2 (G4, 3-4 interleaved launches, same text): 16 GB
+    // wide mailbox is new (see single_max) and the copies are largest. Two A/B runs (RTX PRO 6000, 3-4 interleaved launches, same text): 16 GB
     // chat 167.2 -> 178.3 (launches 2+: 166-168 -> 174.9-186.1), 8k 120.6 -> 134.8; above the share it was mixed: 24 GB (27.5%) chat
     // 203.7 -> 199.3 median over 7 launches (head 189-211, its host batches slower in the slow launches), 8k +2.4%; 32 GB (42%) chat /
     // 8k +4.3 / +2.9% (3 launches). LLAMA_MOE_G4PASS_OV_MAX_FRAC=1: every mailbox window
@@ -9837,21 +9837,21 @@ struct llama_moe_cache::impl {
         }
         return n_ubatch <= mx || overlap_plain_wide(n_ubatch);
     }
-    mutable uint64_t n_ov_wide_host = 0; // k19-g4pass: overlap_small_batch calls answered by the mailbox rule above (engagement)
-    mutable uint64_t n_ov_wide_mid  = 0; // k19-g4mid: the same, answered by the band rule (g4mid_ov_band)
+    mutable uint64_t n_ov_wide_host = 0; // overlap_small_batch calls answered by the mailbox rule above (engagement)
+    mutable uint64_t n_ov_wide_mid  = 0; // the same, answered by the band rule (g4mid_ov_band)
 
-    // k19-g4mid (default on; LLAMA_MOE_G4MID=0 off): the side-stream copy overlap of a 5..8-row mailbox window (k19-g4pass above) also where
-    // the cache holds LLAMA_MOE_G4MID_OV_MIN_FRAC (0.35) .. LLAMA_MOE_G4MID_OV_MAX_FRAC (0.60) of the host experts (G4 fn4n 32 GB: 41.4%).
-    // There a wide window's device side (the admitted experts' copies, then the hits) is the longer of the two per layer: Colab G4
-    // Flash-Next UD-IQ4_XS DFlash2 n6 32 GB chat, GGML_MOE_MAILBOX_TIMING: device beside the host 126.2 us, host 115.4 us per batch, merge
+    // (default on; LLAMA_MOE_G4MID=0 off): the side-stream copy overlap of a 5..8-row mailbox window (above) also where
+    // the cache holds LLAMA_MOE_G4MID_OV_MIN_FRAC (0.35) .. LLAMA_MOE_G4MID_OV_MAX_FRAC (0.60) of the host experts (RTX PRO 6000 Flash-Next at 4 bits 32 GB: 41.4%).
+    // There a wide window's device side (the admitted experts' copies, then the hits) is the longer of the two per layer: RTX PRO 6000
+    // Flash-Next at 4 bits DFlash2 n6 32 GB chat, GGML_MOE_MAILBOX_TIMING: device beside the host 126.2 us, host 115.4 us per batch, merge
     // wait 23.5 us; nsys (node trace, 0am): moe_cache_fetch of a 7-row window 110-125 us per layer, serial before the hits. Beside the hits
-    // the copies leave the host as the longer side, so the pass shortens by the device's excess (w7 21.7 -> 20.1-21.5 ms; gm_p1 / gp_ab1 /
-    // gp_ab3, same text in every cell: chat +1.4..+4.3%, 8k +2.7..+3.0%; gm_s3, 3 launches: device beside the host 123.4 -> 106.0 us, host
-    // 114-123 us, chat 206.0 -> 214.0, 8k 176.2 -> 180.4; gm_ab32, 3 interleaved launches vs the base build: chat 203.6 -> 207.5, 8k
+    // the copies leave the host as the longer side, so the pass shortens by the device's excess (w7 21.7 -> 20.1-21.5 ms; three A/B runs,
+    // same text in every cell: chat +1.4..+4.3%, 8k +2.7..+3.0%; 3 launches: device beside the host 123.4 -> 106.0 us, host
+    // 114-123 us, chat 206.0 -> 214.0, 8k 176.2 -> 180.4; 3 interleaved launches vs the base build: chat 203.6 -> 207.5, 8k
     // 174.7 -> 180.5, with LLAMA_SPEC_PREWARM_CACHED_FRAC=0.3 chat 223.1 -> 233.1, 8k 189.7 -> 194.9, md5 equal in every cell; 48 GB
     // (70.7%) is outside the band, its windows have the host path off). Not below the band by default: at 24 GB (27.5% cached) the device
     // side and the host batch are already level (144.9 vs 145.6-163.7 us), so with the overlap the pass follows the host batch time, which varies by
-    // launch on the G4 host (145-170 us, in both arms): gp_ab1 + gp_ab2 chat median -2.2% over 7 launches (spread 10.8%), gm_s3 +3.9% chat
+    // launch on the RTX PRO 6000 host (145-170 us, in both arms): the A/B chat median -2.2% over 7 launches (spread 10.8%), another run +3.9% chat
     // / +2.5% 8k over 3 (host 144-146 us in every overlapped launch). LLAMA_MOE_G4MID_OV_MIN_FRAC=0.2 takes 24 GB in
     static bool g4mid_on() {
         static const bool on = [] {
@@ -9869,11 +9869,11 @@ struct llama_moe_cache::impl {
     // The overlap below stays on for 5..8-token windows. One 8k case with a 7-row verify picked a different last-row token with it, but a
     // whole-card reference scores the two candidates as a near tie (0.28 vs 0.14), and a reference rescore over 39k tokens on two VMs
     // found no higher wrong-token rate with the overlap than without it (LLAMA_MOE_OVERLAP_PLAIN_MAX=4 turns it off).
-    // k19-bigverify LLAMA_MOE_OVERLAP_PLAIN_MAX=N (default 8, at most GGML_MOE_MAILBOX_MAX_TOKENS; <= 4 = off): verify windows of 5..N tokens
-    // whose host path is off (the plain lookup, k19-q4xcache) take the overlap too: their missing experts are copied on the side stream
+    // LLAMA_MOE_OVERLAP_PLAIN_MAX=N (default 8, at most GGML_MOE_MAILBOX_MAX_TOKENS; <= 4 = off): verify windows of 5..N tokens
+    // whose host path is off (the plain lookup) take the overlap too: their missing experts are copied on the side stream
     // beside the cached ones instead of in the compute stream before any expert of the layer. Windows with the host path on keep the 4-token
-    // limit above (DFlash2 7-row windows on the hybrid path: -2.5 / -3.6% at 24 GB, k19-overlap). Same results as the plain lookup (see
-    // overlap_plain_on). Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6 at a 48 GB cap (70.7% of the host experts cached, host path off),
+    // limit above (DFlash2 7-row windows on the hybrid path: -2.5 / -3.6% at 24 GB). Same results as the plain lookup (see
+    // overlap_plain_on). RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits DFlash2 n6 at a 48 GB cap (70.7% of the host experts cached, host path off),
     // bv_s1g: 208.1 -> 224.5 tok/s chat, same text
     bool overlap_plain_wide(int64_t n_ubatch) const {
         static const int64_t mxp = [] {
@@ -9887,13 +9887,13 @@ struct llama_moe_cache::impl {
         return cm ? cm_share_of(n_ubatch) >= 1.0f : !hybrid_active();
     }
 
-    // k19-l4c deferred admission (LLAMA_MOE_FETCH_DEFER, default 1; 0 = off, 2 = also on hosts without the host team): a single token
+    // deferred admission (LLAMA_MOE_FETCH_DEFER, default 1; 0 = off, 2 = also on hosts without the host team): a single token
     // ubatch on the overlapped hybrid path with the single-graph mailbox hands the experts its assign admits to the host as well, and
     // their copies to the slots run beside the rest of the graph, waited for only at its end (ggml_moe_cache_set_defer). Before, the
-    // layer waited for the copies (zero-copy reads at the link speed, ~470 us per 5.4 MiB expert on Colab L4) to compute the admitted
-    // experts on the device. nsys (l4c_p1, i3f, Colab L4, chat, ms per pass): LFM2.5 8 GB 6.7 of 21.2 waiting for copies (4.1 for the host),
+    // layer waited for the copies (zero-copy reads at the link speed, ~470 us per 5.4 MiB expert on L4) to compute the admitted
+    // experts on the device. nsys (L4, chat, ms per pass): LFM2.5 8 GB 6.7 of 21.2 waiting for copies (4.1 for the host),
     // LFM2.5 4 GB 12.4 of 27.5, Flint 16 GB 5.0 of 22.8.
-    // Only on hosts whose host experts run on the host team (single_team_host: Colab L4 / A100 class; not the G4
+    // Only on hosts whose host experts run on the host team (single_team_host: L4 / A100 class; not the RTX PRO 6000
     // EPYC, whose host has no team, nor a 4-vCPU T4). The admissions and the cache state are the same as without it; the admitted
     // experts are computed on the host (int8 activations) instead of the device, so the output changes: KLD-gated
     bool fetch_defer(int64_t n_ubatch) const {
@@ -9918,8 +9918,8 @@ struct llama_moe_cache::impl {
             return false;
         }
         // only where the cache holds more than LLAMA_MOE_FETCH_DEFER_MIN_FRAC (0.25) and at most LLAMA_MOE_FETCH_DEFER_MAX_FRAC (0.5) of the
-        // host experts (fetch_defer_frac): a host-bound cache (Colab L4 LFM2.5 4 GB, 16% cached) already keeps the host team busy for
-        // the whole step, the admitted experts on top of it cost more than the copies they save (l4c_a2: chat 42.9 vs 44.7 tok/s);
+        // host experts (fetch_defer_frac): a host-bound cache (L4 LFM2.5 4 GB, 16% cached) already keeps the host team busy for
+        // the whole step, the admitted experts on top of it cost more than the copies they save (chat 42.9 vs 44.7 tok/s);
         // LFM2.5 8 GB (40%) +4% alone, +8-12% with the team of 10 waiting blocked; Flint 16 GB (56%): see fetch_defer_frac
         const bool on = (mode == 2 || single_team_host()) && fetch_defer_frac();
         static std::atomic<bool> logged{false};
@@ -10139,11 +10139,11 @@ struct llama_moe_cache::impl {
     }
 
     // deterministic share (LLAMA_MOE_CACHE_HYBRID unset or 2): share = k/(k + n_threads), k = 6, rounded to 1/8, at least 1/8; the
-    // host path is off above 3/4; the timed probe (LLAMA_MOE_CACHE_HYBRID=3) found 0.25 with 24 threads (G4: 58-91 GB/s on the host,
+    // host path is off above 3/4; the timed probe (LLAMA_MOE_CACHE_HYBRID=3) found 0.25 with 24 threads (RTX PRO 6000: 58-91 GB/s on the host,
     // 31 GB/s upload) and 0.5 / 0.625 with 6 threads (L4: 13 / 10 GB/s), and the rounded share flipped between launches, which changed
     // the greedy output; this one depends only on the thread count.
-    // k18-lfm: at most LLAMA_MOE_CACHE_HYBRID_SHARE_CAP (0.25) with LLAMA_MOE_CACHE_HYBRID_SHARE_CAP_THREADS (6) or more decode threads.
-    // L4 (6 threads, 12 GB/s upload, ~470 us per uploaded expert): LFM2.5 UD-Q4_K_XL 4 GB (4.8% cached) at the old 0.5 vs 0.25 decoded
+    // at most LLAMA_MOE_CACHE_HYBRID_SHARE_CAP (0.25) with LLAMA_MOE_CACHE_HYBRID_SHARE_CAP_THREADS (6) or more decode threads.
+    // L4 (6 threads, 12 GB/s upload, ~470 us per uploaded expert): LFM2.5 at 4 bits 4 GB (4.8% cached) at the old 0.5 vs 0.25 decoded
     // chat / 2k / 8k 28.4 / 36.0 / 32.0 vs 37.1 / 52.2 / 51.0 tok/s (every miss on the host: 28.5 / 39.0 / 34.8); 24 threads give 0.25
     // either way. LLAMA_MOE_CACHE_HYBRID_SHARE_CAP=1 restores k/(k + n)
     void set_threads(int n_threads, bool quiet) {
@@ -10185,15 +10185,15 @@ struct llama_moe_cache::impl {
     // calibration, once before the first small batch, with the threads of small batches: the host times one layer's expert tensors for 1
     // expert x 1 token, k experts x 1 token and k experts x T tokens (other experts every repetition, as they are read in generation),
     // the device times uploads of k experts from the host experts and a small synchronous read (the round trip of a host split)
-    // k15-idlewait: set by cm_calibrate when cm_cal_abort stopped a re-calibration (nothing changed, it stays pending)
+    // set by cm_calibrate when cm_cal_abort stopped a re-calibration (nothing changed, it stays pending)
     bool (*cm_cal_abort)(void *) = nullptr;
     void * cm_cal_abort_data     = nullptr;
     bool   cm_cal_aborted        = false;
 
-    // k19-determinism (LLAMA_MOE_CPU_MISS_CAL_PERSIST, default 1): the start-up calibration is kept in a small file per device, host
+    // (LLAMA_MOE_CPU_MISS_CAL_PERSIST, default 1): the start-up calibration is kept in a small file per device, host
     // threads and expert form (LLAMA_MOE_CPU_MISS_CAL_DIR, else $LLAMA_CACHE, else $XDG_CACHE_HOME/llama.cpp, else ~/.cache/llama.cpp), and
     // every later launch reads it at the same point instead of timing the host again; the re-calibration after warm-up then changes nothing.
-    // A per-launch sample decided some batch sizes on a noisy timing: G4 Qwen3.6-35B-A3B UD-Q4_K_XL + MTP 12 GB, host split 30.7 vs 34.7 us
+    // A per-launch sample decided some batch sizes on a noisy timing: RTX PRO 6000 Qwen3.6-35B-A3B at 4 bits + MTP 12 GB, host split 30.7 vs 34.7 us
     // put single token batches on the host path in one launch and not in the other (7931 vs 7388 host batches, other text at temperature 0
     // in 1 of 3 launches). The first launch decides from the numbers it writes, so all launches on a machine decide alike. =0: timed in
     // every launch (the live rule, with the re-calibration); =2: timed again and the file rewritten (after a hardware or load change)
@@ -10205,7 +10205,7 @@ struct llama_moe_cache::impl {
         return mode;
     }
     bool cm_from_file = false; // this launch decides from a persisted calibration
-    // k19-determinism (option a): no file yet. This launch runs the live rule, and the re-calibration after warm-up (the host as it is during
+    // (option a): no file yet. This launch runs the live rule, and the re-calibration after warm-up (the host as it is during
     // decode) writes the file; later launches decide from it from the first token
     bool cm_persist_pending = false;
     std::string cm_pend_dir, cm_pend_key, cm_pend_path;
@@ -10252,13 +10252,13 @@ struct llama_moe_cache::impl {
         return id;
     }
 
-    // (k19-autoprof: the same directory keeps the self-learned profiles, see llama-autoprof.h)
+    // (the same directory keeps the self-learned profiles, see llama-autoprof.h)
     static std::string cm_cal_dir() {
         return llama_autoprof::cal_dir();
     }
 
     // what the timings depend on: the device, the host threads and CPU count, the cache (main / MTP) and the expert form
-    // k19-calvpersist: the pinned calibration (LLAMA_MOE_CPU_MISS_CAL_VALUES="t1 dt tup split", tests / benchmarks), or nullptr. A pinned
+    // the pinned calibration (LLAMA_MOE_CPU_MISS_CAL_VALUES="t1 dt tup split", tests / benchmarks), or nullptr. A pinned
     // run keeps its own calibration file (the key names the values), so the trial verdicts it times persist and replay as on a user
     // machine, and a later launch without the variable never reads the pinned numbers as a calibration of this machine
     static const char * cm_cal_values(double v[4]) {
@@ -10371,7 +10371,7 @@ struct llama_moe_cache::impl {
         return false;
     }
 
-    // k19-determinism: one line at load naming the calibration file this cache will use (read, or written by its first small batch)
+    // one line at load naming the calibration file this cache will use (read, or written by its first small batch)
     void cm_cal_log_file(bool quiet) const {
         if (quiet || !cm || cm_persist_mode() == 0) {
             return;
@@ -10394,7 +10394,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k19-ptres: the next expert id from nx on (mod n_expert) that is not in the core: the timings read host copies, which the core
+    // the next expert id from nx on (mod n_expert) that is not in the core: the timings read host copies, which the core
     // has none of (with no core: nx++ % n_expert, as before)
     int64_t not_core(const group & g, int32_t il, int64_t & nx, int64_t n_expert) const {
         const int32_t * cs = g.lru.n_core > 0 ? g.lru.slot_map[il] : nullptr;
@@ -10420,7 +10420,7 @@ struct llama_moe_cache::impl {
         };
         hybrid_probe = false;
         const int64_t t_start = ggml_time_us();
-        // k13-fn: the second call is the re-calibration after warm-up (see cm_recal_wait): host timings only, see below
+        // the second call is the re-calibration after warm-up (see cm_recal_wait): host timings only, see below
         const bool recal = cm_cal;
         const group * gp = nullptr;
         for (const group & g : groups) {
@@ -10444,7 +10444,7 @@ struct llama_moe_cache::impl {
         const int     T        = 8;
         const int     n_rep    = 11;
 
-        // k19-determinism: a persisted calibration replaces the timing (start-up), and the re-calibration changes nothing
+        // a persisted calibration replaces the timing (start-up), and the re-calibration changes nothing
         const int persist = cm_persist_mode();
         if (recal && cm_from_file) {
             return;
@@ -10457,8 +10457,8 @@ struct llama_moe_cache::impl {
                 cm_t1 = v[0]; cm_dt = v[1]; cm_tup = v[2]; cm_split = v[3];
                 cm_from_file = true;
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration from LLAMA_MOE_CPU_MISS_CAL_VALUES (%s)\n", tag, fv);
-                // k19-calvpersist: the pinned run's calibration file (key + pinned values), so the trial verdicts can be recorded in it
-                // (k19-cmtpersist writes them only into an existing file); without it every pinned launch timed its trials again
+                // the pinned run's calibration file (key + pinned values), so the trial verdicts can be recorded in it
+                // (writes them only into an existing file); without it every pinned launch timed its trials again
                 const std::string dir = persist != 0 ? cm_cal_dir() : std::string();
                 if (!dir.empty()) {
                     const std::string key  = cm_cal_key_eff(g, l);
@@ -10498,9 +10498,9 @@ struct llama_moe_cache::impl {
         }
 
         ggml_init_params params = {
-            /*.mem_size   =*/ (8 + 6*l.experts.size())*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(16, false),
+            /*.mem_size =*/ (8 + 6*l.experts.size())*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(16, false),
             /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
+            /*.no_alloc =*/ true,
         };
         ggml_context_ptr ctx(ggml_init(params));
         ggml_tensor * ids_a = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, ka, 1);
@@ -10548,7 +10548,7 @@ struct llama_moe_cache::impl {
             std::sort(v.begin(), v.end());
             return (double) v[v.size()/2];
         };
-        // k19-determinism: interquartile range over the median of a sample set (the noise of a start-up calibration)
+        // interquartile range over the median of a sample set (the noise of a start-up calibration)
         auto rel_iqr = [](std::vector<int64_t> v) {
             if (v.size() < 4) {
                 return 0.0;
@@ -10564,13 +10564,13 @@ struct llama_moe_cache::impl {
             return ggml_time_us() - t0;
         };
 
-        // k19-calib (LLAMA_MOE_CPU_MISS_CAL_ROBUST, default 1; 0 = the single sample set of before): one sample set of 11 repetitions
-        // (about 50 ms) is a launch lottery on a small host: Colab L4 LFM2.5 (12 vCPUs, 6 decode threads) timed the further token of an
-        // expert at ~73 or ~130 us per launch for the same bin (u13g_l4 / u12_l4b / i3h_l4, both bins), the slow value moved the fetch
+        // (LLAMA_MOE_CPU_MISS_CAL_ROBUST, default 1; 0 = the single sample set of before): one sample set of 11 repetitions
+        // (about 50 ms) is a launch lottery on a small host: L4 LFM2.5 (12 vCPUs, 6 decode threads) timed the further token of an
+        // expert at ~73 or ~130 us per launch for the same bin (three runs, both bins), the slow value moved the fetch
         // shares and the per-launch decode by ~3%. Robust: 3 untimed warm-up repetitions, then 3 (start-up) / 5 (re-calibration) sample
         // sets, a set during which other processes kept CPUs busy retried after a pause; each graph time is the fastest clean set median
         // (a slow set is a busy host, never a faster path), the file keeps the median host time per expert (see below). LLAMA_MOE_CPU_MISS_CAL_LOG=1: every sample, the process CPU time per wall time, the
-        // other processes' busy CPUs, context switches and page faults of each set (the diagnosis of k19-calib)
+        // other processes' busy CPUs, context switches and page faults of each set (the diagnosis of the calibration)
         static const bool cal_robust = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_ROBUST");
             return e == nullptr || atoi(e) != 0;
@@ -10583,7 +10583,7 @@ struct llama_moe_cache::impl {
         const int n_warm = cal_robust ? 3 : 1;
         int n_set_log = 0;
         // one sample set: n_warm untimed repetitions, then n_rep timed ones of the three graphs
-        // k19-calib: a set during which other processes kept more than LLAMA_MOE_CPU_MISS_CAL_BUSY_MAX CPUs (0.75) busy is contended (kcal_l4:
+        // a set during which other processes kept more than LLAMA_MOE_CPU_MISS_CAL_BUSY_MAX CPUs (0.75) busy is contended (
         // every slow-mode set had 1.0-1.5 other CPUs busy, the fast ones at most 0.5): it is retried after a pause, up to 6 more sets
         static const double busy_max = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_BUSY_MAX");
@@ -10671,7 +10671,7 @@ struct llama_moe_cache::impl {
 
         // a busy host gives inconsistent times (more experts not slower, an implausible bandwidth): measured again, at most 3 times
         double d_a = 0.0, d_b = 0.0, d_t = 0.0, slope = 0.0;
-        double slope_med = 0.0;   // k19-calib: the median of the clean sets' own host times per expert (what the file keeps, see below)
+        double slope_med = 0.0;   // the median of the clean sets' own host times per expert (what the file keeps, see below)
         bool ok = false;
         int attempt = 0;
         for (; attempt < 3 && !ok; ++attempt) {
@@ -10682,8 +10682,8 @@ struct llama_moe_cache::impl {
             bool last_busy = false;
             const int n_extra = cal_robust ? 6 : 0;
             while (n_clean < n_sets_rb && n_all < n_sets_rb + n_extra && !(n_all >= n_sets_rb && n_busy == 0)) {
-                // back to back as before unless the last set was contended (a pause re-places the pool's threads: on G4 it also turned the
-                // re-calibration's decode-time 34-36 us per expert into the idle 23, which decodes 24 GB chat 2-3% slower, kcal3_g4)
+                // back to back as before unless the last set was contended (a pause re-places the pool's threads: on RTX PRO 6000 it also turned the
+                // re-calibration's decode-time 34-36 us per expert into the idle 23, which decodes 24 GB chat 2-3% slower)
                 if (last_busy) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(25));
                 }
@@ -10778,7 +10778,7 @@ struct llama_moe_cache::impl {
 
         if (recal && cm_persist_pending) {
             // option (a): the host as it is during decode, the median of LLAMA_MOE_CPU_MISS_CAL_SETS (3) sample sets (this one and more)
-            // k19-calib: with the robust sampling the sets were taken above (the fastest set median of each quantity): one entry here
+            // with the robust sampling the sets were taken above (the fastest set median of each quantity): one entry here
             static const int n_sets = cal_robust ? 1 : [] {
                 const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_SETS");
                 return e != nullptr ? std::max(1, atoi(e)) : 3;
@@ -10813,10 +10813,10 @@ struct llama_moe_cache::impl {
             double spread = 0.0;
             const bool noisy = cm_cal_noisy(t1s, iqr, cm_cal_max_spread(), spread);
             const double t1w = med(t1s), dtw = med(dts), daw = med(das);
-            // k19-calib: robust: the file keeps the faster further-token time of the start-up and the re-calibration (the bimodal quantity:
+            // robust: the file keeps the faster further-token time of the start-up and the re-calibration (the bimodal quantity:
             // a slow draw of either no longer decides every later launch on this host) and, as before, the host time per expert of the
-            // host as it is after warm-up (the median of the re-calibration's clean sets: on G4 Flash-Next 24 GB chat the decode-time 34-36
-            // us per expert decoded 2.5-3% faster than the start-up 23 on its own text, kcal_g4 / kcal2_g4)
+            // host as it is after warm-up (the median of the re-calibration's clean sets: on RTX PRO 6000 Flash-Next 24 GB chat the decode-time 34-36
+            // us per expert decoded 2.5-3% faster than the start-up 23 on its own text)
             const double t1p = cal_robust ? std::max(slope_med, 0.05) : t1w, dtp = cal_robust ? std::min(dtw, cm_dt) : dtw;
             double v[4] = { t1p, dtp, std::max(median(tu)/ka, 0.05), std::max(0.0, daw - ka*t1w) + 2.0*median(trt) };
             cm_persist_pending = false;
@@ -10826,7 +10826,7 @@ struct llama_moe_cache::impl {
             } else {
                 const bool w = cm_cal_write(cm_pend_dir, cm_pend_path, cm_pend_key, v, persist == 2);
                 if (w) {
-                    cmt_ps_flush(); // k19-cmtpersist: verdicts timed before the file existed
+                    cmt_ps_flush(); // verdicts timed before the file existed
                 }
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration %s %s: host %.1f us per expert (%.2f us per further token), upload %.1f us, "
                     "host split %.1f us (re-calibration, %zu sets, spread %.0f%%)\n", tag, w ? "written to" : "could not be written to",
@@ -10834,19 +10834,19 @@ struct llama_moe_cache::impl {
             }
         }
         if (recal) {
-            // k13-fn: one start-up sample set (11 repetitions of one layer, before any request) can be slow as a whole: on the file
-            // tier (G4 Flash-Next UD-IQ4_XS 16 GB / 64 GiB RAM) 2 of 3 launches measured 33.3 instead of 23.1 us per expert, the fetch
+            // one start-up sample set (11 repetitions of one layer, before any request) can be slow as a whole: on the file
+            // tier (RTX PRO 6000 Flash-Next at 4 bits 16 GB / 64 GiB RAM) 2 of 3 launches measured 33.3 instead of 23.1 us per expert, the fetch
             // share went from 0.25 to 0.5 and 8k decode lost 4-9%. After warm-up the host is timed again; if the two disagree by more
             // than 20%, the faster host time is kept (a slow sample comes from a cold page cache or a busy host, not a slower path)
             const double t1_new = std::max(slope, 0.05);
             const double dt_new = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
             const double rel    = std::fabs(t1_new - cm_t1)/std::max(cm_t1, 1e-3);
-            // k15-lfm2 (cm_stable): an agreeing re-calibration also keeps the faster of the two and decides again below (before, it
+            // (cm_stable): an agreeing re-calibration also keeps the faster of the two and decides again below (before, it
             // returned with the start-up decisions, which the next rule window, up to cm_win2 small batches later, then changed)
             if (rel <= cm_recal_tol && cm_stable) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert agrees with %.1f (within %.0f%%), host %.1f "
                     "us per expert kept\n", tag, t1_new, cm_t1, 100.0*cm_recal_tol, std::min(cm_t1, t1_new));
-                // k19-calib: the further token is its own quantity (the bimodal one), the faster of the two is kept on its own
+                // the further token is its own quantity (the bimodal one), the faster of the two is kept on its own
                 cm_dt = cal_robust ? std::min(cm_dt, dt_new) : t1_new < cm_t1 ? dt_new : cm_dt;
                 cm_t1 = std::min(cm_t1, t1_new);
             } else if (rel <= cm_recal_tol && !(cal_robust && dt_new < (1.0 - cm_recal_tol)*cm_dt)) {
@@ -10854,7 +10854,7 @@ struct llama_moe_cache::impl {
                     t1_new, cm_t1, 100.0*cm_recal_tol);
                 return;
             } else if (rel <= cm_recal_tol) {
-                // k19-calib: the host time agrees but the further token is more than cm_recal_tol faster: the start-up set was the slow mode
+                // the host time agrees but the further token is more than cm_recal_tol faster: the start-up set was the slow mode
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.2f us per further token vs %.2f at start-up: kept\n", tag,
                     dt_new, cm_dt);
                 cm_dt = dt_new;
@@ -10872,7 +10872,7 @@ struct llama_moe_cache::impl {
             cm_tup   = std::max(median(tu)/ka, 0.05);
             cm_split = std::max(0.0, d_a - ka*cm_t1) + 2.0*median(trt);
             if (!cal_path.empty()) {
-                // option (a): the start-up sample decides this launch only (it is often faster than the host during decode: G4 Flash-Next
+                // option (a): the start-up sample decides this launch only (it is often faster than the host during decode: RTX PRO 6000 Flash-Next
                 // 23.3-23.9 us per expert at start-up in most launches, 34.6-35.5 re-timed after warm-up in all); the re-calibration writes
                 cm_persist_pending = true;
                 cm_pend_dir  = cal_dir;
@@ -10902,10 +10902,10 @@ struct llama_moe_cache::impl {
         if (!recal || !cm_stable || cm_on.size() != (size_t) cm_max + 1) {
             cm_on.assign(cm_max + 1, 0);
         }
-        // k11 LLAMA_MOE_CPU_MISS_FETCH_SCALE=s (opt-in, unset = 1): the fetched share scaled by s before the levels, with a level of 1/16
+        // LLAMA_MOE_CPU_MISS_FETCH_SCALE=s (opt-in, unset = 1): the fetched share scaled by s before the levels, with a level of 1/16
         // below 1/8. The balance above treats a fetch as running beside the device work, but the fetch kernel reads host memory in the
-        // device stream (G4 q4x + MTP 8 GB nsys: 45% of the decode window), so the device side of the balance is slower than cm_tup says;
-        // G4 with a fixed share of 0.1 instead of 0.25: decode +13.5 / +16.1 / +4.7% (chat / 2k / 8k)
+        // device stream (RTX PRO 6000 with the 4-bit Qwen3.6 + MTP 8 GB nsys: 45% of the decode window), so the device side of the balance is slower than cm_tup says;
+        // RTX PRO 6000 with a fixed share of 0.1 instead of 0.25: decode +13.5 / +16.1 / +4.7% (chat / 2k / 8k)
         static const double fetch_scale = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_FETCH_SCALE");
             return e != nullptr ? std::max(0.0, atof(e)) : 1.0;
@@ -10915,7 +10915,7 @@ struct llama_moe_cache::impl {
             const double tbar = std::max(1.0, (double) n*std::min<int64_t>(n_expert_used, n_expert)/D);
             const double tc   = cm_t1 + (tbar - 1.0)*cm_dt;
             const double raw  = tc/(tc + cm_tup)*fetch_scale;
-            // log levels: two calibrations a little apart rarely fall on two sides of a level. k15-lfm2: small batches (at most
+            // log levels: two calibrations a little apart rarely fall on two sides of a level. small batches (at most
             // max_batch tokens) take 1/4 up to cm_small_half instead of the geometric midpoint 0.354 (see cm_small_half)
             const double half = n <= max_batch ? cm_small_half_eff() : 0.354;
             cm_share[n] = raw <= 0.177 ? 0.125f : raw <= half ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
@@ -10943,21 +10943,21 @@ struct llama_moe_cache::impl {
         }
         cm_dec_init();
         cm_cal = true;
-        cm_recal_wait = cm_from_file ? -1 : cm_recal_after; // k19-determinism: no re-calibration from a persisted one
+        cm_recal_wait = cm_from_file ? -1 : cm_recal_after; // no re-calibration from a persisted one
         // the first prompt and tokens run before any measured miss rate: a prior from the cached share c of the experts, (1 - c)^4
-        // (decode miss rates measured on a G4: Qwen3.6-35B-A3B UD-Q4_K_XL c = 0.17 -> 0.29-0.47, c = 0.39 -> 0.16; gpt-oss-20b Q2_K
+        // (decode miss rates measured on a RTX PRO 6000: Qwen3.6-35B-A3B at 4 bits c = 0.17 -> 0.29-0.47, c = 0.39 -> 0.16; gpt-oss-20b Q2_K
         // c = 0.54 -> 0.007), the first measured window corrects it without the hysteresis
         if (!cm_force) {
             cm_rate = std::max(0.01, std::min(1.0, std::pow(1.0 - std::max(0.0, std::min(1.0, cache_frac)), 4.0)));
             cm_decide();
         }
-        // k11 (LLAMA_MOE_CPU_MISS_TRIAL_FRAC, default 0.20; 0 = the trials of k10 everywhere): a cache that holds less than this share
+        // (LLAMA_MOE_CPU_MISS_TRIAL_FRAC, default 0.20; 0 = the trials of everywhere): a cache that holds less than this share
         // of the host experts runs no warm phase and no timing trials, so small batches follow the cost model from the calibration on;
-        // short prompts stay on the plain cache (they need a trial that kept the host path, see cm_prompt_ok). G4 Qwen3.6 UD-Q4_K_XL
+        // short prompts stay on the plain cache (they need a trial that kept the host path, see cm_prompt_ok). RTX PRO 6000 Qwen3.6 at 4 bits
         // 8 GB + MTP (17% cached): the trials turned the draft context's host path off (0.467 vs 0.501 ms per small batch) and ran their
         // blocks without it, decode -6..-15% against the cost model alone. The cells the trials were made for keep them: Qwen3.6 12 GB
-        // (39% cached, the split costs more than modelled) and gpt-oss-20b Q2_K 8 GB (54%). Round 9 (G4 / L4 / T4, k10 on the same VM):
-        // Qwen3.6 UD-Q4_K_XL 8 GB + MTP (16.8%) decode +5.6..+13.2% G4, +10.7..+21.0% L4; Q3_K_M 8 GB (23.8%) -1..-2% on G4, T4 UD-Q4_K_XL
+        // (39% cached, the split costs more than modelled) and gpt-oss-20b Q2_K 8 GB (54%). Earlier runs (RTX PRO 6000 / L4 / T4, on the same VM):
+        // Qwen3.6 at 4 bits 8 GB + MTP (16.8%) decode +5.6..+13.2% RTX PRO 6000, +10.7..+21.0% L4; Q3_K_M 8 GB (23.8%) -1..-2% on RTX PRO 6000, T4 at 4 bits
         // 8 GB without a draft (22.2%) inside its spread: both stay above 0.20
         const bool trial_skip = cm_skip_trials(false);
         if (cm_trial && !cm_force && !trial_skip) {
@@ -11001,8 +11001,8 @@ struct llama_moe_cache::impl {
         }();
         return on && cm_persist_mode() != 0;
     }
-    // k19-calvmargin: the least gain t_on / t_off of a timed "on" that is persisted as firm (default 0.10); a smaller "on" keeps the host
-    // path off and is timed again by the next launches (LLAMA_MOE_CPU_MISS_PERSIST_MIN=0: every timed verdict firm, k19-calvpersist)
+    // the least gain t_on / t_off of a timed "on" that is persisted as firm (default 0.10); a smaller "on" keeps the host
+    // path off and is timed again by the next launches (LLAMA_MOE_CPU_MISS_PERSIST_MIN=0: every timed verdict firm)
     static double cmt_ps_min_gain() {
         static const double b = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_PERSIST_MIN");
@@ -11020,7 +11020,7 @@ struct llama_moe_cache::impl {
     // launches time it again, an "off" timing makes it firm "off" and cmt_trust_tries() marginal "on" timings in a row make it firm "on"
     // (llama_moe_tp::settle). Only the trial's own measured direction decides: a trial that times the host path slower keeps it off.
     // On these hosts the 4-row mailbox serves the short verify windows of an MTP head beside a cache of 50-90% of the host experts, and
-    // a small measured gain repeats from launch to launch: Colab L4 (12 vCPU, Intel Xeon 2.20 GHz), Qwen3.6-35B-A3B UD-Q4_K_XL with its
+    // a small measured gain repeats from launch to launch: L4 (12 vCPU, Intel Xeon 2.20 GHz), Qwen3.6-35B-A3B at 4 bits with its
     // MTP head capped at 16 GB (58% cached): t_on / t_off 0.935 / 0.931 / 0.939 in three launches, all kept off before
     bool cmt_trust_marginal() const {
         static const bool on = [] {
@@ -11034,7 +11034,7 @@ struct llama_moe_cache::impl {
         static const int n = llama_moe_tp::trust_tries(getenv("LLAMA_MOE_CPU_MISS_TRUST_TRIES"));
         return n;
     }
-    // k19-calvmargin: launches that time a marginal "on" before it is firm "off" (default 3)
+    // launches that time a marginal "on" before it is firm "off" (default 3)
     static int cmt_ps_tries() {
         static const int n = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_PERSIST_TRIES");
@@ -11049,7 +11049,7 @@ struct llama_moe_cache::impl {
         }();
         return cmt_persist_on() ? h : 0.0;
     }
-    // k19-cmtpersist: the calibration file and this cache's tag, and the verdicts recorded there (once, before the first trial ends)
+    // the calibration file and this cache's tag, and the verdicts recorded there (once, before the first trial ends)
     void cmt_ps_setup() {
         if (cmt_ps_state >= 0) {
             return;
@@ -11094,7 +11094,7 @@ struct llama_moe_cache::impl {
             cmt_rec_dirty = false;
             LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: %zu trial verdict(s) written to %s\n", tag, cmt_rec.size(), cmt_ps_path.c_str());
         } else if (!cmt_ps_warned && !cm_persist_pending) {
-            // k19-calvpersist: the write needs the calibration file (its key on the first line); say so instead of failing silently
+            // the write needs the calibration file (its key on the first line); say so instead of failing silently
             // (not while the launch's own re-calibration is still to write that file: it flushes the verdicts then)
             cmt_ps_warned = true;
             LLAMA_LOG_WARN("llama_moe_cache%s: CPU misses: %zu trial verdict(s) not written to %s (no calibration file with this key, or "
@@ -11128,7 +11128,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // r22b prompt timing (see pt_auto): before the graph of a ubatch, and at its end (backends synchronized)
+    // prompt timing (see pt_auto): before the graph of a ubatch, and at its end (backends synchronized)
     bool pt_pending() const {
         return pt_auto && cm && cm_cal && !cm_force;
     }
@@ -11213,9 +11213,9 @@ struct llama_moe_cache::impl {
             std::sort(v.begin(), v.end());
             return v.empty() ? 0.0 : (double) v[v.size()/2];
         };
-        // k19-cmtpersist: a recorded trial runs its recorded length and takes its recorded verdict (no timing decides)
+        // a recorded trial runs its recorded length and takes its recorded verdict (no timing decides)
         cmt_ps_setup();
-        // k19-calvmargin: an open record (a marginal "on") is timed again, not replayed
+        // an open record (a marginal "on") is timed again, not replayed
         const bool have_rec = cmt_ps_state == 1 && (size_t) cmt_n < cmt_rec_file;
         const bool replay   = have_rec && cmt_rec[cmt_n].firm != 0;
         const bool retime   = have_rec && !replay;
@@ -11242,10 +11242,10 @@ struct llama_moe_cache::impl {
                 on       = llama_moe_tp::decide(t_on, t_off, cmt_t[0].size(), cmt_t[1].size(), cmt_n > 0, cm_small_ok, cmt_margin, cmt_hyst());
                 host_ok  = !cmt_host_slow(t_on, t_off);
                 // a clear loss is checked again much later: each trial runs 2 blocks on the slower path, and their fewer admissions leave
-                // the cache colder for a while (G4 Qwen3.6 UD-Q4_K_XL 12 GB, gpt-oss-20b 8 GB: -4..-8% decode with the path off but re-tried)
+                // the cache colder for a while (RTX PRO 6000 Qwen3.6 at 4 bits 12 GB, gpt-oss-20b 8 GB: -4..-8% decode with the path off but re-tried)
                 gap_next = std::min(on || t_on < 1.05*t_off ? 2*cmt_gap : std::max(4*cmt_gap, 512), cmt_gap_max);
                 if (cmt_ps_state == 1) {
-                    // k19-calvmargin: a marginal "on" is not locked in (llama_moe_tp::settle): the host path stays off, the record stays open
+                    // a marginal "on" is not locked in (llama_moe_tp::settle): the host path stays off, the record stays open
                     // and the next launch times the trial again, until a clear timing or cmt_ps_tries() marginal ones make it firm
                     const double thr  = llama_moe_tp::threshold(cmt_n > 0, cm_small_ok, cmt_margin, cmt_hyst());
                     const bool   marg = llama_moe_tp::marginal_on(on, t_on, t_off, cmt_ps_min_gain());
@@ -11434,7 +11434,7 @@ struct llama_moe_cache::impl {
 
     // per batch size: on where the expected time saved per layer beats the cost of the host split
     void cm_decide() {
-        // k13: frozen small batches keep every per-size decision as it was at the freeze (a decision from the miss rate of a window
+        // frozen small batches keep every per-size decision as it was at the freeze (a decision from the miss rate of a window
         // would follow the drafts: their verify windows look up other tokens than single token decodes)
         if (cm_frozen) {
             return;
@@ -11461,9 +11461,9 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                // k15-np (LLAMA_MOE_SINGLE_MIN_MISSES, default 0 = off): the mailbox's cheaper split (single_split_frac) only where a
-                // batch misses at least this many distinct experts per layer at the measured miss rate. Off by default: G4 k15g4n at 1.5
-                // still turned the host path on at q3m 12 GB and q4x 16 GB + MTP, whose first windows miss 7-12% (m(3) 1.8-2.8) before
+                // (LLAMA_MOE_SINGLE_MIN_MISSES, default 0 = off): the mailbox's cheaper split (single_split_frac) only where a
+                // batch misses at least this many distinct experts per layer at the measured miss rate. Off by default: RTX PRO 6000 at 1.5
+                // still turned the host path on at the 3-bit Qwen3.6 12 GB and the 4-bit Qwen3.6 16 GB + MTP, whose first windows miss 7-12% (m(3) 1.8-2.8) before
                 // settling at 4-6%, against 13.5%+ (3.4) where the host path wins; the cache-share gate on the early note (llama-graph.cpp,
                 // LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC) separates those cells instead. Kept as an override
                 static const double mb_min_misses = [] {
@@ -11471,12 +11471,12 @@ struct llama_moe_cache::impl {
                     return e != nullptr ? std::max(0.0, atof(e)) : 0.0;
                 }();
                 const bool mb_cheap = n <= max_batch && single_weigh() && single_usable(n) && m >= mb_min_misses;
-                // k19-l4poly: on a host whose host experts run on the host team (a small host, see single_team_host), where the timing
+                // on a host whose host experts run on the host team (a small host, see single_team_host), where the timing
                 // trials run, a small batch is a candidate at LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM (0.5) times the weighed split instead of
-                // cm_split_scale (3, set on G4 for the graph split's unmodelled cost): the trial then decides it. Colab L4 Flint 16 GB
+                // cm_split_scale (3, set on RTX PRO 6000 for the graph split's unmodelled cost): the trial then decides it. L4 Flint 16 GB
                 // (55.8% cached, trials on): 1-token batches gain ~60 us per layer against a weighed split of 1.5 x 3 x 0.2 x 200-330 us,
-                // so decode fetched every miss over PCIe, while a fixed host share of 1/4 decoded +13% (k19-flint); the scale 0.5 on the
-                // same VM: chat +8.4%, 2k +32% (l4p_b2). LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM_MAILBOX=1: mailbox sizes only. An explicit
+                // so decode fetched every miss over PCIe, while a fixed host share of 1/4 decoded +13% ; the scale 0.5 on the
+                // same VM: chat +8.4%, 2k +32%. LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM_MAILBOX=1: mailbox sizes only. An explicit
                 // LLAMA_MOE_CPU_MISS_SPLIT_SCALE applies to every size as before
                 static const bool team_mb_only = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM_MAILBOX") != nullptr &&
                     atoi(getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM_MAILBOX")) != 0;
@@ -11545,9 +11545,9 @@ struct llama_moe_cache::impl {
         const int     n_rep    = 7;
 
         ggml_init_params params = {
-            /*.mem_size   =*/ (4 + 3*l.experts.size())*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(16, false),
+            /*.mem_size =*/ (4 + 3*l.experts.size())*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(16, false),
             /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
+            /*.no_alloc =*/ true,
         };
         ggml_context_ptr ctx(ggml_init(params));
         ggml_tensor * ids_k = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, k, 1);
@@ -11667,7 +11667,7 @@ struct llama_moe_cache::impl {
         }
         std::vector<int32_t> buf(3*(size_t) g.n_slots, 0);
         std::copy(g.lru.key_of.begin(), g.lru.key_of.end(), buf.begin());
-        // k15-pred r20 (LLAMA_MOE_UPLOAD_AHEAD_DEC_REF=1): the slots the last decode used, if they still hold that expert, start with the
+        // (LLAMA_MOE_UPLOAD_AHEAD_DEC_REF=1): the slots the last decode used, if they still hold that expert, start with the
         // reference bit set, so the decode after a prompt does not evict its own working set first (the hand starts at slot 0 with every bit
         // clear; after a prompt with uploads ahead the decode missed 1400 times per 32 tokens vs 850 off, 90 and fewer with this and KEEP_DECODE)
         if (ua_dec_ref && ua_mode > 0 && !g.ua_dec_key.empty()) {
@@ -11753,7 +11753,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // LLAMA_MOE_CACHE_STATE_LOG=1 (debug, k11 3l): a hash of the host cache state (slots, LRU order, scores) at the first small batch
+    // LLAMA_MOE_CACHE_STATE_LOG=1 (debug, 3l): a hash of the host cache state (slots, LRU order, scores) at the first small batch
     // after large ones, i.e. what a prompt left for the decode
     bool st_after_large = false;
     void state_log() {
@@ -11788,24 +11788,24 @@ struct llama_moe_cache::impl {
             ~in_prepare_scope() { f = false; }
         } ips(in_prepare);
         ua_drain();
-        // k19-l4ttft: a small batch ends the prompt (the scratch of the prompt layer reads is not read again)
+        // a small batch ends the prompt (the scratch of the prompt layer reads is not read again)
         if (n_tokens <= n_small_max && (plr.il >= 0 || plr.p_t0 != 0)) {
             plr_prompt_end();
         }
-        // k19-ramprof2: the profile fill (see hprof_order)
+        // the profile fill (see hprof_order)
         if (host && wstore != nullptr && !hprof_ticket.empty()) {
             hprof_prepare(n_tokens);
         }
-        // k19-autoprof: the target set at a request's first large batch (see ap_use)
+        // the target set at a request's first large batch (see ap_use)
         if (host) {
             ap_prepare(n_tokens);
         }
-        // k19-l4fill: the refill of the freed RAM slots (see fill_mode)
+        // the refill of the freed RAM slots (see fill_mode)
         if (host) {
             fill_prepare(n_tokens);
         }
         // a medium ubatch right after a large one is the tail of the same prompt: the large ubatch just seeded the cache with the
-        // experts this text routes, and evicting them for guesses costs more than the overlap gains (G4 q4x 12 GB multi-turn tails +8%)
+        // experts this text routes, and evicting them for guesses costs more than the overlap gains (RTX PRO 6000 with the 4-bit Qwen3.6 12 GB multi-turn tails +8%)
         ua_skip = ua_prev_tokens > ua_max_tokens;
         ua_prev_tokens = n_tokens;
         static const bool st_log = getenv("LLAMA_MOE_CACHE_STATE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_STATE_LOG")) != 0;
@@ -11844,7 +11844,7 @@ struct llama_moe_cache::impl {
                 download(g);
             }
         }
-        // k13 diagnostic (LLAMA_MOE_CACHE_STATE_LOG=1): a hash of every group's slot map and state as the ubatch of n_tokens starts,
+        // diagnostic (LLAMA_MOE_CACHE_STATE_LOG=1): a hash of every group's slot map and state as the ubatch of n_tokens starts,
         // logged when it changed; verify windows and single token decodes must see the same sequence of states
         static const bool state_log = getenv("LLAMA_MOE_CACHE_STATE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_STATE_LOG")) != 0;
         if (state_log) {
@@ -11908,7 +11908,7 @@ struct llama_moe_cache::impl {
             rf_lend_tokens = n_tokens;
         }
 
-        // k15-lfm2: a graph of in-place prompts lends one layer of slots for its missing experts; its other copies (if any) stay in the
+        // a graph of in-place prompts lends one layer of slots for its missing experts; its other copies (if any) stay in the
         // scheduler's arena
         if (inplace_graph) {
             prompt_lend(backend, id, dry);
@@ -11988,10 +11988,10 @@ struct llama_moe_cache::impl {
                 return;
             }
         }
-        // k15-pp (LLAMA_MOE_LM_LEND_GRAPH_ONLY=0 off): a merged layer-major graph whose growth does not fit lends from the cache even where
+        // (LLAMA_MOE_LM_LEND_GRAPH_ONLY=0 off): a merged layer-major graph whose growth does not fit lends from the cache even where
         // lending is off for the staging copies (lend_decide: they are a small share of the cache): only the graph allocation, for that graph,
         // and the lent slots are refilled after it, so the decode finds the cache as it was. Split instead, each half streamed every host
-        // expert again: G4 Qwen3.8-Flash-Next UD-IQ4_XS at 32 GB (19 GB cache, lending off at 6.7%), 8k prompt, 4 ubatches of 2048 were
+        // expert again: RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits at 32 GB (19 GB cache, lending off at 6.7%), 8k prompt, 4 ubatches of 2048 were
         // short of 10.5 MiB (755 MiB growth, 744.6 MiB free) and ran as two graphs
         static const bool graph_only_env = getenv("LLAMA_MOE_LM_LEND_GRAPH_ONLY") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND_GRAPH_ONLY")) != 0;
         bool graph_only = false;
@@ -12040,7 +12040,7 @@ struct llama_moe_cache::impl {
         const int32_t n_max0 = guard       ? (int32_t) std::min<int64_t>(g.n_slots / 2, g.n_slots - g.host_need - 1)
                              : n_graph > 0 ? std::max<int32_t>(g.n_slots / 2, g.n_slots - n_keep)
                              :               g.n_slots / 2;
-        // k19-ptres: never into the core
+        // never into the core
         const int32_t n_max  = g.lru.n_core > 0 ? std::min<int32_t>(n_max0, g.n_slots - g.lru.n_core - 2) : n_max0;
         int32_t n = (int32_t) std::min<size_t>((need + g.expert_bytes - 1) / g.expert_bytes, (size_t) n_max + 1);
         const int32_t step = std::max<int32_t>(1, n / 16);
@@ -12051,9 +12051,9 @@ struct llama_moe_cache::impl {
         // LLAMA_MOE_CACHE_LEND_PARTS=N > 1 (experimental): else in up to N bank tails
         static const int max_parts = getenv("LLAMA_MOE_CACHE_LEND_PARTS") ? std::max(1, atoi(getenv("LLAMA_MOE_CACHE_LEND_PARTS"))) : 1;
         const int32_t n0 = n;
-        // k15-pp (LLAMA_MOE_LM_LEND_GRAPH_PARTS=0 off): a graph-only lend tries one part per bank first. In one part the graph had to fit
-        // the tail of a single bank, so the slots lent (and refilled after the group) were ~2.6x the graph: G4 Qwen3.8-Flash-Next 32 GB 8k,
-        // a 1740 MiB graph took 2009 slots (4463 MiB); Qwen3.6 q4x local, 509 MiB took 740 slots (1341 MiB)
+        // (LLAMA_MOE_LM_LEND_GRAPH_PARTS=0 off): a graph-only lend tries one part per bank first. In one part the graph had to fit
+        // the tail of a single bank, so the slots lent (and refilled after the group) were ~2.6x the graph: RTX PRO 6000 Qwen3.8-Flash-Next 32 GB 8k,
+        // a 1740 MiB graph took 2009 slots (4463 MiB); Qwen3.6 the 4-bit Qwen3.6 local, 509 MiB took 740 slots (1341 MiB)
         static const bool graph_parts_env = getenv("LLAMA_MOE_LM_LEND_GRAPH_PARTS") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND_GRAPH_PARTS")) != 0;
         const bool parts_first = graph_only && graph_parts_env && n_graph > 1 && g.banks.size() > 1;
         const int  mp          = parts_first ? std::max<int>(max_parts, (int) g.banks.size()) : max_parts;
@@ -12091,8 +12091,8 @@ struct llama_moe_cache::impl {
                 offsets    = std::move(offsets_k);
                 part_sizes = std::move(part_sizes_k);
             } else if (lend_keep_nested) {
-                // k19-fn32: place() is a best fit (the graph part goes to the smallest bank tail that holds it), so it can fail at more slots
-                // where it fit at fewer: G4 Qwen3.8-Flash-Next 32 GB 30k, the last group (3 ubatches) fit in 2104 slots but not in the 2283
+                // place() is a best fit (the graph part goes to the smallest bank tail that holds it), so it can fail at more slots
+                // where it fit at fewer: RTX PRO 6000 Qwen3.8-Flash-Next 32 GB 30k, the last group (3 ubatches) fit in 2104 slots but not in the 2283
                 // lent, and the cache gave all 2283 back, refilled 5.4 GB (111 ms with no kernel) and lent 2104 of them again. The placement
                 // in n_lend slots lies in the last n_lend slots of every bank, inside the n_lent lent ones: keep them all with it
                 // (LLAMA_MOE_CACHE_LEND_KEEP_NESTED=0: give them back as before)
@@ -12167,7 +12167,7 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("%s: %s: MoE cache lends %d of %d slots (%.2f MiB) to the staging copies of large batches (LLAMA_MOE_CACHE_LEND=0 to disable)\n",
                 __func__, ggml_backend_name(backend), n_lend, g.n_slots, (double) n_lend*g.expert_bytes/1024.0/1024.0);
         }
-        // k15-fn LLAMA_MOE_CACHE_LEND_POISON=1 (debug): the lent slots of a graph lend are filled with 0xff (NaN in f32 / f16 / bf16 and in
+        // LLAMA_MOE_CACHE_LEND_POISON=1 (debug): the lent slots of a graph lend are filled with 0xff (NaN in f32 / f16 / bf16 and in
         // the scales of quantized blocks) before the graph, so a read of lent memory before the graph wrote it shows in the output
         static const bool lend_poison = getenv("LLAMA_MOE_CACHE_LEND_POISON") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_LEND_POISON")) != 0;
         if (lend_poison && n_graph > 0) {
@@ -12184,7 +12184,7 @@ struct llama_moe_cache::impl {
         lend_max = std::max(lend_max, n_lend);
     }
 
-    // k15-fn: the most slots the cache could lend to the graph allocation of a merged layer-major graph on the device of backend (the n_max of
+    // the most slots the cache could lend to the graph allocation of a merged layer-major graph on the device of backend (the n_max of
     // lend for a graph without host lookups: every slot but those of one layer), its slot count and bytes; 0 where it lends nothing to a graph
     // (lending off, the banks released, host lookups in its largest group, several devices without LLAMA_MOE_CACHE_LEND_MULTI)
     int32_t graph_lend_capacity(ggml_backend_t backend, int32_t * n_slots_out, size_t * expert_bytes_out) const {
@@ -12229,14 +12229,14 @@ struct llama_moe_cache::impl {
     // is allocated; the memory kept free for a later model or context (set_mem_reserve) is held against the copies and the graph
     // allocation without the copies of a seeding prompt (`seed` bytes of `graph`): a seed that does not fit is dropped by itself (see
     // llama_context::sched_reserve_seed), lending for it costs the prompts the slots
-    // k15-fn: lending frees the staging arena (`need` bytes), and the fit gives those bytes to the cache (see llama_context::sched_reserve);
+    // lending frees the staging arena (`need` bytes), and the fit gives those bytes to the cache (see llama_context::sched_reserve);
     // a prompt that seeds from its own ids then holds the copies of a split (`seed`) in the graph allocation, if the memory left holds
     // them. The cache lends where the arena is at least lend_save_min bytes larger than that split, whatever its share of the cache. The
-    // fit and the load must decide the same, so the rule does not depend on the cache size or the free memory. G4 Qwen3.8-Flash-Next
-    // UD-IQ4_XS + MTP at 32 GB: arena 1275 MiB (6.8% of the cache, lending was off), split 850 MiB -> on; Qwen3.6 UD-Q4_K_XL at 12 / 16 GB:
+    // fit and the load must decide the same, so the rule does not depend on the cache size or the free memory. RTX PRO 6000 Qwen3.8-Flash-Next
+    // (4-bit) + MTP at 32 GB: arena 1275 MiB (6.8% of the cache, lending was off), split 850 MiB -> on; Qwen3.6 at 4 bits at 12 / 16 GB:
     // 354 / 210 MiB -> off (it lends there anyway because the copies do not fit, see below, and its fit is unchanged)
     // Discrete GPUs only: on an integrated GPU (gfx1151, unified memory) the rule is not measured, lending stays as it was there
-    // (k19-igpu: kept so; the fit gives the lent arena's bytes to the cache from the device's free memory, which there is the host's
+    // (kept so; the fit gives the lent arena's bytes to the cache from the device's free memory, which there is the host's
     // available memory that the RAM tier is sized from too)
     bool lend_saves(int32_t id, size_t need, size_t seed) const {
         if (!lend_save || need <= seed || need - seed < lend_save_min) {
@@ -12265,7 +12265,7 @@ struct llama_moe_cache::impl {
             // a measurement (e.g. for --fit) counts the memory with lending: when the device is short of memory the cache lends anyway
             return true;
         }
-        // headroom for the memory the backends allocate while computing (e.g. the CUDA pool); k16-fit: at least the memory --fit left
+        // headroom for the memory the backends allocate while computing (e.g. the CUDA pool); at least the memory --fit left
         // free (LLAMA_FIT_TARGET_MIB, set by common), which an unlent staging arena must not take
         const size_t margin = std::max<size_t>(512ull*1024*1024, getenv("LLAMA_FIT_TARGET_MIB") ? (size_t) atoll(getenv("LLAMA_FIT_TARGET_MIB"))*1024*1024 : 0);
         size_t free  = 0;
@@ -12311,13 +12311,13 @@ struct llama_moe_cache::impl {
         return d.lend_auto != 0;
     }
 
-    // k17-small (lazy KV step 2): the bank buffer of device d. With shrink_on it is a lazy buffer of the backend (the address range of
+    // (lazy KV step 2): the bank buffer of device d. With shrink_on it is a lazy buffer of the backend (the address range of
     // every bank is reserved whole, as the plain buffer would place them) and backed for the slots the groups have now (all of them at
     // load; after a shrink, restore backs only the slots left, the retired tails stay unbacked). A plain buffer otherwise, or if the
     // backend has no lazy buffers (then shrink gives nothing back)
     ggml_backend_buffer_t alloc_banks(device & d) {
         d.bank_lazy = false;
-        if (shrink_on || ext_on) { // (k19-t4small: the decode extension backs only the slots in use)
+        if (shrink_on || ext_on) { // (the decode extension backs only the slots in use)
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(d.buft);
             ggml_backend_reg_t reg = dev != nullptr && !ggml_backend_buft_is_host(d.buft) ? ggml_backend_dev_backend_reg(dev) : nullptr;
             if (reg != nullptr && lazy_alloc_fn == nullptr) {
@@ -12349,7 +12349,7 @@ struct llama_moe_cache::impl {
                         continue;
                     }
                     for (const ggml_tensor * bank : g.banks) {
-                        // (k19-t4small: the decode extension backs a bank's rows as one allocation, and up to where ext_park keeps them)
+                        // (the decode extension backs a bank's rows as one allocation, and up to where ext_park keeps them)
                         ok = ok && (ext_on && lazy_commit_run_fn != nullptr ?
                             lazy_commit_run_fn(buf, (const char *) bank->data - base,
                                 std::min(ggml_nbytes(bank), (size_t) (g.n_slots + 1)*bank->nb[2] + (size_t) 64*1024)) :
@@ -12371,7 +12371,7 @@ struct llama_moe_cache::impl {
         return ggml_backend_alloc_ctx_tensors_from_buft(d.ctx_bank.get(), d.buft);
     }
 
-    // k17-small: the bank tensors the lookup ops of g read and write: the banks, or after a shrink their views over the slots left (they
+    // the bank tensors the lookup ops of g read and write: the banks, or after a shrink their views over the slots left (they
     // follow the banks to the buffer they are in now, which restore replaces)
     std::vector<ggml_tensor *> op_banks(const group & g) const {
         if (g.banks_op.empty()) {
@@ -12384,7 +12384,7 @@ struct llama_moe_cache::impl {
         return g.banks_op;
     }
 
-    // k17-small: the index of the device of the cache on dev (-1: none)
+    // the index of the device of the cache on dev (-1: none)
     int32_t dev_id(ggml_backend_dev_t dev) const {
         for (size_t i = 0; i < devices.size(); ++i) {
             if (devices[i].backend != nullptr && ggml_backend_get_device(devices[i].backend) == dev) {
@@ -12394,7 +12394,7 @@ struct llama_moe_cache::impl {
         return -1;
     }
 
-    // k17-small: the bytes of the slots the groups of device id hold now
+    // the bytes of the slots the groups of device id hold now
     size_t slot_bytes(int32_t id) const {
         size_t n = 0;
         for (const group & g : groups) {
@@ -12405,7 +12405,7 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    // k17-small: the bytes of the slots the groups of device id held at load
+    // the bytes of the slots the groups of device id held at load
     size_t slot_bytes_load(int32_t id) const {
         size_t n = 0;
         for (const group & g : groups) {
@@ -12416,7 +12416,7 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    // k17-small: shrink keeps at least floor bytes of slots on device id, every group in proportion to its slots at load (at least the
+    // shrink keeps at least floor bytes of slots on device id, every group in proportion to its slots at load (at least the
     // experts of one token)
     void set_shrink_floor(int32_t id, size_t floor) {
         devices[id].shrink_floor = floor;
@@ -12436,7 +12436,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k17-small: retire the slots [n_new, n_slots) of g for good and give back the device memory of the bank pages wholly inside the rows
+    // retire the slots [n_new, n_slots) of g for good and give back the device memory of the bank pages wholly inside the rows
     // that are no longer used. The slot after the last one stays backed: it is the spare slot (probe uploads, CUDA MMQ reads past the
     // last expert into it). Every slot count the cache uses (the host LRU, lend's tail, the device lookup state, whose length the kernels
     // read) follows g.n_slots, so nothing can map an expert to a retired slot; the banks and their views keep their load size, so the
@@ -12446,7 +12446,7 @@ struct llama_moe_cache::impl {
         device & d = devices[g.id];
         ggml_backend_t backend = d.backend;
         const int32_t n_old = g.n_slots;
-        // k19-ptres: never into the core, and a whole layer of slots stays above it (as core_place leaves)
+        // never into the core, and a whole layer of slots stays above it (as core_place leaves)
         if (g.lru.n_core > 0) {
             n_new = std::max(n_new, std::min(n_old, g.lru.n_core + g.lru.n_expert));
         }
@@ -12483,9 +12483,9 @@ struct llama_moe_cache::impl {
                     n_banks += gi.banks.size();
                 }
                 ggml_init_params params = {
-                    /*.mem_size   =*/ (n_banks + 1)*ggml_tensor_overhead(),
+                    /*.mem_size =*/ (n_banks + 1)*ggml_tensor_overhead(),
                     /*.mem_buffer =*/ nullptr,
-                    /*.no_alloc   =*/ true,
+                    /*.no_alloc =*/ true,
                 };
                 ctx_banks_op.reset(ggml_init(params));
             }
@@ -12521,7 +12521,7 @@ struct llama_moe_cache::impl {
         return freed;
     }
 
-    // k19-t4small: the lookup state and the op views of g follow a slot count n (as retire sets them)
+    // the lookup state and the op views of g follow a slot count n (as retire sets them)
     void set_slot_count(group & g, int32_t n) {
         rf_join_all(); // asynchronous refill (see rf_on)
         if (g.state != nullptr) {
@@ -12538,9 +12538,9 @@ struct llama_moe_cache::impl {
                     n_banks += gi.banks.size();
                 }
                 ggml_init_params params = {
-                    /*.mem_size   =*/ (n_banks + 1)*ggml_tensor_overhead(),
+                    /*.mem_size =*/ (n_banks + 1)*ggml_tensor_overhead(),
                     /*.mem_buffer =*/ nullptr,
-                    /*.no_alloc   =*/ true,
+                    /*.no_alloc =*/ true,
                 };
                 ctx_banks_op.reset(ggml_init(params));
             }
@@ -12556,7 +12556,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k19-t4small: the CUDA backend has lazy buffers (VMM) on the device of d: a probe reservation is made and freed
+    // the CUDA backend has lazy buffers (VMM) on the device of d: a probe reservation is made and freed
     bool ext_probe(device & d) {
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(d.buft);
         ggml_backend_reg_t reg = dev != nullptr && !ggml_backend_buft_is_host(d.buft) ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -12580,7 +12580,7 @@ struct llama_moe_cache::impl {
         return true;
     }
 
-    // k19-t4small (llama_moe_cache::ext_grow): back and add slots to the groups of device id, in proportion to their fitted slots, for
+    // (llama_moe_cache::ext_grow): back and add slots to the groups of device id, in proportion to their fitted slots, for
     // about bytes of device memory (each group at most to n_slots_cap). The new slots are empty, the next victims: the decode admits
     // its misses into them. Not while the banks are released or slots are lent. Returns the bytes of slots added
     size_t ext_grow(int32_t id, size_t bytes) {
@@ -12670,7 +12670,7 @@ struct llama_moe_cache::impl {
         return grown;
     }
 
-    // k19-t4small (llama_moe_cache::ext_park): the groups of device id go back to their fitted slots, the rows above them are given
+    // (llama_moe_cache::ext_park): the groups of device id go back to their fitted slots, the rows above them are given
     // back to the device (retire). Returns the bytes given back
     size_t ext_park(int32_t id) {
         device & d = devices[id];
@@ -12703,7 +12703,7 @@ struct llama_moe_cache::impl {
         return freed;
     }
 
-    // k19-t4small: the bytes of slots above the fitted ones on device id
+    // the bytes of slots above the fitted ones on device id
     size_t ext_bytes(int32_t id) const {
         size_t n = 0;
         for (const group & g : groups) {
@@ -12714,7 +12714,7 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    // k17-small (lazy KV step 2, llama_moe_cache::shrink): give back at least bytes of device memory of device id by retiring the tail
+    // (lazy KV step 2, llama_moe_cache::shrink): give back at least bytes of device memory of device id by retiring the tail
     // slots of its groups (spread over the groups in proportion to what each holds above its floor) down to the shrink floor. The work of
     // the slots stops first: the uploads ahead are dropped, a pending seed ends, the device state is read back and lent slots come back
     // (unlend; the next large graph lends again). Not while the banks are released (they hold no memory then). Returns the bytes freed
@@ -12779,7 +12779,7 @@ struct llama_moe_cache::impl {
     // the lent slots come back empty: they are cleared once the work that used them is done, because kernels may read a little past
     // the end of the expert in the slot before (e.g. CUDA MMQ in the padding of the last row) and the copies left arbitrary bytes there
     // the experts that a seed could not admit while slots were lent are then uploaded from host memory (LLAMA_MOE_CACHE_REFILL=0 to disable)
-    // k13-small (llama_moe_cache::release): the banks of device id are freed, every slot is lent to nothing first (the lookups and the
+    // (llama_moe_cache::release): the banks of device id are freed, every slot is lent to nothing first (the lookups and the
     // copies then find no expert cached, the lend callback lends nothing, see lend) and the experts they held wait in refill; restore
     // allocates the banks again and refills the slots as after a lend (unlend)
     bool release(int32_t id) {
@@ -12788,7 +12788,7 @@ struct llama_moe_cache::impl {
         if (d.released || !d.buf_bank || !d.ctx_bank || single_no_alloc) {
             return false;
         }
-        // k19-ptres: released banks would empty the core, whose host copies are gone: the banks stay
+        // released banks would empty the core, whose host copies are gone: the banks stay
         if (core_on) {
             if (core_refused++ == 0) {
                 LLAMA_LOG_WARN("%s: MoE cache: the banks are not released (the core has no host copies to refill from)\n", __func__);
@@ -12855,7 +12855,7 @@ struct llama_moe_cache::impl {
         if (!d.released) {
             return false;
         }
-        // k19-fixG: a graph run while released may have placed a bank tensor it still referenced in its compute buffer; the allocation
+        // a graph run while released may have placed a bank tensor it still referenced in its compute buffer; the allocation
         // below skips tensors with data, so every binding is cleared first
         for (ggml_tensor * t = ggml_get_first_tensor(d.ctx_bank.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx_bank.get(), t)) {
             t->data   = nullptr;
@@ -12863,7 +12863,7 @@ struct llama_moe_cache::impl {
         }
         d.buf_bank.reset(alloc_banks(d));
         if (!d.buf_bank && restore_soft) {
-            // k19-place8 (see set_restore_soft): the banks stay released, the caller runs as during a prompt and tries again later
+            // (see set_restore_soft): the banks stay released, the caller runs as during a prompt and tries again later
             if (n_restore_fail++ < 4) {
                 LLAMA_LOG_WARN("%s: MoE cache: the released banks (%.2f MiB) could not be allocated again: they stay released, tried again "
                     "at the next small batch\n", __func__, d.buf_size/1048576.0);
@@ -12953,9 +12953,9 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // k15-fn LLAMA_MOE_CACHE_LEND_SAVE_REFILL=0 (opt-in): slots lent for the memory lending frees (lend_saves) come back empty and
-        // misses fill them, instead of uploading every expert they held before the prompt (G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at
-        // 32 GB: 994 slots, 2208 MiB after every 2k prompt). k15gn_g4: the 2k prompt loss of lending went from -5.3% to -2.0%, but the
+        // LLAMA_MOE_CACHE_LEND_SAVE_REFILL=0 (opt-in): slots lent for the memory lending frees (lend_saves) come back empty and
+        // misses fill them, instead of uploading every expert they held before the prompt (RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits + MTP at
+        // 32 GB: 994 slots, 2208 MiB after every 2k prompt). the 2k prompt loss of lending went from -5.3% to -2.0%, but the
         // next short prompt reads the experts back: chat TTFT 320 -> 342 ms (refilled: 318). Residency only, the outputs do not change
         if (devices[g.id].lend_saving && !lend_save_refill) {
             for (int32_t il : g.layers) {
@@ -12970,7 +12970,7 @@ struct llama_moe_cache::impl {
         }
         n_refill_routed += routed ? 1 : 0;
         // at most the n slots that came back are filled, so the refill never evicts an expert that stayed cached
-        // (k19-kvsel: and at most refill_cap_once bytes over the groups of this restore, in layer order)
+        // (and at most refill_cap_once bytes over the groups of this restore, in layer order)
         size_t budget = (size_t) n;
         if (refill_cap_once != SIZE_MAX && g.expert_bytes > 0) {
             budget = std::min(budget, refill_cap_once / g.expert_bytes);
@@ -13178,7 +13178,7 @@ struct llama_moe_cache::impl {
         return true;
     }
 
-    // k15-lfm2: in-place prompts, see prompt_of. A group that does not hold every expert of its layers lends prompt_rings*M slots, M the
+    // in-place prompts, see prompt_of. A group that does not hold every expert of its layers lends prompt_rings*M slots, M the
     // most experts a layer of the group misses (the slot maps do not change during such a graph: no seed, no admission). The copy of a
     // prompt map may be prefetched on the copy queue: each staging slot of the scheduler (told apart by where the copy of the map lands)
     // gets its own ring of M lent slots, so a ring is written again only after the scheduler retired the split that read it
@@ -13252,7 +13252,7 @@ struct llama_moe_cache::impl {
                     continue;
                 }
                 const std::vector<int32_t> & counts = *cp;
-                // (k19-ptres: the core slots take no seeds)
+                // (the core slots take no seeds)
                 const size_t n_avail = (size_t) (g.n_slots - g.lru.n_lent - g.lru.n_core);
                 size_t n_seed = n_avail / g.layers.size();
                 size_t n_full = (size_t) (g.n_slots - g.lru.n_core) / g.layers.size();
@@ -13498,7 +13498,7 @@ struct llama_moe_cache::impl {
         return it != prompt_of.end() ? it->second : -1;
     }
 
-    // k15-lfm2: copy of the prompt map of layer il into dst (on the compute backend or the scheduler's copy queue): the slots of its cached
+    // copy of the prompt map of layer il into dst (on the compute backend or the scheduler's copy queue): the slots of its cached
     // experts, its ring for the others, which are uploaded there
     bool prompt_copy(ggml_backend_t backend, int32_t il, ggml_tensor * dst, const std::vector<int32_t> *) {
         layer & l = layers[il];
@@ -13609,7 +13609,7 @@ struct llama_moe_cache::impl {
         }
         const layer & l = layers[il];
 
-        // k15-lfm2: a large batch reads its experts in place (see prompt_of)
+        // a large batch reads its experts in place (see prompt_of)
         if (n_tokens > max_batch && prompt_inplace_ok(il)) {
             return l.prompt_map;
         }
@@ -13693,7 +13693,7 @@ struct llama_moe_cache::impl {
             return 0;
         }
 
-        // k19-ptres: a core expert is always copied from its slot (its host copy is not registered and not in RAM): the core slots never
+        // a core expert is always copied from its slot (its host copy is not registered and not in RAM): the core slots never
         // change, so the host map is right for them even where the device state is newer
         if (g.lru.n_core > 0) {
             const int32_t * cs = g.lru.slot_map[b.il];
@@ -13728,7 +13728,7 @@ struct llama_moe_cache::impl {
             return 0;
         }
 
-        // k15-pred: a layer with experts admitted ahead of its routing whose bank is not uploaded is read from the host
+        // a layer with experts admitted ahead of its routing whose bank is not uploaded is read from the host
         if (!ua_readable(b.il, b.ip)) {
             ua_st_ub.blocked++;
             return 0;
@@ -13787,7 +13787,7 @@ struct llama_moe_cache::impl {
 
         GGML_ASSERT(backend == devices[g.id].backend);
 
-        // k15-pred: a lookup reads the slots through the slot map: the experts admitted ahead get every bank first
+        // a lookup reads the slots through the slot map: the experts admitted ahead get every bank first
         ua_lookup_guard(backend, g, il);
 
         // the get_rows that looks up the slots of the selected experts
@@ -13851,7 +13851,7 @@ struct llama_moe_cache::impl {
             t_prof = t;
         }
 
-        // k19-mgpu2: the routing of a decode / verify window, for the next launch's resident device prefill (see rp_rec)
+        // the routing of a decode / verify window, for the next launch's resident device prefill (see rp_rec)
         if (rp_rec && tiered && ids.size() <= (size_t) 8*n_expert_used) {
             rp_count(il, ids);
         }
@@ -13875,7 +13875,7 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // k19-l4full: the route tail skip of a host lookup leaves its entries out of the plan (see tail_skip_host)
+        // the route tail skip of a host lookup leaves its entries out of the plan (see tail_skip_host)
         const int32_t * pids  = ids.data();
         size_t          n_ids = ids.size();
         {
@@ -13886,7 +13886,7 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // k19-mgpu2: deferred resident prompt fill: this layer's pending swaps go first, on the same stream, within the pass budget
+        // deferred resident prompt fill: this layer's pending swaps go first, on the same stream, within the pass budget
         if (tiered && !rpf_pending.empty() && ids.size() <= (size_t) 8*n_expert_used && host->exclusive()) {
             resident_fill_lookup(g, backend, il);
         }
@@ -13986,7 +13986,7 @@ struct llama_moe_cache::impl {
         }
         g.lru.clear();
         for (ggml_tensor * bank : g.banks) {
-            // (k17-small: the slots left and the spare slot, not the retired rows; k19-ptres: the core keeps its experts)
+            // (the slots left and the spare slot, not the retired rows; the core keeps its experts)
             ggml_backend_tensor_memset(bank, 0, (size_t) g.lru.n_core*bank->nb[2], (size_t) (g.n_slots + 1 - g.lru.n_core)*bank->nb[2]);
         }
         g.dev_newer = false;
@@ -14022,7 +14022,7 @@ struct llama_moe_cache::impl {
         return std::max<int32_t>(1, std::min<int32_t>(g.lru.n_expert, g.n_slots / (int32_t) g.layers.size()));
     }
 
-    // k19-fixG: none in a graph built as a large ubatch (set_force_large: the tail and output members of a layer-major group that
+    // none in a graph built as a large ubatch (set_force_large: the tail and output members of a layer-major group that
     // releases the banks), which must not read or bind the banks
     ggml_tensor * devseed_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_tokens) const {
         if (force_large || n_tokens < devseed_min || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
@@ -14201,7 +14201,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k11 (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY): the device seed that a prefetched large ubatch run by itself does (devseed_prepare / the plans of
+    // (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY): the device seed that a prefetched large ubatch run by itself does (devseed_prepare / the plans of
     // its graph / devseed_end), for a ubatch that ran inside a merged layer-major graph without it: after that graph, from its routing (rec:
     // per layer, in layer order, the routing outputs that graph left on the device). The plans run in layer order on the device state that the ubatch's
     // own graph would have started from (the host state uploaded as devseed_prepare does), with the same seed shares; the experts they admit
@@ -14384,7 +14384,7 @@ struct llama_moe_cache::impl {
 
             const int32_t n_expert = g.lru.n_expert;
             // while slots are lent, the experts that the lent slots would hold are uploaded when they come back (see unlend)
-            // (k19-ptres: the core slots take no seeds)
+            // (the core slots take no seeds)
             const size_t  n_avail  = (size_t) (g.n_slots - g.lru.n_lent - g.lru.n_core);
             size_t        n_seed   = n_avail / g.layers.size();
             size_t        n_full   = (size_t) (g.n_slots - g.lru.n_core) / g.layers.size();
@@ -14447,7 +14447,7 @@ struct llama_moe_cache::impl {
             sd.gen = g.lru.gen;
             if (tiered) {
                 // exclusive: the experts the seed evicts move to RAM before any of their device slots is overwritten
-                // k19-ramevict: a large batch seeds layer b.il after its experts were staged, so the RAM slots they need make room in the
+                // a large batch seeds layer b.il after its experts were staged, so the RAM slots they need make room in the
                 // layers this pass has finished first (see llama_moe_host_cache::set_stream_layer); decode never seeds
                 host->set_stream_layer(b.il);
                 shadow_slots(backend, g, evicted_tmp, true);
@@ -14528,7 +14528,7 @@ struct llama_moe_cache::impl {
                             hst.promoted++;
                         }
                     } else if (host->contains(sd.il, f.expert) && !host->is_async(host->slot_of_key(sd.il, f.expert))) {
-                        // (k19-ramprof2: a slot being read in the background is left to its read: published, it is a duplicate)
+                        // (a slot being read in the background is left to its read: published, it is a duplicate)
                         host->release_key(sd.il, f.expert);
                         hst.promoted++;
                         sss.prom_seed++;
@@ -14647,7 +14647,7 @@ struct llama_moe_cache::impl {
         return std::any_of(seed_counts.begin(), seed_counts.end(), [](const std::vector<int32_t> & c) { return !c.empty(); });
     }
 
-    // k19-prewexact: see llama_moe_cache::prewarm_begin. The state a decode moves, as it was before the server's verify-graph prewarm
+    // see llama_moe_cache::prewarm_begin. The state a decode moves, as it was before the server's verify-graph prewarm
     struct pw_group {
         moe_cache_lru lru;
         std::vector<std::vector<int32_t>> slot_maps; // [layers of the group] the host slot maps
@@ -14764,7 +14764,7 @@ struct llama_moe_cache::impl {
     }
 
     // the experts of the slots that changed come back into the banks, then every saved value; false: refused (the state stays as the
-    // prewarm left it, the rules resume as after the k19-tokcost pause)
+    // prewarm left it, the rules resume as after the pause)
     bool prewarm_end() {
         if (!pw_active) {
             return false;
@@ -15323,7 +15323,7 @@ bool llama_moe_cache::cpu_miss_tick_sync(int64_t n_tokens) const {
 }
 
 void llama_moe_cache::cpu_miss_tick(int64_t n_tokens) {
-    // k15-fv diagnostic LLAMA_MOE_ROUND_LOG=1 (off by default; it reads the device counters before every ubatch of at most 16 tokens,
+    // diagnostic LLAMA_MOE_ROUND_LOG=1 (off by default; it reads the device counters before every ubatch of at most 16 tokens,
     // i.e. it waits for the previous one): hits / fetched / host experts and uploaded MiB of the previous such ubatch
     static const bool round_log = getenv("LLAMA_MOE_ROUND_LOG") != nullptr && atoi(getenv("LLAMA_MOE_ROUND_LOG")) != 0;
     if (round_log && n_tokens <= 16) {
@@ -15647,7 +15647,7 @@ void llama_moe_cache::prompt_inplace_block(bool blocked) {
 }
 
 void llama_moe_cache::prompt_ubatch(bool ok, bool seed_prev) {
-    pimpl->rank_clear(); // k19-l4held: the routing of the previous ubatch no longer ranks the offers
+    pimpl->rank_clear(); // the routing of the previous ubatch no longer ranks the offers
     // LLAMA_MOE_PROMPT_INPLACE_SEED=0: a ubatch that seeds from an earlier routing keeps the staging copies
     static const bool seed_on = [] { const char * e = getenv("LLAMA_MOE_PROMPT_INPLACE_SEED"); return e == nullptr || atoi(e) != 0; }();
     pimpl->prompt_ubatch_ok   = ok && (!seed_prev || seed_on);
@@ -15747,7 +15747,7 @@ bool llama_moe_cache::host_exclusive() const {
 
 bool llama_moe_cache::resident_union() const {
     // resident mode alone (>= LLAMA_MOE_RESIDENT_MIN_FRAC of the experts in RAM + device slots): with the host reserve the tier can
-    // hold the complement without spare room (G4 fndl 48 GiB, full 6 GiB reserve: 15045 + 9253 slots for 24576 experts), and prompt
+    // hold the complement without spare room (RTX PRO 6000 fndl 48 GiB, full 6 GiB reserve: 15045 + 9253 slots for 24576 experts), and prompt
     // seeds there demoted 151 GB and read 12 GB from disk per 8k prompt
     return pimpl->host && pimpl->host->exclusive() && pimpl->resident_mode;
 }
@@ -16063,7 +16063,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
 }
 
 //
-// k19-ramprof: the routing profile file
+// the routing profile file
 //
 
 bool llama_moe_profile_load(const std::string & path, const std::vector<int32_t> & n_expert, std::vector<llama_moe_profile_entry> & out) {
