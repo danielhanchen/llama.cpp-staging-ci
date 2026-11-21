@@ -25,6 +25,14 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+// POSIX environment helpers for the MSVC CRT (getenv sees _putenv_s; an empty value removes the variable)
+static int setenv(const char * name, const char * value, int overwrite) {
+    return !overwrite && getenv(name) != nullptr ? 0 : _putenv_s(name, value);
+}
+static int unsetenv(const char * name) { return _putenv_s(name, ""); }
+#endif
+
 struct cfg {
     ggml_type type    = GGML_TYPE_F16;
     int32_t   win     = -1;

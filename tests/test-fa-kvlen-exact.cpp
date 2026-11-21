@@ -24,6 +24,13 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+// POSIX environment helpers for the MSVC CRT (getenv sees _putenv_s; an empty value removes the variable)
+static int setenv(const char * name, const char * value, int overwrite) {
+    return !overwrite && getenv(name) != nullptr ? 0 : _putenv_s(name, value);
+}
+#endif
+
 static int n_captures = 0;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
