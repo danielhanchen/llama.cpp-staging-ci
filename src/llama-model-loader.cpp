@@ -2050,6 +2050,15 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
+#if defined(__linux__)
+                // with lazy tensors the mapping is not populated up front (see llama_mmap), and the one WILLNEED hint per
+                // range there reads at most one readahead window: hint each tensor right before its copy, so the device
+                // upload does not fault the pages in one by one (LLAMA_LOAD_READAHEAD=0: off)
+                static const bool readahead = getenv("LLAMA_LOAD_READAHEAD") == nullptr || atoi(getenv("LLAMA_LOAD_READAHEAD")) != 0;
+                if (readahead && use_mmap && lazy.any() && !lazy.has(cur)) {
+                    llama_prefetch({{ data, n_size }});
+                }
+#endif
                 ggml_backend_tensor_set(cur, data, 0, n_size);
                 if (cur->buffer != nullptr && !ggml_backend_buffer_is_host(cur->buffer) && !lazy.has(cur)) {
                     device_ranges.push_back({ weight->idx, weight->offs, n_size });
