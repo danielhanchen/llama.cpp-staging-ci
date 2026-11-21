@@ -1513,7 +1513,11 @@ static void common_params_fit_impl(
             return false;
         }
         // step 3 can only spill if it is allowed to change the weight placement:
-        if (mparams->n_gpu_layers != default_mparams.n_gpu_layers || !tensor_buft_overrides ||
+        bool ts_user = false; // a tensor split given by the user (step 3 aborts on it)
+        for (size_t id = 0; mparams->tensor_split != nullptr && id < nd; id++) {
+            ts_user = ts_user || mparams->tensor_split[id] != 0.0f;
+        }
+        if (mparams->n_gpu_layers != default_mparams.n_gpu_layers || !tensor_buft_overrides || (nd > 1 && ts_user) ||
                 (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft) && tbo_user.empty()) ||
                 (nd > 1 && (!tensor_split || mparams->split_mode == LLAMA_SPLIT_MODE_ROW))) {
             return false;
