@@ -186,7 +186,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // 2048-cell step there. RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits at a 32 GB cap (41.4% cached): the warm-up request leaves the 4..7-row
     // verify widths to be built and captured inside the next one (36-129 ms per width); prewarmed, with the CPU-miss windows paused (below),
     // DFlash2 n6 chat 203.1 -> 224.1 tok/s (same text), 8k 172.7 -> 190.3 (other text: the prewarm moves the cached experts, so the
-    // host-computed ones; srv_kld long48 inside the -fa off band), 3 launches on one VM with the CPU-miss calibration pinned for both
+    // host-computed ones; the 48-prompt long-context KLD check inside the -fa off band), 3 launches on one VM with the CPU-miss calibration pinned for both
     // builds. At 16 GB (15.5% cached) keep it off: level with the pause, -24% without it. Opt-in because the 8k text changes (exact in chat)
     // with the cache taken back after the windows (exact, below) the text is that of no prewarm in chat and 8k: same VM,
     // CPU-miss calibration pinned, 3 launches: chat 213.1 (previous default) / 209.8 (FRAC unset) -> 231.5 tok/s, 8k 180.5 / 180.5 -> 179.9,

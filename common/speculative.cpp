@@ -1144,7 +1144,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // slots hold more than LLAMA_DFLASH_CACHED_FRAC_MAX of the host experts and >= LLAMA_DFLASH_CACHED_TOKENS_MAX tokens (A100 48 GB:
     // 70.7%, 36 tokens; chat +6.2%, 8k +20% vs the kill switch, ac_a48b); the cached bands below keep their own rules. Not without a
     // cache: A100, 4-bit model on the full card (the 26.8 GiB PLE table is the only host part) has a flat cost curve, chat level (169.7 vs 170.1,
-    // ac_a0), and srv_kld long48 put one position above the -fa off band's max there (0.090 vs 0.075).
+    // ac_a0), and the 48-prompt long-context KLD check put one position above the -fa off band's max there (0.090 vs 0.075).
     // Under the exact verify contract beside a MoE cache it stays off by default: there the cache's host path computes the misses of
     // some batch sizes on the CPU (ac_a48 48 GB 8k: EV-auto on / off gave two exact texts); =1 forces it
     static int eva_mode() {
@@ -1658,7 +1658,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const bool use_ev = is_dflash2 && !ev_rule.first.empty();
                 // the window of a DFlash2 draft beside a target without a MoE cache, on by default under the exact verify
                 // contract (LLAMA_MTP_EXACT=1: the text does not depend on the window), else opt-in (LLAMA_DFLASH_WINDOW=1: the default
-                // verify's kernels follow the width, so the text changes: srv_kld long48 on an RTX PRO 6000 mean 0.0016 / p99 0.015 vs the -fa off band
+                // verify's kernels follow the width, so the text changes: the 48-prompt long-context KLD check on an RTX PRO 6000 mean 0.0016 / p99 0.015 vs the -fa off band
                 // 0.0037 / 0.035, but one position at 0.30 above the band's max 0.155); LLAMA_DFLASH_WINDOW=0: off; LLAMA_DFLASH_EV,
                 // --spec-draft-p-min and LLAMA_DFLASH_P_CUM replace it. Of two windows, the short one
                 // (4 rows below position 4096, 3 above) and the whole draft, the one with more expected tokens per ms: the expected tokens
@@ -1697,7 +1697,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // hold 3 / 7, 48 GB 32 (there the full-card costs stay opt-in, LLAMA_DFLASH_WINDOW=2)
                 static const int32_t df2_cached_tok_max = getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX") ? atoi(getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX")) : 12;
                 // LLAMA_DFLASH_CACHED_FRAC_MAX, default K19_DF2COST_FRAC_MAX 0.5; 0 = off; the cache leaves
-                // LLAMA_DFLASH_CACHED_RESERVE_MIB for the second width's graphs, see common.cpp: without it the srv_kld gate at 32 GB died
+                // LLAMA_DFLASH_CACHED_RESERVE_MIB for the second width's graphs, see common.cpp: without it the the server KLD check gate at 32 GB died
                 // of a CUDA out of memory): also
                 // where the cache holds LLAMA_DFLASH_CACHED_FRAC_MIN (0.20) .. LLAMA_DFLASH_CACHED_FRAC_MAX of the
                 // host experts (llama_moe_cache_frac; RTX PRO 6000 4-bit 24 GB 27.5%, 32 GB 42%), at every position, with that band's pass costs

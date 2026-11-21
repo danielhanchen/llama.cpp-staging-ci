@@ -543,7 +543,7 @@ llama_context::llama_context(
             // a DFlash2 draft drafts over a restricted vocabulary of the target's head (LLAMA_DFLASH_DRAFT_VOCAB). By
             // default only for a target without a MoE cache: there the target's text is unchanged (RTX PRO 6000 Flash-Next full card, md5 = full
             // head). Beside a cache the head's memory comes from the cache, which moves the target's placement and so its text
-            // (srv_kld long48 at 32 GB above the -fa off band of the full card); an explicit LLAMA_DFLASH_DRAFT_VOCAB=n opts in there
+            // (the 48-prompt long-context KLD check at 32 GB above the -fa off band of the full card); an explicit LLAMA_DFLASH_DRAFT_VOCAB=n opts in there
             // A cache that holds most of the experts (llama_moe_cache_wide_graphs: the band where the verify graphs are prewarmed as
             // without a cache) also takes the restricted head by default, where the drafter's lm head is a quarter of its graph; the fit
             // keeps the head's bytes free from the cache in that band beside a DFlash draft model, so the prewarm keeps its memory
@@ -1827,7 +1827,7 @@ llama_context::llama_context(
                                     atoll(getenv("LLAMA_PLE_PIN_FLOOR_MIB")) : 4096) << 20;
                                 // MemAvailable counts the page cache of the registered (pinned) expert mappings as free, so on
                                 // A100 the 4-bit model (83.5 GiB, 48.5 GiB of registered host weights + the 26.8 GiB pin = 8.2 GiB unpinned)
-                                // the floor above passed while srv_kld long48 (8 GiB prompt cache) froze the VM in 3 attempts (the third logged
+                                // the floor above passed while the 48-prompt long-context KLD check (8 GiB prompt cache) froze the VM in 3 attempts (the third logged
                                 // it at the pinned launch). The pin also needs MemTotal - the other host weights - the table >= LLAMA_PLE_PIN_ROOM_MIB
                                 // (default 16384: kernel, the process, the 8 GiB prompt cache; 0 = off)
                                 static const uint64_t room_b = (uint64_t) std::max<int64_t>(0, getenv("LLAMA_PLE_PIN_ROOM_MIB") ?
@@ -2192,7 +2192,7 @@ void llama_context::rs_replay_commit(bool sync) {
     // belong to the scheduler's context, which the next graph's split frees and rebuilds. A cached graph allocated again after another
     // key's graph read the other graph's copies: a CONT of a 2-entry gate / beta window read an 8-entry one, and the commit aborted in
     // the copy op (ne == ggml_nelements(src1), CUDA cpy.cu; cloud host 2x T4 Qwen3.8-Flash-Next + MTP at the server's prompt save, every
-    // arm of a 48-prompt srv_kld; reproduced on two RPC CPU devices). Such a hit is built again instead (one graph build per key change).
+    // arm of a 48-prompt the server KLD check; reproduced on two RPC CPU devices). Such a hit is built again instead (one graph build per key change).
     // LLAMA_RS_REPLAY_SCHED_REBUILD=0: the old reuse
     static const bool sched_rebuild = getenv("LLAMA_RS_REPLAY_SCHED_REBUILD") == nullptr || atoi(getenv("LLAMA_RS_REPLAY_SCHED_REBUILD")) != 0;
     if (hit != rs_graphs.end() && rs_mode < 0 && key != rs_key && sched_rebuild) {
@@ -2779,7 +2779,7 @@ void llama_context::tiny_rel_leave() {
     const size_t trimmed = pool_mark_trim_dev(true);
     // the CUDA graphs captured or replayed while the pools were above the mark hold pointers into the range the trim unmapped
     // (the temporaries the ops take from the pool are not graph nodes, so the replay check does not see them). A later window replayed
-    // one before its pool had grown back that far: RTX PRO 6000 4-bit 12 GB DFlash2, srv_kld long48, CUDA illegal address in the ubatch after a
+    // one before its pool had grown back that far: RTX PRO 6000 4-bit 12 GB DFlash2, the 48-prompt long-context KLD check, CUDA illegal address in the ubatch after a
     // released layer-major group, the 6th 8200-token prompt in two runs (/ d1); with the group's trim off the pool stayed large
     // enough and nothing failed. They are evicted with the trim (recaptured by the next window). LLAMA_MOE_TRIM_EVICT=0: kept, as before
     static const bool trim_evict = getenv("LLAMA_MOE_TRIM_EVICT") == nullptr || atoi(getenv("LLAMA_MOE_TRIM_EVICT")) != 0;
@@ -5983,7 +5983,7 @@ static void llama_phase(const char * what) {
 // the 4-token call takes the short prompt's host path too. A call with an output for every token (generation, verify) ends a run
 int64_t llama_context::prompt_run_tokens(int64_t n_outputs_all, int64_t n_tokens_all) {
     // on by default again. With it the 4-token call computes its misses on the host (q8_K activations) instead of
-    // uploading them: the same experts, rounded on another device (srv_kld short192 means and top-1 inside / better than the -fa off
+    // uploading them: the same experts, rounded on another device (the 192-prompt short KLD check means and top-1 inside / better than the -fa off
     // band, single-position maxima above it: first token 1.41 vs 1.11, decode 1.42 vs 1.33). L4 LFM2.5 4 GB chat TTFT 0.840 -> 0.680 s
     static const bool on = getenv("LLAMA_MOE_PROMPT_RUN") == nullptr || atoi(getenv("LLAMA_MOE_PROMPT_RUN")) != 0;
     const llama_batch & b = balloc->get_batch();
@@ -7114,7 +7114,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // its expert products on the device, it reads the host experts the group already copies for each layer instead of looking them up,
     // copying the misses and computing some on the host in a pass of its own
     // opt-in for now (LLAMA_LM_TAIL=1): exact without speculative decoding, but beside an MTP drafter the first verify after the prompt
-    // gives other logits (local B200, Qwen3.6 the 4-bit model 12 GB pinned: draft acceptance 33/58 -> 23/80 at 2k), cause not found yet
+    // gives other logits (local B200, Qwen3.6 at 4 bits 12 GB pinned: draft acceptance 33/58 -> 23/80 at 2k), cause not found yet
     static const bool lm_tail_env = getenv("LLAMA_LM_TAIL") != nullptr && atoi(getenv("LLAMA_LM_TAIL")) != 0;
     // the device assignments of the tail member, set again after every scheduler reset (a refused allocation, a split of the group)
     std::vector<std::pair<ggml_tensor *, ggml_backend_t>> lm_tail_pins;
@@ -7943,7 +7943,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             lm_async_used = 0;
             lm_async_nev  = 0;
             // a group with a tail member (LLAMA_LM_TAIL) seeds synchronously: with the asynchronous read the seed of some layers
-            // copied experts from staging memory already reused (Qwen3.6 the 4-bit model + MTP 12 GB: the cache after the prompt held wrong experts, the
+            // copied experts from staging memory already reused (Qwen3.6 at 4 bits + MTP 12 GB: the cache after the prompt held wrong experts, the
             // first MTP verify gave other logits); not found yet why the extra member breaks the "due" rule of lm_seed_resolve_due
             const bool lm_has_tail = !group.empty() && (int64_t) group.back().ub->n_tokens < prefetch_min_batch;
             if (lm_async_env && cparams.cb_eval == nullptr && !lm_has_tail) {
@@ -9700,7 +9700,7 @@ bool llama_context::restore_pp_plan(bool idle) {
     // reservation here was a token graph of n_ubatch rows with the lm head on every row: 500 MiB for a drafter that runs 30 MiB (cloud host
     // A100 48 GB, the 4-bit model DFlash2, n_ubatch 512). At every request end it freed the drafter's 30 MiB buffer to plan the 500 MiB one; with
     // the device nearly full that failed ("re-reserving the pp graph failed"), the next prompt's 512-row injection then needed its
-    // 30 MiB again after the target's graphs had taken the memory, and its allocation failed: HTTP 500 (srv_kld long48, -fa on).
+    // 30 MiB again after the target's graphs had taken the memory, and its allocation failed: HTTP 500 (the 48-prompt long-context KLD check, -fa on).
     // Where 500 MiB were free it took them from the target's graphs
     static const bool dflash_split_env = (getenv("LLAMA_PP_RERESERVE_DFLASH_SPLIT") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE_DFLASH_SPLIT")) != 0) &&
         (getenv("LLAMA_DFLASH_RESERVE_SPLIT") == nullptr || atoi(getenv("LLAMA_DFLASH_RESERVE_SPLIT")) != 0);
@@ -13581,7 +13581,7 @@ bool llama_context::layer_major_on() const {
 // a batch of n_before + n_after prompt tokens of one sequence, from the start of the batch, with a ubatch break after n_before: the first
 // ubatch after the break runs in the layer-major group of the one before it (decode_layer_major: every member eligible, at most lm_ub_max
 // per group). Otherwise the merge only drops the seed the separate batches made between them: a ubatch before the break that is too short
-// for a group (Qwen3.6 the 4-bit model 12 GB, -ub 512: a 640-token prompt runs [124] [512] [4]) or a group that ends at the break
+// for a group (Qwen3.6 at 4 bits 12 GB, -ub 512: a 640-token prompt runs [124] [512] [4]) or a group that ends at the break
 bool llama_context::layer_major_spans(int64_t n_before, int64_t n_after) const {
     if (!layer_major_on() || lm_refused_min <= 2 || n_before <= 0 || n_after <= 0) {
         return false;

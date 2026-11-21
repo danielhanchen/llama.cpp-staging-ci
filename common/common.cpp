@@ -5003,7 +5003,7 @@ uma_restart:
         // (LLAMA_FIT_FAOFF_UB=0 off): without flash attention and without -ub the fit chose n_ubatch for the F16 copies of
         // the KQ matrix it reserves (common_fit_faoff_ubatch_plan); it stays as if given with -ub, so the n_ubatch growth rules below
         // (resident ubatch, the MoE cache's auto ubatch, up to 2048 and more), which do not price those copies, keep it. 2x T4
-        // dsf8 -fa off ctx 16384: -ub 2048 with its 4096 MiB reserve 4.5 / 2.5 tok/s chat / 8k, -ub 512 52.7 / 17.1, both without an abort
+        // the 8-bit DeepSeek fake, -fa off, ctx 16384: -ub 2048 with its 4096 MiB reserve 4.5 / 2.5 tok/s chat / 8k, -ub 512 52.7 / 17.1, both without an abort
         if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && !params.n_ubatch_set && common_fit_faoff_ubatch() > 0) {
             const uint32_t ub = std::min<uint32_t>(cparams.n_ubatch, common_fit_faoff_ubatch());
             COM_INF("%s: --fit: flash attention off: n_ubatch %u kept (the KQ copies are reserved at it; LLAMA_FIT_FAOFF_UB=0 lets it grow)\n",
@@ -5047,7 +5047,7 @@ uma_restart:
         // ctx 16384: no draft chat 13.2 -> 18.6 tok/s, MTP n2 chat 23.8 -> 31.4, 8k 22.0 -> 30.2; Qwen3.6-35B-A3B 4-bit + MTP
         // chat 101.7 -> 108.7, 8k 93.0 -> 105.8. A draft model follows the target's split mode (common_base_params_to_speculative)
         // MoE models too by default (an earlier build; LLAMA_SPLIT_AUTO_TENSOR=3 = dense models only, the earlier multi-GPU default). The Qwen3.6-35B-A3B
-        // 4-bit "out of band" verdict (srv_kld long48 first-token KLD mean 0.00184 vs the -fa off arm's 0.00145) was the gate, not the
+        // 4-bit "out of band" verdict (the 48-prompt long-context KLD check first-token KLD mean 0.00184 vs the -fa off arm's 0.00145) was the gate, not the
         // split: the AllReduce adds the two F32 halves exactly (P2P) at quant-block-aligned splits, and a rounding-only change on the layer
         // path (GGML_CUDA_DISABLE_FUSION=1) lands at 0.00101 on the same prompts; the three arms' means overlap (bootstrap 95% CIs), tensor
         // vs -fa off paired p = 0.43, 24 / 48 prompts worse, median / geometric mean lower (0.00048 / 0.00047 vs 0.00065 / 0.00049): one
@@ -5086,9 +5086,9 @@ uma_restart:
             // -ot overrides and a MoE cache, none given by the user) is measured for -sm tensor too: where the tensor split holds the
             // whole model, the fit's host experts and cache are dropped and it loads split by tensor. Layer split places whole layers
             // per GPU, so a model of few large layers (DeepSeek-V4.1 8-layer fake: 2.64 GiB of experts per layer, 24.1 GiB) leaves
-            // slack on both cards that the even tensor split uses. 2x T4 dsf8: -sm layer + 2 x 8.9 GB
+            // slack on both cards that the even tensor split uses. 2x T4, the 8-bit DeepSeek fake: -sm layer + 2 x 8.9 GB
             // MoE cache 65.6 / 63.1 tok/s (chat / 8k), 8k TTFT 11.5 s; -sm tensor 75.1 / 69.3, 5.05 s
-            // srv_kld long48 on dsf8 (vs the layer + cache default): first-token KLD mean 0.0091 / p99 0.134 / top1 0.917, per position
+            // the 48-prompt long-context KLD check on the 8-bit DeepSeek fake (vs the layer + cache default): first-token KLD mean 0.0091 / p99 0.134 / top1 0.917, per position
             // 0.0027 / 0.133 / 0.9725, inside the -fa off band of the same launch (an earlier build, -fa off vs on: 0.0095 / 0.143 / 0.917 and
             // 0.0025 / 0.133 / 0.9736), so on by default; LLAMA_SPLIT_AUTO_TENSOR_HOST=0 = the layer fit's host experts and cache as before
             static const bool host_on = [] {
@@ -5209,7 +5209,7 @@ uma_restart:
 
     // where the DFlash2 cached window band engages (a DFlash drafter, the cache holding LLAMA_DFLASH_CACHED_FRAC_MIN ..
     // LLAMA_DFLASH_CACHED_FRAC_MAX of the host experts, see common/speculative.cpp) the target keeps the verify graphs of two widths
-    // (3 rows and the whole draft) and their CUDA graphs, which the fit did not price: RTX PRO 6000 Qwen3.8-Flash-Next 4-bit 32 GB, srv_kld long48
+    // (3 rows and the whole draft) and their CUDA graphs, which the fit did not price: RTX PRO 6000 Qwen3.8-Flash-Next 4-bit 32 GB, the 48-prompt long-context KLD check
     // aborted with CUDA out of memory after a 2096-token prompt. The cache leaves LLAMA_DFLASH_CACHED_RESERVE_MIB (K19_DF2COST_RESERVE_MIB)
     // of device memory for them (0: none)
     if (!model_only && cparams.moe_cache_size > 0 && cparams.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES &&
