@@ -1180,7 +1180,18 @@ int ggml_cuda_moe_refill_register(ggml_backend_cuda_context & ctx, const void * 
     std::lock_guard<std::mutex> lock(moe_rf_mutex);
     const auto it = moe_rf_regs.find(state_data);
     if (it != moe_rf_regs.end()) {
-        return it->second.idx;
+        // a cache registers each group once per lifetime: a known address is the state of a destroyed cache (it synchronized its
+        // streams) reused by a new one, whose epochs restart at 0, so the row starts at 0 again (nothing pending)
+        moe_rf_reg & r = it->second;
+        if (r.device != ctx.device) {
+            return -1;
+        }
+        ggml_cuda_set_device(ctx.device);
+        memset(r.h_need, 0, MOE_RF_ROW*sizeof(int32_t));
+        memset(r.h_done, 0, MOE_RF_ROW*sizeof(int32_t));
+        r.mirror.assign(MOE_RF_ROW, 0);
+        CUDA_CHECK(cudaMemcpyToSymbol(moe_rf_tab, r.h_need, MOE_RF_ROW*sizeof(int32_t), (size_t) r.idx*MOE_RF_ROW*sizeof(int32_t), cudaMemcpyHostToDevice));
+        return r.idx;
     }
     if (ctx.device < 0 || ctx.device >= GGML_CUDA_MAX_DEVICES || moe_rf_count[ctx.device] >= MOE_RF_GROUPS) {
         return -1;
