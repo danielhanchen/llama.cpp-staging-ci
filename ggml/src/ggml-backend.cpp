@@ -5501,7 +5501,31 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
             }
         }
         // split and bind again from fresh tensor copies (the bound copies of this graph hold arena addresses); the depth is now the
-        // default, so this does not come back here
+        // default, so this does not come back here. The split pointed the sources of the graph's nodes at the input copies, which
+        // live in the scheduler's context that the next split reuses: point them back at the original tensors first
+        {
+            std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> orig;
+            for (int i = 0; i < sched->n_splits; i++) {
+                const struct ggml_backend_sched_split * split = &sched->splits[i];
+                for (int j = 0; j < split->n_inputs; j++) {
+                    for (int c = 0; c < sched->n_copies; c++) {
+                        struct ggml_tensor * cpy = tensor_copy(split->inputs[j], split->backend_id, c);
+                        if (cpy != NULL) {
+                            orig[cpy] = split->inputs[j];
+                        }
+                    }
+                }
+            }
+            for (int i = 0; i < measure_graph->n_nodes; i++) {
+                struct ggml_tensor * node = measure_graph->nodes[i];
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    auto it = node->src[j] != NULL ? orig.find(node->src[j]) : orig.end();
+                    if (it != orig.end()) {
+                        node->src[j] = it->second;
+                    }
+                }
+            }
+        }
         sched->pf_check = false;
         ggml_backend_sched_reset(sched);
         return ggml_backend_sched_reserve(sched, measure_graph);
