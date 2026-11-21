@@ -3825,6 +3825,20 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// (proc "ggml_backend_memset_tensor_async"): size bytes of tensor from offset set to value on the backend's stream, the host does not wait
+static void ggml_backend_cuda_memset_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    GGML_ASSERT(buf != nullptr && !ggml_backend_buffer_is_host(buf) && "unsupported buffer type");
+    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    if (size == 0) {
+        return;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cuda_ctx->stream()));
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -13728,6 +13742,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_moe_refill_done") == 0) {
         return (void *)ggml_backend_cuda_moe_refill_done;
+    }
+    if (strcmp(name, "ggml_backend_memset_tensor_async") == 0) {
+        return (void *)ggml_backend_cuda_memset_tensor_async;
     }
     if (strcmp(name, "ggml_backend_cuda_preload_graph") == 0) {
         return (void *)ggml_backend_cuda_preload_graph;

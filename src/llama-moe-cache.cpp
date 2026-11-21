@@ -854,6 +854,7 @@ struct llama_moe_cache::impl {
         int      rf_skip    = 0;       // prepare calls that still leave it pending (the graph it overlaps)
         ggml_backend_event_t rf_ev0 = nullptr; // compute stream -> upload stream: the cleared slots
         ggml_backend_event_t rf_ev1 = nullptr; // upload stream -> compute stream: the refill complete
+        ggml_backend_event_t rf_evc = nullptr; // upload stream -> compute stream: the lent slots cleared (see unlend)
     };
 
     struct layer {
@@ -4077,7 +4078,7 @@ struct llama_moe_cache::impl {
             }
         }
         for (group & g : groups) {
-            for (ggml_backend_event_t * ev : { &g.rf_ev0, &g.rf_ev1 }) {
+            for (ggml_backend_event_t * ev : { &g.rf_ev0, &g.rf_ev1, &g.rf_evc }) {
                 if (*ev != nullptr) {
                     ggml_backend_event_free(*ev);
                     *ev = nullptr;
@@ -7902,8 +7903,11 @@ struct llama_moe_cache::impl {
     typedef int  (*rf_register_t)(ggml_backend_t, const ggml_tensor *);
     typedef bool (*rf_need_t)(ggml_backend_t, const ggml_tensor *, const int32_t *, int, int32_t, int32_t);
     typedef bool (*rf_done_t)(ggml_backend_t, const ggml_tensor *, int, int32_t);
+    int64_t n_clear_async = 0;
     rf_need_t rf_need_fn = nullptr;
     rf_done_t rf_done_fn = nullptr;
+    typedef void (*memset_async_t)(ggml_backend_t, ggml_tensor *, uint8_t, size_t, size_t);
+    memset_async_t memset_async_fn = nullptr; // ggml_backend_memset_tensor_async: a clear on the backend's stream
     struct rf_dev_t {
         bool tried = false;
         ggml_backend_t be = nullptr;
@@ -8616,6 +8620,7 @@ struct llama_moe_cache::impl {
                 auto rf_register = (rf_register_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_refill_register");
                 rf_need_fn = (rf_need_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_refill_need");
                 rf_done_fn = (rf_done_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_refill_done");
+                memset_async_fn = (memset_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_memset_tensor_async");
                 if (rf_register != nullptr && rf_need_fn != nullptr && rf_done_fn != nullptr && layers.size() <= 128) {
                     g.rf_idx = rf_register(backend, g.state);
                 }
@@ -12913,8 +12918,33 @@ struct llama_moe_cache::impl {
             verify(g, "while lent");
         }
         const int32_t n = g.lru.n_lent;
-        for (ggml_tensor * bank : g.banks) {
-            ggml_backend_tensor_memset(bank, 0, (size_t) (g.n_slots - n)*bank->nb[2], (size_t) (n + 1)*bank->nb[2]);
+        // (LLAMA_MOE_LENT_CLEAR_ASYNC=0: off) where the refill may run on the upload stream, the lent slots are cleared there, before its
+        // uploads, and the compute stream waits for the clear on the device: the same bytes in the same stream order for every later reader
+        // (the compute stream's work and the refill), without the main thread waiting for it before its next launches (RTX PRO 6000
+        // Qwen3.8-Flash-Next + MTP at 48 GB: 2320 slots, ~3.5 ms before the MTP drafter's prompt pass was launched)
+        static const bool clear_async_env = getenv("LLAMA_MOE_LENT_CLEAR_ASYNC") == nullptr || atoi(getenv("LLAMA_MOE_LENT_CLEAR_ASYNC")) != 0;
+        ggml_backend_t up_clear = clear_async_env && memset_async_fn != nullptr && n > 0 && refill_enabled && rf_allow &&
+            rf_lend_tokens >= rf_min_tokens && rf_eligible(g) ? rf_backend(g.id) : nullptr;
+        if (up_clear != nullptr && g.rf_evc == nullptr) {
+            g.rf_evc = ggml_backend_event_new(ggml_backend_get_device(backend));
+        }
+        if (up_clear != nullptr && g.rf_evc != nullptr) {
+            ggml_backend_event_record(g.rf_ev0, backend);
+            ggml_backend_event_wait(up_clear, g.rf_ev0);
+            for (ggml_tensor * bank : g.banks) {
+                memset_async_fn(up_clear, bank, 0, (size_t) (g.n_slots - n)*bank->nb[2], (size_t) (n + 1)*bank->nb[2]);
+            }
+            ggml_backend_event_record(g.rf_evc, up_clear);
+            ggml_backend_event_wait(backend, g.rf_evc);
+            n_clear_async++;
+            if (n_clear_async <= 2) {
+                LLAMA_LOG_INFO("%s: %s: MoE cache: %d lent slots cleared on the upload stream (LLAMA_MOE_LENT_CLEAR_ASYNC=0: on the main "
+                    "thread)\n", __func__, ggml_backend_name(backend), n);
+            }
+        } else {
+            for (ggml_tensor * bank : g.banks) {
+                ggml_backend_tensor_memset(bank, 0, (size_t) (g.n_slots - n)*bank->nb[2], (size_t) (n + 1)*bank->nb[2]);
+            }
         }
         g.lru.set_lent(0);
 
