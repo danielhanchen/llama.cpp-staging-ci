@@ -1117,6 +1117,10 @@ extern "C" {
     LLAMA_API int32_t llama_batch_ext_add_token(struct llama_batch_ext * batch, llama_seq_id seq_id, llama_token id);
     LLAMA_API int32_t llama_batch_ext_add_embd (struct llama_batch_ext * batch, llama_seq_id seq_id, struct llama_embd embd);
 
+    // As llama_batch_ext_add_embd, but the batch keeps a pointer to embd.data instead of a copy: the data must stay valid and
+    // unchanged until the llama_decode() / llama_process() call that takes this batch has returned
+    LLAMA_API int32_t llama_batch_ext_add_embd_ref(struct llama_batch_ext * batch, llama_seq_id seq_id, struct llama_embd embd);
+
     // Add the token at index idx in the batch to another sequence id. The position will stays the same.
     // Note: this should be called before other _set() functions
     LLAMA_API bool llama_batch_ext_add_seq(

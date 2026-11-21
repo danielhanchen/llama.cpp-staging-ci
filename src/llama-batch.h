@@ -113,6 +113,7 @@ struct llama_batch_ext {
         llama_token  id = LLAMA_TOKEN_NULL;
         bool         has_embd = false; // whether embd_off is set
         size_t       embd_off = 0; // index offset in the embd array
+        const float * embd_ref = nullptr; // the caller's row instead of embd_off (llama_batch_ext_add_embd_ref)
         bool         has_state = false; // whether state_off is set
         size_t       state_off = 0; // index offset in the state array
         const float * state_ref = nullptr; // k19-host: the caller's row instead of state_off (llama_batch_ext_set_embd_state_ref)
@@ -145,7 +146,7 @@ struct llama_batch_ext {
 
     bool add_seq(int32_t idx, llama_seq_id seq_id);
     bool set_token_id(int32_t idx, llama_token id);
-    bool set_token_embd(int32_t idx, llama_embd embd_in);
+    bool set_token_embd(int32_t idx, llama_embd embd_in, bool by_ref = false);
     bool set_token_state(int32_t idx, llama_embd state_in, bool by_ref = false);
     void reserve(size_t n_tokens, size_t n_state_tokens);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
@@ -229,6 +230,7 @@ private:
 
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
+    bool                        embd_view = false; // batch.embd points at the caller's rows (held by reference, consecutive in memory)
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
     const float *               state_src = nullptr; // the state rows of the batch: state_vec, or the input batch itself (no copy)

@@ -29,6 +29,7 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <thread>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1287,6 +1288,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         batch        = common_batch(ctx_dft);
         batch_inject = common_batch(ctx_dft);
+        // LLAMA_DFLASH_INGEST_REF=0: the injected features are copied into the batch and its ubatches, as before. Default: the batch
+        // and its ubatches read them in place from features_buf (consecutive rows, alive until llama_process returns)
+        batch_inject.embd_ref = getenv("LLAMA_DFLASH_INGEST_REF") == nullptr || atoi(getenv("LLAMA_DFLASH_INGEST_REF")) != 0;
 
         // embd batches on an M-RoPE draft carry 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
@@ -1424,16 +1428,45 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
+                const float * layers[64];
+                GGML_ASSERT(target_layer_ids_n <= 64);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
+                    layers[k] = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    if (!layers[k]) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (nextn_row_offset + i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                }
+                const size_t row0 = (size_t) (nextn_row_offset + i_batch_beg[seq_id] + offset);
+                auto gather = [&](int32_t i0, int32_t i1) {
+                    for (int32_t i = i0; i < i1; ++i) {
+                        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                            float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                            const float * src = layers[k] + (row0 + i) * n_embd_tgt;
+                            std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        }
                     }
+                };
+                // LLAMA_DFLASH_INGEST_THREADS=N (default 4, 1 = one thread as before): a long chunk's gather is split over N threads
+                // (the same bytes to the same places; the host copy is most of a long prompt's ingestion)
+                static const int32_t n_gather_thr = [] {
+                    const char * e = getenv("LLAMA_DFLASH_INGEST_THREADS");
+                    const int32_t hw = (int32_t) std::max(1u, std::thread::hardware_concurrency());
+                    return std::max<int32_t>(1, std::min<int32_t>(e ? atoi(e) : 4, std::max(1, hw/2)));
+                }();
+                const int32_t n_thr = n_chunk >= 128 ? std::min<int32_t>(n_gather_thr, n_chunk/32) : 1;
+                if (n_thr > 1) {
+                    std::vector<std::thread> thr;
+                    thr.reserve(n_thr - 1);
+                    const int32_t per = (n_chunk + n_thr - 1)/n_thr;
+                    for (int32_t t = 1; t < n_thr; ++t) {
+                        thr.emplace_back(gather, std::min(n_chunk, t*per), std::min(n_chunk, (t + 1)*per));
+                    }
+                    gather(0, std::min(n_chunk, per));
+                    for (auto & th : thr) {
+                        th.join();
+                    }
+                } else {
+                    gather(0, n_chunk);
                 }
 
                 // k19-df2pp (diagnostic, LLAMA_DFLASH_FEAT_HASH=1): a running FNV-1a hash of the features the drafter takes, in position
