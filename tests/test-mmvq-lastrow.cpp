@@ -1,4 +1,4 @@
-// k19-ikfix: the CUDA mat-vec (MUL_MAT at 1..8 columns, MUL_MAT_ID at 1..4 tokens) must not read past the last row of a weight
+// the CUDA mat-vec (MUL_MAT at 1..8 columns, MUL_MAT_ID at 1..4 tokens) must not read past the last row of a weight
 // matrix when the last row block is partial (rows per block > 1: 2..8 columns, small K at one column, the MoE multi-token kernel; rows
 // not a multiple of it). The weights of each case end right before an unmapped page: a read past their last row is an illegal address
 // (the CUDA error aborts the test), so it fails without compute-sanitizer. Per case:

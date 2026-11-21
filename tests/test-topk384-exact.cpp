@@ -1,4 +1,4 @@
-// k19-dsv4: the fused CUDA top-k MoE routing for 384 experts (DeepSeek-V4.1: sqrt-softplus gating, exp_probs_b bias for the selection,
+// the fused CUDA top-k MoE routing for 384 experts (DeepSeek-V4.1: sqrt-softplus gating, exp_probs_b bias for the selection,
 // 6 used, weights normalised and scaled by 1.5) vs the unfused graph (GGML_CUDA_TOPK_MOE_384=0) and vs the CPU backend.
 // The graph is test-backend-ops' test_topk_moe. Each CUDA mode runs in a child process (this binary with --child MODE FILE; the CUDA
 // switches are read once per process) that dumps ids + weights per case; GGML_CUDA_TOPK_MOE_LOG=1 counts the fused launches: the fused
@@ -78,7 +78,7 @@ static std::vector<uint8_t> run_case(ggml_backend_t backend, const tcase & c, in
     // buffer (ggml_backend_alloc_ctx_tensors), so ids and weights are read after the compute as they are
     // expand the weights only (ids is reached through get_rows): the fusion matcher wants the graph order the model produces,
     // softplus -> sqrt -> reshape(probs) -> add(bias) -> argsort -> ...; expanding ids first put the reshape after the argsort, so
-    // nothing fused (A100 r7 and Kaggle T4 r8: 0 fused launches logged)
+    // nothing fused (A100 r7 and T4 r8: 0 fused launches logged)
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, w);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);

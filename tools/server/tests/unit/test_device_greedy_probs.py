@@ -1,7 +1,7 @@
 import pytest
 from utils import *
 
-# k15-fn: greedy requests that ask for probabilities (n_probs on /completion, logprobs / top_logprobs on /v1/chat/completions, streaming
+# Greedy requests that ask for probabilities (n_probs on /completion, logprobs / top_logprobs on /v1/chat/completions, streaming
 # or not) return them while the device greedy chain is on (the default on CUDA / ROCm when every layer is offloaded: run with
 # N_GPU_LAYERS=99 to exercise it), and the text and probabilities equal those of the host path (LLAMA_SERVER_DEVICE_GREEDY=0)
 

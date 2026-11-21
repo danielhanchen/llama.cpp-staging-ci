@@ -1,4 +1,4 @@
-// k19-l4b: ggml_cpu_moe_host_ffn (the host experts of a single-graph MoE mailbox batch) is bit-identical to the graph it replaces
+// ggml_cpu_moe_host_ffn (the host experts of a single-graph MoE mailbox batch) is bit-identical to the graph it replaces
 // (mul_mat_id up / gate, swiglu_split, mul_mat_id down on the CPU backend) for every thread count, on the OpenMP region and on
 // ggml_cpu_moe_host_ffn_team (the host team; the OpenMP region again with GGML_MOE_HOST_TEAM=0). Rows of id -1 must be 0. Any byte difference fails.
 // "perf" as the first argument times both forms instead (LFM2.5-24B-A2B expert shapes, 1 token, 4 experts per batch).
@@ -105,7 +105,7 @@ static std::vector<float> run_graph(ffn_case & c, int n_threads) {
 
 static bool g_team = true; // ggml_cpu_moe_host_ffn_team, else ggml_cpu_moe_host_ffn (the OpenMP region)
 
-// k19-overlap: GGML_MOE_HOST_LEAN bit 1 (default on) leaves the rows of id -1 as they were (run_fused fills them with 12345)
+// GGML_MOE_HOST_LEAN bit 1 (default on) leaves the rows of id -1 as they were (run_fused fills them with 12345)
 static bool lean_skip_rows() {
     const char * e = getenv("GGML_MOE_HOST_LEAN");
     return ((e != nullptr ? atoi(e) : 3) & 1) != 0;
@@ -139,7 +139,7 @@ static bool run_fused(ffn_case & c, int n_threads, std::vector<float> & out) {
 }
 
 static int perf_main() {
-    // LFM2.5-24B-A2B: n_embd 2048, n_ff 1536, 64 experts; gate / up Q4_K, down Q5_K (UD-Q4_K_XL); 4 used, the host gets 2-3 of them
+    // LFM2.5-24B-A2B: n_embd 2048, n_ff 1536, 64 experts; gate / up Q4_K, down Q5_K (4-bit); 4 used, the host gets 2-3 of them
     ffn_case c;
     make_case(c, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 2048, 1536, 64, 4, 1, 7, false);
     for (int team = 0; team < 2; ++team) {
@@ -194,9 +194,9 @@ int main(int argc, char ** argv) {
         { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, 256, 512, 12, 8, 8, true  },
         { GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, 128, 384, 4,  4, 8, false },
         { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, 256, 512, 16, 8, 4, false },
-        // k19-hostrow: Flash-Next's expert types (the AVX-512 IQ3_S kernel where the build has it), experts shared by 2-4 rows
+        // Flash-Next's expert types (the AVX-512 IQ3_S kernel where the build has it), experts shared by 2-4 rows
         { GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, 512, 640, 6,  4, 6, false },
-        // the IQ3_XXS gate / up and Q5_0 down experts of Flash-Next's UD-IQ4_XS layers (the Q5_0 multi-column kernel for shared experts)
+        // the IQ3_XXS gate / up and Q5_0 down experts of Flash-Next's 4-bit layers (the Q5_0 multi-column kernel for shared experts)
         { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, 512, 512, 6,  4, 6, false },
         { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, 256, 512, 16, 8, 3, true  },
     };
@@ -213,7 +213,7 @@ int main(int argc, char ** argv) {
         make_case(c, k.tu, k.td, k.n_embd, k.n_ff, k.n_exp, k.n_used, k.n_tokens, seed++, k.skip);
         const std::vector<float> ref = run_graph(c, 4);
         for (int team = team0; team < 2; ++team)
-        // k19-hostadapt: then fewer threads than the team has, and back (the idle workers skip those batches)
+        // then fewer threads than the team has, and back (the idle workers skip those batches)
         for (int nt : { 1, 2, 3, 5, 7, 11, 16, 6, 5, 4, 6, 5 }) {
             for (int rep = 0; rep < 3; ++rep) {
                 std::vector<float> out;

@@ -411,7 +411,7 @@ struct server_slot_stats {
     int64_t t_gen_last    = 0;
 
     // can only move one direction: start -> prompt -> gen
-    // t_from_us > 0: the prompt time starts there (not after now), e.g. when the request's task was posted (k15-hostcut)
+    // t_from_us > 0: the prompt time starts there (not after now), e.g. when the request's task was posted
     void update_prompt_start(int64_t t_from_us = 0) {
         GGML_ASSERT(t_start == 0);
         const int64_t t_now = ggml_time_us();

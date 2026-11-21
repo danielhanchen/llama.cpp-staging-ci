@@ -330,10 +330,10 @@ struct common_params_model {
     }
 };
 
-// k19-fnmtp: bytes of every routed expert tensor of a GGUF (and its splits), 0 for a model without experts or an unreadable file
+// bytes of every routed expert tensor of a GGUF (and its splits), 0 for a model without experts or an unreadable file
 uint64_t common_moe_expert_bytes(const std::string & path);
 
-// k19-l4gap: how many tokens' routed experts cache_bytes hold (the tiny-cache rule's estimate: largest layer's expert bytes x n_used x
+// how many tokens' routed experts cache_bytes hold (the tiny-cache rule's estimate: largest layer's expert bytes x n_used x
 // n_layer), -1 when unknown
 double common_moe_cache_tokens(const std::string & path, uint64_t cache_bytes);
 
@@ -341,10 +341,10 @@ double common_moe_cache_tokens(const std::string & path, uint64_t cache_bytes);
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
-    int32_t n_floor = 0; // k19-tpp: > 0: an MTP window keeps n_floor drafts and one more (n_max = n_floor + 1) only where it pays
-    bool    deep_cached = false; // k19-fnmtp: the server's rule keeps the deep windows (n_max) below LLAMA_SPEC_DEPTH_POS beside a MoE cache
-    int32_t fit_n_max = 0; // k19-g4tail2: > 0: --fit admits a drafter by the verify cost of windows of fit_n_max drafts, not n_max
-    int32_t adraft = 0; // k19-adraft: > 0: sampled requests size the MTP window by expected tokens per ms up to n_max, greedy ones keep adraft drafts
+    int32_t n_floor = 0; // > 0: an MTP window keeps n_floor drafts and one more (n_max = n_floor + 1) only where it pays
+    bool    deep_cached = false; // the server's rule keeps the deep windows (n_max) below LLAMA_SPEC_DEPTH_POS beside a MoE cache
+    int32_t fit_n_max = 0; // > 0: --fit admits a drafter by the verify cost of windows of fit_n_max drafts, not n_max
+    int32_t adraft = 0; // > 0: sampled requests size the MTP window by expected tokens per ms up to n_max, greedy ones keep adraft drafts
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -398,19 +398,19 @@ struct common_params_speculative_ngram_suffix {
     int32_t n_long_match = 8;
     float   p_cut        = 0.6f;
     float   p_take       = 0.9f;
-    // k11-decode: alone, the cost-priced window choice (common/spec-cost-policy.h) replaces the n_min_draft / p_cut gate.
+    // alone, the cost-priced window choice (common/spec-cost-policy.h) replaces the n_min_draft / p_cut gate.
     // auto_mode: the server turned this drafter on by itself (no --spec-type given, LLAMA_SPEC_AUTO); policy is on there
-    // (LLAMA_SPEC_SUFFIX_POLICY=0 restores the k9 gate, =1 also prices an explicit --spec-type ngram-suffix)
+    // (LLAMA_SPEC_SUFFIX_POLICY=0 restores the n_min_draft / p_cut gate, =1 also prices an explicit --spec-type ngram-suffix)
     bool    auto_mode    = false;
-    // k15-spec: prompts of at least long_prompt tokens draft from repeats of at least n_min_match_long tokens (0: n_min_match)
+    // prompts of at least long_prompt tokens draft from repeats of at least n_min_match_long tokens (0: n_min_match)
     int32_t long_prompt      = 0;
     int32_t n_min_match_long = 0;
-    // k15-lfm2: prompts of at least win_long_prompt tokens (0: off) take the short window n_max_short_long (from a match under
+    // prompts of at least win_long_prompt tokens (0: off) take the short window n_max_short_long (from a match under
     // n_long_match_long; the full window from there): the server sets them where drafts verify exactly (output unchanged)
     int32_t win_long_prompt   = 0;
     int32_t n_max_short_long  = 0;
     int32_t n_long_match_long = 0;
-    // k19-rollback: the server drafts these windows in place of a draft model that --fit left out (LLAMA_SPEC_DROP_NGRAM, common_fit_drop_ngram);
+    // the server drafts these windows in place of a draft model that --fit left out (LLAMA_SPEC_DROP_NGRAM, common_fit_drop_ngram);
     // their rollback keeps no per-token recurrent rows on the device. drop_spill: the mode of server_spec_spill_mode under a MoE cache with
     // host experts (-1: the model's own); an explicit LLAMA_SPEC_SPILL still wins
     bool    drop_fallback = false;
@@ -460,7 +460,7 @@ struct common_params_speculative {
         });
 
         uint32_t n = needs_rs_seq ? (uint32_t) std::max(0, draft.n_max) : 0u;
-        // k9-draft: suffix drafts are verified in one batch too; a recurrent model rolls them back from per-token snapshots instead
+        // suffix drafts are verified in one batch too; a recurrent model rolls them back from per-token snapshots instead
         // of a state checkpoint per verify (LLAMA_SPEC_SUFFIX_RS=0: as before, the snapshots cover the model drafter only)
         static const bool suffix_rs = getenv("LLAMA_SPEC_SUFFIX_RS") == nullptr || atoi(getenv("LLAMA_SPEC_SUFFIX_RS")) != 0;
         if (suffix_rs) {
@@ -469,9 +469,9 @@ struct common_params_speculative {
         return n;
     }
 
-    // k9-draft: the longest ngram-suffix draft (0 without that type). LLAMA_SPEC_SUFFIX_N_MAX sets it; else ngram_suffix.n_max (7)
+    // the longest ngram-suffix draft (0 without that type). LLAMA_SPEC_SUFFIX_N_MAX sets it; else ngram_suffix.n_max (7)
     // alone, and the model drafter's n_max beside one: the suffix draft then takes a model round when it is sure, with no new verify
-    // shape and no extra recurrent snapshots (each kept position of Qwen3.6-35B-A3B is a 63 MiB state taken from the MoE cache; G4,
+    // shape and no extra recurrent snapshots (each kept position of Qwen3.6-35B-A3B is a 63 MiB state taken from the MoE cache; RTX PRO 6000,
     // a window of 4 beside MTP 2 lost 1-7% decode at 8 / 32 GB against MTP alone, rep cell included)
     int32_t suffix_n_max() const {
         if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX) == types.end()) {
@@ -576,8 +576,8 @@ struct common_params {
     bool fit_params_target_set = false; // --fit-target given (the margin beside a MoE cache is then kept as given)
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
-    bool split_mode_set  = false; // -sm given (k19-mgpu: the fit then never picks the split mode)
-    bool split_mode_auto = false; // k19-mgpu: -sm tensor picked by the fit (a reload from params fits again from -sm layer)
+    bool split_mode_set  = false; // -sm given (the fit then never picks the split mode)
+    bool split_mode_auto = false; // -sm tensor picked by the fit (a reload from params fits again from -sm layer)
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
@@ -679,7 +679,7 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
-    bool mtp_borrow_io     = false; // k16-draft: an MTP draft model takes token_embd / output from the target (set by common_base_params_to_speculative)
+    bool mtp_borrow_io     = false; // an MTP draft model takes token_embd / output from the target (set by common_base_params_to_speculative)
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -688,7 +688,7 @@ struct common_params {
     bool cache_type_k_set  = false; // -ctk / LLAMA_ARG_CACHE_TYPE_K given (no automatic q8_0 K/V then, LLAMA_KV_AUTO_Q8)
     bool cache_type_v_set  = false; // -ctv / LLAMA_ARG_CACHE_TYPE_V given
 
-    // k19-kvwin: recent-window ring beside the (4-bit) KV cache: --kv-window N keeps the last N positions of every sequence and its
+    // recent-window ring beside the (4-bit) KV cache: --kv-window N keeps the last N positions of every sequence and its
     // first kv_win_sinks positions also in cache_type_k_win / cache_type_v_win (-1: off). Without -ctk / -ctv the cache is then q4_0
     int32_t   kv_win             = -1;
     int32_t   kv_win_sinks       = 4;
@@ -1066,7 +1066,7 @@ bool common_is_tty(FILE * file);
 // n_ubatch of the draft context of speculative decoding for a target context at n_ubatch u (see common.cpp)
 uint32_t common_draft_n_ubatch(const common_params & params, uint32_t u);
 
-// k19-df3: the device memory of a DFlash / DSpark draft, which cannot be created (and so measured) without its target: weights (its GGUF's
+// the device memory of a DFlash / DSpark draft, which cannot be created (and so measured) without its target: weights (its GGUF's
 // tensors), K/V and compute buffer (see common_fit_dflash_estimate in common.cpp); false for other drafts
 bool common_fit_dflash_draft_bytes(const char * path_dft, const llama_context_params & cp_dft, const char * path_tgt, uint32_t n_ubatch_tgt,
         size_t & weights, size_t & kv, size_t & compute);
@@ -1405,9 +1405,9 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 
 // a byte buffer whose resize() leaves new bytes uninitialized: a checkpoint is overwritten in full by the state save, and the
 // zero-fill of a fresh multi-MiB buffer (page faults included) otherwise ran on the main thread before the save was queued
-// k15-ttft: buffers of at least 4 MiB are 2 MiB aligned and marked MADV_HUGEPAGE (Linux), so a fresh state / checkpoint buffer faults
+// buffers of at least 4 MiB are 2 MiB aligned and marked MADV_HUGEPAGE (Linux), so a fresh state / checkpoint buffer faults
 // in 2 MiB pages instead of 4 KiB ones (a 77 MiB prompt-cache save: ~40 faults instead of ~20000). Same memory, same bytes.
-// Opt-in (LLAMA_STATE_THP=1): on G4 Flash-Next 32 GB (62 GB host RSS) the madvised allocations stalled in direct compaction
+// Opt-in (LLAMA_STATE_THP=1): on RTX PRO 6000 Flash-Next 32 GB (62 GB host RSS) the madvised allocations stalled in direct compaction
 // (multi-turn steps of 6.8 s and 10.8 s against 2.1 s and 0.95 s, regenerate 64 ms against 44 ms)
 bool   common_state_thp_on();
 void * common_state_thp_alloc(size_t bytes);
@@ -1437,25 +1437,25 @@ struct common_default_init_allocator : std::allocator<T> {
 
 using common_state_buf = std::vector<uint8_t, common_default_init_allocator<uint8_t>>;
 
-// k11 (LLAMA_CKPT_POOL, default on, =0 off): freed checkpoint buffers are kept (at most 4, the largest) and given to the next checkpoint
+// (LLAMA_CKPT_POOL, default on, =0 off): freed checkpoint buffers are kept (at most 4, the largest) and given to the next checkpoint
 // that fits, so its pages are resident: without the zero-fill the state save's host copy otherwise faults every page of a fresh buffer
-// on the save worker, and the next decode() waits for it (G4 Qwen3.6 32 GB, no MTP: 42..600-token prompts -5..-9% vs k10)
+// on the save worker, and the next decode() waits for it (RTX PRO 6000 Qwen3.6 32 GB, no MTP: 42..600-token prompts -5..-9% vs before)
 void common_state_buf_recycle(common_state_buf && buf);
 // a buffer of at least n bytes from the pool into buf, if buf is smaller (returns true when one was taken)
 bool common_state_buf_take(common_state_buf & buf, size_t n);
 size_t common_state_buf_pool_bytes(); // debug: capacity held by the pool
 std::string common_state_buf_pool_desc(); // debug: the capacities (MiB) of the pooled buffers, and those pending
-// k17: a buffer of this capacity will be recycled shortly (common_state_buf_recycle_pending): the prefault worker counts it as pooled
+// a buffer of this capacity will be recycled shortly (common_state_buf_recycle_pending): the prefault worker counts it as pooled
 void common_state_buf_pending_add(size_t capacity);
 void common_state_buf_recycle_pending(common_state_buf && buf);
 void common_state_buf_pending_drop(size_t capacity); // ... that will not come back after all
-// k17: as common_state_buf_take / _prefault, but only a pooled buffer of at most fit times n counts (fit <= 0: the pool's rule)
+// as common_state_buf_take / _prefault, but only a pooled buffer of at most fit times n counts (fit <= 0: the pool's rule)
 bool common_state_buf_take_fit(common_state_buf & buf, size_t n, int fit);
 void common_state_buf_prefault_fit(size_t n, int count, int fit);
-// k17: new checkpoints take fitted pooled buffers (see common_prompt_checkpoint::update_tgt); auto mode turns it on at the first idle lend
+// new checkpoints take fitted pooled buffers (see common_prompt_checkpoint::update_tgt); auto mode turns it on at the first idle lend
 bool common_state_ckpt_fit();
 void common_state_ckpt_fit_enable();
-// k11 (LLAMA_STATE_PREFAULT=0 turns it off): ask a background thread to keep count pooled buffers of at least n bytes with resident pages
+// (LLAMA_STATE_PREFAULT=0 turns it off): ask a background thread to keep count pooled buffers of at least n bytes with resident pages
 void common_state_buf_prefault(size_t n, int count);
 
 struct common_prompt_checkpoint {

@@ -1,9 +1,9 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// k19-fattnq4: the tensor-core flash attention reading a q4_0 (or mixed q4_0 / q8_0) K / V cache in place (default: the raw rows
+// the tensor-core flash attention reading a q4_0 (or mixed q4_0 / q8_0) K / V cache in place (default: the raw rows
 // pipelined where the f16 kernel pipelines, else synchronous loads; and GGML_CUDA_FATTN_Q8_MODE=1: synchronous loads everywhere) against
 // the staged path that converts the whole K and V to f16 first (GGML_CUDA_FATTN_Q4_INPLACE=0 / GGML_CUDA_FATTN_Q8_INPLACE=0), byte for
 // byte on the GPU backend. Type pairs q4_0 / q4_0, q4_0 / q8_0, q8_0 / q4_0, and q8_0 / q8_0 at head size 64 (in place since
-// k19-fattnq4). Each mode runs in a child process (the switches are read once per process) that dumps every output, the median time
+// the q4 flash attention change). Each mode runs in a child process (the switches are read once per process) that dumps every output, the median time
 // of the timed graph runs per case and whether the in-place kernels logged. K / V live in the KV cache layout (a [D*HKV, cells] tensor,
 // viewed per head and permuted as llama-graph does; some cases with an unused head per row, so the staged copy takes the strided
 // conversion), filled from normal draws with per cell scales from 1e-6 to 1e2 (subnormal and large f16 block scales, both signs of d),
@@ -88,7 +88,7 @@ static std::vector<tcase> cases() {
             v.push_back({ tp.first, tp.second, 256, 16, 2, T, 8192, false, 1027 });
         }
     }
-    // q8_0 / q8_0 at head size 64 (in place since k19-fattnq4)
+    // q8_0 / q8_0 at head size 64 (in place since the q4 flash attention change)
     for (int g : { 1, 4, 8 }) {
         for (int T : { 2, 3, 8, 16, 64 }) {
             v.push_back({ Q8, Q8, 64, g*2, 2, T, 1000, false, 0 });

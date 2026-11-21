@@ -1,5 +1,5 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// Bit identity of a flash attention node padded to P cells with its live length L (ggml_flash_attn_ext_set_kv_len, k19-graph) against
+// Bit identity of a flash attention node padded to P cells with its live length L (ggml_flash_attn_ext_set_kv_len) against
 // the node of L cells, on the GPU backend, at the shape of Qwen3.8-Flash-Next's QSA attention (head size 256, 24 query heads over 2 KV
 // heads, f16 K / V in the KV cache layout, 1..8 query rows), dense (n_kv_max 0) and sparse (n_kv_max = the QSA selection, 2051 visible
 // cells per row), with and without the verify flag. One padded graph per (rows, P, mode) is evaluated at a sequence of lengths, so its
@@ -7,7 +7,7 @@
 // graph of L cells. GGML_CUDA_GRAPH_CAPTURE_LOG counts the captures of the padded graphs: with the device length they follow the
 // launch signature (a few per graph), not the length. Negative control: the padded node without its length must differ somewhere
 // (the dense stream-k split follows the cells). GGML_CUDA_FA_KV_LEN=0 (the kill switch) must pass too, with a capture per length.
-// k19-fattnq8: the same with a q8_0 K / V cache (the MMA kernel reads it in place, so its padded node takes the device length too).
+// the same with a q8_0 K / V cache (the MMA kernel reads it in place, so its padded node takes the device length too).
 // No GPU: SKIP, exit 0.
 
 #include "ggml.h"

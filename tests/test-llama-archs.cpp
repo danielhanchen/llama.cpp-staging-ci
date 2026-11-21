@@ -1510,10 +1510,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok ? 0 : 1;
 }
 
-// k19-mgpucache: the delta-net replay commit graphs of a recurrent state split over two devices run through a scheduler
+// the delta-net replay commit graphs of a recurrent state split over two devices run through a scheduler
 // (llama_context::rs_replay_commit). Splitting such a graph rewrites node inputs that live on another backend to the scheduler's own
 // copies; a cached commit graph allocated again after another key's graph read the other graph's copies and the copy op aborted
-// (ne == ggml_nelements(src1); Kaggle 2x T4 Qwen3.8-Flash-Next + MTP at the server's prompt save). Two in-process RPC servers over the
+// (ne == ggml_nelements(src1); a 2x T4 host Qwen3.8-Flash-Next + MTP at the server's prompt save). Two in-process RPC servers over the
 // CPU give the two devices (skipped without the RPC backend or on Windows); qwen35 with 4 layers (delta-net layers 0 and 2) split 1:2
 // puts a delta-net state on each. Verify windows of 2-4 tokens (the last one rejected) and a state size query after each (it commits the pending
 // window) alternate the commit keys A, B, A, ...; the logits after every window must match a single-device run of the same calls.
@@ -1678,7 +1678,7 @@ static int check_qwen35_replay_sched(const size_t seed, const float stdev) {
 }
 
 
-// k19-mgpu3: a kept small graph allocated again without being built again (its first swap-in, which saves the plan later swap-ins
+// a kept small graph allocated again without being built again (its first swap-in, which saves the plan later swap-ins
 // restore) keeps the backends the graph builder assigned. The scheduler reset before it dropped them, so on a GPU the get_rows of an
 // MoE cache slot map went to the CPU and the copy callback that looks up and uploads the routed experts never ran (1x T4 Flash-Next:
 // degenerate text). On the CPU the builder's "norm" assignments of small ubatches are the witnesses: LLAMA_GRAPH_SMALL_CHECK=1 counts
@@ -1801,8 +1801,8 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool rs_decode_parity = false;
-    bool rs_replay_sched  = false; // k19-mgpucache
-    bool small_backends   = false; // k19-mgpu3
+    bool rs_replay_sched  = false; // delta-net replay commits of a split state
+    bool small_backends   = false; // small backends
 
     int verbosity = LOG_LEVEL_ERROR;
 

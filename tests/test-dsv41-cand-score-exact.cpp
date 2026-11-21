@@ -1,5 +1,5 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// k19-p6dsv: DeepSeek-V4.1 candidate scoring. A candidate consumer layer used to score every compressed row with the fused lightning
+// DeepSeek-V4.1 candidate scoring. A candidate consumer layer used to score every compressed row with the fused lightning
 // indexer and then add a block mask built from the candidate source's block ids (0 inside a candidate block, -inf elsewhere: fill +
 // set_rows + repeat + cont + add, exactly as deepseek41.cpp builds it with LLAMA_DSV41_CAND_SCORE=0). Now the indexer node takes the
 // block ids (src[4], block size in op_params[0]) and scores only the rows of those blocks. This test runs both graphs on one device

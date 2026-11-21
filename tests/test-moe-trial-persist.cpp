@@ -1,5 +1,5 @@
-// test-moe-trial-persist: k19-cmtpersist, the CPU-miss timing trials' verdicts kept in the calibration file (src/llama-moe-trial-persist.h).
-// The file is the k19-determinism calibration file: the key on line 1, the four calibration numbers on line 2, then one line of trial
+// test-moe-trial-persist: the CPU-miss timing trials' verdicts kept in the calibration file (src/llama-moe-trial-persist.h).
+// The file is the calibration file: the key on line 1, the four calibration numbers on line 2, then one line of trial
 // verdicts per tag (cache size, layer count, small-batch limit). Checked here, on the CPU:
 //   - a verdict line round-trips (format / parse), malformed lines are refused;
 //   - write needs the calibration file with the same key (a missing file or another key writes nothing);
@@ -7,7 +7,7 @@
 //   - the calibration reader's form (key line, then fscanf of four numbers) still reads a file with trial lines;
 //   - a later "launch" reads the verdicts back in order (replay), and appended verdicts are read by the one after it;
 //   - decide: the first verdict uses the plain margin; later ones keep the previous verdict inside the hysteresis band, and
-//     hyst = 0 (LLAMA_MOE_CPU_MISS_PERSIST=0) is the old rule exactly, including the tc_k1 Kaggle T4 numbers that split the launches.
+//     hyst = 0 (LLAMA_MOE_CPU_MISS_PERSIST=0) is the old rule exactly, including the tc_k1 T4 numbers that split the launches.
 
 #include "../src/llama-moe-trial-persist.h"
 
@@ -116,7 +116,7 @@ int main() {
         CHECK(slurp(path) == "another key\n1 2 3 4\n", "a file of another key was changed");
     }
 
-    // a first launch: the calibration exists (k19-determinism wrote it), no verdicts yet
+    // a first launch: the calibration exists (the determinism calibration wrote it), no verdicts yet
     write_file(path, key + "\n154.7 129.55 188.0 47.0\n");
     std::vector<tp::rec> got;
     CHECK(!tp::read(path, key, tag12, got) && got.empty(), "no verdicts may be read before any were written");
@@ -176,7 +176,7 @@ int main() {
     // too few samples: off, as before
     CHECK(!tp::decide(10.0, 33.0, 2, 13, false, false, m, h), "fewer than 3 samples must be off");
 
-    // k19-calvpersist: a pinned run (LLAMA_MOE_CPU_MISS_CAL_VALUES) has its own file, keyed by calv_key; the library creates it (key +
+    // a pinned run (LLAMA_MOE_CPU_MISS_CAL_VALUES) has its own file, keyed by calv_key; the library creates it (key +
     // the pinned numbers, the form of cm_cal_write) before the first trial, so the verdicts persist and a second launch replays them
     {
         const double pv[4] = { 20.7, 11.19, 46.7, 41.0 };
@@ -205,7 +205,7 @@ int main() {
         std::remove(pp.c_str());
     }
 
-    // k19-calvmargin: a marginal "on" is not locked in. The A100 40 Flash-Next numbers (37.3 ms without, 35.7 with: -4.3%, first trial,
+    // a marginal "on" is not locked in. The A100 40 Flash-Next numbers (37.3 ms without, 35.7 with: -4.3%, first trial,
     // switch point 0.97) are an "on" below the 10% gain a persisted "on" needs: off, open, timed again by the next launches, firm "off"
     // after 3 timings without a clear one; a clear timing, or any "off", is firm at once; a line written before (no :firm:tries) reads
     // as firm
@@ -222,7 +222,7 @@ int main() {
                 CHECK(d == (r < t) || std::abs(r - t) < 1e-9, "threshold disagrees with decide at %.3f (case %d)", r, k);
             }
         }
-        // k19-calvmargin: a persisted "on" needs a 10% gain
+        // a persisted "on" needs a 10% gain
         const double g = 0.10;
         CHECK( tp::marginal_on(true, 35.7, 37.3, g), "the A100 -4.3%% on must be marginal");
         CHECK( tp::marginal_on(true, 27.4, 29.4, g), "the A100 -6.8%% on (replayed 11%% slower later) must be marginal");

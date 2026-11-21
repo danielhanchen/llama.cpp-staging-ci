@@ -1,4 +1,4 @@
-// k19-sharednoise: the shared-noise final stage (LLAMA_SHARED_NOISE=1) must sample the target's distribution exactly, and a drafter
+// the shared-noise final stage (LLAMA_SHARED_NOISE=1) must sample the target's distribution exactly, and a drafter
 // with the target's logits and chain must propose the token the target draws. Takes any model (one decode, the logits row is then
 // overwritten with fixed values). Run it with and without LLAMA_SHARED_NOISE=1: both must pass the goodness-of-fit checks against
 // the probabilities the chain leaves (dist and shared noise sample the same distribution); the coupling checks run only with it on.

@@ -1,4 +1,4 @@
-// k19-hostgap: the host-side changes of a speculative pass leave every token, every draft and the memory state unchanged.
+// the host-side changes of a speculative pass leave every token, every draft and the memory state unchanged.
 // Greedy MTP speculative decoding (the generated qwen35moe-mtp model, a 2048-cell cache of which a few hundred cells are used, drafts
 // rejected and rewound every pass: llama_memory_seq_rm on the target and the drafter) runs in a child process per setting of the
 // switches; the parent compares the outputs: generated tokens, every draft, and a hash of the target's and the drafter's sequence

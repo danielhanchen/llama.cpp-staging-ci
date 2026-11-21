@@ -1,4 +1,4 @@
-// k19-mmq-pipe: MoE expert GEMM (MUL_MAT_ID, MMQ) exactness + timing at the Flash-Next / Qwen3.6 MoE prompt shapes.
+// MoE expert GEMM (MUL_MAT_ID, MMQ) exactness + timing at the Flash-Next / Qwen3.6 MoE prompt shapes.
 // For each case one MUL_MAT_ID runs on the first GPU backend; prints
 //   case <name> md5 <md5 of the output> us <median microseconds per graph compute over the timed reps>
 // Run it once per GGML_CUDA_MMQ_PIPE value: the md5 of every case must equal the GGML_CUDA_MMQ_PIPE=0 run (byte-identical output).
@@ -225,7 +225,7 @@ int main(int argc, char ** argv) {
     cs.push_back({ "fn_down_iq4nl_inplace",  GGML_TYPE_IQ4_NL,  640, 2560, 512, 10, false, 2048, 384, 0.0f,  0.5f, 4 }); // stream-k
     cs.push_back({ "fn_gate_iq3s_1638",      GGML_TYPE_IQ3_S,  2560,  640, 512, 10, true,  1638, 0,   0.0f,  0.0f, 5 }); // J 32
     cs.push_back({ "fn_gate_iq3s_1229",      GGML_TYPE_IQ3_S,  2560,  640, 512, 10, true,  1229, 0,   0.0f,  0.0f, 6 }); // J 24: base
-    // the UD-IQ4_XS Flash-Next expert types: IQ3_XXS / Q5_0 on the pipe (GGML_CUDA_MMQ_PIPE_EXT), IQ2_S on the base kernel
+    // the 4-bit Flash-Next expert types: IQ3_XXS / Q5_0 on the pipe (GGML_CUDA_MMQ_PIPE_EXT), IQ2_S on the base kernel
     cs.push_back({ "fn_gate_iq3xxs_2048",    GGML_TYPE_IQ3_XXS, 2560, 640, 512, 10, true,  2048, 0,   0.0f,  0.0f, 1 });
     cs.push_back({ "fn_gate_iq2s_2048",      GGML_TYPE_IQ2_S,  2560,  640, 512, 10, true,  2048, 0,   0.0f,  0.0f, 1 });
     cs.push_back({ "fn_down_q5_0_2048",      GGML_TYPE_Q5_0,    640, 2560, 512, 10, false, 2048, 0,   0.0f,  0.0f, 1 });

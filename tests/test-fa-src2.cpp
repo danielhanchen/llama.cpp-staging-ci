@@ -1,4 +1,4 @@
-// k19-kvwin: the CPU two-source flash attention (ggml_flash_attn_ext_set_src2) is the softmax over the cells of both sources:
+// the CPU two-source flash attention (ggml_flash_attn_ext_set_src2) is the softmax over the cells of both sources:
 //  1. equal quantized types: bitwise equal to one flash attention over the two sources concatenated (the CPU loop takes the first source, then
 //     the second, in the order of the concatenation), for decode, verify and prompt row counts, sinks, ALiBi, GQA, two streams;
 //  2. mixed types (a q4_0 cache beside a q8_0 ring, the window mode's layout): against a double precision reference on the

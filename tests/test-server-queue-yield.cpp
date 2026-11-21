@@ -1,4 +1,4 @@
-// k19-hostgap: server_queue::yield_to_queue with and without the fast end (LLAMA_SERVER_YIELD_FAST). The main loop runs many short
+// server_queue::yield_to_queue with and without the fast end (LLAMA_SERVER_YIELD_FAST). The main loop runs many short
 // yields (as a speculative pass does: draft, verify, the drafter's pass) while another thread posts tasks at random times. Checked:
 // every task is processed exactly once; a task is processed by the worker only while the main thread is inside yield_to_queue() (the
 // server's slot code outside a yield never runs beside a task); tasks queued when a yield starts are processed during that yield as

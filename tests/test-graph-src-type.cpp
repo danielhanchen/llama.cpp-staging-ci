@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-// k15-mmid: a MUL_MAT_ID graph whose expert tensor changes type between F16 and BF16 in place: the same tensor addresses, shapes and
+// a MUL_MAT_ID graph whose expert tensor changes type between F16 and BF16 in place: the same tensor addresses, shapes and
 // strides (both types are 2 bytes), so only the source type tells the two graphs apart. The CUDA backend captures the first one into a
 // CUDA graph (an eager pass, a capture, a replay); the second must not replay that exec, whose kernels were chosen for the other type.
 // This is what a later test-backend-ops graph whose tensors land on the addresses of an earlier one looks like to the backend.

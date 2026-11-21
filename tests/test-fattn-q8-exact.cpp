@@ -1,5 +1,5 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// k19-fattnq8: the tensor-core flash attention reading a q8_0 K / V cache in place (default: the raw rows pipelined where the f16 kernel
+// the tensor-core flash attention reading a q8_0 K / V cache in place (default: the raw rows pipelined where the f16 kernel
 // pipelines, else synchronous loads; and GGML_CUDA_FATTN_Q8_MODE=1: synchronous loads everywhere) against the staged path that converts
 // the whole K and V to f16 first (GGML_CUDA_FATTN_Q8_INPLACE=0), byte for byte on the GPU backend. Each mode runs in a child process (the
 // switch is read once per process) that dumps every output, the median time of the timed graph runs per case and whether the in-place

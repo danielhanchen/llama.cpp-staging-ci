@@ -4,7 +4,7 @@
 //     over multi-ubatch prompts, generation, two interleaved sequences, an EOS inside the prompt and a seq_rm,
 //   - the prefetcher is engaged for each mode when the table is lazy (jobs > 0),
 //   - the logits are bit-identical across off / madvise / populate / pread,
-//   - k19-disktt: with the prompt reads of the PLE rows (llama_ple_prompt_reader, every ubatch here) and the part residency path
+//   - with the prompt reads of the PLE rows (llama_ple_prompt_reader, every ubatch here) and the part residency path
 //     (LLAMA_PLE_RESIDENT=2) engaged (LLAMA_PLE_PROMPT_READ=1), the logits equal those of a load with the reads off (=0).
 // usage: test-ple-prefetch <model.gguf> [more models]
 // a tiny qwen4exp model: test-llama-archs -a qwen4exp -o <dir>
@@ -53,7 +53,7 @@ struct run_result {
     uint64_t jobs     = 0;
     uint64_t predicted = 0;
     bool     engaged  = false;
-    bool     part     = false; // k19-disktt: the context read the table in part (LLAMA_PLE_RESIDENT=2)
+    bool     part     = false; // the context read the table in part (LLAMA_PLE_RESIDENT=2)
 };
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & toks, const std::vector<llama_seq_id> & seqs,
@@ -168,7 +168,7 @@ int main(int argc, char ** argv) {
     setenv("LLAMA_PLE_PREFETCH_VERIFY", "1", 1);
     setenv("LLAMA_PLE_PREFETCH_STATS",  "1", 1);
     unsetenv("LLAMA_PLE_PREFETCH");
-    // k19-disktt: every ubatch takes the prompt reads, and the table the part residency read (read once per process)
+    // every ubatch takes the prompt reads, and the table the part residency read (read once per process)
     setenv("LLAMA_PLE_PROMPT_READ_MIN_ROWS", "1", 1);
     setenv("LLAMA_PLE_RESIDENT", "2", 1);
     setenv("LLAMA_PLE_PROMPT_READ", "1", 1);
@@ -214,7 +214,7 @@ int main(int argc, char ** argv) {
 
         llama_model_free(model);
 
-        // k19-disktt: the same runs on a fresh load with the prompt reads on (and the part residency read), then off; the reads are
+        // the same runs on a fresh load with the prompt reads on (and the part residency read), then off; the reads are
         // counted when the model is freed
         std::vector<float> logits_rd[2];
         bool part_read = false;

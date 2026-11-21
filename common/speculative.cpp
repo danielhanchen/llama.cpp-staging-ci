@@ -12,7 +12,7 @@
 #include "sampling.h"
 #include "spec-cost-policy.h"
 
-// k19-df2pp: the DFlash2 window beside a small MoE cache (see the draft window below)
+// the DFlash2 window beside a small MoE cache (see the draft window below)
 #ifndef K19_DF2PP_TOK_ALL
 #define K19_DF2PP_TOK_ALL 5
 #endif
@@ -42,10 +42,10 @@
 
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
 // both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
-// k9-draft: OPT-IN, LLAMA_SPEC_DRAFT_MIRROR=1: the probabilistic draft samples from the target's own truncation (top-k, top-p, min-p,
+// OPT-IN, LLAMA_SPEC_DRAFT_MIRROR=1: the probabilistic draft samples from the target's own truncation (top-k, top-p, min-p,
 // then the temperature; top-k capped at LLAMA_SPEC_DRAFT_TOPK_MAX, 40). The draft stays exact for any q (rejection sampling), but the
 // mirrored q accepted less than the default top-k 10 + temperature (Qwen3.6-35B-A3B + MTP, Studio's presence penalty 1.5 moves p and
-// not q: B200 acceptance over 4-6 x 256 tokens 0.61 vs 0.64 at T 1.0, 0.62 vs 0.64 at T 0.6, 0.61 vs 0.63 at T 0.7; G4 chat_s / chat_t
+// not q: B200 acceptance over 4-6 x 256 tokens 0.61 vs 0.64 at T 1.0, 0.62 vs 0.64 at T 0.6, 0.61 vs 0.63 at T 0.7; RTX PRO 6000 chat_s / chat_t
 // decode below the default), so the default keeps the earlier sampler.
 static void spec_retune(
         std::vector<common_sampler_ptr> & smpls,
@@ -239,19 +239,19 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
-    // kdp (LLAMA_MTP_DRAFT_LEND): a prompt batch whose rows lie before the prompt's last LLAMA_MTP_PROMPT_TAIL rows is not run
+    // LLAMA_MTP_DRAFT_LEND: a prompt batch whose rows lie before the prompt's last LLAMA_MTP_PROMPT_TAIL rows is not run
     // through the drafter; an impl that keeps its own state per position processes it as usual
     virtual bool skip_prompt(const common_batch & batch) { return process(batch); }
 
-    // k11 (LLAMA_LM_CKPT_MERGE): process() reads the target's rows from this batch index on (a segment of a merged prompt batch);
+    // LLAMA_LM_CKPT_MERGE: process() reads the target's rows from this batch index on (a segment of a merged prompt batch);
     // impls that read target features without honouring it say so
     int32_t nextn_row_offset = 0;
     virtual bool row_offset_ok() const { return true; }
-    // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP): process() reads the target's rows without a synchronization (llama_get_embeddings_nextn_early),
+    // LLAMA_MTP_PROMPT_OVERLAP: process() reads the target's rows without a synchronization (llama_get_embeddings_nextn_early),
     // the caller waited for them (llama_nextn_rows_wait); only impls that read nothing else of the target say yes
     bool rows_early = false;
     virtual bool rows_early_ok() const { return false; }
-    // k19-host (LLAMA_MTP_PROMPT_BG): process() reads the target's rows through a pointer the caller resolved (no target call: it may run
+    // LLAMA_MTP_PROMPT_BG: process() reads the target's rows through a pointer the caller resolved (no target call: it may run
     // on a worker beside the target's next decode), rows [0, n_lo) from a copy the caller made first; floats per row (0 = not supported)
     virtual int64_t rows_ext_floats() const { return 0; }
     virtual bool rows_ext_set(const float * /*h*/, int32_t /*n_rows*/, int32_t /*n_lo*/) { return false; }
@@ -417,7 +417,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
-            // k19-sharednoise: so does a draft drawn with the target's noise (sample-and-match is what keeps it exact)
+            // so does a draft drawn with the target's noise (sample-and-match is what keeps it exact)
             if (!params.probabilistic || (dp.sn != nullptr && dp.sn->on)) {
                 dp.result_q = nullptr;
             }
@@ -470,7 +470,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
-                // k19-sharednoise: the draft takes the target's noise at its position (the probability fed to the window policies
+                // the draft takes the target's noise at its position (the probability fed to the window policies
                 // is the picked token's under the mirrored chain; they calibrate it against what held)
                 float p_draft = cur_p->data[0].p;
                 const bool sn_on = dp.sn != nullptr && dp.sn->on;
@@ -1038,7 +1038,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
-// k19-handoff diagnostics of the DFlash2 drafter (all off by default; none changes a draft except LLAMA_DFLASH_CYCLE)
+// Diagnostics of the DFlash2 drafter (all off by default; none changes a draft except LLAMA_DFLASH_CYCLE)
 common_dflash_diag_t & common_dflash_diag() {
     static common_dflash_diag_t d = [] {
         common_dflash_diag_t x;
@@ -1054,7 +1054,7 @@ common_dflash_diag_t & common_dflash_diag() {
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
-    // k19-df2pp: process() reads the target's layer inputs at the segment's rows of the decode (nextn_row_offset), so a merged prompt
+    // process() reads the target's layer inputs at the segment's rows of the decode (nextn_row_offset), so a merged prompt
     // batch (the server's checkpoint break inside one layer-major decode) feeds the drafter as the separate batches did.
     // LLAMA_DFLASH_ROW_OFFSET=0: refused, the server splits the batch at the checkpoint as before
     bool row_offset_ok() const override {
@@ -1068,7 +1068,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_batch batch_inject; // target features for KV cache injection
 
     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
-    std::vector<uint64_t> feat_hash_v; // k19-df2pp: LLAMA_DFLASH_FEAT_HASH running hash per sequence
+    std::vector<uint64_t> feat_hash_v; // LLAMA_DFLASH_FEAT_HASH running hash per sequence
     std::vector<int64_t>  feat_hash_n;
 
     std::vector<common_sampler_ptr> smpls;
@@ -1105,12 +1105,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
-    // k19-a100chat (LLAMA_DFLASH_EV_AUTO): the DFlash2 window that maximises the expected tokens per ms, with both inputs measured in
-    // this run instead of taken from a G4 table (LLAMA_DFLASH_EV): the pass cost by verify width (host time from the end of the draft
+    // LLAMA_DFLASH_EV_AUTO: the DFlash2 window that maximises the expected tokens per ms, with both inputs measured in
+    // this run instead of taken from a RTX PRO 6000 table (LLAMA_DFLASH_EV): the pass cost by verify width (host time from the end of the draft
     // to the target's accept, plus the draft call itself) and the chance that a step is accepted given its selector probability (20
-    // bins, a prior of the G4 calibration worth 10 drafts per bin). Beside a MoE cache whose slots hold most of the host experts (no
-    // other window rule runs there: A100 80 GB fn4n full card / 48 GB) every further verify row costs 2.7 / 4.4 ms (tc_n1a: w3 16.2 /
-    // 25.6 ms, w7 26.8 / 43.0), more than on G4, so the whole 7-row window verifies rows that are rarely accepted. The window then
+    // bins, a prior of the RTX PRO 6000 calibration worth 10 drafts per bin). Beside a MoE cache whose slots hold most of the host experts (no
+    // other window rule runs there: A100 80 GB, 4-bit model on the full card / 48 GB) every further verify row costs 2.7 / 4.4 ms (tc_n1a: w3 16.2 /
+    // 25.6 ms, w7 26.8 / 43.0), more than on an RTX PRO 6000, so the whole 7-row window verifies rows that are rarely accepted. The window then
     // follows timing, so the default-mode text can differ between launches; under the exact verify contract it does not
     struct eva_t {
         static constexpr int W  = 10; // widths 1..9
@@ -1120,16 +1120,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         double  f_acc[NB] = {}, f_reach[NB] = {};    // accepted / reached steps by selector probability bin
         int64_t n_meas = 0, n_cut = 0, n_rows_cut = 0;
         int64_t picks[W] = {};
-        int64_t cnt[W] = {}, last_meas[W] = {};      // k19-g4verify: measured passes by width, n_meas at a width's last measurement
-        int64_t n_probe = 0;                         // k19-g4verify: windows switched to re-measure the other width (see df2_meas)
-        bool    small   = false;                     // k19-g4verify: the rule runs beside a small MoE cache (df2_meas)
+        int64_t cnt[W] = {}, last_meas[W] = {};      // measured passes by width, n_meas at a width's last measurement
+        int64_t n_probe = 0;                         // windows switched to re-measure the other width (see df2_meas)
+        bool    small   = false;                     // the rule runs beside a small MoE cache (df2_meas)
         std::vector<int64_t> t_end;                  // per seq: end of the last draft call (0 = nothing pending)
         std::vector<int32_t> w_last;                 // per seq: verify rows of that draft
         std::vector<std::vector<float>> p_last;      // per seq: its steps' selector probabilities
         bool init = false;
     } eva;
 
-    // k19-g4verify: the small-share band's passes, measured against the band's priced cost of their width (see df2_low_lng_ratio)
+    // the small-share band's passes, measured against the band's priced cost of their width (see df2_low_lng_ratio)
     struct lowg_t {
         double  r_sum = 0.0, r_n = 0.0;              // decayed sums / counts of measured over priced ms
         int64_t n = 0;
@@ -1143,7 +1143,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // 0 = off, 1 = on wherever a DFlash2 draft runs without another window rule, 2 = default: one sequence beside a MoE cache whose
     // slots hold more than LLAMA_DFLASH_CACHED_FRAC_MAX of the host experts and >= LLAMA_DFLASH_CACHED_TOKENS_MAX tokens (A100 48 GB:
     // 70.7%, 36 tokens; chat +6.2%, 8k +20% vs the kill switch, ac_a48b); the cached bands below keep their own rules. Not without a
-    // cache: A100 fn4n full card (the 26.8 GiB PLE table is the only host part) has a flat cost curve, chat level (169.7 vs 170.1,
+    // cache: A100, 4-bit model on the full card (the 26.8 GiB PLE table is the only host part) has a flat cost curve, chat level (169.7 vs 170.1,
     // ac_a0), and srv_kld long48 put one position above the -fa off band's max there (0.090 vs 0.075).
     // Under the exact verify contract beside a MoE cache it stays off by default: there the cache's host path computes the misses of
     // some batch sizes on the CPU (ac_a48 48 GB 8k: EV-auto on / off gave two exact texts); =1 forces it
@@ -1155,7 +1155,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return m;
     }
 
-    // verify ms of a pass of w rows: the decayed mean where measured, shrunk towards the shape of A100 / G4 cached passes
+    // verify ms of a pass of w rows: the decayed mean where measured, shrunk towards the shape of A100 / RTX PRO 6000 cached passes
     // (v(w) ~ 0.3 + 0.1 w of v(7): tc_n1a v3 / v7 = 0.60 at full card and 48 GB) scaled by the most measured width
     double eva_verify_ms(int w) const {
         int wr = -1;
@@ -1354,7 +1354,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         if (is_dflash2) {
-            // k19-draftcost: the restricted DFlash2 draft head (LLAMA_DFLASH_DRAFT_VOCAB) gets rows for the prompt's tokens it lacks
+            // the restricted DFlash2 draft head (LLAMA_DFLASH_DRAFT_VOCAB) gets rows for the prompt's tokens it lacks
             const int32_t n_add = llama_model_draft_head_add(llama_get_model(params.ctx_dft), prompt.data(), N);
             if (n_add > 0) {
                 SPC_DBG("%s: draft head: %d prompt tokens added\n", __func__, n_add);
@@ -1436,7 +1436,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
-                // k19-df2pp (diagnostic, LLAMA_DFLASH_FEAT_HASH=1): a running FNV-1a hash of the features the drafter takes, in position
+                // diagnostic, LLAMA_DFLASH_FEAT_HASH=1: a running FNV-1a hash of the features the drafter takes, in position
                 // order per sequence, logged after each chunk: equal hashes = the drafter saw bit-identical target features
                 static const bool feat_hash = getenv("LLAMA_DFLASH_FEAT_HASH") != nullptr && atoi(getenv("LLAMA_DFLASH_FEAT_HASH")) != 0;
                 if (feat_hash) {
@@ -1466,10 +1466,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     return llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
                 };
-                // k19-a100chat (LLAMA_DFLASH_INJECT_SPLIT=0: off): a chunk whose graph does not get its compute buffer (rc -2: the
+                // LLAMA_DFLASH_INJECT_SPLIT=0: off: a chunk whose graph does not get its compute buffer (rc -2: the
                 // allocation failed, the drafter's KV from the chunk's first position on is removed) is injected again from the first
                 // row not yet in, in halves down to 32 rows: a smaller graph needs a smaller buffer. Before, the request failed with an
-                // HTTP 500 (Colab A100 48 GB fn4n, default cache, -fa on, srv_kld long48: the 512-row graph's 30 MiB did not fit).
+                // HTTP 500 (an A100 48 GB host, 4-bit model, default cache, -fa on, long 48k prompt: the 512-row graph's 30 MiB did not fit).
                 // Only after a failed allocation, so every run that did not fail is unchanged
                 static const bool inject_split = getenv("LLAMA_DFLASH_INJECT_SPLIT") == nullptr || atoi(getenv("LLAMA_DFLASH_INJECT_SPLIT")) != 0;
                 int32_t done = 0;
@@ -1541,7 +1541,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_draft = params.n_max;
-            // k19-df2acc (LLAMA_DFLASH_FULL_BLOCK=1): a DFlash2 draft decodes the whole trained block (the anchor + block_size - 1 masks)
+            // LLAMA_DFLASH_FULL_BLOCK=1: a DFlash2 draft decodes the whole trained block (the anchor + block_size - 1 masks)
             // and walks only its first n_max rows. The attention over the block is not causal, so a block cut to n_max + 1 rows changes
             // every row's draft against the block the drafter was trained on
             static const bool full_block = getenv("LLAMA_DFLASH_FULL_BLOCK") != nullptr && atoi(getenv("LLAMA_DFLASH_FULL_BLOCK")) != 0;
@@ -1593,7 +1593,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
                 const int64_t t_d2 = tm ? ggml_time_us() : 0;
                 auto & dg = common_dflash_diag();
-                // k19-handoff (diagnostic, LLAMA_DFLASH_TRACE=1): the selector's per-step probability and score margin of each draft,
+                // diagnostic, LLAMA_DFLASH_TRACE=1: the selector's per-step probability and score margin of each draft,
                 // logged with its accepted count in accept(); the draft itself is unchanged
                 const bool trace = is_dflash2 && dg.trace && seq_id < (llama_seq_id) dg.p.size();
                 if (trace) {
@@ -1611,13 +1611,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }();
                 const float p_cum_thr = is_dflash2 ? p_cum_min : 0.0f;
                 float p_cum = 1.0f;
-                // k19-handoff: LLAMA_DFLASH_P_CUM_EXP=a (default 1): the product above is of p^a, a temperature for a selector whose
+                // LLAMA_DFLASH_P_CUM_EXP=a (default 1): the product above is of p^a, a temperature for a selector whose
                 // probabilities are not calibrated (a < 1 trusts a low p less)
                 static const float p_cum_exp = [] {
                     const char * e = getenv("LLAMA_DFLASH_P_CUM_EXP");
                     return e != nullptr && atof(e) > 0.0 ? (float) atof(e) : 1.0f;
                 }();
-                // k19-handoff: LLAMA_DFLASH_EV="f_0,..,f_(B-1)/c_1,..,c_(n_max+1)" (default off): the window that maximises the expected
+                // LLAMA_DFLASH_EV="f_0,..,f_(B-1)/c_1,..,c_(n_max+1)" (default off): the window that maximises the expected
                 // tokens per ms, from a calibration table f (the chance that step i is accepted given the steps before it were, by the
                 // step's selector probability in B equal bins of [0, 1]) and the cost c_w of a pass that verifies w rows
                 static const std::pair<std::vector<float>, std::vector<float>> ev_rule = [] {
@@ -1656,24 +1656,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return r;
                 }();
                 const bool use_ev = is_dflash2 && !ev_rule.first.empty();
-                // k19-handoff: the window of a DFlash2 draft beside a target without a MoE cache, on by default under the exact verify
+                // the window of a DFlash2 draft beside a target without a MoE cache, on by default under the exact verify
                 // contract (LLAMA_MTP_EXACT=1: the text does not depend on the window), else opt-in (LLAMA_DFLASH_WINDOW=1: the default
-                // verify's kernels follow the width, so the text changes: srv_kld long48 on G4 mean 0.0016 / p99 0.015 vs the -fa off band
+                // verify's kernels follow the width, so the text changes: srv_kld long48 on an RTX PRO 6000 mean 0.0016 / p99 0.015 vs the -fa off band
                 // 0.0037 / 0.035, but one position at 0.30 above the band's max 0.155); LLAMA_DFLASH_WINDOW=0: off; LLAMA_DFLASH_EV,
                 // --spec-draft-p-min and LLAMA_DFLASH_P_CUM replace it. Of two windows, the short one
                 // (4 rows below position 4096, 3 above) and the whole draft, the one with more expected tokens per ms: the expected tokens
-                // come from the chance that each step is accepted given its selector probability (calibrated on G4 Flash-Next, 48 prompts
-                // of 2k / 8k tokens: the selector is near calibrated, a little over-confident at the top), the ms from G4's pass cost by
+                // come from the chance that each step is accepted given its selector probability (calibrated on an RTX PRO 6000 Flash-Next, 48 prompts
+                // of 2k / 8k tokens: the selector is near calibrated, a little over-confident at the top), the ms from RTX PRO 6000's pass cost by
                 // verify width (the drafter and host ~1.25 ms plus the verify, ~0.9 ms per row below 4096 and ~1.1 above). Two widths
                 // only: each width is one more CUDA graph capture (~20 ms) at every new KV bucket
                 static const bool df2_window = [] {
                     const char * e = getenv("LLAMA_DFLASH_WINDOW");
                     return e == nullptr ? llama_exact_verify_enabled() : atoi(e) != 0;
                 }();
-                // k19-placemid (LLAMA_DFLASH_WINDOW=2, opt-in, measurement): the rule beside a MoE cache too, with the same pass costs
+                // LLAMA_DFLASH_WINDOW=2, opt-in, measurement: the rule beside a MoE cache too, with the same pass costs
                 static const bool df2_window_cached = getenv("LLAMA_DFLASH_WINDOW") != nullptr && atoi(getenv("LLAMA_DFLASH_WINDOW")) == 2;
-                // k19-df2pp: beside a MoE cache each further verify row costs ~3.4 ms (the experts it misses), not the ~1 ms of a full card,
-                // so the whole 7-row draft lost to MTP at long contexts (G4 Flash-Next fn4, default verify: 3 rows ~17 / 20 ms, 7 rows ~29 / 35 ms
+                // beside a MoE cache each further verify row costs ~3.4 ms (the experts it misses), not the ~1 ms of a full card,
+                // so the whole 7-row draft lost to MTP at long contexts (RTX PRO 6000 Flash-Next at 4 bits, default verify: 3 rows ~17 / 20 ms, 7 rows ~29 / 35 ms
                 // per pass at 16 / 12 GB, the same ratio 1.7 at both). There the rule runs by default with those costs: the short window is
                 // 3 rows at every position, LLAMA_DFLASH_CACHED_COST="c_lo,slope" (ms) overrides them; LLAMA_DFLASH_CACHED_WINDOW=0 (or
                 // LLAMA_DFLASH_WINDOW=0) off, LLAMA_DFLASH_WINDOW=2 keeps the full-card costs beside the cache. The EV rule over every width
@@ -1693,16 +1693,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     return c;
                 }();
-                // only where the cache's device slots hold the experts of fewer than LLAMA_DFLASH_CACHED_TOKENS_MAX (12) tokens: G4 fn4 12 / 16 GB
+                // only where the cache's device slots hold the experts of fewer than LLAMA_DFLASH_CACHED_TOKENS_MAX (12) tokens: RTX PRO 6000 4-bit 12 / 16 GB
                 // hold 3 / 7, 48 GB 32 (there the full-card costs stay opt-in, LLAMA_DFLASH_WINDOW=2)
                 static const int32_t df2_cached_tok_max = getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX") ? atoi(getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX")) : 12;
-                // k19-df2cost (LLAMA_DFLASH_CACHED_FRAC_MAX, default K19_DF2COST_FRAC_MAX 0.5; 0 = off; the cache leaves
+                // LLAMA_DFLASH_CACHED_FRAC_MAX, default K19_DF2COST_FRAC_MAX 0.5; 0 = off; the cache leaves
                 // LLAMA_DFLASH_CACHED_RESERVE_MIB for the second width's graphs, see common.cpp: without it the srv_kld gate at 32 GB died
                 // of a CUDA out of memory): also
                 // where the cache holds LLAMA_DFLASH_CACHED_FRAC_MIN (0.20) .. LLAMA_DFLASH_CACHED_FRAC_MAX of the
-                // host experts (llama_moe_cache_frac; G4 fn4 24 GB 27.5%, 32 GB 42%), at every position, with that band's pass costs
-                // (LLAMA_DFLASH_CACHED_COST_MID="c_lo,slope", default 15 ms at 3 rows + 2.3 ms per further row: G4 fn4 fixed-width passes
-                // w3 14.8 / 16.1 ms, w7 23.0 / 25.9 ms at 32 / 24 GB, k19-df2cost round 2). The whole 7-row window there cost 8-11 ms more
+                // host experts (llama_moe_cache_frac; RTX PRO 6000 4-bit 24 GB 27.5%, 32 GB 42%), at every position, with that band's pass costs
+                // (LLAMA_DFLASH_CACHED_COST_MID="c_lo,slope", default 15 ms at 3 rows + 2.3 ms per further row: RTX PRO 6000 4-bit fixed-width passes
+                // w3 14.8 / 16.1 ms, w7 23.0 / 25.9 ms at 32 / 24 GB, second measurement). The whole 7-row window there cost 8-11 ms more
                 // than a 3-row one at 8k (dc_r6, 3 launches: 32 GB 143.6 -> 166.0, 24 GB 105.2 -> 129.8 tok/s; chat +1 / +5%).
                 // LLAMA_DFLASH_CACHED_WINDOW=0 turns it off with the band below it
                 static const double df2_mid_lo = getenv("LLAMA_DFLASH_CACHED_FRAC_MIN") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MIN")) : 0.20;
@@ -1731,13 +1731,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     return c;
                 }();
-                // k19-g4verify: from position 4096 on the band's costs are used only where its passes run near the price: once 8
+                // from position 4096 on the band's costs are used only where its passes run near the price: once 8
                 // passes are timed, a mean of more than LLAMA_DFLASH_CACHED_LOW_LNG_RATIO (2.0) x the priced ms of their width falls
                 // back to the cached costs there. The choice is made once per context and never revisited, so the windows (and the
                 // text) do not follow later timing; a negative value takes the cached costs from 4096 on without timing. Those passes are host bound, so a further verify row costs a smaller share of a
-                // pass than on G4: L4 12 GB / 131K (4.0%) 8k 586 ms per pass at mean length 2.31 in the band vs 656 ms at 2.93 with
-                // the cached costs (4.4 vs 3.9 tok/s), A100 40 GB @10 (3.4%) 113 vs 133 ms, 2.48 vs 2.88 (21.9 vs 21.5); G4 10 GB
-                // runs at 0.8-1.1 x (8k 26 ms per pass, +9%). Below 4096 the band stays (chat L4 +5%, A100 +9%, G4 +8%). 0 = off
+                // pass than on an RTX PRO 6000: L4 12 GB / 131K (4.0%) 8k 586 ms per pass at mean length 2.31 in the band vs 656 ms at 2.93 with
+                // the cached costs (4.4 vs 3.9 tok/s), A100 40 GB @10 (3.4%) 113 vs 133 ms, 2.48 vs 2.88 (21.9 vs 21.5); RTX PRO 6000 10 GB
+                // runs at 0.8-1.1 x (8k 26 ms per pass, +9%). Below 4096 the band stays (chat L4 +5%, A100 +9%, RTX PRO 6000 +8%). 0 = off
                 static const double df2_low_lng_ratio = getenv("LLAMA_DFLASH_CACHED_LOW_LNG_RATIO") ?
                     atof(getenv("LLAMA_DFLASH_CACHED_LOW_LNG_RATIO")) : 2.0;
                 const bool   df2_cache_on = is_dflash2 && llama_moe_cache_active(params.ctx_tgt);
@@ -1747,15 +1747,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const bool df2_cached = df2_cache_on && (llama_moe_cache_tokens(params.ctx_tgt) < df2_cached_tok_max || df2_mid);
                 const bool df2_low = df2_cached && !df2_mid && df2_frac >= 0.0 && df2_frac < df2_low_frac;
                 // where the slots hold at least LLAMA_DFLASH_CACHED_TOKENS_ALL (K19_DF2PP_TOK_ALL) tokens, only from position
-                // LLAMA_DFLASH_CACHED_POS_MIN (K19_DF2PP_POS_MIN) on: there the whole draft paid at chat / 8k (G4 fn4 16 GB, slots of 7 tokens)
+                // LLAMA_DFLASH_CACHED_POS_MIN (K19_DF2PP_POS_MIN) on: there the whole draft paid at chat / 8k (RTX PRO 6000, 4-bit model, 16 GB, slots of 7 tokens)
                 static const int32_t df2_cached_tok_all = getenv("LLAMA_DFLASH_CACHED_TOKENS_ALL") ? atoi(getenv("LLAMA_DFLASH_CACHED_TOKENS_ALL")) : K19_DF2PP_TOK_ALL;
                 static const int32_t df2_cached_pos_min = getenv("LLAMA_DFLASH_CACHED_POS_MIN") ? atoi(getenv("LLAMA_DFLASH_CACHED_POS_MIN")) : K19_DF2PP_POS_MIN;
                 const bool df2_cached_here = df2_cached && (df2_window_cached || df2_mid ||
                     llama_moe_cache_tokens(params.ctx_tgt) < df2_cached_tok_all || dp.pos0 >= df2_cached_pos_min);
-                // k19-g4verify: where the cache holds less than LLAMA_DFLASH_CACHED_LOW_FRAC (0.05) of the host experts the fixed costs
+                // where the cache holds less than LLAMA_DFLASH_CACHED_LOW_FRAC (0.05) of the host experts the fixed costs
                 // above underprice wide windows: a verify ubatch of more tokens than the slots hold (llama_moe_cache_tokens) leaves the
                 // device slots and the single-graph host path (batches of up to 4 tokens), so every row's experts run on the host in an
-                // eager split. G4 fn4 Flash-Next 10 GB / 131K and 12 GB / 262K (3.2% / 2.8%, slots of 4 tokens): w3 25-28 ms, w4 31-35,
+                // eager split. RTX PRO 6000 Flash-Next at 4 bits 10 GB / 131K and 12 GB / 262K (3.2% / 2.8%, slots of 4 tokens): w3 25-28 ms, w4 31-35,
                 // w7 56-60 ms per pass, not the 32 ms priced, and 47% of chat passes verified 7 rows; the 3-row short window also left
                 // out w4. There the short window is the slots' rows (3..4) and the costs are those passes': LLAMA_DFLASH_CACHED_COST_LOW
                 // ="c_at_short,slope" (default 33 ms + 8 ms per further row), so the whole draft is taken only for a near-certain one
@@ -1793,7 +1793,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
                 }
-                // k19-a100chat: the measured EV window (see eva_t), where neither LLAMA_DFLASH_EV nor a two-width window runs
+                // the measured EV window (see eva_t), where neither LLAMA_DFLASH_EV nor a two-width window runs
                 const bool use_eva = is_dflash2 && !use_ev && !use_df2w && eva_mode() != 0 && (df2_meas ||
                     eva_mode() == 1 || (n_seq == 1 && df2_cache_on && !df2_cached && df2_frac >= df2_mid_hi && !llama_exact_verify_enabled()));
                 if (use_eva) {
@@ -1813,10 +1813,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 int32_t predecessor = 0;
                 std::vector<llama_token_data> sn_cand;
-                // k19-a80verify (LLAMA_DFLASH_N_MAX_SM80, default 4, 0 = off): a DFlash2 draft walks at most that many steps where every
+                // LLAMA_DFLASH_N_MAX_SM80, default 4, 0 = off: a DFlash2 draft walks at most that many steps where every
                 // GPU is compute capability 8.0 (A100 / A30). There each further verify row costs 2.6-2.9 ms of a ~27 ms 7-row pass (no
-                // MoE cache) and the drafter's 5th / 6th steps are accepted too rarely to pay for theirs: Colab A100 80 GB, Qwen3.8-Flash-Next
-                // fn4n full card, --spec-draft-n-max 6: capped chat 182.9 vs 165.9 tok/s, 8k 109.8 vs 93.2, the same text (md5 equal), 5
+                // MoE cache) and the drafter's 5th / 6th steps are accepted too rarely to pay for theirs: an A100 80 GB host, Qwen3.8-Flash-Next
+                // 4-bit, full card, --spec-draft-n-max 6: capped chat 182.9 vs 165.9 tok/s, 8k 109.8 vs 93.2, the same text (md5 equal), 5
                 // rows (n_max 4) at 21.2 ms vs 7 rows at 26.8. The window rules below (EV, P_CUM, p_min) still
                 // cut inside it. A user's --spec-draft-n-max below it is kept. Not beside a MoE cache (LLAMA_DFLASH_N_MAX_SM80_CACHED=1: there
                 // too): there the measured EV window (eva_t) already picks the width, and the route tail skip makes the text follow the
@@ -1865,7 +1865,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    // k19-sharednoise: the step takes the target's noise at its position over the selector's candidates
+                    // the step takes the target's noise at its position over the selector's candidates
                     if (dp.sn != nullptr && dp.sn->on) {
                         sn_cand.resize(top_k);
                         for (int32_t k = 0; k < top_k; ++k) {
@@ -1912,7 +1912,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                                        0.460f, 0.492f, 0.583f, 0.614f, 0.614f, 0.619f, 0.657f, 0.748f, 0.814f, 0.929f };
                     const bool   lng   = dp.pos0 >= 4096;
                     const bool   low_lng_off = lng && (df2_low_lng_ratio < 0.0 || (df2_low_lng_ratio > 0.0 && lowg.latched == 1));
-                    const bool   low   = df2w_cached_costs && df2_low && !low_lng_off; // k19-g4verify: the small-share band (see df2_low_frac)
+                    const bool   low   = df2w_cached_costs && df2_low && !low_lng_off; // the small-share band (see df2_low_frac)
                     const size_t w_lo  = low ? (size_t) std::max(3, std::min(4, (int) llama_moe_cache_tokens(params.ctx_tgt))) :
                                          df2w_cached_costs ? 3 : lng ? 3 : 4;  // verify rows of the short window
                     const size_t w_hi  = result.size() + 1;                    // the whole draft
@@ -1931,8 +1931,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             }
                         }
                         const double c_hi = c_lo + slope * (double) (w_hi - w_lo);
-                        // k19-g4verify: in the small-share band 3 rows stay a third choice below the slots' rows (at 8k the steps past the
-                        // third are accepted less often: G4 10 GB 8k, the 4-row window alone 77.1 vs 82.0 tok/s for 3-or-4)
+                        // in the small-share band 3 rows stay a third choice below the slots' rows (at 8k the steps past the
+                        // third are accepted less often: RTX PRO 6000 10 GB 8k, the 4-row window alone 77.1 vs 82.0 tok/s for 3-or-4)
                         const double c_3 = c_lo - slope * (double) (w_lo - 3);
                         const bool   use3 = low && w_lo > 3 && c_3 > 0.0 && e_3 / c_3 > e_lo / c_lo && e_3 / c_3 > e_tok / c_hi;
                         if (use3) {
@@ -1961,13 +1961,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     result.resize(best_k);
                 }
-                // k19-a100chat: the cut of the measured EV rule. The first LLAMA_DFLASH_EV_AUTO_WARM (8) passes keep the whole draft so
+                // the cut of the measured EV rule. The first LLAMA_DFLASH_EV_AUTO_WARM (8) passes keep the whole draft so
                 // the most used width is measured first; at least one draft token stays (an empty draft skips the verify and its timing)
                 if (use_eva && !result.empty()) {
                     static const int64_t warm = getenv("LLAMA_DFLASH_EV_AUTO_WARM") ? atoll(getenv("LLAMA_DFLASH_EV_AUTO_WARM")) : 8;
                     static const int64_t stale = getenv("LLAMA_DFLASH_MEAS_STALE") ? atoll(getenv("LLAMA_DFLASH_MEAS_STALE")) : 128;
                     if (df2_meas) {
-                        // k19-g4verify: two widths, as the fixed rule, so few graphs are built and both costs are measured within a
+                        // two widths, as the fixed rule, so few graphs are built and both costs are measured within a
                         // request: the short window of as many rows as the slots hold (3..4: the single-graph host path batches up to 4
                         // tokens) and the whole draft, each priced by its measured mean pass (the first pass of a width untimed), the fixed
                         // costs until then, and the measured acceptance by selector probability. The width not verified for `stale`
@@ -2023,7 +2023,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
-                // k19-handoff (diagnostic, LLAMA_DFLASH_CYCLE=1): the draft is cut to 0, 1, .., n_max tokens in turn, so one run
+                // diagnostic, LLAMA_DFLASH_CYCLE=1: the draft is cut to 0, 1, .., n_max tokens in turn, so one run
                 // times every verify width at the same contexts (under the exact verify contract the text does not change)
                 if (is_dflash2 && dg.cycle) {
                     const size_t keep = (size_t) (dg.n_cycle++ % (uint64_t) (params.n_max + 1));
@@ -2034,7 +2034,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                 }
-                // k19-g4verify: in the small-share band each pass is timed until its accept, against the band's price of its width
+                // in the small-share band each pass is timed until its accept, against the band's price of its width
                 if (use_df2w && df2w_cached_costs && df2_low && df2_low_lng_ratio > 0.0 && lowg.latched < 0 && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
                     if (lowg.t_end.size() != n_seq) {
                         lowg.t_end.assign(n_seq, 0);
@@ -2051,7 +2051,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     lowg.w_last[seq_id] = (int32_t) n_ver + 1;
                     lowg.c_last[seq_id] = c_w;
                 }
-                // k19-a100chat: the pass of this draft is timed until its accept (the verify, sampling and rollback) and the draft call
+                // the pass of this draft is timed until its accept (the verify, sampling and rollback) and the draft call
                 // itself; the server's own cut (dp.n_max) is the width it verifies
                 if (use_eva) {
                     const int64_t now = ggml_time_us();
@@ -2141,7 +2141,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
-        // k19-g4verify: the band's pass, measured over its price (a first pass of a width or one > 3x the mean ratio left out)
+        // the band's pass, measured over its price (a first pass of a width or one > 3x the mean ratio left out)
         if (is_dflash2 && seq_id >= 0 && seq_id < (llama_seq_id) lowg.t_end.size() && lowg.t_end[seq_id] > 0) {
             const double ms = (ggml_time_us() - lowg.t_end[seq_id]) / 1000.0;
             const int    w  = lowg.w_last[seq_id];
@@ -2161,7 +2161,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
         }
-        // k19-a100chat: the measured pass cost of the draft's width and the acceptance of its steps (LLAMA_DFLASH_EV_AUTO)
+        // the measured pass cost of the draft's width and the acceptance of its steps (LLAMA_DFLASH_EV_AUTO)
         if (is_dflash2 && eva.init && seq_id >= 0 && seq_id < (llama_seq_id) eva.t_end.size() && eva.t_end[seq_id] > 0) {
             const double ms = (ggml_time_us() - eva.t_end[seq_id]) / 1000.0;
             const int    w  = eva.w_last[seq_id];
@@ -2169,7 +2169,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (w > 0 && w < eva_t::W) {
                 // a pass that also re-captured graphs or waited for something else (> 3x its width's mean once measured) is left out
                 const double m = eva.v_n[w] >= 3.0 ? eva.v_sum[w] / eva.v_n[w] : 0.0;
-                // k19-g4verify: beside a small cache the first pass of a width also builds its graphs: counted as a probe, not timed
+                // beside a small cache the first pass of a width also builds its graphs: counted as a probe, not timed
                 const bool first = eva.small && eva.cnt[w] == 0;
                 eva.cnt[w]++;
                 if (!first && ms > 0.0 && ms < 2000.0 && (m == 0.0 || ms < 3.0 * m)) {
@@ -2249,15 +2249,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // LLAMA_MTP_HANDOFF_VH=0: verify_h keeps every row of a prompt ubatch, as before
     const bool verify_h_trim = handoff_copy && common_mtp_handoff_on("VH");
 
-    // LLAMA_MTP_DEV_H=1 (opt-in: decode -0.7..-1.0% on Qwen3.6 at 32 GB, Flash-Next 8k prompt -8% on G4; default = host rows, as before):
+    // LLAMA_MTP_DEV_H=1 (opt-in: decode -0.7..-1.0% on Qwen3.6 at 32 GB, Flash-Next 8k prompt -8% on an RTX PRO 6000; default = host rows, as before):
     // (single-sequence batches of LLAMA_MTP_DEV_H_MIN = 64 tokens or more) they stay on the device (llama_mtp_dev_h_attach) and the
     // drafter's pass is queued without waiting on the target from the host.
     bool dev_h = false;
-    // k11: segments of a merged prompt batch (LLAMA_LM_CKPT_MERGE) read host rows at an offset, the device sink holds whole batches
+    // segments of a merged prompt batch (LLAMA_LM_CKPT_MERGE) read host rows at an offset, the device sink holds whole batches
     bool row_offset_ok() const override { return !dev_h; }
     bool rows_early_ok() const override { return !dev_h && !is_mem_shared; }
 
-    // k19-host (LLAMA_MTP_PROMPT_BG): see common_speculative_rows_ext_set
+    // LLAMA_MTP_PROMPT_BG: see common_speculative_rows_ext_set
     const float *      h_ext = nullptr; // the target's next-n rows, row i at h_ext + i*n_embd
     int32_t            h_ext_lo = 0;    // rows [0, h_ext_lo) are read from h_ext_stash instead (the next decode may overwrite them)
     std::vector<float> h_ext_stash;     // kept between prompts (at most 256 rows)
@@ -2285,13 +2285,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<uint8_t> pending_dev;     // per seq: its pending row is sink row 0 (pending_h is stale)
     std::vector<uint8_t> verify_dev;      // per seq: the verify rows are sink rows 1 .. verify_h_rows (verify_h is unused)
 
-    // k15-fn: LLAMA_SPEC_COST=1 (opt-in): the cost-aware MTP window (common_spec_mtp_cost): the drafts
+    // LLAMA_SPEC_COST=1 (opt-in): the cost-aware MTP window (common_spec_mtp_cost): the drafts
     // kept per round are the ones with the best expected tokens per ms, from the drafts' probabilities and measured round times
     const bool spec_cost = [] {
         const char * e = getenv("LLAMA_SPEC_COST");
         return e != nullptr && atoi(e) != 0;
     }();
-    // k19-tpp: LLAMA_SPEC_TPP (the server sets params.n_floor): the window keeps n_floor drafts and one more only where the expected
+    // LLAMA_SPEC_TPP (the server sets params.n_floor): the window keeps n_floor drafts and one more only where the expected
     // tokens per ms of the wider window (calibrated draft acceptance, common_spec_mtp_cost::chain_e) beat the floor window's at the
     // measured round times (common_spec_tpp_cost), so the verify sizes are n_floor + 1 and n_floor + 2 only
     int32_t tpp_floor = 0;
@@ -2302,7 +2302,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // n_max: from LLAMA_SPEC_DEPTH_CHAT_POS, 1536, on they end at depth_main drafts; 0: n_max everywhere)
     int32_t depth_main     = 0;
     int64_t depth_chat_pos = 1536;
-    // k19-adraft (params.adraft > 0: the greedy window's drafts). Sampled requests, LLAMA_SPEC_ADRAFT=1: confidence gate, the 2nd draft
+    // Adaptive drafting (params.adraft > 0: the greedy window's drafts). Sampled requests, LLAMA_SPEC_ADRAFT=1: confidence gate, the 2nd draft
     // is kept when its probability is at least adraft_p2 (LLAMA_SPEC_ADRAFT_P2, default 0: always), every later one when at least adraft_p
     // (LLAMA_SPEC_ADRAFT_P, default 0.9), the window ending at the first draft below its bar (a function of the text: no timing).
     // =2: priced by cost_pol (expected tokens per ms, live round times; LLAMA_SPEC_ADRAFT_FLOOR: fewest drafts)
@@ -2338,7 +2338,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool gated(const common_speculative_draft_params & dp) const {
         return !dp.result_q && adraft_mode == 1 && adraft_keep > 0 && sampled(dp);
     }
-    // the window cap of a request that is neither gated nor priced (k19-adraft modes 3 / 4: per-stretch width; else adraft_keep)
+    // the window cap of a request that is neither gated nor priced (adraft modes 3 / 4: per-stretch width; else adraft_keep)
     int adraft_cap(llama_seq_id seq_id, const common_speculative_draft_params & dp) const {
         if (dp.result_q || !sampled(dp) || adraft_keep <= 0) {
             return adraft_keep;
@@ -2354,9 +2354,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     struct cost_seq {
         int64_t t_us = 0;            // the previous draft() call (0: none since the request began)
         int     rows = 1;            // the window drafted then
-        int     drafted = 0;         // k19-tpp: the drafts made then (more than rows - 1: a wider window was drafted and not kept)
-        bool    cal = true;          // k19-adraft: its drafts calibrate the hold rates (sampled rounds only)
-        bool    shared = false;      // k19-small1115: the round drafted then ran beside another active slot (dp.shared)
+        int     drafted = 0;         // the drafts made then (more than rows - 1: a wider window was drafted and not kept)
+        bool    cal = true;          // its drafts calibrate the hold rates (sampled rounds only)
+        bool    shared = false;      // the round drafted then ran beside another active slot (dp.shared)
         std::vector<float> probs;    // its drafts' probabilities
         common_spec_mtp_cost::chain_state chain;
     };
@@ -2435,9 +2435,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 c.reserve((size_t) (this->params.n_max + 1) * n_embd);
             }
         }
-        // k19-tpp: one trained head without shared memory only (chained heads and gemma4's shared KV keep the floor as their length)
+        // one trained head without shared memory only (chained heads and gemma4's shared KV keep the floor as their length)
         if (this->params.n_floor > 0) {
-            // (k19-depth: n_floor + 2 and more, the deep windows below LLAMA_SPEC_DEPTH_POS)
+            // (n_floor + 2 and more, the deep windows below LLAMA_SPEC_DEPTH_POS)
             if (!chain_heads && !is_mem_shared && !spec_cost && this->params.n_max >= this->params.n_floor + 1) {
                 tpp_floor = this->params.n_floor;
                 tpp_cost.deep_extra = this->params.n_max - this->params.n_floor - 1;
@@ -2452,7 +2452,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 this->params.n_max = std::min(this->params.n_max, this->params.n_floor);
             }
         }
-        // k19-adraft: one trained head without shared memory, no other window policy
+        // one trained head without shared memory, no other window policy
         if (this->params.adraft > 0) {
             if (!chain_heads && !is_mem_shared && !spec_cost && tpp_floor == 0 && this->params.n_max > this->params.adraft) {
                 const char * m = getenv("LLAMA_SPEC_ADRAFT");
@@ -2527,10 +2527,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const char * fe = getenv("LLAMA_SPEC_TPP_FORCE_CACHED");
             const bool cached = (this->params.ctx_tgt != nullptr && llama_moe_cache_active(this->params.ctx_tgt)) || (fe != nullptr && atoi(fe) != 0);
             const char * ce = getenv("LLAMA_SPEC_TPP_CACHED");
-            // (k19-fnmtp: the server's rule for a cache, params.deep_cached, keeps the windows)
+            // (the server's rule for a cache, params.deep_cached, keeps the windows)
             if (cached && !(ce != nullptr && atoi(ce) != 0) && !this->params.deep_cached) {
                 // an MoE cache: the policy is off and the window is the floor's, as with LLAMA_SPEC_TPP=0 (a wider window reads more
-                // streamed experts and moves which ones stay resident; G4 fn4 16 GB, ktp_g4e: 0.94-0.96 of base at 16k / 30k)
+                // streamed experts and moves which ones stay resident; RTX PRO 6000, 4-bit model, 16 GB, ktp_g4e: 0.94-0.96 of base at 16k / 30k)
                 tpp_floor = 0;
                 tpp_cost.deep_extra = 0;
                 this->params.n_max = this->params.n_floor;
@@ -2544,20 +2544,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const bool cached = this->params.ctx_tgt != nullptr && llama_moe_cache_active(this->params.ctx_tgt);
             tpp_cost.set_cached(cached);
             if (this->params.deep_cached) {
-                // k19-fnmtp: every window below deep_pos drafts n_max, also where that is floor + 1 (3 drafts)
+                // every window below deep_pos drafts n_max, also where that is floor + 1 (3 drafts)
                 tpp_cost.deep_all = true;
                 LOG_INF("%s: MoE cache %s: MTP windows of %d drafts below position %lld, from there %d and a priced %d "
                     "(LLAMA_SPEC_DEPTH_CACHED=0: off)\n", __func__, cached ? "on" : "off (expected by the server)", this->params.n_max,
                     (long long) tpp_cost.deep_pos, tpp_floor, tpp_floor + 1);
             }
-            // k19-q38d: a dense target (no <arch>.expert_count) keeps the deep windows at every position. Its verify reads each weight
-            // once for all the window's rows, so the deeper window's extra rows cost little at long context too: G4 Qwen3.8-27B
-            // UD-Q4_K_XL + its MTP head, full card, 30k prompt: 4 drafts past position 12288 151.1 tok/s (3.12 tokens, 20.7 ms per pass)
-            // against 134.5 with 2 (2.44, 18.1 ms); chat / 8k unchanged (deep band already). MoE targets keep 12288 (fn4 full card: 4
+            // a dense target (no <arch>.expert_count) keeps the deep windows at every position. Its verify reads each weight
+            // once for all the window's rows, so the deeper window's extra rows cost little at long context too: RTX PRO 6000 Qwen3.8-27B
+            // A 4-bit quant + its MTP head, full card, 30k prompt: 4 drafts past position 12288 151.1 tok/s (3.12 tokens, 20.7 ms per pass)
+            // against 134.5 with 2 (2.44, 18.1 ms); chat / 8k unchanged (deep band already). MoE targets keep 12288 (4-bit, full card: 4
             // drafts -13% at 30k). LLAMA_SPEC_DEPTH_POS set: that position; LLAMA_SPEC_DEPTH_DENSE=0: 12288 as before.
             // Not on the HBM data-centre parts (compute capability 8.0 / 9.0: A100, A30, H100, H200), whose bandwidth per dp4a op makes the
             // extra verify rows dear: A100 80 GB, the same model and prompt, 30k 86.6 tok/s with every position deep against 90.1 at 12288
-            // (-3.9%; chat / 8k equal). L4 (8.9) +10.6% and G4 (12.0) +12.5% at 30k. LLAMA_SPEC_DEPTH_DENSE=1 forces it on any GPU
+            // (-3.9%; chat / 8k equal). L4 (8.9) +10.6% and RTX PRO 6000 (12.0) +12.5% at 30k. LLAMA_SPEC_DEPTH_DENSE=1 forces it on any GPU
             const char * e_dd = getenv("LLAMA_SPEC_DEPTH_DENSE");
             const bool hbm_dc = [] {
                 for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -2601,19 +2601,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 "off); round times %s (cost ratio %.2f at 16k, MoE cache %s; LLAMA_SPEC_TPP_LIVE=1: live medians)\n", __func__, tpp_floor,
                 tpp_floor + 1, tpp_cost.live ? "live" : "from the fixed table", tpp_cost.cost_ratio[3], cached ? "on" : "off");
         }
-        // k15-pp: on by default beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): the target's next-n rows of a prompt
+        // on by default beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): the target's next-n rows of a prompt
         // batch then go to the device sink and the host keeps none of them (llama_context::nextn_store_ensure), so the host rows no
-        // longer grow with n_batch (q4x 16384-token groups: 128 MiB pinned). A -md draft model keeps the host path (G4 Flash-Next 8k
+        // longer grow with n_batch (4-bit MoE, 16384-token groups: 128 MiB pinned). A -md draft model keeps the host path (RTX PRO 6000 Flash-Next 8k
         // prompt +8% with it). LLAMA_MTP_DEV_H=0 / =1 forces it off / on
         const char * dev_h_env = getenv("LLAMA_MTP_DEV_H");
-        // (G4 k15g4q1 measured it together with 16384 groups beside the heads, which cost decode and stay opt-in; at 8192 the device
+        // (an RTX PRO 6000 run measured it together with 16384 groups beside the heads, which cost decode and stay opt-in; at 8192 the device
         // path saves the 64 MiB of host rows for a 64 MiB sink)
         const bool dev_h_on = dev_h_env != nullptr ? atoi(dev_h_env) != 0 :
             getenv("LLAMA_SPEC_MTP_HEADS") != nullptr && atoi(getenv("LLAMA_SPEC_MTP_HEADS")) != 0;
         if (!is_mem_shared && !chain_heads && common_mtp_handoff_on("DEV_H") && dev_h_on) {
             dev_h = llama_mtp_dev_h_attach(ctx_dft, ctx_tgt, (int32_t) llama_n_batch(ctx_tgt));
         }
-        // k17: the device handoff reads no host state rows, so the batch's prefaulted ones (n_batch x n_embd floats: 64 MiB at 8192,
+        // the device handoff reads no host state rows, so the batch's prefaulted ones (n_batch x n_embd floats: 64 MiB at 8192,
         // 128 MiB at 16384 for Qwen3.6 + MTP heads) are given back; a host-path batch grows them again (LLAMA_MTP_DEV_H_KEEP_STATE=1 keeps them)
         if (dev_h && getenv("LLAMA_MTP_DEV_H_KEEP_STATE") == nullptr) {
             llama_batch_ext_release_state(batch.batch.get());
@@ -2692,7 +2692,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    // kdp: the drafter keeps no cells of a skipped batch's sequences (the k18 window's drop: it attends to the rows it gets later,
+    // the drafter keeps no cells of a skipped batch's sequences (the earlier window's drop: it attends to the rows it gets later,
     // RoPE positions as in the target) and pairs the next batch's first row with the target's row of this batch's last token. Drafts
     // are verified: only the acceptance moves. Host rows only, as the window
     bool skip_prompt(const common_batch & batch_in) override {
@@ -2761,8 +2761,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
-        // k15-pp3: rows the caller already waited for (unmasked: row i at i*n_embd), else the synchronizing lookups
-        // k19-host: with h_ext (LLAMA_MTP_PROMPT_BG) the rows come from the caller's pointer and stash, no target call at all
+        // rows the caller already waited for (unmasked: row i at i*n_embd), else the synchronizing lookups
+        // with h_ext (LLAMA_MTP_PROMPT_BG) the rows come from the caller's pointer and stash, no target call at all
         const bool ext = h_ext != nullptr;
         const float * h_early = !ext && rows_early ? llama_get_embeddings_nextn_early(ctx_tgt) : nullptr;
         GGML_ASSERT(ext || !rows_early || h_early);
@@ -2820,7 +2820,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 t_tr_sync = ggml_time_us();
             }
 
-            // k18 (LLAMA_MTP_PROMPT_WINDOW=W, opt-in; 0 = every row): a batch of more than W rows of one sequence gives the drafter only
+            // LLAMA_MTP_PROMPT_WINDOW=W, opt-in; 0 = every row: a batch of more than W rows of one sequence gives the drafter only
             // its last W rows; the draft's cells of that sequence are dropped first (it then attends to the last W prompt positions,
             // RoPE positions as in the target). Drafts are verified: only the acceptance moves. Host rows only (not the device sink,
             // shared KV or chained heads)
@@ -2936,7 +2936,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float * h_beg = handoff_copy ? tgt_row(nextn_row_offset + i_batch_beg[seq_id]) : nullptr;
             const float * h_end = handoff_copy ? tgt_row(nextn_row_offset + i_batch_end[seq_id]) : nullptr;
             if (ext && handoff_copy) {
-                // k19-host: the copy below row by row (the stash breaks the rows' contiguity): the same n_keep rows and pending row
+                // the copy below row by row (the stash breaks the rows' contiguity): the same n_keep rows and pending row
                 const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(256, n_max + 2)) : n_rows;
                 verify_h_kept[seq_id] = n_keep;
                 if (verify_h[seq_id].size() < (size_t) n_keep * n_embd) {
@@ -3002,7 +3002,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
-            // k19-sharednoise: so does a draft drawn with the target's noise (sample-and-match is what keeps it exact)
+            // so does a draft drawn with the target's noise (sample-and-match is what keeps it exact)
             if (!params.probabilistic || (dp.sn != nullptr && dp.sn->on)) {
                 dp.result_q = nullptr;
             }
@@ -3107,7 +3107,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
-                // k19-sharednoise: the draft takes the target's noise at its position (the probability fed to the window policies
+                // the draft takes the target's noise at its position (the probability fed to the window policies
                 // is the picked token's under the mirrored chain; they calibrate it against what held)
                 float p_draft = cur_p->data[0].p;
                 const bool sn_on = dp.sn != nullptr && dp.sn->on;
@@ -3123,7 +3123,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                // k19-adraft: the confidence gate (the draft below its bar is not proposed)
+                // the confidence gate (the draft below its bar is not proposed)
                 if (gated(dp) && !adraft_prev && !result.empty() && p_draft < (result.size() == 1 ? adraft_p2 : adraft_p)) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -3163,7 +3163,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             continue;
                         }
                     } else if ((int) result.size() == tpp_floor + 1 && !tpp_cost.deep()) {
-                        // k19-depth: past the deep band a window ends at floor + 1 drafts, as with n_max floor + 1
+                        // past the deep band a window ends at floor + 1 drafts, as with n_max floor + 1
                         drafting[seq_id] = false;
                         n_drafting--;
                         continue;
@@ -3179,12 +3179,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         continue;
                     }
                 } else if (gated(dp) && adraft_prev && p_draft < (result.size() == 1 ? adraft_p2 : adraft_p)) {
-                    // k19-adraft (LLAMA_SPEC_ADRAFT_PREV=1): the next draft is made only when this one clears the next one's bar
+                    // LLAMA_SPEC_ADRAFT_PREV=1: the next draft is made only when this one clears the next one's bar
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
                 } else if (adraft_keep > 0 && !gated(dp) && (int) result.size() >= adraft_cap(seq_id, dp)) {
-                    // k19-adraft: a greedy request's window, as with n_max = adraft_keep (modes 3 / 4: the stretch's width)
+                    // a greedy request's window, as with n_max = adraft_keep (modes 3 / 4: the stretch's width)
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -3245,7 +3245,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             if (tpp_floor > 0 && !dp.result_q) {
-                // k19-tpp: the floor's drafts, and the one beyond it where the wider window pays with the drafted token's probability
+                // the floor's drafts, and the one beyond it where the wider window pays with the drafted token's probability
                 auto & cs = cost_st[seq_id];
                 cs.drafted = (int) dp.result->size();
                 if ((int) dp.result->size() > tpp_floor && (int) cs.probs.size() > tpp_floor) {
@@ -3257,7 +3257,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                 }
             } else if (priced(dp)) {
-                // the window keeps the drafts of the best expected tokens per ms (k19-adraft: at least adraft_floor)
+                // the window keeps the drafts of the best expected tokens per ms (at least adraft_floor)
                 const size_t kept = (size_t) std::max(adraft_floor, cost_st[seq_id].chain.best_rows - 1);
                 if (dp.result->size() > kept) {
                     dp.result->resize(kept);
@@ -3289,7 +3289,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         if (adraft_mode == 3 && seq_id < (llama_seq_id) adraft_st.size() && adraft_st[seq_id].drafted > 0) {
-            // k19-adraft: the share of this window's drafts that held, into the request's running share; a width switch past the dwell
+            // the share of this window's drafts that held, into the request's running share; a width switch past the dwell
             auto & a = adraft_st[seq_id];
             const double held = std::min(1.0, (double) n_accepted / a.drafted);
             a.ema = a.rounds == 0 ? held : a.ema + (held - a.ema)/adraft_ema_n;
@@ -3305,7 +3305,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (cost_on) {
             auto & cs = cost_st[seq_id];
-            // k19-tpp: a kept draft past the floor, reached (the floor's drafts held): did it hold, against its predicted rate
+            // a kept draft past the floor, reached (the floor's drafts held): did it hold, against its predicted rate
             if (tpp_floor > 0 && (int) cs.probs.size() == tpp_floor + 1 && n_accepted >= tpp_floor) {
                 tpp_cost.observe_marginal(cost_pol.draft_rate(cs.probs[tpp_floor]), n_accepted > tpp_floor);
             }
@@ -3622,7 +3622,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     }
 };
 
-// k9-draft: ngram-suffix. The draft is what followed the longest earlier repeat (at least n_min_match, at most 64 tokens) of the last
+// ngram-suffix. The draft is what followed the longest earlier repeat (at least n_min_match, at most 64 tokens) of the last
 // tokens of the prompt + output, found through a hash of trigrams that keeps the last 4 places of each. Its length follows the decayed
 // acceptance of earlier suffix drafts of the same match-length class, q per token, with fixed priors:
 // k tokens while q^k >= p_cut, at most n_max_short below a match of n_long_match tokens and n_max from there (a
@@ -3640,7 +3640,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
 
     common_params_speculative_ngram_suffix params;
     bool with_model = false;
-    // k11-decode: cost-priced windows alone (common/spec-cost-policy.h); one cost table for every sequence
+    // cost-priced windows alone (common/spec-cost-policy.h); one cost table for every sequence
     bool policy_on  = false;
     common_spec_cost_policy policy;
 
@@ -3662,9 +3662,9 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         int match_last  = 0;
         // per request counters (logged when the next request begins)
         int64_t n_lookups = 0, n_matches = 0, n_drafts = 0, n_drafted = 0, n_accepted = 0, n_yield = 0;
-        common_spec_round_timer timer;   // k11-decode: round times of this sequence (policy_on)
+        common_spec_round_timer timer;   // round times of this sequence (policy_on)
         int64_t n_probe = 0;
-        int64_t n_win[common_spec_cost_policy::MAX_T + 1] = {};   // k19-lookup8: drafted rounds by window (rows), this request
+        int64_t n_win[common_spec_cost_policy::MAX_T + 1] = {};   // drafted rounds by window (rows), this request
         std::string win_text() const {
             std::string o;
             for (int t = 2; t <= common_spec_cost_policy::MAX_T; ++t) {
@@ -3674,8 +3674,8 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             }
             return o;
         }
-        int min_match = 3;               // k15-spec: this request's shortest repeat (n_min_match, n_min_match_long for a long prompt)
-        int n_short   = 3;               // k15-lfm2: this request's short window and full-window match (n_max_short / n_long_match, or
+        int min_match = 3;               // this request's shortest repeat (n_min_match, n_min_match_long for a long prompt)
+        int n_short   = 3;               // this request's short window and full-window match (n_max_short / n_long_match, or
         int n_long    = 8;               //           n_max_short_long / n_long_match_long for a long prompt)
     };
 
@@ -3723,7 +3723,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             const char * e = getenv("LLAMA_SPEC_SUFFIX_POLICY");
             policy_on = !with_model && (e != nullptr ? atoi(e) != 0 : params.auto_mode);
             policy.short_k = params.n_max_short;
-            // k19-lookup8: LLAMA_SPEC_SUFFIX_SIZES="2,3,4,8" prices every listed window size (rows), see common_spec_cost_policy::choose_sizes
+            // LLAMA_SPEC_SUFFIX_SIZES="2,3,4,8" prices every listed window size (rows), see common_spec_cost_policy::choose_sizes
             policy.sizes = common_spec_cost_policy::parse_sizes(getenv("LLAMA_SPEC_SUFFIX_SIZES"));
         }
         if (policy_on && policy.sizes != 0) {
@@ -3959,13 +3959,13 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             const double q   = rate(si, b);
             const int    win = match >= si.n_long ? cap : std::min(cap, si.n_short);
             // the draft is the whole window (fewer tokens only where the repeat runs out): every verify length is a graph of its own
-            // (a change of length rebuilds the target graph, 10-15 ms on G4), so the lengths stay few
+            // (a change of length rebuilds the target graph, 10-15 ms on an RTX PRO 6000), so the lengths stay few
             int k = 0;
             if (with_model) {
                 // a full window from a class that is right most of the time, else the model drafts this round
                 k = (offered >= win && q >= params.p_take) ? win : 0;
             } else if (policy_on) {
-                // k11-decode: the window that commits the most tokens per measured ms, or none (common/spec-cost-policy.h)
+                // the window that commits the most tokens per measured ms, or none (common/spec-cost-policy.h)
                 const int k_full = std::min(offered, win);
                 k = policy.sizes != 0 ? policy.choose_sizes(offered, q) :
                     policy.choose(k_full, std::min(k_full, si.n_short), q, si.n_short != params.n_max_short);
@@ -4489,7 +4489,7 @@ uint32_t common_draft_ubatch_max() {
     return v;
 }
 
-// k16-draft: the shape (and type) of tensor `name` in a GGUF (split-aware: a target's lm head is usually in a later shard): 1 found,
+// the shape (and type) of tensor `name` in a GGUF (split-aware: a target's lm head is usually in a later shard): 1 found,
 // 0 absent from every readable shard, -1 a shard could not be read
 static int common_gguf_tensor_find(const std::string & path, const char * name, int64_t ne[GGML_MAX_DIMS], ggml_type * type = nullptr) {
     std::string prefix;
@@ -4526,11 +4526,11 @@ static int common_gguf_tensor_find(const std::string & path, const char * name, 
     return 0;
 }
 
-// k16-draft (idea from ik_llama.cpp by ikawrakow): a separate MTP draft model (-md with --spec-type draft-mtp) uses the target's
+// idea from ik_llama.cpp by ikawrakow: a separate MTP draft model (-md with --spec-type draft-mtp) uses the target's
 // token_embd and output when both files hold them with the same shapes (llama_model_loader::borrow_io checks again at load, against
 // the loaded target). Decided here so the fit's measurements of the draft (no target loaded yet) count the lm head as the target's.
 // LLAMA_MTP_BORROW_IO=0: the draft loads its own copies
-// k19-pr374 (ported from LeoBorcherding's Qwen4Exp shared MTP heads, unslothai/llama.cpp, MIT): a shared drafter (mtp-*-shared-*.gguf)
+// ported from LeoBorcherding's Qwen4Exp shared MTP heads, unslothai/llama.cpp, MIT: a shared drafter (mtp-*-shared-*.gguf)
 // has neither tensor (a drafter missing only one keeps the old rule: no borrow); it borrows both, and `missing` gets the target's type of each one it lacks (the measurement prices them in it).
 // LLAMA_MTP_BORROW_MISSING=0: a drafter without them is not borrowed for (its load fails on the missing tensor, as before)
 static bool common_mtp_borrow_io_ok(const std::string & path_tgt, const std::string & path_dft,
@@ -4607,7 +4607,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
         }
 
-        // k18 (LLAMA_DRAFT_REQUANT=q4_k|q3_k|..., opt-in): the draft model's FFN / expert weights are requantized to that type at load
+        // LLAMA_DRAFT_REQUANT=q4_k|q3_k|..., opt-in: the draft model's FFN / expert weights are requantized to that type at load
         // (llama_model_loader, KV override general.requant_type), so the fit prices the smaller drafter; drafts are verified, so the
         // output does not change, only the acceptance
         for (const char * rq_env : { "LLAMA_DRAFT_REQUANT", "LLAMA_DRAFT_REQUANT_OUTPUT" }) {
@@ -4629,7 +4629,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
-    // k19-mtpkeep: a draft whose experts the fit placed in host memory runs without op offload: its prompt rows only write K / V and
+    // a draft whose experts the fit placed in host memory runs without op offload: its prompt rows only write K / V and
     // its draft steps are a few rows, so the expert products stay on the CPU, and the graph reserve does not keep a device copy of an
     // expert tensor (850 MiB for the Q8_0 MTP layer of Qwen3.8-Flash-Next) that no batch would use. LLAMA_FIT_DRAFT_HOST_EXPS_NO_OFFLOAD=0 off
     if (common_fit_draft_host_exps_get() && common_fit_draft_host_exps_no_offload()) {
@@ -4645,10 +4645,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     result.moe_cache_size = spec_mtp && !has_draft ? params.moe_cache_size : 0;
 
-    // k16-draft: borrowed token_embd / output (llama_model_params::mtp_borrow_io)
+    // borrowed token_embd / output (llama_model_params::mtp_borrow_io)
     std::vector<std::pair<std::string, ggml_type>> borrow_missing;
     result.mtp_borrow_io = spec_mtp && has_draft && common_mtp_borrow_io_ok(params.model.path, params_spec.mparams.path, &borrow_missing);
-    // k19-pr374: a shared drafter's absent token_embd / output, in the target's types, for the memory measurement of the draft
+    // a shared drafter's absent token_embd / output, in the target's types, for the memory measurement of the draft
     // (llama_model_loader::borrow_missing_type)
     for (const auto & [name, type] : borrow_missing) {
         if (!result.kv_overrides.empty() && result.kv_overrides.back().key[0] == 0) {
@@ -4754,7 +4754,7 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        // k16-draft: the target lends its token_embd / output to an MTP draft model (llama_model_loader::borrow_io)
+        // the target lends its token_embd / output to an MTP draft model (llama_model_loader::borrow_io)
         if (spec_mtp && mparams.mtp_borrow_io) {
             mparams.model_shared = model_tgt;
         }

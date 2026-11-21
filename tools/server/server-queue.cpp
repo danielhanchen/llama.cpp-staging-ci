@@ -202,7 +202,7 @@ void server_queue::worker_loop() {
             });
             worker.parked = false;
             if (worker.released) {
-                // k19-hostgap: the yield ended while this thread was parked and yield_to_queue() took busy back; the wake-up may
+                // the yield ended while this thread was parked and yield_to_queue() took busy back; the wake-up may
                 // have been meant for another waiter of condition_tasks (the start_loop() thread, a wait_until_no_sleep() caller):
                 // it is passed on
                 worker.released = false;
@@ -225,7 +225,7 @@ void server_queue::worker_loop() {
     }
 }
 
-// k19-hostgap (LLAMA_SERVER_YIELD_FAST=0: off): a yield that ends while the worker is parked (waiting for a task, none in hand) does not
+// LLAMA_SERVER_YIELD_FAST=0: off: a yield that ends while the worker is parked (waiting for a task, none in hand) does not
 // wait for the worker to wake and acknowledge (two thread hand-offs on the critical path of every speculative pass step)
 static std::atomic<int64_t> g_yield_fast{0};
 static std::atomic<int64_t> g_yield_total{0};
@@ -267,7 +267,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
         GGML_ASSERT(!worker.busy && "yield_to_queue() cannot be nested");
         worker.busy     = true;
         worker.yielding = true;
-        // k19-hostgap: a worker left parked by the last yield (see below) does not wait on cv: it is woken here if tasks wait
+        // a worker left parked by the last yield (see below) does not wait on cv: it is woken here if tasks wait
         kick = worker.parked && !queue_tasks.empty();
     }
     worker.cv.notify_one();
@@ -289,7 +289,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
         // the yield is over, wait for the worker to finish its current task
         worker.yielding = false;
         g_yield_total.fetch_add(1, std::memory_order_relaxed);
-        // k19-hostgap: parked = no task in hand and none taken until the lock is released: it is told so and left asleep. Only with
+        // parked = no task in hand and none taken until the lock is released: it is told so and left asleep. Only with
         // an empty queue: a task queued before this point (e.g. posted right before the yield, while the worker kicked at the
         // start was not scheduled yet) is processed by the worker before the yield returns, as in the waiting path below; a fast
         // end with tasks queued left them to the start_loop() thread after the slot code (one server loop later)
@@ -341,7 +341,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     worker.thread = std::thread([this]() { worker_loop(); });
 
     constexpr auto max_wait_time = std::chrono::seconds(1);
-    // opt-in (default 0 = the idle work runs at once, as before): on G4 q4x 12 GB the 2k prompt was 10% slower with 200 (4684 vs 5222
+    // opt-in (default 0 = the idle work runs at once, as before): on an RTX PRO 6000 with a 4-bit MoE at 12 GB the 2k prompt was 10% slower with 200 (4684 vs 5222
     // tok/s, 3 launches; not explained yet) and the bench cells showed no TTFT gain
     static const int64_t idle_work_delay_ms = getenv("LLAMA_SERVER_IDLE_WORK_DELAY_MS") ? std::max(0, atoi(getenv("LLAMA_SERVER_IDLE_WORK_DELAY_MS"))) : 0;
     auto should_sleep = [&]() -> bool {
@@ -380,7 +380,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 break; // go back to process new tasks or terminate
             }
 
-            // k15-ttft: idle work once the queue has stayed empty for idle_work_delay_ms
+            // idle work once the queue has stayed empty for idle_work_delay_ms
             if (idle_work_pending && callback_idle_work) {
                 const bool arrived = idle_work_delay_ms > 0 && condition_tasks.wait_for(lock, std::chrono::milliseconds(idle_work_delay_ms), [&]{
                     return (!queue_tasks.empty() || !running);

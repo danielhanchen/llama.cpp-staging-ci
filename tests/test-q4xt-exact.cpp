@@ -1,6 +1,6 @@
-// k19-q4xt: bit identity of the single token MUL_MAT_ID warp per row launch (mul_mat_vec_q_wpr_launch, GGML_CUDA_MMVQ_IDS_WPR) against
+// bit identity of the single token MUL_MAT_ID warp per row launch (mul_mat_vec_q_wpr_launch, GGML_CUDA_MMVQ_IDS_WPR) against
 // the launch it replaces, byte for byte: K-quant / Q4_0 / Q5_0 / IQ4 experts whose rows one warp covers in one pass (Qwen3.6-35B-A3B
-// UD-Q4_K_XL down: Q5_K K 512, 2048 rows, top-8; IQ4_XS K 512 / 1024), every warps x rows setting (GGML_CUDA_MMVQ_IDS_WPR_W 2 / 4,
+// 4-bit down: Q5_K K 512, 2048 rows, top-8; IQ4_XS K 512 / 1024), every warps x rows setting (GGML_CUDA_MMVQ_IDS_WPR_W 2 / 4,
 // GGML_CUDA_MMVQ_IDS_WPR_ROWS 1 / 2 / 4), 1..4 tokens, plain and as a batch invariant verify batch (the exact verify path runs the
 // single token launch per token), fused gate + up + SWIGLU and the product alone, rows that the rows per block do not divide (the
 // launch then falls back) and shapes it never takes (K 2048, Q6_K / Q8_0: controls). Each mode runs in a child process (the switches
@@ -462,7 +462,7 @@ int main(int argc, char ** argv) {
     };
     if (const char * be = getenv("Q4XT_BASE_EXE")) {
         // a copy of this test in the other build's bin dir (the CUDA backend is loaded from the executable's directory, so
-        // LD_LIBRARY_PATH alone does not switch it): that build's defaults (no k19-q4xt code: never logs) vs this build's
+        // LD_LIBRARY_PATH alone does not switch it): that build's defaults (no such code: never logs) vs this build's
         const std::string b = be;
         modes.push_back({ "xbin_default", "", "", -1, false, b });
         modes.push_back({ "xbin_off",     "", off, 0, false, b });
@@ -519,7 +519,7 @@ int main(int argc, char ** argv) {
             ok ? "OK  " : "FAIL", md.name, rb, lb, (unsigned long long) fnv(db.data(), db.size()), rh, lh,
             (unsigned long long) fnv(dh.data(), dh.size()), db.size(), ndiff);
         fflush(stdout);
-        // the exact verify modes count too: their run-to-run variation (66-row MUL_MAT_ID) was the single column row guard, fixed in k19-exactdet
+        // the exact verify modes count too: their run-to-run variation (66-row MUL_MAT_ID) was the single column row guard, fixed in this change
         n_fail += !ok;
     }
     printf("%s: %d of %zu modes failed\n", n_fail ? "FAIL" : "PASS", n_fail, modes.size());

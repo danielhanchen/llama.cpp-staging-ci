@@ -1,4 +1,4 @@
-// k19-dsv4long: the CUDA deterministic top-k (ggml_top_k) with the 8-columns-per-thread one-block radix select
+// the CUDA deterministic top-k (ggml_top_k) with the 8-columns-per-thread one-block radix select
 // (GGML_CUDA_TOPK_ONEBLOCK_V2, default on) vs the previous one-block kernel (GGML_CUDA_TOPK_ONEBLOCK_V2=0, up to 65536 columns, then
 // the multi-block path) vs the multi-block path only (GGML_CUDA_TOPK_ONEBLOCK=0), and vs a host reference of the documented order
 // (keys above the k-th largest in column order, then the first kept ties in column order; -0 == +0). Each mode runs in a child

@@ -2909,7 +2909,7 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
-// k15-fn: RMS_NORM -> MUL -> ROPE with a multi-section rope as qwen4exp builds it (per-head q / k norm over a strided view,
+// RMS_NORM -> MUL -> ROPE with a multi-section rope as qwen4exp builds it (per-head q / k norm over a strided view,
 // partial rotary window, optionally at an offset, in place, with freq factors), fused into the norm kernel by the CUDA backend
 struct test_norm_mrope : public test_case {
     const std::array<int64_t, 3> ne; // head dim, heads, tokens
@@ -4836,7 +4836,7 @@ struct test_hc_post_norm : public test_case {
 
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, bool skip, float amax);
 
-// k19-fu2 F2: the gated delta net output norm of a prompt batch (RMS_NORM -> MUL -> SIGMOID(z) -> MUL over [hd, heads, T], read as
+// F2: the gated delta net output norm of a prompt batch (RMS_NORM -> MUL -> SIGMOID(z) -> MUL over [hd, heads, T], read as
 // [hd*heads, T]) feeding a quantized product on the MMQ path; CUDA writes the q8_1 MMQ copy in the norm kernel for D4 types
 // (GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ=1: off), other layouts quantize in the product
 struct test_gated_norm_mmq : public test_case {
@@ -4878,7 +4878,7 @@ struct test_gated_norm_mmq : public test_case {
     }
 };
 
-// k19-fu2 F3: the routed experts' SWIGLU (split gate / up, [n_ff, n_used, T]) feeding the down MUL_MAT_ID of a prompt batch; CUDA
+// F3: the routed experts' SWIGLU (split gate / up, [n_ff, n_used, T]) feeding the down MUL_MAT_ID of a prompt batch; CUDA
 // computes the SWIGLU in the product's gathered quantize (GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID=1: off). skip: some slots are -1
 struct test_swiglu_mmid : public test_case {
     const ggml_type type;
@@ -5386,7 +5386,7 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
-// k15-fn: GET_ROWS (one recurrent-state row by id) -> GATED_DELTA_NET, with beta = SIGMOID(b) and g = MUL(SOFTPLUS(ADD(a, dt)), A):
+// GET_ROWS (one recurrent-state row by id) -> GATED_DELTA_NET, with beta = SIGMOID(b) and g = MUL(SOFTPLUS(ADD(a, dt)), A):
 // the CUDA backend reads the state in place and applies both gates inside the kernel (GGML_CUDA_GDN_STATE_IN_PLACE, GGML_CUDA_GDN_GATES)
 struct test_gdn_inplace_gates : public test_case {
     const int64_t head_count;
@@ -6043,7 +6043,7 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
-// k15-lfm2: MUL_MAT_ID over a bank of n_mats slots of which only n_active are routed (in-place prompts read the MoE cache bank:
+// MUL_MAT_ID over a bank of n_mats slots of which only n_active are routed (in-place prompts read the MoE cache bank:
 // ne02 = the slots of the cache, the ids the slots of the layer's experts)
 struct test_mul_mat_id_sparse : public test_mul_mat_id {
     const int n_active;
@@ -8532,7 +8532,7 @@ struct test_moe_amax_rescale : public test_case {
     }
 };
 
-// k15-fn: a gated op (swiglu GLU, or SIGMOID / SILU -> MUL as the CUDA backend fuses it) read by a quantized mat-vec product
+// a gated op (swiglu GLU, or SIGMOID / SILU -> MUL as the CUDA backend fuses it) read by a quantized mat-vec product
 // (MUL_MAT, or MUL_MAT_ID over n_used rows as the MoE down projection): the CUDA gated kernel writes the q8_1 copy of its output
 // for the product (unary_gated_q8_1_kernel): swiglu + quantize fused
 struct test_gated_mmvq : public test_case {
@@ -8592,7 +8592,7 @@ struct test_gated_mmvq : public test_case {
     }
 };
 
-// k15-fn: a shared expert gate: MUL(x, UNARY(g)) with one gate value per row of x, optionally added to the routed experts' output
+// a shared expert gate: MUL(x, UNARY(g)) with one gate value per row of x, optionally added to the routed experts' output
 // (ADD(a, gated)); the CUDA backend fuses the two or three ops into one kernel
 struct test_gate_mul_add : public test_case {
     const std::string op;
@@ -8664,18 +8664,18 @@ struct test_glu_src1_alias : public test_case {
     }
 
     double max_nmse_err() override {
-        // three chained q4_0 products of q8 activations: the CPU reference and CUDA differ by quantization alone (k15: 80 runs,
+        // three chained q4_0 products of q8 activations: the CPU reference and CUDA differ by quantization alone (80 runs,
         // NMSE up to 7.8e-4 with the src1-alias fusion and 6.3e-4 with it off, GGML_CUDA_DISABLE_GLU_SRC1_ALIAS_FUSION=1); a wrong
         // fusion gives NMSE of order 1
         return type == GGML_TYPE_Q4_0 ? 2e-3 : 5e-4;
     }
 };
 
-// k15-mm: dense quantized products over one activation that the CUDA backend runs as one multi-matrix mul_mat_vec_q.
+// dense quantized products over one activation that the CUDA backend runs as one multi-matrix mul_mat_vec_q.
 // pattern 0: q, k, v adjacent; 1: the attention order (q, a view of it, rms_norm * w, then k, v: moved next to q before allocation);
 // 2: v of another type (only q + k share a launch); 3: k and v followed by bias adds (gpt-oss: those keep their own fusion);
 // 4: two products (gated delta net qkv + gate) with a reshape between them. Rows of q / k / v are not multiples of the rows per block.
-// k15-fn: the conv input of a qwen4exp / qwen35 short convolution (build_conv_state_at): CONCAT of the state columns (read in place from
+// the conv input of a qwen4exp / qwen35 short convolution (build_conv_state_at): CONCAT of the state columns (read in place from
 // the recurrent cache row) and the transposed new tokens, the per-rollback-slot tail copies into the cache (slot 0 over the row the
 // state was read from), then SSM_CONV + SILU. The CUDA backend does not run the concat in decode / verify (ssm_conv_cat_f32, kill
 // GGML_CUDA_DISABLE_CONV_CAT_FUSION=1) and writes the copies in the convolution (GGML_CUDA_DISABLE_CONV_STATE_FUSION=1).
@@ -8686,7 +8686,7 @@ struct test_conv_cat_state : public test_case {
     const int64_t n_t;
     const int64_t n_slots;
     const bool    cpy_after;
-    const int64_t n_gap; // k19-vrow3: unrelated nodes between the copies and the convolution (the state gather of qwen4exp)
+    const int64_t n_gap; // unrelated nodes between the copies and the convolution (the state gather of qwen4exp)
     std::vector<ggml_tensor *> checked;
 
     std::string vars() override {
@@ -8759,7 +8759,7 @@ struct test_conv_cat_state : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
 };
 
-// k15-fn: a qwen4exp QSA layer's new pooled keys (build_qsa_sel): GET_ROWS of the kpool member keys from the f16 indexer cache -> CONT
+// a qwen4exp QSA layer's new pooled keys (build_qsa_sel): GET_ROWS of the kpool member keys from the f16 indexer cache -> CONT
 // + ADDs -> SCALE -> RMS_NORM -> MUL -> RESHAPE -> multi-section ROPE -> RESHAPE -> SET_ROWS into the pooled half of the rep rows. The
 // CUDA backend runs it as one warp per pool (k_qsa_pool, kill GGML_CUDA_DISABLE_QSA_POOL_FUSION=1)
 struct test_qsa_pool_keys : public test_case {
@@ -8837,7 +8837,7 @@ struct test_qsa_pool_keys : public test_case {
     }
 };
 
-// k15-fn: a qwen4exp QSA layer's packed indexer key row (build_qsa_sel): FILL (the pooled half, zero) -> CONCAT with the raw key ->
+// a qwen4exp QSA layer's packed indexer key row (build_qsa_sel): FILL (the pooled half, zero) -> CONCAT with the raw key ->
 // views -> SET_ROWS into the f16 indexer cache. The CUDA backend writes it in one kernel (k_qsa_key_pack, kill
 // GGML_CUDA_DISABLE_QSA_KEY_PACK_FUSION=1)
 struct test_qsa_key_pack : public test_case {
@@ -8889,7 +8889,7 @@ struct test_qsa_key_pack : public test_case {
     }
 };
 
-// k15-fn: the attention output gate of qwen35 / qwen35moe / qwen3next / qwen4exp: CONT of the strided view of every head's second half
+// the attention output gate of qwen35 / qwen35moe / qwen3next / qwen4exp: CONT of the strided view of every head's second half
 // of Qcur_full, SIGMOID, MUL with the attention output (+ the wo mat-vec, whose q8_1 input the fused kernel writes). The CUDA backend
 // does not run the CONT, the fused sigmoid * mul reads the view (kill GGML_CUDA_DISABLE_UNARY_SRC_CONT_FUSION=1)
 struct test_gate_cont : public test_case {
@@ -8937,7 +8937,7 @@ struct test_gate_cont : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return with_mm ? std::vector<ggml_tensor *>{ gated, out } : std::vector<ggml_tensor *>{ gated }; }
 };
 
-// k15-mm2: the QSA selection mask of qwen4exp (llama_model_qwen4exp::graph::build_qsa_sel) feeding sparse flash attention:
+// the QSA selection mask of qwen4exp (llama_model_qwen4exp::graph::build_qsa_sel) feeding sparse flash attention:
 // sel = add(view(set_rows(repeat(fill(-inf)), repeat(fill(0)), idx)), kq_mask), dead slots pointing at dump rows >= n_kv.
 // The CUDA backend gathers from idx and kq_mask without building sel (GGML_CUDA_QSA_MASKLESS)
 struct test_qsa_sel_fa : public test_case {
@@ -8947,7 +8947,7 @@ struct test_qsa_sel_fa : public test_case {
     const int64_t kv;
     const int64_t nb;  // tokens
     const int64_t n_sel;
-    const bool    op; // k19-kvlong: the mask as one ggml_sel_mask node instead of the chain
+    const bool    op; // the mask as one ggml_sel_mask node instead of the chain
 
     std::string vars() override {
         return VARS_TO_STR7(hs, nh, nr, kv, nb, n_sel, op);
@@ -9039,7 +9039,7 @@ struct test_qsa_sel_fa : public test_case {
     }
 };
 
-// k19-kvlong: ggml_sel_mask (GGML_OP_KQ_MASK mode 1) alone. chain = 0: the node; chain = 1: the node minus the chain it replaces, as
+// ggml_sel_mask (GGML_OP_KQ_MASK mode 1) alone. chain = 0: the node; chain = 1: the node minus the chain it replaces, as
 // exp(node) - exp(chain) (both 0 or 1 at every cell: exact equality gives all zeros on every backend)
 struct test_sel_mask : public test_case {
     const int64_t kv, nb, n_sel;
@@ -9197,7 +9197,7 @@ struct test_mul_mat_vec_multi : public test_case {
     }
 };
 
-// k15-mmvffix: the mat-vec fusions of a Flash-Next layer at m columns, through a scheduler (graph_optimize plans the side stream) and
+// the mat-vec fusions of a Flash-Next layer at m columns, through a scheduler (graph_optimize plans the side stream) and
 // captured into a CUDA graph (eval_sched_runs): a long-K 4-row F32 product read 24+ nodes later (the hc inject: side stream at up to 4
 // columns), the same product over 0 columns (the last layer of a prompt ubatch without outputs: skipped, never sent to the side
 // stream), an F32 router + shared expert gate over one activation (F32 multi mat-vec), Q8_0 products over one activation (mmvq multi)
@@ -9255,7 +9255,7 @@ struct test_mmv_fused_cols : public test_case {
     }
 };
 
-// k15-mm2: hyper-connection down -> silu(scale) -> up: the up product applies the elementwise chain to its src1 in its own launch
+// hyper-connection down -> silu(scale) -> up: the up product applies the elementwise chain to its src1 in its own launch
 // (ggml_cuda_mul_mat_vec_q_ew). pattern 0: scale + silu, 1: silu, 2: scale with bias, 3: scale + silu with the chain input read
 // by a second node too (no fusion)
 struct test_hc_mix : public test_case {
@@ -9308,7 +9308,7 @@ struct test_hc_mix : public test_case {
     }
 };
 
-// k15-mm2: gated outputs read by a quantized mat-vec (their q8_1 copy written by the gated kernel): SWIGLU (split) -> Q product
+// gated outputs read by a quantized mat-vec (their q8_1 copy written by the gated kernel): SWIGLU (split) -> Q product
 // over the same rows (padded q8_1 rows), and sigmoid(z) * x over [hd, heads, T] read as [hd*heads, T] (the Qwen3-Next style output gate)
 struct test_gated_q8_1 : public test_case {
     const int mode;     // 0: swiglu split, 1: sigmoid * x reshaped, 2: silu * x
@@ -9353,7 +9353,7 @@ struct test_gated_q8_1 : public test_case {
     }
 };
 
-// k15-mm2: one qwen4exp hyper-connection mix (build_hc_mix): grouped norm -> down (Q8_0) -> silu(scale) -> up (Q8_0) -> gated
+// one qwen4exp hyper-connection mix (build_hc_mix): grouped norm -> down (Q8_0) -> silu(scale) -> up (Q8_0) -> gated
 // DSV4_HC_PRE, and the F32 inject product over the normed streams (before or after the down projection), with a Q8_0 product
 // reading the mixed stream (its q8_1 copy). CUDA: the down + inject launch and the up + hc_pre launch.
 struct test_hc_block : public test_case {
@@ -10199,8 +10199,8 @@ struct test_arange : public test_case {
     }
 };
 
-// GGML_OP_KQ_MASK (k15-pp)
-// k19-handoff: GGML_OP_DFLASH2_CONV (the DFlash2 drafter's dynamic grouped conv)
+// GGML_OP_KQ_MASK
+// GGML_OP_DFLASH2_CONV (the DFlash2 drafter's dynamic grouped conv)
 struct test_dflash2_conv : public test_case {
     const int64_t H, T;
     const int K, gs, n_blocks, side;
@@ -10226,7 +10226,7 @@ struct test_kq_mask : public test_case {
     const ggml_type type;
     const int64_t n_kv, n_tps, n_stream;
     const int swa_type, n_swa, is_2d;
-    const int win_mode, n_win, n_sinks; // k19-kvwin: ggml_kq_mask_win (1 = body without the flagged window cells, 2 = ring)
+    const int win_mode, n_win, n_sinks; // ggml_kq_mask_win (1 = body without the flagged window cells, 2 = ring)
 
     std::string vars() override {
         if (win_mode != 0) {
@@ -10483,7 +10483,7 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
-// k19-kvsel: test_flash_attn_ext with the sparse preference (op_params[5] = 1) that qwen4exp sets on attention whose K / V cells are partly
+// test_flash_attn_ext with the sparse preference (op_params[5] = 1) that qwen4exp sets on attention whose K / V cells are partly
 // in host memory: the CUDA backend then gathers the selected cells for 1-2 row quantized decode too (instead of the vector kernel)
 struct test_flash_attn_ext_sparse_pref : public test_flash_attn_ext {
     test_flash_attn_ext_sparse_pref(int64_t hs, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb, ggml_type type_kv, int64_t n_kv_max)
@@ -10541,7 +10541,7 @@ struct test_flash_attn_ext_k_outliers : public test_flash_attn_ext {
     }
 };
 
-// k19-kvwin: two-source flash attention (ggml_flash_attn_ext_set_src2): a cache source (k, v, mask: views of a cache, kv cells) and a
+// two-source flash attention (ggml_flash_attn_ext_set_src2): a cache source (k, v, mask: views of a cache, kv cells) and a
 // ring source (k2, v2, mask2: views of a ring of kv2 slots with a dump row, like llama_kv_cache's window ring). The masks are disjoint
 // as the cache builds them: every visible cell is finite in exactly one of the two (disjoint = false: random masks for both)
 struct test_flash_attn_ext_src2 : public test_case {
@@ -11782,7 +11782,7 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
-// k15-lfm2: a test case whose output node carries the batch invariant flag (a speculative verify node), vars tagged bi=1
+// a test case whose output node carries the batch invariant flag (a speculative verify node), vars tagged bi=1
 template <class T> struct test_bi : public T {
     using T::T;
     std::string vars() override { return T::vars() + ",bi=1"; }
@@ -11793,7 +11793,7 @@ template <class T> struct test_bi : public T {
     }
 };
 
-// k15-lfm2: a batch invariant FA node over nb tokens minus the nb one token nodes (as decode runs them): exact means every output is
+// a batch invariant FA node over nb tokens minus the nb one token nodes (as decode runs them): exact means every output is
 // 0 on the backend under test (err = max |out|, tolerance 0; the CPU reference is not used)
 struct test_fa_bi_exact : public test_case {
     const int64_t hs, nh, ngqa, kv, nb;
@@ -11834,7 +11834,7 @@ struct test_fa_bi_exact : public test_case {
     }
 };
 
-// k19-vrow3: a test case whose output node carries the verify flag (a speculative verify window that is not batch invariant), vars
+// a test case whose output node carries the verify flag (a speculative verify window that is not batch invariant), vars
 // tagged vf=1: ggml-cuda then runs 5..8 columns with the kernels of a 1..4-column window (GGML_CUDA_VERIFY_WIDE)
 template <class T> struct test_vf : public T {
     using T::T;
@@ -11846,7 +11846,7 @@ template <class T> struct test_vf : public T {
     }
 };
 
-// k19-vrow3: rows of a verify window are bitwise those of single-row products. In one verify-flagged graph, nm (1..3) products of one
+// rows of a verify window are bitwise those of single-row products. In one verify-flagged graph, nm (1..3) products of one
 // type and K over an activation of T columns (adjacent, so the CUDA backend may run them as one multi-matrix launch), minus the same
 // products over each column alone, concatenated: exact means every output is 0 on the backend under test (err = max |out|, tolerance 0;
 // the CPU reference is not used). On CUDA (NVIDIA Ampere+) this holds for 1..4 columns by construction and for 5..8 with
@@ -11861,9 +11861,9 @@ struct test_vrow_inv : public test_case {
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "VROW_INV"; }
     bool run_whole_graph() override { return true; }
     double max_err() override { return 0.0; }
-    // k19-int3fix2: bit for bit except for the products the CUDA few-row MMQ takes (k19-kqtc, GGML_CUDA_MMQ_FEW): it quantizes the
+    // bit for bit except for the products the CUDA few-row MMQ takes (GGML_CUDA_MMQ_FEW): it quantizes the
     // activations of a 2..8-row window itself, so those rows are not the single-row (mmvq) bytes by design (KLD-gated, like the Turing
-    // verify MMQ; T4, which the k19-vrow3 kernels do not cover, fails 43 of these cases on every bin). Bit identity across widths is the contract of
+    // verify MMQ; T4, which the few-row verify kernels do not cover, fails 43 of these cases on every build). Bit identity across widths is the contract of
     // the exact verify only (batch invariant + GGML_CUDA_VERIFY_REASSOC=0, LLAMA_MTP_EXACT=1), where the few-row MMQ never engages
     // (test-kqtc-exact checks it); the default verify reassociates by design and is KLD-gated, and no decision of speculative decoding
     // compares rows of different widths (acceptance compares each verify row's own argmax with its draft). Those cases are not compared
@@ -11929,27 +11929,27 @@ struct test_vrow_inv : public test_case {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // k15-lfm2: batch invariant FA verify == one token FA, bit for bit (GQA 4 head 64 as LFM2.5; GQA 8 head 128 for the generic path)
+    // batch invariant FA verify == one token FA, bit for bit (GQA 4 head 64 as LFM2.5; GQA 8 head 128 for the generic path)
     for (int64_t nb : { 2, 3, 5, 8 }) {
         for (int64_t kv : { 256, 2048, 8192 }) {
             test_cases.emplace_back(new test_fa_bi_exact(64, 8, 4, kv, nb));
         }
         test_cases.emplace_back(new test_fa_bi_exact(128, 2, 8, 1024, nb));
     }
-    // k15-lfm2: flagged (verify) dense products against the CPU reference (GGML_CUDA_VERIFY_MMQ takes MMQ)
+    // flagged (verify) dense products against the CPU reference (GGML_CUDA_VERIFY_MMQ takes MMQ)
     for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
         for (int64_t n : { 2, 8 }) {
             test_cases.emplace_back(new test_bi<test_mul_mat>(t, GGML_TYPE_F32, 512, n, 2048, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
         }
     }
-    // k15-lfm2: flagged (verify) FA against the CPU reference (GGML_CUDA_FA_VERIFY_MMA takes the batched MMA kernel on Turing / Ampere)
+    // flagged (verify) FA against the CPU reference (GGML_CUDA_FA_VERIFY_MMA takes the batched MMA kernel on Turing / Ampere)
     for (int64_t nb : { 2, 8 }) {
         for (int64_t kv : { 512, 4096 }) {
             test_cases.emplace_back(new test_bi<test_flash_attn_ext>(64, 64, 8, std::array<int64_t, 2>{4, 1}, kv, nb, true, false, 0.0f, 0.0f,
                 GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
-    // k19-vrow3: verify windows of 1..8 rows at the Qwen3.8-Flash-Next (qwen4exp) shapes: the rows of a T-row window against the single
+    // verify windows of 1..8 rows at the Qwen3.8-Flash-Next (qwen4exp) shapes: the rows of a T-row window against the single
     // row products, bit for bit (VROW_INV), and the verify-flagged products against the CPU reference. Q8_0: hc down (K 10240, 320 rows:
     // one row per block + unrolled K), hc up (K 320: 4 rows per block), the gated delta net in-projections (2 products over one input:
     // the multi-matrix launch), attention q / k / v (3 products), shared expert down; Q6_K (the lm head's type), IQ4_XS, Q4_0 (no
@@ -12091,12 +12091,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool mm : {false, true}) {
             test_cases.emplace_back(new test_hc_post_norm(2560, 4, 1, gated, mm));
             test_cases.emplace_back(new test_hc_post_norm(512, 4, 2, gated, mm));
-            // k15-mm2: the 3 / 4 token MTP verify (the post computed in the q8_1 norm kernel)
+            // the 3 / 4 token MTP verify (the post computed in the q8_1 norm kernel)
             test_cases.emplace_back(new test_hc_post_norm(2560, 4, 3, gated, mm));
             test_cases.emplace_back(new test_hc_post_norm(mm ? 40 : 30, 4, 4, gated, mm)); // 40*4 is a Q8_0 row; 40 straddles q8_1 blocks
         }
         test_cases.emplace_back(new test_hc_post_norm(31, 4, 17, gated, false));
-        // k15-mm2: gated outputs with their q8_1 copy (the gated kernel writes it)
+        // gated outputs with their q8_1 copy (the gated kernel writes it)
         if (!gated) {
             for (int64_t nt : {1, 3, 4}) {
                 test_cases.emplace_back(new test_gated_q8_1(0, 640, 1, nt));
@@ -12106,7 +12106,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_gated_q8_1(2, 96, 3, nt));
             }
         }
-        // k15-mm2: hc down + inject, hc up + hc_pre (the first of them also allocates the split-K buffers)
+        // hc down + inject, hc up + hc_pre (the first of them also allocates the split-K buffers)
         if (!gated) {
             for (bool inj_first : {true, false}) {
                 for (int64_t nt : {1, 2, 3, 4}) {
@@ -13892,7 +13892,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1}, 256, GGML_ROPE_TYPE_NEOX,   512, 1.0f, 0.0f, 1.0f, false, 0, true)); // gemma4 E2B sliding
     test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {512,  8, 512, 1}, 128, GGML_ROPE_TYPE_NEOX,   512, 1.0f, 0.0f, 1.0f, true,  0, true)); // gemma4 E4B global
 
-    // k19-q4xt: the GDN conv state concat of a speculative verify window (2..8 tokens, transposed src1) and around the tile kernel's
+    // the GDN conv state concat of a speculative verify window (2..8 tokens, transposed src1) and around the tile kernel's
     // token gate (GGML_CUDA_CONCAT_TRANSPOSED_MIN, default 2), Qwen3.6-35B-A3B (8192 channels) and odd channel counts
     for (int64_t ch : { 8192, 6144, 100 }) {
         for (int64_t n_tok : { 1, 2, 3, 4, 5, 8, 31, 33 }) {
@@ -14135,7 +14135,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 3, 100, 0));
         // more than 65535 tokens per stream (the CUDA grid.y limit), two streams
         test_cases.emplace_back(new test_kq_mask(t, 64, 65600, 2, 0, 0, 0));
-        // k19-kvwin: the window rule (body without the flagged window cells / the ring's window cells), sinks, two streams, 2D
+        // the window rule (body without the flagged window cells / the ring's window cells), sinks, two streams, 2D
         for (int mode : { 1, 2 }) {
             test_cases.emplace_back(new test_kq_mask(t, 1024, 64,  1, 0, 0, 0, mode, 100, 4));
             test_cases.emplace_back(new test_kq_mask(t, 4096, 512, 1, 0, 0, 0, mode, 1024, 0));
@@ -14287,7 +14287,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // k19-fattnq4: q4_0 K / V and the mixed pairs (q4_0 / q8_0, q8_0 / q4_0) at the head sizes the CUDA MMA kernel reads in place
+    // q4_0 K / V and the mixed pairs (q4_0 / q8_0, q8_0 / q4_0) at the head sizes the CUDA MMA kernel reads in place
     // (64 / 128 / 256), decode (nb 1: the vector kernel, mixed pairs in place too), verify windows and prompt batches (staged by default)
     for (const auto & tp : { std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0), std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0),
                              std::make_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0) }) {
@@ -14304,7 +14304,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    // q8_0 / q8_0 at head size 64 (in place since k19-fattnq4)
+    // q8_0 / q8_0 at head size 64 (in place since the q4 flash attention change)
     for (int nr2 : { 1, 2, 8 }) {
         for (int nb : { 2, 3, 8, 16 }) {
             test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32,
@@ -14345,7 +14345,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1}, 2048, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
     }
 
-    // k19-fattnq8: q8_0 K / V at the head sizes the CUDA MMA kernel reads in place (128 / 256), GQA 1 / 2 / 6 (Qwen3.8-27B) / 8
+    // q8_0 K / V at the head sizes the CUDA MMA kernel reads in place (128 / 256), GQA 1 / 2 / 6 (Qwen3.8-27B) / 8
     // (Qwen3.6-35B-A3B), verify windows and prompt batches, KV lengths with and without the 256 padding, with and without sinks
     for (int hs : { 128, 256 }) {
         for (int nr2 : { 1, 2, 6, 8 }) {
@@ -14360,7 +14360,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // k19-decmma: one-row decode over a q8_0 / q4_0 K and V cache at head size 128 / 256 with GQA 4 / 6 / 8 / 16 (the in-place MMA
+    // one-row decode over a q8_0 / q4_0 K and V cache at head size 128 / 256 with GQA 4 / 6 / 8 / 16 (the in-place MMA
     // kernel on CUDA Turing+; the vector kernel with GGML_CUDA_FATTN_DEC_MMA=0 or an unpadded KV length), with and without sinks
     for (const auto & tp : { std::make_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0), std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0),
                              std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0), std::make_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0) }) {
@@ -14376,7 +14376,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // k19-kvwin: two-source flash attention (a q4_0 cache beside a q8_0 ring): decode (1-2 rows), MTP / DFlash verify windows
+    // two-source flash attention (a q4_0 cache beside a q8_0 ring): decode (1-2 rows), MTP / DFlash verify windows
     // (3-16 rows) and prompt batches; head sizes 64 / 128 / 256 and the MLA latent (576 K, V = its first 512); GQA 1 / 2 / 6 / 8; rings of
     // 256 .. 4096 slots, sinks, ALiBi, random (overlapping) masks, mixed and equal types
     for (int hs : { 64, 128, 256 }) {
@@ -14456,7 +14456,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
 
-    // k19-dsv4next: DeepSeek-V4.1 prompt attention: 64 query heads on one K=V head of 512, sinks, prompt rows, bound = window 128 +
+    // DeepSeek-V4.1 prompt attention: 64 query heads on one K=V head of 512, sinks, prompt rows, bound = window 128 +
     // top-k 512 finite entries per row (the CUDA sparse gather from K >= 10240 vs the CPU's dense reference)
     for (int64_t kv : {12288, 16384}) {
         for (int nb : {64, 131}) {
@@ -14482,7 +14482,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
     // quantized cache, deep enough to take the sparse path
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
-    // k19-kvsel: Flash-Next decode / verify rows over a quantized cache that ask for the selected-cell gather (op_params[5] = 1)
+    // Flash-Next decode / verify rows over a quantized cache that ask for the selected-cell gather (op_params[5] = 1)
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
         for (int nb : {1, 2, 5}) {
             for (int64_t kv : {8192, 40960}) {
@@ -14622,7 +14622,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
     }
-    // k19-dsv4long: the DeepSeek-V4.1 SwiGLU limit on its UD-IQ1_S expert types (fused single-column MUL_MAT_ID, incl. the sm_75
+    // the DeepSeek-V4.1 SwiGLU limit on its 1-bit expert types (fused single-column MUL_MAT_ID, incl. the sm_75
     // codebook-in-shared-memory launch) and its dense shared-expert types (fused MUL_MAT)
     for (ggml_type t : { GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS }) {
         for (bool b : {false, true}) {
@@ -14643,7 +14643,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // k15-fn: q / k norm + multi-section rope (the qwen4exp attention and indexer shapes: head dim 256 / 128, partial rotary)
+    // q / k norm + multi-section rope (the qwen4exp attention and indexer shapes: head dim 256 / 128, partial rotary)
     for (int mode : { GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_MROPE }) {
         for (int64_t n_tok : { 1, 3, 17 }) {
             test_cases.emplace_back(new test_norm_mrope({ 256, 16, n_tok }, 64, mode, true));
@@ -14658,7 +14658,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // k15-fn: gated op + quantized mat-vec (the q8_1 copy written by the gated kernel); k = 1024 rows carry no padding, 768 do
+    // gated op + quantized mat-vec (the q8_1 copy written by the gated kernel); k = 1024 rows carry no padding, 768 do
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS }) {
         for (const char * gate : { "swiglu", "sigmoid", "silu" }) {
             for (int64_t k : { 768, 1024 }) {
@@ -14682,8 +14682,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // k15-mm2: QSA selection mask + sparse flash attention (Flash-Next: 256, 2 KV heads x 8 / 12, 2051 cells); at 16k 8 tokens
-    // take the dense kernel (the CUDA backend rebuilds the dense mask), the rest gather; 40 tokens and the prompt ubatches (k19-fuse
+    // QSA selection mask + sparse flash attention (Flash-Next: 256, 2 KV heads x 8 / 12, 2051 cells); at 16k 8 tokens
+    // take the dense kernel (the CUDA backend rebuilds the dense mask), the rest gather; 40 tokens and the prompt ubatches (
     // F6, kill GGML_CUDA_DISABLE_QSA_PROMPT_MASK=1) get the dense mask rebuilt in one launch
     for (int64_t nr : { 8, 12 }) {
         for (int64_t nb : { 1, 3, 8, 40 }) {
@@ -14695,7 +14695,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nb : { 512, 2048 }) {
         test_cases.emplace_back(new test_qsa_sel_fa(256, 2, 12, 8192, nb, 2051));
     }
-    // k19-kvlong: the same with the mask as one ggml_sel_mask node (decode / verify gather, the dense 8-token case, prompts), and the
+    // the same with the mask as one ggml_sel_mask node (decode / verify gather, the dense 8-token case, prompts), and the
     // node alone and against the chain
     for (int64_t nb : { 1, 3, 8, 40 }) {
         test_cases.emplace_back(new test_qsa_sel_fa(256, 2, 12, 16384, nb, 2051, true));
@@ -14734,14 +14734,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // k15-mmvffix: the mat-vec fusions at 1..16 columns, with and without a 0 column product, captured into a CUDA graph
+    // the mat-vec fusions at 1..16 columns, with and without a 0 column product, captured into a CUDA graph
     for (int64_t m : { 1, 2, 3, 4, 8, 9, 10, 12, 15, 16 }) {
         for (bool empty : { false, true }) {
             test_cases.emplace_back(new test_mmv_fused_cols(m, empty));
         }
     }
 
-    // k15-mm2: hc down -> silu(scale) -> up in the up launch (K 320: Flash-Next; 96 / 992: the K range; 1024 and 5 tokens: not fused)
+    // hc down -> silu(scale) -> up in the up launch (K 320: Flash-Next; 96 / 992: the K range; 1024 and 5 tokens: not fused)
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         for (int64_t m : { 1, 2, 3, 4, 5 }) {
             for (int64_t lr : { 96, 320, 992, 1024 }) {
@@ -14752,7 +14752,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // k15-mm2: multi-matrix F32 / BF16 mat-vec (ggml_cuda_mul_mat_vec_f_multi): the same graphs with float weights, 1-4 columns
+    // multi-matrix F32 / BF16 mat-vec (ggml_cuda_mul_mat_vec_f_multi): the same graphs with float weights, 1-4 columns
     // (K 2048 / 2560: Qwen3.6 / Flash-Next alpha + beta, router + shared expert gate, indexer q + k)
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_BF16 }) {
         for (int64_t m : { 1, 2, 3, 4 }) {
@@ -14764,7 +14764,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // k15-mm2: split-K F32 mat-vec (few rows, long K; mmvf.cu): Flash-Next hc inject 10240 -> 4, ssm alpha / beta 2560 -> 48, the
+    // split-K F32 mat-vec (few rows, long K; mmvf.cu): Flash-Next hc inject 10240 -> 4, ssm alpha / beta 2560 -> 48, the
     // shared expert gate 2560 -> 1, a K that is not a multiple of the 1024 chunk, the largest row count it takes, 1-8 columns,
     // and a strided src1 (non contiguous columns)
     for (int64_t n : { 1, 2, 3, 8 }) {
@@ -14944,7 +14944,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_gdn_inplace_gates(48, 128, 3, 3, 3, 0)); // Flash-Next verify shape
     test_cases.emplace_back(new test_gdn_inplace_gates(8, 64, 1, 1, 2, 1));   // no snapshots
-    // k15-fn decode fusions at the Qwen3.8-Flash-Next / Qwen3.6 shapes (decode n_t 1, MTP verify 3), plus the refused orders
+    // decode fusions at the Qwen3.8-Flash-Next / Qwen3.6 shapes (decode n_t 1, MTP verify 3), plus the refused orders
     for (int64_t nt : { 1, 3 }) {
         test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, 3, false));
         test_cases.emplace_back(new test_conv_cat_state(8192, 4, nt, 3, false));   // Qwen3.6 conv channels
@@ -14955,20 +14955,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gate_cont(128, 48, nt, false));
     }
     test_cases.emplace_back(new test_conv_cat_state(10240, 4, 1, 1, false));        // one rollback slot (no drafting)
-    // k19-vrow3: the deep verify windows (DFlash2 n_max 4 / 6 / 7: 5 / 7 / 8 rows and rollback slots), with the qwen4exp state gather's
+    // the deep verify windows (DFlash2 n_max 4 / 6 / 7: 5 / 7 / 8 rows and rollback slots), with the qwen4exp state gather's
     // nodes between the copies and the convolution (the elision looks GGML_CUDA_CONV_CAT_LOOKAHEAD nodes ahead)
     for (int64_t nt : { 5, 7, 8 }) {
         test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, nt, false));
         test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, nt, false, 6));
         test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, nt, true));
     }
-    // k19-fuse F5 prompt ubatches (kill GGML_CUDA_DISABLE_CONV_CAT_PROMPT=1): past the 32-token boundary, a partial tile, 512 / 2048
+    // F5 prompt ubatches (kill GGML_CUDA_DISABLE_CONV_CAT_PROMPT=1): past the 32-token boundary, a partial tile, 512 / 2048
     for (int64_t nt : { 33, 100, 512, 2048 }) {
         test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, 3, false));
         test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, 1, false));
     }
     test_cases.emplace_back(new test_conv_cat_state(10240, 4, 512, 3, true));
-    // k19-fu2 prompt fusions at the Qwen3.8-Flash-Next shapes: F1 the hc combine in the next mix's norm (+ its Q8_0 MMQ copy), F2 the
+    // prompt fusions at the Qwen3.8-Flash-Next shapes: F1 the hc combine in the next mix's norm (+ its Q8_0 MMQ copy), F2 the
     // gated delta net output norm with its MMQ copy (Q8_0 / Q6_K: D4; Q4_K: DS4, not taken), F3 the routed SWIGLU in the down quantize
     for (int64_t nt : { 33, 512, 2048 }) {
         test_cases.emplace_back(new test_hc_post_norm(2560, 4, nt, true, true));
@@ -15019,7 +15019,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // k15-mm2: MUL_MAT_ID over a sparse bank (the MoE cache read in place: 64 of 2091 / 512 slots routed), with the op param 2 hint that
+    // MUL_MAT_ID over a sparse bank (the MoE cache read in place: 64 of 2091 / 512 slots routed), with the op param 2 hint that
     // makes mmq give the empty slots no tile (GGML_CUDA_MMQ_SKIP_EMPTY), and without; 64 to 1024 tokens (the tiling and stream-k paths)
     for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
         for (int n_mats : { 2091, 512 }) {
@@ -15042,7 +15042,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // k19-vrow3: Flash-Next verify products at 1..8 rows, verify-flagged (as a server verify window) and not (the kernels of base)
+    // Flash-Next verify products at 1..8 rows, verify-flagged (as a server verify window) and not (the kernels of base)
     for (int64_t T = 1; T <= 8; ++T) {
         for (auto c : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{
                  { GGML_TYPE_Q8_0, 320, 10240 }, { GGML_TYPE_Q8_0, 10240, 320 }, { GGML_TYPE_Q8_0, 6144, 2560 }, { GGML_TYPE_Q8_0, 2560, 1024 },
@@ -15054,7 +15054,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // k15-lfm2: LFM2.5 prompt expert products (2048 tokens, 4 of 64 experts) over the experts alone and over a 2091-slot cache bank
+    // LFM2.5 prompt expert products (2048 tokens, 4 of 64 experts) over the experts alone and over a 2091-slot cache bank
     for (auto tmk : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{ { GGML_TYPE_Q4_K, 1536, 2048 }, { GGML_TYPE_Q5_K, 2048, 1536 } }) {
         const auto [t, m, k] = tmk;
         test_cases.emplace_back(new test_mul_mat_id_sparse(t, 64, 64, 4, m, 2048, k));
@@ -15063,7 +15063,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id_sparse(t, 512, 64, 4, m, 2048, k));
     }
 
-    // k15-lfm2: LFM2.5-24B-A2B verify at 1 / 8 rows (n-gram windows of 7 drafts): the dense products (attention q / k / v / o Q8_0, short
+    // LFM2.5-24B-A2B verify at 1 / 8 rows (n-gram windows of 7 drafts): the dense products (attention q / k / v / o Q8_0, short
     // conv in / out Q4_K, dense FFN Q8_0, tied output head Q8_0, router F32) and FA (head 64, 8 KV heads, GQA 4) at 2k / 8k / 16k KV,
     // with the verify flag (bi=1) and without
     for (int64_t n : { 1, 2, 4, 8 }) {
@@ -15085,7 +15085,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // k15-mm: Flash-Next (qwen4exp) decode projections at 1 and 3 columns (an MTP verify window): hyper-connection down / up / inject,
+    // Flash-Next (qwen4exp) decode projections at 1 and 3 columns (an MTP verify window): hyper-connection down / up / inject,
     // gated delta net qkv / gate / out, attention q, shared expert, router and the linear-attention alpha / beta
     for (int64_t n : { 1, 3 }) {
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 320, 10240 }, { 10240, 320 }, { 10240, 2560 }, { 6144, 2560 }, { 2560, 6144 },
@@ -15095,9 +15095,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 4, 10240 }, { 48, 2560 }, { 512, 2560 }, { 1, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
         }
-        // k15-mm2: hc down -> silu(scale) -> up (+ sigmoid) at the Flash-Next shape (GGML_CUDA_MMVQ_EW=0: the unfused launches)
+        // hc down -> silu(scale) -> up (+ sigmoid) at the Flash-Next shape (GGML_CUDA_MMVQ_EW=0: the unfused launches)
         test_cases.emplace_back(new test_hc_mix(GGML_TYPE_Q8_0, n, 320, 0, false, 10240));
-        // k15-mm2: the router and indexer shapes as BF16 (the F32 router weights are exactly BF16-representable; indexer q / k)
+        // the router and indexer shapes as BF16 (the F32 router weights are exactly BF16-representable; indexer q / k)
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 512, 2560 }, { 128, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
         }
@@ -15421,7 +15421,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
-    // k15-mm2: decode attention (vector kernel) for the KV split cap (GGML_CUDA_FA_PB_MIN_TILES / GGML_CUDA_FA_PB_MAX):
+    // decode attention (vector kernel) for the KV split cap (GGML_CUDA_FA_PB_MIN_TILES / GGML_CUDA_FA_PB_MAX):
     // LFM2.5 (64, 8 KV heads x 4), Qwen3.6 / Flash-Next full attention (256, 2 x 8; 1 and 3 queries), gemma-4 26B (sliding 256 and
     // global 512), gpt-oss (64, 8 x 8, sinks)
     for (int64_t kv : { 2048, 8192, 32768 }) {
@@ -15643,7 +15643,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
-    // k15-mm2: chunked MMA eligible prefill shapes (16 key heads): Qwen3.6-35B-A3B (32 value heads), Flash-Next / Qwen3.6-27B (48)
+    // chunked MMA eligible prefill shapes (16 key heads): Qwen3.6-35B-A3B (32 value heads), Flash-Next / Qwen3.6-27B (48)
     for (int64_t n_tok : { 512, 2048 }) {
         for (int v_rep : { 2, 3 }) {
             test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tok, 1, v_rep));

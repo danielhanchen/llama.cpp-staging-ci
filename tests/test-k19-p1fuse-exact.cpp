@@ -1,4 +1,4 @@
-// Bit identity of the k19-p1fuse CUDA changes, at the real decode / verify / prompt shapes of Qwen3.5 / 3.6 (qwen35, qwen35moe):
+// Bit identity of the CUDA changes, at the real decode / verify / prompt shapes of Qwen3.5 / 3.6 (qwen35, qwen35moe):
 //   8.1a: the gated_delta_net fusion predicate (GGML_CUDA_GDN_FUSE_PRED=0: shape-only) lets a 2..8-token replay window (and any launch
 //         that takes the AR kernel) read its state in place from the cache rows and apply its gates in the kernel;
 //   6.2a: the gated output norm RMS_NORM -> MUL -> SILU(z) -> MUL in one kernel (GGML_CUDA_GATED_NORM_SILU=0: sigmoid only), with the
@@ -6,7 +6,7 @@
 //   2.3:  mul_mat_vec_f with one barrier for all its columns (GGML_CUDA_MMVF_ONEBAR=0: a barrier pair per column), F32 / F16 / BF16
 //         weights at 1..8 columns, also the multi-matrix launch (alpha + beta of a delta-net layer).
 // Three children of this binary run every case and dump the outputs: "head" (defaults), "kill" (the three switches off = the code
-// before k19-p1fuse) and "unfused" (kill + the gated norm, the in-place state and the gate fusions off). The parent compares the dumps
+// before this change) and "unfused" (kill + the gated norm, the in-place state and the gate fusions off). The parent compares the dumps
 // byte for byte. GGML_CUDA_P1FUSE_STATS=1 makes each child print its launch counts at exit (stderr): the head child must take every
 // new path (counts > 0), the kill and unfused children none, so a silent fallback fails. No CUDA device: SKIP, exit 0.
 

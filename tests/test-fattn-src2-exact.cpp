@@ -1,5 +1,5 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
-// k19-fattnq4: two-source flash attention (ggml_flash_attn_ext_set_src2: a body K / V with its mask plus a ring K / V with its own mask)
+// two-source flash attention (ggml_flash_attn_ext_set_src2: a body K / V with its mask plus a ring K / V with its own mask)
 // on the CUDA MMA kernel, byte for byte:
 //   (a) the two-source node in place (body q4_0 / q4_0 or q8_0 / q8_0 read in place, ring q8_0 / q8_0 in place; default load mode and
 //       GGML_CUDA_FATTN_Q8_MODE=1 synchronous loads) == the same node staged (GGML_CUDA_FATTN_Q4_INPLACE=0, GGML_CUDA_FATTN_Q8_INPLACE=0:
@@ -9,7 +9,7 @@
 //       softmax, so it computes exactly what the one-source kernel computes over the concatenation.
 // Each mode runs in a child process (the switches are read once per process). K / V in the KV cache layout ([D*HKV, cells], viewed per
 // head and permuted), per cell scales from 1e-6 to 1e2; masks: the body sees a causal prefix minus the cells in the ring window, the
-// ring sees its window slots (some empty, some masked), so the two are disjoint as k19-kvwin builds them. Head sizes 64 / 128 / 256 and
+// ring sees its window slots (some empty, some masked), so the two are disjoint as the recent-window ring builds them. Head sizes 64 / 128 / 256 and
 // the MLA 576 / 512 (V = view of K, staged), GQA 1 / 2 / 6 / 8, 1 .. 512 query rows, body 256 .. 8192 cells, ring 256 / 1792.
 // Gate: every case equal in (a) and (b), the two-source kernel logged in every mode. No CUDA device: SKIP, exit 0.
 

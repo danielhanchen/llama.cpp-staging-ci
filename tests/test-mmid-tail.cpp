@@ -1,4 +1,4 @@
-// k19-exactdet: single column MUL_MAT_ID launches whose last row block is partial (small K: rows per block = warps; rows not a
+// single column MUL_MAT_ID launches whose last row block is partial (small K: rows per block = warps; rows not a
 // multiple of it) must not write past an expert's rows. Before the fix the row guard of mul_mat_vec_q compared against the token stride,
 // so the last block of slot s wrote its rows past N into slot s+1's first rows (two blocks writing one value: the bytes depended on which
 // wrote last, run to run) and the last slot of the last token wrote past dst. Checks, per case (types, fused gate + up + SWIGLU or the
@@ -186,7 +186,7 @@ static std::vector<tcase> make_cases() {
         { 1024, 68, 32, 16, true  },   // rows a multiple of 4, not of 8 (8 rows per block levers)
         { 4096, 70, 16, 16, true  },   // K of 16 super-blocks: no small-K launch, the codebook / grid launches with 2 / 4 / 8 rows
         { 4096, 72, 16, 16, true  },   // same, rows a multiple of 8
-        {  512, 68, 32, 16, false },   // k19-q4xt: K of one warp pass (warp per row launch), rows a multiple of 4, not of 8
+        {  512, 68, 32, 16, false },   // K of one warp pass (warp per row launch), rows a multiple of 4, not of 8
         {  512, 72, 32, 16, true  },   // same, rows a multiple of 8
     };
     const ggml_type types[] = { GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
@@ -339,21 +339,21 @@ int main(int argc, char ** argv) {
         std::vector<std::string> envs = { "TAIL_MODE=exact GGML_CUDA_VERIFY_REASSOC=0", "TAIL_MODE=exact_per_token GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MMVQ_EXACT_IDS_MERGE=0" };
         // every single column launch lever on (default) / off / at its other rows per block, plain and in the exact verify mode
         const char * levers[][2] = {
-            { "iqtab0",    "GGML_CUDA_MMVQ_IQ_TAB=0" },                // k19-dsv4p IQ1_S / IQ2_XXS codebook off
+            { "iqtab0",    "GGML_CUDA_MMVQ_IQ_TAB=0" },                // IQ1_S / IQ2_XXS codebook off
             { "iqtab2",    "GGML_CUDA_MMVQ_IQ_TAB=2" },                // and forced on (any table)
             { "idsrows1",  "GGML_CUDA_MMVQ_TURING_IDS_ROWS=1" },       // its MUL_MAT_ID rows per block 1 / 4 (default 2)
             { "idsrows4",  "GGML_CUDA_MMVQ_TURING_IDS_ROWS=4" },
-            { "gsm0",      "GGML_CUDA_MMVQ_GRID_SMEM=0" },             // k19-q38t IQ3 grid in shared memory off
-            { "gids0",     "GGML_CUDA_MMVQ_GRID_IDS=0" },              // k19-iqsmem IQ3 MUL_MAT_ID rows: off / 2 / 4 / 8
+            { "gsm0",      "GGML_CUDA_MMVQ_GRID_SMEM=0" },             // IQ3 grid in shared memory off
+            { "gids0",     "GGML_CUDA_MMVQ_GRID_IDS=0" },              // IQ3 MUL_MAT_ID rows: off / 2 / 4 / 8
             { "gids2",     "GGML_CUDA_MMVQ_GRID_IDS=2" },
             { "gids4",     "GGML_CUDA_MMVQ_GRID_IDS=4" },
             { "gids8",     "GGML_CUDA_MMVQ_GRID_IDS=8" },
             { "gidsw0",    "GGML_CUDA_MMVQ_GRID_IDS_WARPS=0" },        // its 2 warps off
             { "gids8w0",   "GGML_CUDA_MMVQ_GRID_IDS=8 GGML_CUDA_MMVQ_GRID_IDS_WARPS=0" },
-            { "iq2tab0",   "GGML_CUDA_MMVQ_IQ2_TAB=0" },               // k19-iqsmem IQ2_XS / IQ2_S codebook off
+            { "iq2tab0",   "GGML_CUDA_MMVQ_IQ2_TAB=0" },               // IQ2_XS / IQ2_S codebook off
             { "iq2r4",     "GGML_CUDA_MMVQ_IQ2_TAB_ROWS=4" },          // its dense rows 4 / 8
             { "iq2r8",     "GGML_CUDA_MMVQ_IQ2_TAB_ROWS=8" },
-            { "wpr0",      "GGML_CUDA_MMVQ_IDS_WPR=0" },               // k19-q4xt warp per row MUL_MAT_ID launch off
+            { "wpr0",      "GGML_CUDA_MMVQ_IDS_WPR=0" },               // warp per row MUL_MAT_ID launch off
             { "wprw2r1",   "GGML_CUDA_MMVQ_IDS_WPR_W=2 GGML_CUDA_MMVQ_IDS_WPR_ROWS=1" },   // its warps x rows (default 4 x 2)
             { "wprw2r2",   "GGML_CUDA_MMVQ_IDS_WPR_W=2 GGML_CUDA_MMVQ_IDS_WPR_ROWS=2" },
             { "wprw4r4",   "GGML_CUDA_MMVQ_IDS_WPR_W=4 GGML_CUDA_MMVQ_IDS_WPR_ROWS=4" },

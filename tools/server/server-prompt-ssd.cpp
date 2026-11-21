@@ -21,7 +21,7 @@ namespace fs = std::filesystem;
 
 static constexpr uint32_t SSD_MAGIC     = 0x4353504c; // "LPSC"
 static constexpr uint32_t SSD_MAGIC_END = 0x444e4550; // "PEND"
-// 2 (k19-fixF): the namespace of 1 did not include --override-kv, so a cache written with overrides by a version-1 build sits in the
+// 2: the namespace of 1 did not include --override-kv, so a cache written with overrides by a version-1 build sits in the
 // default namespace; the bump retires every version-1 entry (one miss on upgrade)
 static constexpr uint32_t SSD_VERSION   = server_prompt_ssd::FORMAT_VERSION;
 
@@ -785,8 +785,8 @@ std::string server_prompt_ssd_namespace(
             params.rope_freq_scale, params.yarn_ext_factor, params.yarn_attn_factor, params.yarn_beta_fast,
             params.yarn_beta_slow, params.yarn_orig_ctx));
 
-    // k19-fixE: the lines below are added only off their defaults, so that a default configuration keeps its namespace (directory)
-    // k19-kvwin: the KV window ring (its rows are part of the saved states)
+    // the lines below are added only off their defaults, so that a default configuration keeps its namespace (directory)
+    // the KV window ring (its rows are part of the saved states)
     if (params.kv_win >= 0) {
         add("kv_win", string_format("%d|%d|%s|%s", params.kv_win, params.kv_win_sinks, ggml_type_name(params.cache_type_k_win),
                 ggml_type_name(params.cache_type_v_win)));
@@ -809,7 +809,7 @@ std::string server_prompt_ssd_namespace(
             case LLAMA_KV_OVERRIDE_TYPE_STR:   v = std::string(o.val_str, strnlen(o.val_str, sizeof(o.val_str))); break;
         }
         // the key and a str value are free text: escaped, so that a newline cannot forge another line and a ':' cannot move the
-        // key / value boundary (k19-fixF)
+        // key / value boundary
         auto esc = [](const std::string & x) {
             std::string r;
             for (const char c : x) {

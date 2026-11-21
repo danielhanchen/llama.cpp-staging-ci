@@ -405,7 +405,7 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
-// k19-npmtp: two parallel requests with draft verify windows (llama-server --parallel N with an MTP / draft model). A batch holds the
+// two parallel requests with draft verify windows (llama-server --parallel N with an MTP / draft model). A batch holds the
 // verify window of one sequence and a prompt chunk of another, so the window is not in the last ubatch of the decode; the window is
 // then rolled back after the decode. A later batch places two windows so that the cells move. Run with the delta-net rollback by replay
 // (LLAMA_RS_REPLAY=1) against the snapshot rows (LLAMA_RS_REPLAY=0), every logit compared. Before the fix the replay context committed
@@ -534,7 +534,7 @@ struct case_replay_overlap : ctx_test {
             }
         }
 
-        // the four requests of llama-server --parallel 4 (G4 k15kn_g4 par4): a verify window of seq 0 in its own ubatch, then a ubatch
+        // the four requests of llama-server --parallel 4 (RTX PRO 6000): a verify window of seq 0 in its own ubatch, then a ubatch
         // of the three others whose cells are gathered next to each other, which moves the cell of seq 0 before its rollback
         CTX_REQUIRE(both({ { 0, pos[0], pos[0] + 3 }, { 1, pos[1], pos[1] + 4 }, { 2, pos[2], pos[2] + 4 }, { 3, n_pre, n_pre + 4 } }),
                 "four-sequence decode failed");
@@ -682,12 +682,12 @@ struct case_k19_move : ctx_test {
 // window) of several sequences decoded together, against a context that decodes one sequence per ubatch; every state after every step.
 // Covers several moved cells per ubatch, chains of swaps, a window whose cell is the destination of another, and rollbacks consumed by
 // a ubatch of other sequences.
-// k19-rsbis: the attention runs without flash attention on F32 K / V, and the logits of every token are compared too. The CPU flash
+// the attention runs without flash attention on F32 K / V, and the logits of every token are compared too. The CPU flash
 // attention accumulates an F16 V in F16 (ggml-cpu ops.cpp, VKQ16), so its result depends on the order of the cells, which differs
 // between the two contexts: kimi-k3 / glm5-next differed by up to 1.1e-3 of the state (bf16 or q8_0 V, or no flash attention: 4e-7),
 // with the same recurrent rows. The state bytes are compared only without SWA layers: a PARTIAL_ONLY save also holds the SWA cells,
 // in cell order, and the masked cells the cache did not reuse yet (lfm2: one more cell, out of the window of every next token).
-// k19-rsbis: with SWA layers each sequence has its own KV stream here (kv_unified = 0). In a unified SWA cache a later ubatch of
+// with SWA layers each sequence has its own KV stream here (kv_unified = 0). In a unified SWA cache a later ubatch of
 // another sequence can take a cell that only the tokens of a verify window masked, and the rollback of that window cannot bring it
 // back, so the logits after the rollback depend on the placement (a limitation of the unified SWA cache with partial rollbacks;
 // case_swa_prepare covers the purge inside one decode, which was a bug)
@@ -848,7 +848,7 @@ struct case_k19_fuzz : ctx_test {
     }
 };
 
-// k19-rsbis: the SWA purge inside one decode. llama_kv_cache::prepare() places every ubatch of a decode ahead and puts the cells
+// the SWA purge inside one decode. llama_kv_cache::prepare() places every ubatch of a decode ahead and puts the cells
 // back; the purge of a ubatch (the positions of a sequence below a masked cell it reuses) also removed cells outside its slot, and
 // those stayed removed, so an earlier ubatch of the same decode ran without cells still in its window. A k19_fuzz schedule (seed 4,
 // 4 sequences, steps 0..8 of lfm2): at the last decode seq 0 was cleared and restarts beside seq 2, its second ubatch reuses the cell

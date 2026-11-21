@@ -56,23 +56,23 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
-// k15-fn: the chain picks the argmax of the raw logits (greedy, no logit bias, no active penalties, no probabilities requested)
+// the chain picks the argmax of the raw logits (greedy, no logit bias, no active penalties, no probabilities requested)
 bool common_sampler_device_greedy(const struct common_sampler * gsmpl);
-// k15-fn: the request picks the argmax with a token set excluded (every bias -inf, e.g. ignore_eos): true and mask = those tokens, ascending
+// the request picks the argmax with a token set excluded (every bias -inf, e.g. ignore_eos): true and mask = those tokens, ascending
 bool common_sampler_device_greedy_masked(const struct common_sampler * gsmpl, std::vector<llama_token> & mask);
-// k15-fn: the chain gives the same token and candidates from the k_dev highest raw logits of a row (a device top-k, see
+// the chain gives the same token and candidates from the k_dev highest raw logits of a row (a device top-k, see
 // common_sampler_device_topk in sampling.cpp for the conditions): k_dev, or 0 when the request needs the full row
 int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t k_dev);
-// k15-fn: the rows' logits are device top-k candidates (put in id order before the chain)
+// the rows' logits are device top-k candidates (put in id order before the chain)
 void common_sampler_set_device_topk(struct common_sampler * gsmpl, bool on);
-// k15-fn: the sampler takes the token a device greedy chain picked for the row (the server sets it for device greedy requests)
+// the sampler takes the token a device greedy chain picked for the row (the server sets it for device greedy requests)
 void common_sampler_set_device_token(struct common_sampler * gsmpl, bool on);
-// k19-gramdev: a device top-k request with a grammar or a reasoning budget also needs its raw rows on the host
+// a device top-k request with a grammar or a reasoning budget also needs its raw rows on the host
 // (llama_set_sampler_keep_logits) for the positions the candidates cannot decide
 bool common_sampler_device_topk_needs_raw(const struct common_sampler * gsmpl);
-// k19-gramdev: LLAMA_DEVICE_TOPK_GRAMMAR (default 1); 0: grammar / reasoning budget requests sample the full rows on the host as before
+// LLAMA_DEVICE_TOPK_GRAMMAR (default 1); 0: grammar / reasoning budget requests sample the full rows on the host as before
 bool common_sampler_device_topk_grammar_enabled();
-// k19-gramdev: rows sampled from device top-k candidates with a grammar / reasoning budget; rejected = the grammar rejected the chain's
+// rows sampled from device top-k candidates with a grammar / reasoning budget; rejected = the grammar rejected the chain's
 // token, fallback = the candidates could not decide the resample, forced = the reasoning budget was forcing; full = full rows sampled
 struct common_sampler_dev_stats {
     int64_t n_rows     = 0;
@@ -121,7 +121,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
-// k19-sharednoise: shared-noise (Gumbel-max) sampling, LLAMA_SHARED_NOISE=1 (default off; 0 = off, the kill switch).
+// shared-noise (Gumbel-max) sampling, LLAMA_SHARED_NOISE=1 (default off; 0 = off, the kill switch).
 // The final draw of a sampled chain (the one `dist` makes) becomes argmax_i(l_i + g(seed, n, i)) over the candidates the chain left
 // (after penalties, truncation and temperature), with g a Gumbel(0, 1) variate computed from a counter-based hash of the request
 // seed, the number n of tokens the sampler has accepted so far, and the token id. That is an exact sample of softmax(l): the
@@ -152,7 +152,7 @@ struct common_shared_noise_draft {
     float    pen_present = 0.0f;
     std::vector<llama_token> window;              // the target's last pen_last_n accepted tokens
     std::vector<std::pair<llama_token, float>> scratch;
-    // k19-q4xaccept: 0 = Gumbel-max with the target's shared noise; 2 = the argmax of the mirrored chain (the request's penalties applied
+    // 0 = Gumbel-max with the target's shared noise; 2 = the argmax of the mirrored chain (the request's penalties applied
     // to the draft's candidates)
     int32_t mode = 0;
 };
@@ -160,7 +160,7 @@ struct common_shared_noise_draft {
 // fills sn from the target sampler: false (sn.on = false) when its chain does not end in the shared-noise stage
 bool common_sampler_shared_noise_draft_init(const struct common_sampler * gsmpl, common_shared_noise_draft & sn);
 
-// k19-q4xaccept: fills sn (mode 2) from a target sampler whose request has penalties (repeat / frequency / presence over a window):
+// fills sn (mode 2) from a target sampler whose request has penalties (repeat / frequency / presence over a window):
 // the drafter then proposes the argmax of its candidates after the request's penalties (window = the target's last tokens plus the ones
 // drafted before), the token the target is most likely to pick. false (sn.on = false) without penalties (the argmax is unchanged
 // then), for shared noise, mirostat and backend sampling
