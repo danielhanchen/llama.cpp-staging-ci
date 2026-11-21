@@ -3122,6 +3122,11 @@ llama_context::~llama_context() {
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
+
+    // the probes share one graph until a probe changes the flags it was built with (LLAMA_FUSED_PROBE_REUSE=0: one graph per probe)
+    static const bool reuse = getenv("LLAMA_FUSED_PROBE_REUSE") == nullptr || atoi(getenv("LLAMA_FUSED_PROBE_REUSE")) != 0;
+    uint32_t n_tokens_gf = 0; // 0 = no valid graph
+
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
         if (!enabled) {
             return;
@@ -3129,9 +3134,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
         const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
 
-        auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
-        if (!gf) {
-            throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
+        if (!reuse || n_tokens_gf != n_tokens_probe) {
+            auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
+            if (!gf) {
+                throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
+            }
+            n_tokens_gf = n_tokens_probe;
         }
 
         bool device_mismatch = false;
@@ -3163,6 +3171,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
         if (device_mismatch) {
             enabled = false;
+            n_tokens_gf = 0;
             LLAMA_LOG_WARN("%s: %s not supported, set to disabled\n", func, probe.name);
         } else {
             enabled = true;
