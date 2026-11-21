@@ -14757,7 +14757,8 @@ struct llama_moe_cache::impl {
             s.lru = g.lru;
             s.slot_maps.resize(g.layers.size());
             for (size_t j = 0; j < g.layers.size(); ++j) {
-                const int32_t * p = g.lru.slot_map[g.layers[j]];
+                // a group the budget left uncached keeps its layers but has no slot maps (its LRU was never initialized)
+                const int32_t * p = (size_t) g.layers[j] < g.lru.slot_map.size() ? g.lru.slot_map[g.layers[j]] : nullptr;
                 s.slot_maps[j].assign(p, p + (p != nullptr ? g.lru.n_expert : 0));
             }
             pw_get(g.map,    s.dev[0]);
@@ -14859,7 +14860,7 @@ struct llama_moe_cache::impl {
             }
             g.lru = s.lru;
             for (size_t j = 0; j < g.layers.size(); ++j) {
-                int32_t * p = g.lru.slot_map[g.layers[j]];
+                int32_t * p = (size_t) g.layers[j] < g.lru.slot_map.size() ? g.lru.slot_map[g.layers[j]] : nullptr;
                 if (p != nullptr && !s.slot_maps[j].empty()) {
                     memcpy(p, s.slot_maps[j].data(), s.slot_maps[j].size()*sizeof(int32_t));
                 }
@@ -14926,7 +14927,7 @@ struct llama_moe_cache::impl {
             mixb(hl, g.lru.scores.data(), g.lru.scores.size()*sizeof(int32_t));
             mixv(hl, g.lru.head); mixv(hl, g.lru.tail); mixv(hl, g.lru.w); mixv(hl, g.lru.n_lent); mixv(hl, g.lru.n_core);
             for (int32_t il : g.layers) {
-                if (g.lru.slot_map[il] != nullptr) {
+                if ((size_t) il < g.lru.slot_map.size() && g.lru.slot_map[il] != nullptr) {
                     mixb(hl, g.lru.slot_map[il], g.lru.n_expert*sizeof(int32_t));
                 }
             }
