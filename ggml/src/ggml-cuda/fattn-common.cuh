@@ -1302,7 +1302,10 @@ void launch_fattn(
             qsa = &it->second;
         }
     }
-    const bool qsa_gather = qsa && !qsa->prompt && use_sparse && ggml_cuda_qsa_maskless_gather_ok(*qsa) && ggml_cuda_qsa_maskless_mode() == 1;
+    // (one query per tile only: a wider tile shares the union of its queries' cells, where the causal mask of one query is finite at
+    // cells only another query selected, so it takes the dense mask)
+    const bool qsa_gather = qsa && !qsa->prompt && use_sparse && ncols1 == 1 && ggml_cuda_qsa_maskless_gather_ok(*qsa) &&
+        ggml_cuda_qsa_maskless_mode() == 1;
     // the mask node's buffer may hold the selection or the causal mask (the allocator reused it), then a pool copy takes the mask;
     // allocated before the kernel's pool buffers, freed after them
     // (the dense mask of the graph node, all of its padded cells; the launch reads the live ones through the same strides)
@@ -1637,9 +1640,10 @@ void launch_fattn(
         // tile the same number of blocks) or none, read again by the kernel and the fixup from the live length
         const int nblocks_live = blocks_num.x;
         fixup_kind = (nblocks_live % ntiles_dst == 0 && nblocks_live > ntiles_dst) ? 1 : (ntiles_dst % nblocks_live != 0 ? 2 : 0);
-        // (or K / V read in place by the kernel, need_f16_* false: no conversion that follows the length)
+        // (or K / V read in place by the kernel, need_f16_* false: no conversion that follows the length). Not with the INT8 rows of
+        // an f16 K: their staging launch quantizes the K rows of the length it was launched with, so it is launched again per length
         dev_ok = !use_sparse && !scan_mask && K2 == nullptr && (K->type == GGML_TYPE_F16 || !need_f16_K) && (V->type == GGML_TYPE_F16 || !need_f16_V) &&
-            fixup_kind != 2;
+            fixup_kind != 2 && i8_f16 == 0;
         if (kvl && kvl->kv_len && !probe) {
             GGML_ASSERT(dev_ok && "a device KV length needs the launch choices the probe found");
             // the grid of the padded length (the block count only grows with the length), the blocks past the live count exit

@@ -1504,6 +1504,7 @@ struct ggml_cuda_q8_1_cache {
         const char * src_hi = nullptr;
         int64_t      key[n_key] = {};
         bool         valid  = false;
+        bool         side   = false; // written by a side-stream branch (see side_stream)
     };
 
     char * arena     = nullptr; // n_slots * slot_size bytes, owned by the graph evaluation
@@ -1513,6 +1514,9 @@ struct ggml_cuda_q8_1_cache {
     // slots handed out so far (get() misses + reserve()), never reset within an evaluation: a side-stream branch that reads
     // slots is joined before the main stream could hand any of them out again (see ggml_cuda_side_chain_plan)
     uint64_t n_claims = 0;
+    // set while a side-stream branch is enqueued: the copies it makes are only complete for the main stream after its join, so they
+    // are dropped when the branch ends (invalidate_side) and a main-stream reader makes its own
+    bool   side_stream = false;
     entry  entries[n_slots];
     std::unordered_set<const void *> norm_targets; // producer tensors whose kernel writes the q8_1 copy (see ggml_cuda_q8_1_cache_slot_size)
     // the reader's row length of a producer target whose rows differ from the reader's (any width: the gated producer writes its
@@ -1528,6 +1532,7 @@ struct ggml_cuda_q8_1_cache {
         slot_size = slot_size_;
         next      = 0;
         pending   = -1;
+        side_stream = false;
         invalidate_all();
     }
 
@@ -1559,6 +1564,7 @@ struct ggml_cuda_q8_1_cache {
         e.src_hi = (const char *) src + src_nbytes;
         std::copy(key, key + n_key, e.key);
         e.valid = true;
+        e.side  = side_stream;
         return arena + i*slot_size;
     }
 
@@ -1577,6 +1583,7 @@ struct ggml_cuda_q8_1_cache {
         e.src_hi = (const char *) src + src_nbytes;
         std::copy(key, key + n_key, e.key);
         e.valid = false;
+        e.side  = side_stream;
         pending = i;
         return arena + i*slot_size;
     }
@@ -1594,6 +1601,15 @@ struct ggml_cuda_q8_1_cache {
         for (entry & e : entries) {
             if (e.valid && lo < e.src_hi && e.src_lo < hi) {
                 e.valid = false;
+            }
+        }
+    }
+
+    void invalidate_side() {
+        for (entry & e : entries) {
+            if (e.side) {
+                e.valid = false;
+                e.side  = false;
             }
         }
     }

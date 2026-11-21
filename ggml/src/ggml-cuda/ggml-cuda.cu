@@ -1755,6 +1755,8 @@ static size_t ggml_backend_cuda_buffer_move(ggml_backend_buffer_t buffer, size_t
             return SIZE_MAX;
         }
         CUDA_CHECK(cudaMemcpy((void *) tmp, (const void *) at, ctx->lazy_gran, cudaMemcpyDeviceToDevice));
+        // a device-to-device cudaMemcpy may return before the copy has finished: wait for it before either mapping goes away
+        CUDA_CHECK(cudaDeviceSynchronize());
         CU_CHECK(cuMemUnmap(tmp, ctx->lazy_gran));
         CU_CHECK(cuMemUnmap(at, ctx->lazy_gran));
         CU_CHECK(cuMemRelease(ctx->chunks[i]));
@@ -7768,9 +7770,10 @@ static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const gg
 static bool ggml_cuda_gdn_sigmoid_deferred(const ggml_cgraph * cgraph, int i);
 
 // no node between i and j writes over the bytes of t (the allocator may reuse them once their last planned reader ran); a beta
-// sigmoid that its gated_delta_net applies itself (ggml_cuda_gdn_sigmoid_deferred) writes nothing
+// sigmoid that its gated_delta_net applies itself (ggml_cuda_gdn_sigmoid_deferred) writes nothing. The consumer j itself is checked
+// too: it reads t while it writes its own output, so its output may not have been placed over the freed bytes of t either
 static bool ggml_cuda_kept_until(const ggml_cgraph * cgraph, int i, int j, const ggml_tensor * t, bool skip_deferred = false) {
-    for (int m = i + 1; m < j; ++m) {
+    for (int m = i + 1; m <= j; ++m) {
         const ggml_tensor * n = cgraph->nodes[m];
         if (ggml_cuda_is_view_or_noop(n) || n->data == nullptr) {
             continue;
@@ -10293,6 +10296,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     cudaEvent_t join = cuda_ctx->side_mv_join[side_mv_n_events++];
                     CUDA_CHECK(cudaEventRecord(join, cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM)));
                     side_mv_pending.push_back({ side_chain_reader, join });
+                    cuda_ctx->q8_1_cache.invalidate_side();
+                    cuda_ctx->q8_1_cache.side_stream = false;
                     cuda_ctx->src1_memo.release();
                     cuda_ctx->src1_memo.share_next = false;
                     cuda_ctx->side_chain_active = false;
@@ -10327,6 +10332,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         cuda_ctx->src1_memo.share_next = false;
                         cuda_ctx->curr_stream_no    = GGML_CUDA_SIDE_MV_STREAM;
                         cuda_ctx->side_chain_active = true;
+                        cuda_ctx->q8_1_cache.side_stream = true;
                         cuda_ctx->side_chain_last   = it->second.first;
                         side_chain_reader  = it->second.second;
                         // the slot of x's q8_1 copy was handed out before the fork: counted from one claim earlier
@@ -10597,6 +10603,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 CUDA_CHECK(cudaEventRecord(cuda_ctx->side_mv_fork, cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM)));
                 CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(cuda_ctx->device, 0), cuda_ctx->side_mv_fork, 0));
                 cuda_ctx->side_chain_active = false;
+                cuda_ctx->q8_1_cache.invalidate_side();
+                cuda_ctx->q8_1_cache.side_stream = false;
                 cuda_ctx->side_chain_last   = -1;
                 cuda_ctx->curr_stream_no    = 0;
             }

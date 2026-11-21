@@ -839,7 +839,10 @@ static bool mul_mat_vec_f_splitk_plan(ggml_backend_cuda_context & ctx, const flo
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaMalloc((void **) &ctx.mmvf_splitk_part, GGML_CUDA_MAX_STREAMS*part_per_stream*sizeof(float)));
         CUDA_CHECK(cudaMalloc((void **) &ctx.mmvf_splitk_cnt,  GGML_CUDA_MAX_STREAMS*MMVF_SPLITK_MAX_ROWS*sizeof(unsigned int)));
-        CUDA_CHECK(cudaMemset(ctx.mmvf_splitk_cnt, 0, GGML_CUDA_MAX_STREAMS*MMVF_SPLITK_MAX_ROWS*sizeof(unsigned int)));
+        // zeroed on the backend stream and waited for: a cudaMemset runs on the legacy default stream, which the non-blocking
+        // backend streams do not wait for, so a first split-K kernel could count arrivals before the counters are zero
+        CUDA_CHECK(cudaMemsetAsync(ctx.mmvf_splitk_cnt, 0, GGML_CUDA_MAX_STREAMS*MMVF_SPLITK_MAX_ROWS*sizeof(unsigned int), stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     // one region per stream: products on the side / concurrent streams may run at the same time as those on stream 0
     a.x              = x;

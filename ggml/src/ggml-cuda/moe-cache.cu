@@ -412,6 +412,25 @@ static __global__ void moe_cache_assign(
         n_take = pf.max_fill;
         __syncthreads();
     }
+    // a prefetch admits at most the slots its hits leave unpinned (its top-n predictions may outnumber the slots, which a lookup's
+    // distinct ids never do); the rest stay uncached
+    if (pf.is_pf) {
+        int n_pin = n_hit;
+        for (int off = MOE_CACHE_LANES/2; off > 0; off >>= 1) {
+            n_pin += __shfl_xor_sync(full, n_pin, off, MOE_CACHE_LANES);
+        }
+        const int n_room = max(0, n_slots - lo - n_pin);
+        if (n_take > n_room) {
+            for (int j = n_room + lane; j < n_take; j += MOE_CACHE_LANES) {
+                row[take_e[j]] = -1;
+            }
+            if (lane == 0) {
+                pf.stat[MOE_PF_STAT_CAPPED] += (unsigned long long) (n_take - n_room);
+            }
+            n_take = n_room;
+            __syncthreads();
+        }
+    }
 
     // victims: CLOCK sweep, 32 slots at a time, the slots used by this lookup are skipped
     // there are enough unpinned slots because the number of distinct ids is at most the number of slots
@@ -1805,7 +1824,8 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
             n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q,
             scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, ggml_get_op_params_i32(dst, 15),
-            tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
+            // the skip counter is words 4..5 of the statistics row: only a row of 6+ experts has them
+            tail_rank, tail_rank > 0 && counts->ne[0] >= 6 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
             ggml_get_op_params_i32(dst, 9), margin_q, admit_add_q, ggml_get_op_params_i32(dst, 8),
             ggml_get_op_params_i32(dst, 7), moe_pf_real_args(state), moe_rf_real(state));
         CUDA_CHECK(cudaGetLastError());
