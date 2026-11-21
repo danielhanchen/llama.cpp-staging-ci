@@ -3127,6 +3127,33 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 
+    // A weight with one channel, broadcast over ne12 src1 channels with a single column each, is
+    // one GEMM with ne12 columns rather than ne12 separate GEMVs. Left as is, the weight crosses
+    // memory ne12 times. Fold the channel axis into the column axis so it is read once; the
+    // dispatch below then picks mmf or cuBLAS for the wider shape.
+    if (ne11 == 1 && src1->ne[2] > 1 && src1->ne[3] == 1
+            && src0->ne[2] == 1 && src0->ne[3] == 1
+            && src1->nb[0] == ggml_type_size(src1->type)
+            &&  dst->nb[0] == ggml_type_size(dst->type)
+            && src1->nb[2] % ggml_type_size(src1->type) == 0
+            &&  dst->nb[2] % ggml_type_size(dst->type)  == 0) {
+        ggml_tensor src1_folded = *src1;
+        src1_folded.ne[1] = src1->ne[2];
+        src1_folded.ne[2] = 1;
+        src1_folded.nb[1] = src1->nb[2];
+        src1_folded.nb[2] = src1->nb[3];
+
+        ggml_tensor dst_folded = *dst;
+        dst_folded.ne[1] = dst->ne[2];
+        dst_folded.ne[2] = 1;
+        dst_folded.nb[1] = dst->nb[2];
+        dst_folded.nb[2] = dst->nb[3];
+        dst_folded.src[1] = &src1_folded;
+
+        ggml_cuda_mul_mat(ctx, src0, &src1_folded, &dst_folded);
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
