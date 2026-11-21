@@ -67,7 +67,7 @@
 #include <sys/resource.h>
 #endif
 
-static bool moe_cache_released_counts(); // k19-autoprof2 (defined beside moe_cache_refill_from_ids)
+static bool moe_cache_released_counts(); // (defined beside moe_cache_refill_from_ids)
 
 // the lowest compute capability (major*100 + minor*10) of the model's GPU devices, -1 if one is not a CUDA device or there is none
 static int model_gpu_min_cc(const llama_model & model) {
@@ -182,7 +182,7 @@ static bool llama_exact_verify_env() {
     return value;
 }
 
-// k19-tpp: LLAMA_SPEC_TPP_VERIFY (default on, =0 off): the nodes of a verify batch that is not computed batch invariant carry
+// LLAMA_SPEC_TPP_VERIFY (default on, =0 off): the nodes of a verify batch that is not computed batch invariant carry
 // GGML_TENSOR_FLAG_VERIFY, so the backend keeps the kernels of a 3-row verify for a 4-row one (ggml-cuda: F32 weights stay on mmvf at 4
 // columns instead of MMF): a row's sums do not depend on whether the window drafted 2 or 3. Prompt tails are never tagged
 static bool llama_verify_tag_env() {
@@ -193,7 +193,7 @@ static bool llama_verify_tag_env() {
     return value;
 }
 
-// k19-vrow3: LLAMA_SPEC_VERIFY_WIDE_CACHED (default on, =0 off): while an MoE cache runs, a verify batch of 5 or more tokens (a deep
+// LLAMA_SPEC_VERIFY_WIDE_CACHED (default on, =0 off): while an MoE cache runs, a verify batch of 5 or more tokens (a deep
 // MTP / DFlash window; the tpp windows of 3..4 rows stay untagged there) is tagged too, so its dense / F32 products keep the kernels of a
 // 1..4-row window as on a full card (ggml-cuda GGML_CUDA_VERIFY_WIDE): only windows the Studio MTP default never forms
 static bool llama_verify_wide_cached_env() {
@@ -204,9 +204,9 @@ static bool llama_verify_wide_cached_env() {
     return value;
 }
 
-// k19-fnmtp: LLAMA_SPEC_VERIFY4_CACHED=1 (off by default; the server sets it with LLAMA_SPEC_DEPTH_CACHED): beside an MoE cache a
+// LLAMA_SPEC_VERIFY4_CACHED=1 (off by default; the server sets it with LLAMA_SPEC_DEPTH_CACHED): beside an MoE cache a
 // 4-token verify batch (a 3-draft MTP window, a 4-row DFlash window) is tagged too. Untagged, its F32 products leave mmvf for cuBLAS
-// (TF32 sgemm + split-K outside the CUDA graph: 3.7 ms of kernels and ~12 ms of host time per pass, Colab A100 48 GB fn4n;
+// (TF32 sgemm + split-K outside the CUDA graph: 3.7 ms of kernels and ~12 ms of host time per pass, A100 48 GB the 4-bit model;
 // fm_m1 A100 40 GB full card: 4-row verify 54.8 ms untagged vs 52.5 tagged); tagged it runs the 3-row
 // window's kernels. 2..3-token windows (Studio's 2-draft MTP default) are never affected
 static bool llama_verify4_cached_env() {
@@ -217,7 +217,7 @@ static bool llama_verify4_cached_env() {
     return value;
 }
 
-// k19-tpp: no verify tag while an MoE cache runs (LLAMA_SPEC_TPP_CACHED=1: tagged there too; LLAMA_SPEC_TPP_FORCE_CACHED=1, a test
+// no verify tag while an MoE cache runs (LLAMA_SPEC_TPP_CACHED=1: tagged there too; LLAMA_SPEC_TPP_FORCE_CACHED=1, a test
 // hook: as if a cache ran), so a cached tier verifies as LLAMA_SPEC_TPP=0 does there
 static bool llama_tpp_cached_env() {
     static const bool value = [] {
@@ -227,9 +227,9 @@ static bool llama_tpp_cached_env() {
     return value;
 }
 
-// k19-a100chat (LLAMA_SPEC_TPP_CACHED=2, opt-in): beside a MoE cache the 2..4-row verify windows are tagged only from KV position
+// (LLAMA_SPEC_TPP_CACHED=2, opt-in): beside a MoE cache the 2..4-row verify windows are tagged only from KV position
 // LLAMA_SPEC_TPP_CACHED_POS (default 4096) on. Untagged, the F32 products of a 4-row window go to cuBLAS (TF32 sgemm + split-K, outside
-// the CUDA graph: 3.7 ms of kernels and ~12 ms of host time per pass, Colab A100 48 GB fn4n, ac_r2a nsys). Tagged everywhere
+// the CUDA graph: 3.7 ms of kernels and ~12 ms of host time per pass, A100 48 GB the 4-bit model, ac_r2a nsys). Tagged everywhere
 // (=1) that won 8k (+15% with EV-auto) but lost chat (-2.5%, ac_r3a), so the position gate keeps chat-length contexts as before
 static int32_t llama_tpp_cached_pos_min() {
     static const int32_t value = [] {
@@ -307,9 +307,9 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-// k16 dense host pin: the weights of the layers that --fit / -ngl leave in system memory sit in a memory-mapped (pageable) buffer, so the
+// dense host pin: the weights of the layers that --fit / -ngl leave in system memory sit in a memory-mapped (pageable) buffer, so the
 // scheduler's copies of them for the prompt ops it offloads to the GPU go through the driver's staging buffer and block the host
-// (cudaMemcpyAsync from pageable memory): L4, dense Qwen3.6-27B UD-Q4_K_XL at 12 GB (32 of 65 layers on the GPU), 8.7 GB of CPU layers
+// (cudaMemcpyAsync from pageable memory): L4, dense Qwen3.6-27B 4-bit quant at 12 GB (32 of 65 layers on the GPU), 8.7 GB of CPU layers
 // per 512-token ubatch at ~3.5 GB/s, 207 prompt tok/s at 2k-16k (16k TTFT 80 s). Page-locking those buffers (read-only, not mapped into the
 // device address space, so no VRAM is spent on page tables) lets the copies run as DMA at the link's speed and overlap the compute (prefetch depth 2).
 // Once per model, only for buffers of layer weights ("blk." tensors other than routed experts, which a MoE cache maps itself), only with
@@ -322,7 +322,7 @@ static void llama_dense_host_pin(const llama_model & model) {
     using host_mapped_bytes_t = size_t (*)(void);
     // opt-in (LLAMA_DENSE_HOST_PIN=1): the driver keeps GPU page tables for registered host memory, ~2 MiB of VRAM per GiB page-locked
     // whatever the flags (Default / Portable / Portable | Mapped, 4 KiB or 2 MiB host pages: exclusive B200, 8 GiB -> +16 MiB, 2 GiB ->
-    // +4 MiB, nothing charged to the process; G4 / L4 / T4 dense Qwen3.6-27B 12 GB: +18 MiB for 8.7 GiB), outside any buffer of ours
+    // +4 MiB, nothing charged to the process; RTX PRO 6000 / L4 / T4 dense Qwen3.6-27B 12 GB: +18 MiB for 8.7 GiB), outside any buffer of ours
     if (const char * e = getenv("LLAMA_DENSE_HOST_PIN"); e == nullptr || atoi(e) == 0) {
         return;
     }
@@ -332,7 +332,7 @@ static void llama_dense_host_pin(const llama_model & model) {
     }
     model.host_pin_done = true;
     ggml_backend_reg_t reg = nullptr;
-    // discrete GPUs only (k19-igpu): on an integrated GPU (IGPU, unified memory: Strix Halo gfx1151, Jetson, DGX Spark) the device memory
+    // discrete GPUs only: on an integrated GPU (IGPU, unified memory: Strix Halo gfx1151, Jetson, DGX Spark) the device memory
     // is the host's, so page-locking host weights takes from the pool the device allocates from and speeds a copy from RAM to RAM
     for (const auto & d : model.devices) {
         if (d.is_meta || d.dev == nullptr || ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -404,17 +404,17 @@ static void llama_dense_host_pin(const llama_model & model) {
         need/1048576.0, n_tensors, bufs.size(), (ggml_time_us() - t0)/1000.0);
 }
 
-// k15-fn: the time of the last ubatch of any context of the process (the PLE table read-in runs in the gaps, see below)
+// the time of the last ubatch of any context of the process (the PLE table read-in runs in the gaps, see below)
 static std::atomic<int64_t> llama_ple_busy_us{0};
 
-// k17-small: the MTP draft contexts of the process (a target's layer-major prompt group frees their device compute buffers, see
+// the MTP draft contexts of the process (a target's layer-major prompt group frees their device compute buffers, see
 // decode_layer_major)
 static std::mutex                   llama_mtp_ctx_mutex;
 static std::vector<llama_context *> llama_mtp_ctxs;
-// k19-mtpkeep: the targets whose released prompt ubatches borrow their MTP drafter's weights (llama_context::place8_lend)
+// the targets whose released prompt ubatches borrow their MTP drafter's weights (llama_context::place8_lend)
 static std::vector<llama_context *> llama_place8_lend_tgts;
 
-// k19-tiny-ub debug (LLAMA_MOE_TINY_RELEASE_TRACE=1): step lines around the release / restore and a backtrace on a fatal signal
+// debug (LLAMA_MOE_TINY_RELEASE_TRACE=1): step lines around the release / restore and a backtrace on a fatal signal
 static bool tiny_rel_trace() {
     static const bool on = getenv("LLAMA_MOE_TINY_RELEASE_TRACE") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_TRACE")) != 0;
     return on;
@@ -432,7 +432,7 @@ static bool tiny_rel_trace() {
 #endif
 #define TINY_TRACE(...) do { if (tiny_rel_trace()) { LLAMA_LOG_INFO(__VA_ARGS__); } } while (0)
 
-// k17-small (lazy KV step 2): the KV caches of a memory module (the attention caches of a hybrid or iSWA memory)
+// (lazy KV step 2): the KV caches of a memory module (the attention caches of a hybrid or iSWA memory)
 static std::vector<llama_kv_cache *> llama_memory_kv_caches(llama_memory_i * mem) {
     std::vector<llama_kv_cache *> res;
     auto add_iswa = [&](llama_kv_cache_iswa * m) {
@@ -540,8 +540,8 @@ llama_context::llama_context(
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
-            // k19-draftcost: a DFlash2 draft drafts over a restricted vocabulary of the target's head (LLAMA_DFLASH_DRAFT_VOCAB). By
-            // default only for a target without a MoE cache: there the target's text is unchanged (G4 Flash-Next full card, md5 = full
+            // a DFlash2 draft drafts over a restricted vocabulary of the target's head (LLAMA_DFLASH_DRAFT_VOCAB). By
+            // default only for a target without a MoE cache: there the target's text is unchanged (RTX PRO 6000 Flash-Next full card, md5 = full
             // head). Beside a cache the head's memory comes from the cache, which moves the target's placement and so its text
             // (srv_kld long48 at 32 GB above the -fa off band of the full card); an explicit LLAMA_DFLASH_DRAFT_VOCAB=n opts in there
             // A cache that holds most of the experts (llama_moe_cache_wide_graphs: the band where the verify graphs are prewarmed as
@@ -651,7 +651,7 @@ llama_context::llama_context(
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
-    // k19-p3topk: one top-k over all the verify rows of a sequence instead of one per row, where the output device's top-k returns
+    // one top-k over all the verify rows of a sequence instead of one per row, where the output device's top-k returns
     // for each row of a multi-row input what that row alone returns (same set, same order): the CPU (std::partial_sort per row) and
     // the CUDA deterministic top-k past 32768 columns in launches of at most 15 rows, where one row and several rows take the same
     // kernels (the multi-block radix select; k <= 10 and <= 8 rows: the two-stage kernel, whose order is the radix select's): the
@@ -694,9 +694,9 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
-    // k17-models: a model without experts takes no MoE cache (it used to throw "MoE cache requires a MoE model" from the cache): with
+    // a model without experts takes no MoE cache (it used to throw "MoE cache requires a MoE model" from the cache): with
     // --fit on --moe-cache-mib auto (Studio's argv) that error aborted the fit's probe context, so a dense model was loaded with every layer
-    // on the device and failed to allocate wherever it does not fit (Kaggle T4: Llama-3.1-8B at 4 GB, Mistral-Small-3.2-24B at 8 / 16 GB).
+    // on the device and failed to allocate wherever it does not fit (T4: Llama-3.1-8B at 4 GB, Mistral-Small-3.2-24B at 8 / 16 GB).
     // Same path and text as without the flag; MoE models are unchanged
     cparams.moe_cache_size = model.hparams.n_expert > 0 ? params.moe_cache_size : 0;
     if (params.moe_cache_size > 0 && model.hparams.n_expert == 0) {
@@ -730,7 +730,7 @@ llama_context::llama_context(
         // and a batch holds at least two ubatches (checked once the cache exists)
         const char * env = getenv("LLAMA_MOE_LAYER_MAJOR");
         lm_auto    = env == nullptr || strcmp(env, "auto") == 0;
-        // k15-small4: LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT=1 (set by common where its rules keep the default n_ubatch with spilled experts,
+        // LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT=1 (set by common where its rules keep the default n_ubatch with spilled experts,
         // see common_moe_cache_auto_ubatch): auto also without a draft
         const char * env_nd = getenv("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT");
         const bool   lm_nd  = env_nd != nullptr && atoi(env_nd) != 0;
@@ -738,14 +738,14 @@ llama_context::llama_context(
         if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX")) {
             lm_ub_max = std::max(1, atoi(e));
         }
-        // k9-prompt-pass: a batch holds at most ceil(n_batch / n_ubatch) ubatches, so no group is larger: the scheduler and the per-ubatch
+        // a batch holds at most ceil(n_batch / n_ubatch) ubatches, so no group is larger: the scheduler and the per-ubatch
         // graph results are sized for that (at -ub 2048 -b 8192: 4, not 16)
         if (cparams.n_ubatch > 0) {
             lm_ub_max = std::max(1, std::min<int>(lm_ub_max, (int) ((cparams.n_batch + cparams.n_ubatch - 1)/cparams.n_ubatch)));
         }
         lm_verbose = getenv("LLAMA_MOE_LAYER_MAJOR_LOG") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_LOG")) != 0;
-        // k9-prompt-pass: a context whose prompt ubatches seed the cache on the device (the device-seed fallback, n_ubatch >= 1024, e.g.
-        // Studio's -ub 2048) refused every group, so an 8k prompt copied each spilled expert once per ubatch (G4, Flash-Next UD-IQ4_XS
+        // a context whose prompt ubatches seed the cache on the device (the device-seed fallback, n_ubatch >= 1024, e.g.
+        // Studio's -ub 2048) refused every group, so an 8k prompt copied each spilled expert once per ubatch (RTX PRO 6000, Flash-Next 4-bit quant
         // 32 GB: 147.7 GB in 4 passes). The group runs there too: its members do not seed on the device, a ubatch run alone after it
         // (the server's checkpoint batch) still does, and a group that ends the prompt seeds from the routing of its last but one member
         lm_devseed      = getenv("LLAMA_MOE_LAYER_MAJOR_DEVSEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_DEVSEED")) != 0;
@@ -796,9 +796,9 @@ llama_context::llama_context(
         } else if (cparams.moe_cache_size > 0 && cparams.n_ubatch > 2*llama_moe_cache::n_small_max &&
                    (int64_t) cparams.n_ubatch <= prefetch_min_batch + llama_moe_cache::n_small_max &&
                    (getenv("LLAMA_LM_SHORT_MEMBER") == nullptr || atoi(getenv("LLAMA_LM_SHORT_MEMBER")) != 0)) {
-            // k19-g4verify: the server makes its far prompt checkpoint 4 + n_ubatch tokens before the end, which leaves a ubatch of
+            // the server makes its far prompt checkpoint 4 + n_ubatch tokens before the end, which leaves a ubatch of
             // n_ubatch - 4 tokens. At n_ubatch 256 that is below the 256 above, so the layer-major group broke there and that ubatch
-            // and the last one each read every host expert in a pass of their own (G4 Flash-Next 12 GB / 262K, 8k prompt at -ub 256:
+            // and the last one each read every host expert in a pass of their own (RTX PRO 6000 Flash-Next 12 GB / 262K, 8k prompt at -ub 256:
             // 201 GB copied, 1529 tok/s; with the member in the group 2177 tok/s). At an n_ubatch of at most 256 + 32 the limit is
             // n_ubatch - 32, so such ubatches are prefetched like full ones. LLAMA_LM_SHORT_MEMBER=0 or GGML_SCHED_PREFETCH_MIN_BATCH
             // set: as before
@@ -921,7 +921,7 @@ llama_context::llama_context(
         };
 
         {
-            // k19-kvwin: the caches that are windows themselves take the window types
+            // the caches that are windows themselves take the window types
             llama_kv_win_params wp = llama_kv_win_params_from(params);
             if (!cparams.flash_attn) {
                 wp.n_win = -1;
@@ -929,7 +929,7 @@ llama_context::llama_context(
             llama_kv_win_creating_scope scope(&wp);
             memory.reset(model.create_memory(params_mem, cparams));
         }
-        // k19-kvwin: the recent-window ring of the attention cache (allocated beside it, before any graph is reserved)
+        // the recent-window ring of the attention cache (allocated beside it, before any graph is reserved)
         if (memory) {
             llama_kv_win_params wp = llama_kv_win_params_from(params);
             wp.n_ubatch = cparams.n_ubatch;
@@ -963,20 +963,20 @@ llama_context::llama_context(
         }
         if (memory) {
             memory->wait_state_reads = [this]() { state_async_wait_reads(); };
-            // k16-draft: the replay commit of the delta-net states runs on this context's backends
+            // the replay commit of the delta-net states runs on this context's backends
             llama_memory_recurrent * mr = dynamic_cast<llama_memory_recurrent *>(memory.get());
             if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
                 mr = mh->get_mem_recr();
             } else if (auto * mhi = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
                 mr = mhi->get_mem_recr();
             }
-            // k19-npmtp: the rollback rows of moved cells (snapshot groups, replay windows) move with them
+            // the rollback rows of moved cells (snapshot groups, replay windows) move with them
             if (mr != nullptr && mr->n_rs_seq > 0 && !model.hparams.no_alloc) {
                 rs_move_mem = mr;
                 mr->move_cb = [this, mr](const std::vector<std::pair<uint32_t, uint32_t>> & swaps) { rs_replay_move(mr, swaps); };
-                // k19-fixB: rollback_copy waits for the decodes first; not under -sm tensor (meta buffers, see sync_cb)
+                // rollback_copy waits for the decodes first; not under -sm tensor (meta buffers, see sync_cb)
                 const bool any_meta = std::any_of(model.devices.begin(), model.devices.end(), [](const auto & d) { return d.is_meta; });
-                // k19-fixD: under -sm tensor the move makes no views (move_by_host)
+                // under -sm tensor the move makes no views (move_by_host)
                 mr->move_by_host = any_meta;
                 if (!any_meta) {
                     mr->sync_cb = [this]() {
@@ -1131,7 +1131,7 @@ llama_context::llama_context(
                 moe_cache.reset();
             }
         } else if (moe_cache_budget > 0) {
-            // k18cov: an explicit --moe-cache-mib below the experts of one token runs without the cache (a warning) instead of failing the
+            // an explicit --moe-cache-mib below the experts of one token runs without the cache (a warning) instead of failing the
             // context (Granite 4.0-H tiny Q4_K_M, --moe-cache-mib 4); a memory probe of the fit (no_alloc) still gets the exception, its
             // search handles it. LLAMA_MOE_CACHE_TOO_SMALL_FAIL=1: the context fails as before
             static const bool too_small_fail = [] {
@@ -1161,12 +1161,12 @@ llama_context::llama_context(
             lm_enabled = false;
         }
         if (moe_cache) {
-            moe_cache->prompt_inplace_block(lm_enabled); // k15-lfm2: layer-major seeds read the staging copies
+            moe_cache->prompt_inplace_block(lm_enabled); // layer-major seeds read the staging copies
         }
-        // k17-small (lazy KV step 2): a lazy KV cache (LLAMA_KV_LAZY=1) backs its cells as they grow, and the MoE cache gives the memory
+        // (lazy KV step 2): a lazy KV cache (LLAMA_KV_LAZY=1) backs its cells as they grow, and the MoE cache gives the memory
         // for them back (llama_moe_cache::shrink). Its floor is what it holds now less the KV bytes not backed yet: the fit gave it those
         // bytes on top of the size it fitted beside the full-context KV (common_fit), so at the floor every cell fits
-        // k19-vramlend: a lazy KV cache of the automatic mode (LLAMA_KV_LAZY unset, the fit's grant) whose memory no MoE cache can give
+        // a lazy KV cache of the automatic mode (LLAMA_KV_LAZY unset, the fit's grant) whose memory no MoE cache can give
         // back (no cache, e.g. a refit without one, or banks that are not lazy) is backed whole now, as with LLAMA_KV_LAZY=0
         if (memory && !model.hparams.no_alloc && llama_kv_lazy_mode() == 2) {
             for (llama_kv_cache * kv : llama_memory_kv_caches(memory.get())) {
@@ -1230,9 +1230,9 @@ llama_context::llama_context(
         // no stored routing of an earlier ubatch nor a larger seed graph; groups without device lookups are not seeded by prefetched ubatches
         if (moe_cache && llama_moe_cache::seed_mode() == 2 && prefetch_min_batch != INT64_MAX) {
             const char * env = getenv("LLAMA_MOE_CACHE_DEVSEED");
-            // opt-in: measured faster prompts at 8-32 GB on fast links (L4 gemma +4..+30%, G4 Flash-Next IQ4_XS +7..+18%), but slower first
+            // opt-in: measured faster prompts at 8-32 GB on fast links (L4 gemma +4..+30%, RTX PRO 6000 Flash-Next IQ4_XS +7..+18%), but slower first
             // prompts on a throttled link (the #268 seed uploads only the routed experts of a single-ubatch prompt) and 2-3% slower decode
-            // after a prompt on the G4 (a different cache mix than the host LRU seed)
+            // after a prompt on the RTX PRO 6000 (a different cache mix than the host LRU seed)
             if (env != nullptr && atoi(env) != 0 && moe_cache->devseed_init(prefetch_min_batch)) {
                 moe_cache_devseed_on = true;
                 moe_cache_seed_sync  = false;
@@ -1244,11 +1244,11 @@ llama_context::llama_context(
         if (moe_cache && moe_cache_seed_auto) {
             moe_cache->prompts_do_not_seed();
         }
-        // k18-lowram: where the exclusive RAM tier and the device slots hold every streamed expert (resident mode: RAM + VRAM hold the
+        // where the exclusive RAM tier and the device slots hold every streamed expert (resident mode: RAM + VRAM hold the
         // model, the RAM alone cannot pin it), prompts do not seed the device cache. A seed admits the prompt's experts into device slots
         // and evicts device experts RAM does not hold; their copies back into a RAM tier the prompt pins found no slot or evicted another
         // expert RAM alone held, so every prompt dropped experts from both tiers and the next prompt and the decode after it read them
-        // from the files (G4, Qwen3.8-Flash-Next UD-IQ4_XS 32 GB at 48 GiB RAM, Studio argv: 18.0 / 34.9 GB read in the 8k / 16k cells,
+        // from the files (RTX PRO 6000, Qwen3.8-Flash-Next 4-bit quant 32 GB at 48 GiB RAM, Studio argv: 18.0 / 34.9 GB read in the 8k / 16k cells,
         // 10162 copies back without a slot, decode 9.1 / 9.5 tok/s; without seeds 3.5 / 5.4 GB, RAM hit rate 87.6 -> 98.5%, 8k / 16k TTFT
         // 115.7 -> 64.6 / 251.1 -> 134.8 s, decode 34.8 / 39.4 tok/s, same text). LLAMA_MOE_HOST_SEED=1 seeds as before
         if (moe_cache && moe_cache_seed_enabled && getenv("LLAMA_MOE_CACHE_SEED") == nullptr && moe_cache->resident_union() &&
@@ -1258,9 +1258,9 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: MoE cache: RAM and the device slots hold every streamed expert: prompts do not seed the device cache "
                 "(LLAMA_MOE_HOST_SEED=1 seeds)\n", __func__);
         }
-        // k15-pp3: the capture snapshots fit counted (cap_planned_bytes) are allocated here, before the MoE cache's decisions read the free
+        // the capture snapshots fit counted (cap_planned_bytes) are allocated here, before the MoE cache's decisions read the free
         // memory, instead of at the first capture: with their bytes still free, the first reserve kept the staging copies outside the
-        // cache and the first prompt kept its graph allocation out of the lent memory (G4 q4x 12 GB + MTP: lending off, then the graph
+        // cache and the first prompt kept its graph allocation out of the lent memory (RTX PRO 6000 the 4-bit model 12 GB + MTP: lending off, then the graph
         // in its own compute buffer, 188 / 248 MiB free at exit instead of 408 with LLAMA_FIT_CAPTURE=0). cap_prepare takes these buffers
         if (moe_cache && !model.hparams.no_alloc) {
             const int n_cap = cap_count();
@@ -1279,7 +1279,7 @@ llama_context::llama_context(
                 moe_cache->set_mem_reserve(backend_ptrs[i], mem_reserve[i]);
             }
         }
-        // k19-tiny-ub: the context common's tiny-cache rule sized ("<default n_ubatch>:<n_ubatch>:<cache bytes>"): its cache keeps the size
+        // the context common's tiny-cache rule sized ("<default n_ubatch>:<n_ubatch>:<cache bytes>"): its cache keeps the size
         // of the default n_ubatch and is released while larger ubatches run, starting with the reserve below (see tiny_rel_enter)
         if (const char * e = getenv("LLAMA_MOE_TINY_RELEASE"); e != nullptr && *e != '\0' && !model.hparams.no_alloc &&
                 cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
@@ -1304,7 +1304,7 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: MoE cache: ubatches of more than %d tokens run with the cache banks released (LLAMA_MOE_TINY_RELEASE_FORCE)\n", __func__, tiny_force);
         } else if (const char * e8 = getenv("LLAMA_MOE_PLACE8_UB"); e8 != nullptr && atoi(e8) > 0 && moe_cache && !model.hparams.no_alloc &&
                 cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && (int64_t) cparams.n_ubatch > atoi(e8)) {
-            // k19-place8 (set by common's fit, common_fit_place8): the cache of a small device took the memory of the prompt compute
+            // (set by common's fit, common_fit_place8): the cache of a small device took the memory of the prompt compute
             // buffers; the graphs are reserved at that many tokens and larger ubatches run with the banks released, as for the tiny-cache rule
             tiny_rel_ub     = atoi(e8);
             tiny_rel_res_ub = tiny_rel_ub;
@@ -1316,28 +1316,28 @@ llama_context::llama_context(
                 llama_place8_lend_tgts.push_back(this);
             }
             tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
-            // k19-placemid (LLAMA_MOE_PLACE8_MID, set with it by the fit of a mid-size device): prompts keep their layer-major groups,
+            // (LLAMA_MOE_PLACE8_MID, set with it by the fit of a mid-size device): prompts keep their layer-major groups,
             // which release the banks for the merged graph; only a large ubatch outside a group takes the release above
             const char * em = getenv("LLAMA_MOE_PLACE8_MID");
             if (em == nullptr || atoi(em) == 0) {
                 lm_enabled = false;
             } else {
                 place8_grow = (size_t) std::max(0, atoi(em)) << 20;
-                // k19-pgroups2: the small device of k19-pgroups (LLAMA_MOE_PLACE8_GROUPS, set by the fit with LLAMA_MOE_PLACE8_MID) keeps
+                // the small device of (LLAMA_MOE_PLACE8_GROUPS, set by the fit with LLAMA_MOE_PLACE8_MID) keeps
                 // the groups but not the short-prompt split (place8_chunk_max) of a mid-size device, and a released short prompt's
                 // ubatch refills the banks with the experts they held before. Its cache holds ~5% of the host experts: a split chat
-                // prompt reads the banks ubatch by ubatch and fetches every miss. G4 fn4 ctx 131072, 3 launches (gfn1pg_g): chat TTFT
+                // prompt reads the banks ubatch by ubatch and fetches every miss. RTX PRO 6000 4-bit ctx 131072, 3 launches (gfn1pg_g): chat TTFT
                 // 12 GB 0.494 -> 0.370 s, 10 GB + LLAMA_FIT_LONGCTX_KV4 0.498 -> 0.365 s (groups off 0.353). The refill after a group
                 // stays routed by default: held-before there (LLAMA_MOE_PLACE8_GROUPS_LEAN=2) gave 12 GB 2k / 8k decode 75.5 / 72.0 ->
-                // 76.7 / 74.5 tok/s but 10 GB 73.2 / 70.0 -> 71.8 / 68.9. LLAMA_MOE_PLACE8_GROUPS_LEAN=0: as k19-placemid
+                // 76.7 / 74.5 tok/s but 10 GB 73.2 / 70.0 -> 71.8 / 68.9. LLAMA_MOE_PLACE8_GROUPS_LEAN=0: as
                 static const int groups_lean = getenv("LLAMA_MOE_PLACE8_GROUPS_LEAN") != nullptr ? atoi(getenv("LLAMA_MOE_PLACE8_GROUPS_LEAN")) : 1;
                 const char * eg = getenv("LLAMA_MOE_PLACE8_GROUPS");
                 place8_lean       = groups_lean > 0 && eg != nullptr && atoi(eg) != 0;
                 place8_lean_group = place8_lean && groups_lean >= 2;
                 // the refill after a released prompt ubatch takes the experts it routed most (LLAMA_MOE_TINY_RELEASE_ROUTED=0: the experts
-                // held before), as the layer-major groups below (see lm_release_routed): G4 12 / 16 GB fn4 + MTP, 2 launches each,
+                // held before), as the layer-major groups below (see lm_release_routed): RTX PRO 6000 12 / 16 GB 4-bit + MTP, 2 launches each,
                 // decode chat / 8k / 30k held-before 129.5 / 107.4 / 105.1 -> 139.6 / 126.3 / 103.0 (12 GB), 147.7 / 151.3 / 107.8 ->
-                // 159.0 / 137.9 / 129.2 (16 GB); base 120.0 / 100.1 / 91.0 and 141.0 / 100.0 / 109.8 (k19pm_g3a / g3b)
+                // 159.0 / 137.9 / 129.2 (16 GB); base 120.0 / 100.1 / 91.0 and 141.0 / 100.0 / 109.8 (/ g3b)
                 tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr ? atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0 : !place8_lean;
                 if (place8_lean) {
                     LLAMA_LOG_INFO("%s: MoE cache: short prompts run in one ubatch with the banks released, the banks come back "
@@ -1379,14 +1379,14 @@ llama_context::llama_context(
 
         sched_reserve();
 
-        // k16-replay-oom: the replay commit's fallback allocation is taken at load, before the run fills the device
+        // the replay commit's fallback allocation is taken at load, before the run fills the device
         if (rs_replay_mem != nullptr) {
             rs_replay_setup();
         }
 
-        // layer-major prompts: the host arena of the group inputs (mostly the KQ masks) and the graph results of the members. k9 made them
+        // layer-major prompts: the host arena of the group inputs (mostly the KQ masks) and the graph results of the members. made them
         // at load so that the first prompt does not pay for them: 2 x 256 MiB of pinned memory (main + MTP context) and ~290 MiB of zeroed
-        // graph metadata (16 results per context) in every such process, also one that never reads a long prompt (k9 vs k8 host RSS +805 MiB
+        // graph metadata (16 results per context) in every such process, also one that never reads a long prompt (vs k8 host RSS +805 MiB
         // at idle on a B200, +884 MiB on gfx1151). Now both are made by the first group, the arena sized by what
         // it needs (decode_layer_major grows it); LLAMA_MOE_LAYER_MAJOR_EAGER=1 allocates them here as before
         static const bool lm_eager = getenv("LLAMA_MOE_LAYER_MAJOR_EAGER") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EAGER")) != 0;
@@ -1463,9 +1463,9 @@ llama_context::llama_context(
         ple.enabled = t && (ple_prefetcher || ple.verify);
     }
 
-    // k15-fn (LLAMA_PLE_RESIDENT: unset = auto, 0 = off, 1 = always): the lazy per-layer embedding table (Qwen3.8-Flash-Next: 26.8 GiB,
+    // (LLAMA_PLE_RESIDENT: unset = auto, 0 = off, 1 = always): the lazy per-layer embedding table (Qwen3.8-Flash-Next: 26.8 GiB,
     // read a few rows per token through the mapping) is read in whole and locked when the host has room for it beside every other host
-    // weight plus 8 GiB: the rows of a prompt then cost no page faults (a cold disk: G4 fn4 8k TTFT
+    // weight plus 8 GiB: the rows of a prompt then cost no page faults (a cold disk: RTX PRO 6000 4-bit 8k TTFT
     // 25.2 -> 2.0 s), and the page cache cannot evict them. The same bytes through the same mapping, so exact. Once per model, Linux only.
     // The read runs in a background thread after the load (the server is ready at once; a row a prompt touches first is read by its own
     // fault, the thread then finds it resident), with idle I/O priority and the readahead the lazy mapping's MADV_RANDOM switches off
@@ -1478,7 +1478,7 @@ llama_context::llama_context(
         if (res_env != 0 && t && model.can_prefetch.count(t) && t->data && t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
                 cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
             std::lock_guard<std::mutex> lock(res_mtx);
-            // once per model (k19-plerow: a flag of the model, not a set of tensor addresses, which a later model can reuse)
+            // once per model (a flag of the model, not a set of tensor addresses, which a later model can reuse)
             if (!model.ple_res_done.exchange(true)) {
                 const size_t table = ggml_nbytes(t);
                 size_t host = 0;
@@ -1487,7 +1487,7 @@ llama_context::llama_context(
                         host += ggml_nbytes(w);
                     }
                 }
-                // k19-ptres (LLAMA_MOE_CORE=1): the host copies of the MoE cache's core are not in RAM (see llama_moe_cache::core_dropped_bytes)
+                // (LLAMA_MOE_CORE=1): the host copies of the MoE cache's core are not in RAM (see llama_moe_cache::core_dropped_bytes)
                 if (moe_cache && moe_cache->core_dropped_bytes() > 0) {
                     const size_t dropped = std::min(host, moe_cache->core_dropped_bytes());
                     LLAMA_LOG_INFO("%s: PLE table: %.1f GiB of host weights are a MoE cache core without host copies\n", __func__,
@@ -1509,9 +1509,9 @@ llama_context::llama_context(
                     fd   = it->second.fd;
                     offs = it->second.offs;
                 }
-                // k19-disktt: a table that does not fit beside the other host weights is read in part, as far as the RAM left after them
+                // a table that does not fit beside the other host weights is read in part, as far as the RAM left after them
                 // and a reserve (LLAMA_PLE_RESIDENT_PARTIAL_RESERVE_MIB, 4096) holds: the page cache keeps those pages (not locked), and a
-                // prompt's gather faults only the rows past them. A100 40 GB VM (83 GB RAM), Flash-Next UD-IQ4_XS on the VM disk: 57.6 GB of
+                // prompt's gather faults only the rows past them. A100 40 GB VM (83 GB RAM), Flash-Next 4-bit quant on the VM disk: 57.6 GB of
                 // registered host experts beside the 26.8 GiB table; every 8k prompt read ~100k random pages of it (~36 s on a 3k IOPS
                 // disk). The same bytes through the same mapping, so exact. Only for files on a disk (not tmpfs / ramfs).
                 // LLAMA_PLE_RESIDENT_PARTIAL=0: off (the table stays lazy, as before)
@@ -1532,7 +1532,7 @@ llama_context::llama_context(
                         part = (size_t) std::min<uint64_t>(table, (avail - keep) & ~((8ull << 20) - 1));
                     }
                 }
-                // k19-fnttft: the page cache is the table's only room: models loaded after this one drop the page cache of what they copy to
+                // the page cache is the table's only room: models loaded after this one drop the page cache of what they copy to
                 // a device (llama_model_loader::drop_device_cache); LLAMA_PLE_TOPUP=0 turns this off with the top-up (llama_ple_topup)
                 static const bool topup_off = getenv("LLAMA_PLE_TOPUP") != nullptr && atoi(getenv("LLAMA_PLE_TOPUP")) == 0;
                 if (!admit && on_disk && !topup_off) {
@@ -1542,7 +1542,7 @@ llama_context::llama_context(
                     model.drop_device_cache();
                 }
 #endif
-                // k19-plerow: a row cache in front of a table that is not made resident and sits on a disk (LLAMA_PLE_ROW_CACHE=0 off,
+                // a row cache in front of a table that is not made resident and sits on a disk (LLAMA_PLE_ROW_CACHE=0 off,
                 // =2 forced: test hook). A row reached through the mapping faults its whole 4 KiB page (Flash-Next: 90-byte rows, 45x
                 // the bytes); the cache keeps packed copies of rows: the hottest rows of a saved profile (LLAMA_PLE_ROW_PROFILE=path,
                 // read sequentially now, up to LLAMA_PLE_ROW_CACHE_PRELOAD_MIB: 2048 beside a part, else 512) and the rows the gather
@@ -1565,7 +1565,7 @@ llama_context::llama_context(
                         };
                         const char * prof_env = getenv("LLAMA_PLE_ROW_PROFILE");
                         std::string prof = prof_env ? prof_env : "";
-                        // k19-autoprof (LLAMA_MOE_AUTOPROF, see llama-autoprof.h): without an explicit profile the cache uses the one the
+                        // (LLAMA_MOE_AUTOPROF, see llama-autoprof.h): without an explicit profile the cache uses the one the
                         // earlier launches of this model recorded (<dir>/autoprof_ple_<model hash>.<rows>) and records this launch's rows
                         // for the next: a recorder beside the cache counts every row the gather reads (with a copy of its bytes, at most
                         // LLAMA_MOE_AUTOPROF_PLE_MIB, 256) and the profile is written at exit. Beside a part with no profile yet the cache
@@ -1617,12 +1617,12 @@ llama_context::llama_context(
                         size_t dyn_b  = env_mib("LLAMA_PLE_ROW_CACHE_MIB", 256);
                         // beside a page part, rows the gather faults stay in the page cache anyway: without a profile (or a profile
                         // to write back, or an explicit LLAMA_PLE_ROW_CACHE_MIB) the cache would only take RAM from the part
-                        // (A100 VM fn4nd 8k, dynamic rows only: 52.9k disk reads vs 47.5k), so it is not made there
+                        // (A100 VM the 4-bit model 8k, dynamic rows only: 52.9k disk reads vs 47.5k), so it is not made there
                         const bool prof_save = getenv("LLAMA_PLE_ROW_PROFILE_SAVE") && atoi(getenv("LLAMA_PLE_ROW_PROFILE_SAVE")) != 0;
                         if (part > 0 && part < table && stat_b == 0 && !prof_save && getenv("LLAMA_PLE_ROW_CACHE_MIB") == nullptr && rc_mode != 2) {
                             dyn_b = 0;
                         }
-                        // k19-autoprof: the recorder alone is enough to make the cache (no slots beside a part without a profile)
+                        // the recorder alone is enough to make the cache (no slots beside a part without a profile)
                         bool    ok   = stat_b + dyn_b > 0 || ap_rec;
                         int64_t skip = 0;
                         size_t  part_min = part;
@@ -1637,7 +1637,7 @@ llama_context::llama_context(
                             part_min = (part - stat_b - dyn_b) & ~((8ull << 20) - 1);
                             skip = (int64_t) (part_min / t->nb[1]);
                         } else if (ok && part == 0 && rc_mode != 2 && avail > 0 && avail < (uint64_t) (stat_b + dyn_b) + (2ull << 30)) {
-                            // (k19-autoprof: then the recorder alone, no slots)
+                            // (then the recorder alone, no slots)
                             ok = ap_rec;
                             stat_b = 0;
                             dyn_b  = 0;
@@ -1695,9 +1695,9 @@ llama_context::llama_context(
                     const bool partial = !admit;
                     std::atomic<bool> * whole_done = &model.ple_table_resident;
                     ple_res_runner * pr = &ple_res;
-                    // k19-ptres: a MoE cache core freed the RAM the whole table is read into (see the pin below)
+                    // a MoE cache core freed the RAM the whole table is read into (see the pin below)
                     const bool core_freed = moe_cache && moe_cache->core_dropped_bytes() > 0;
-                    const size_t host_b = host; // k19-core2: the other host weights (on a GPU host: registered, not reclaimable)
+                    const size_t host_b = host; // the other host weights (on a GPU host: registered, not reclaimable)
                     auto work = [t, table, limit, partial, fd, offs, tname, stop, whole_done, pr, core_freed, host_b](bool background) {
                         const int64_t t0 = ggml_time_us();
                         if (background) {
@@ -1712,16 +1712,16 @@ llama_context::llama_context(
                         // 8 MiB per step: a step waits while any context ran a ubatch in the last 300 ms (a request's own reads and faults
                         // go first: with the mq-deadline / none schedulers of NVMe the idle class is not enforced), then reads the chunk
                         // into the page cache with pread (no mmap lock held while the disk works: a populate that waited on the disk held
-                        // it and stalled the request's own mapping calls, G4 k15gk: 8k TTFT 17-48 s), then maps the cached pages
+                        // it and stalled the request's own mapping calls, RTX PRO 6000 8k TTFT 17-48 s), then maps the cached pages
                         const size_t chunk = 8ull << 20;
                         static const int64_t gap_us = getenv("LLAMA_PLE_RESIDENT_GAP_MS") ? 1000ll*atoll(getenv("LLAMA_PLE_RESIDENT_GAP_MS")) : 300000;
                         std::atomic<bool>   pop_ok_a {true};
                         std::atomic<size_t> next {0};
                         std::atomic<size_t> done_a {0};
-                        // k19-disktt: a part read is activated (each chunk is read twice: pages accessed twice go to the active list, while
+                        // a part read is activated (each chunk is read twice: pages accessed twice go to the active list, while
                         // the second copies a loop-device / overlay stack keeps of the same reads were accessed once and are reclaimed
                         // first; LLAMA_PLE_RESIDENT_PARTIAL_ACTIVATE=0 off), and read in LLAMA_PLE_RESIDENT_PARTIAL_PASSES (2) passes: a later
-                        // pass reads back what the page cache gave up during the earlier one (Colab A100 VM: 19.2 GiB read, ~half of it
+                        // pass reads back what the page cache gave up during the earlier one (A100 VM: 19.2 GiB read, ~half of it
                         // gone again by the first 8k prompt)
                         static const bool act_env = getenv("LLAMA_PLE_RESIDENT_PARTIAL_ACTIVATE") == nullptr || atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_ACTIVATE")) != 0;
                         const bool activate = partial && act_env;
@@ -1780,7 +1780,7 @@ llama_context::llama_context(
                                 }
                             }
                         };
-                        // k19-disktt: a read during the load runs on LLAMA_PLE_RESIDENT_THREADS (4) threads over disjoint chunks (a cloud disk
+                        // a read during the load runs on LLAMA_PLE_RESIDENT_THREADS (4) threads over disjoint chunks (a cloud disk
                         // reaches its throughput only with several reads in flight); the background read stays one thread
                         int n_thr = 1;
                         if (!background) {
@@ -1815,18 +1815,18 @@ llama_context::llama_context(
                             // pages the page cache would otherwise give up first: they were read once, before the drafter and the
                             // requests read theirs); pinned pages cannot be reclaimed when the process grows, so by default only where a MoE
                             // cache core (LLAMA_MOE_CORE=1) dropped its host copies, the whole table was read and the RAM left after the pin
-                            // keeps 4 GiB (k19-ptres, Colab A100 fn4nd 32 GB, 3 launches: 8k TTFT 9.5 -> 5.6 s, the pinned pages stopped
+                            // keeps 4 GiB (A100 the 4-bit model 32 GB, 3 launches: 8k TTFT 9.5 -> 5.6 s, the pinned pages stopped
                             // the ~100 MB of PLE re-reads per 8k prompt); =1 always, =0 never (the page cache alone, as before)
                             static const int pin_env = getenv("LLAMA_PLE_RESIDENT_PARTIAL_PIN") ? atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_PIN")) : -1;
                             bool pin_on = pin_env > 0;
                             const char * pin_why = "";
                             if (pin_env < 0 && core_freed) {
                                 const uint64_t avail_now = llama_sysmem::available();
-                                // k19-core2: the RAM left after the pin, LLAMA_PLE_PIN_FLOOR_MIB (default 4096)
+                                // the RAM left after the pin, LLAMA_PLE_PIN_FLOOR_MIB (default 4096)
                                 static const uint64_t floor_b = (uint64_t) std::max<int64_t>(0, getenv("LLAMA_PLE_PIN_FLOOR_MIB") ?
                                     atoll(getenv("LLAMA_PLE_PIN_FLOOR_MIB")) : 4096) << 20;
-                                // k19-core2: MemAvailable counts the page cache of the registered (pinned) expert mappings as free, so on
-                                // Colab A100 fn4nd (83.5 GiB, 48.5 GiB of registered host weights + the 26.8 GiB pin = 8.2 GiB unpinned)
+                                // MemAvailable counts the page cache of the registered (pinned) expert mappings as free, so on
+                                // A100 the 4-bit model (83.5 GiB, 48.5 GiB of registered host weights + the 26.8 GiB pin = 8.2 GiB unpinned)
                                 // the floor above passed while srv_kld long48 (8 GiB prompt cache) froze the VM in 3 attempts (the third logged
                                 // it at the pinned launch). The pin also needs MemTotal - the other host weights - the table >= LLAMA_PLE_PIN_ROOM_MIB
                                 // (default 16384: kernel, the process, the 8 GiB prompt cache; 0 = off)
@@ -1865,7 +1865,7 @@ llama_context::llama_context(
                                         pr->pin_addr  = a0;
                                         pr->pin_unmap = hunmap;
                                         pr->pin_len   = len;
-                                        llama_sysmem::pinned_file_add((int64_t) len); // k19-core2: the pinned table pages are not reclaimable
+                                        llama_sysmem::pinned_file_add((int64_t) len); // the pinned table pages are not reclaimable
                                         pin_res = ", pinned";
                                     }
                                     break;
@@ -1877,7 +1877,7 @@ llama_context::llama_context(
                                 pop_ok ? "ok" : "by touch", pin_res, n_pass, t_pass1, evicted_a.load()*(double) pg/1073741824.0,
                                 activate ? ", activated" : "", pin_why);
                             if (pr->pin_addr == nullptr) {
-                                // k19-fnttft: the span for a later top-up (llama_ple_topup), the whole table's pages
+                                // the span for a later top-up (llama_ple_topup), the whole table's pages
                                 pr->span_addr = a0;
                                 pr->span_len  = (size_t) (((uintptr_t) t->data + table - (uintptr_t) a0 + pg - 1) & ~(uintptr_t) (pg - 1));
                                 pr->part_len  = len;
@@ -1896,7 +1896,7 @@ llama_context::llama_context(
                         const int lr = mlock(a0, len);
                         const int le = errno;
                         if (lr == 0) {
-                            whole_done->store(true); // k19-disktt: locked, every row stays in RAM: the prompt reads stop
+                            whole_done->store(true); // locked, every row stays in RAM: the prompt reads stop
                         }
                         LLAMA_LOG_INFO("%s: PLE table '%s' resident: %.1f GiB read in %.1f s%s (populate %s), %s%s\n", __func__, tname.c_str(),
                             len/1073741824.0, t_read, background ? " in the background" : "", pop_ok ? "ok" : "by touch",
@@ -1923,7 +1923,7 @@ llama_context::llama_context(
         }
     }
 
-    // kdp (G4 k15kn_g4, strict 12 GB argv: the drafter's compute buffers did not fit, init failed after the registration, and the next
+    // kdp (RTX PRO 6000, strict 12 GB argv: the drafter's compute buffers did not fit, init failed after the registration, and the next
     // released group read the freed drafter model and the server died): only a fully constructed MTP context is registered
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
@@ -1943,8 +1943,8 @@ void llama_context::small_plan_free(uint32_t i) {
     }
 }
 
-// k16-replay-oom: the backend the commit graphs run on, and (one backend) a fallback allocation of the largest commit graph reserved at
-// load. Kaggle T4 k17s_kg2, Qwen3.6 UD-Q3_K_M + MTP at a 4 GB tier, 32k: the device was full by the 2k request (CUDA graph instances
+// the backend the commit graphs run on, and (one backend) a fallback allocation of the largest commit graph reserved at
+// load. T4, Qwen3.6 3-bit quant + MTP at a 4 GB tier, 32k: the device was full by the 2k request (CUDA graph instances
 // out of memory too) and the 2.05 MiB allocation of a new commit graph aborted the server in 8 of 8 launches. A commit now drops the
 // cached graphs and retries, then allocates in this reserved buffer (synchronized, not cached). LLAMA_RS_REPLAY_FALLBACK=0: no reserve
 void llama_context::rs_replay_setup() {
@@ -2088,10 +2088,10 @@ void llama_context::rs_commit_build(ggml_context * ctx, ggml_cgraph * gf, bool w
     }
 }
 
-// k19-npmtp: find_slot gathers the cells of a multi-sequence ubatch next to each other by swapping cells; the state and conv rows of a
+// find_slot gathers the cells of a multi-sequence ubatch next to each other by swapping cells; the state and conv rows of a
 // moved cell are copied by the ubatch graph (s_copy), but a window still pending there (its stored inputs, the conv snapshot rows of
 // its rollback) stays in the old cell. It is moved here, in swap order, before the commit or ubatch graphs that read it.
-// k19-b33mv: row to row copies through scratch units allocated with the cache (llama_memory_recurrent::rs_move_rows), after the graphs
+// row to row copies through scratch units allocated with the cache (llama_memory_recurrent::rs_move_rows), after the graphs
 // in flight (ubatch, replay commits, async state reads) have finished: no graph and no compute buffer (9c2e built a dup graph whose
 // buffer the fit did not price, and aborted when it could not be allocated)
 void llama_context::rs_replay_move(llama_memory_recurrent * mem, const std::vector<std::pair<uint32_t, uint32_t>> & swaps) {
@@ -2126,7 +2126,7 @@ void llama_context::rs_replay_commit(bool sync) {
     if (rs_mode == 0) {
         rs_replay_setup();
     }
-    // k19-g4tier (LLAMA_RS_CONV_BATCH=0 off): a commit left with conv snapshots only (every window committed by a fused ubatch: the usual
+    // (LLAMA_RS_CONV_BATCH=0 off): a commit left with conv snapshots only (every window committed by a fused ubatch: the usual
     // verify after a rejected draft) is one batched copy on the backend's stream instead of a commit graph of one CPY per conv history
     // (Flash-Next: 36 copies of 120 KiB launched eagerly, or a re-captured graph, between the drafter and the verify, plus the graph's
     // host work): the same bytes from the same snapshot rows onto the same live rows, in the same stream order
@@ -2186,12 +2186,12 @@ void llama_context::rs_replay_commit(bool sync) {
     }
     static const bool reuse = getenv("LLAMA_RS_REPLAY_REUSE") == nullptr || atoi(getenv("LLAMA_RS_REPLAY_REUSE")) != 0;
     auto hit = reuse ? rs_graphs.find(key) : rs_graphs.end();
-    // k19-mgpucache: with the commit graphs run through a scheduler (the recurrent states on several devices, e.g. -sm layer over 2
+    // with the commit graphs run through a scheduler (the recurrent states on several devices, e.g. -sm layer over 2
     // GPUs) a cached graph is reused only while it is the scheduler's current allocation. Splitting a graph rewrites the inputs of its
     // nodes that live on another backend to the scheduler's own copies (node->src[j], ggml_backend_sched_split_graph pass 5); those copies
     // belong to the scheduler's context, which the next graph's split frees and rebuilds. A cached graph allocated again after another
     // key's graph read the other graph's copies: a CONT of a 2-entry gate / beta window read an 8-entry one, and the commit aborted in
-    // the copy op (ne == ggml_nelements(src1), CUDA cpy.cu; Kaggle 2x T4 Qwen3.8-Flash-Next + MTP at the server's prompt save, every
+    // the copy op (ne == ggml_nelements(src1), CUDA cpy.cu; cloud host 2x T4 Qwen3.8-Flash-Next + MTP at the server's prompt save, every
     // arm of a 48-prompt srv_kld; reproduced on two RPC CPU devices). Such a hit is built again instead (one graph build per key change).
     // LLAMA_RS_REPLAY_SCHED_REBUILD=0: the old reuse
     static const bool sched_rebuild = getenv("LLAMA_RS_REPLAY_SCHED_REBUILD") == nullptr || atoi(getenv("LLAMA_RS_REPLAY_SCHED_REBUILD")) != 0;
@@ -2225,7 +2225,7 @@ void llama_context::rs_replay_commit(bool sync) {
             }
         };
         if (e.shared) {
-            // k16-replay-oom: the graphs share the buffer reserved at load; another key's graph was allocated there since: re-allocate
+            // the graphs share the buffer reserved at load; another key's graph was allocated there since: re-allocate
             // (same stream, so the commit before has finished with the buffer when this one runs)
             if (key != rs_key) {
                 clear_own(e.ctx.get());
@@ -2301,12 +2301,12 @@ void llama_context::rs_replay_commit(bool sync) {
     if (ggml_graph_n_nodes(gf) > 0) {
         rs_graph e;
         e.gf = gf;
-        // opt-in (LLAMA_RS_REPLAY_SHARED=1): G4 k15r_cg33g / cg34g, Qwen3.6 + MTP at a pinned 4000 MiB cache, strict: the shared buffer
+        // opt-in (LLAMA_RS_REPLAY_SHARED=1): RTX PRO 6000 / cg34g, Qwen3.6 + MTP at a pinned 4000 MiB cache, strict: the shared buffer
         // gave other text in 7 of 27 launches against 1 of 33 for the base and 0 of 12 without the reserve; the cached graphs' own
         // allocations stay the default and the reserve is only the fallback of a commit that cannot allocate (synchronized, not cached)
         static const bool shared_on = getenv("LLAMA_RS_REPLAY_SHARED") != nullptr && atoi(getenv("LLAMA_RS_REPLAY_SHARED")) != 0;
         if (rs_mode == 1 && rs_ga_fb && shared_on) {
-            // k16-replay-oom: every commit graph in the one buffer reserved at load (no allocation while the run fills the device; the
+            // every commit graph in the one buffer reserved at load (no allocation while the run fills the device; the
             // per-graph allocations held up to 8 x 2 MiB on top)
             if (!ggml_gallocr_alloc_graph(rs_ga_fb.get(), gf)) {
                 GGML_ABORT("%s: cannot allocate the replay commit graph in its reserved buffer", __func__);
@@ -2326,7 +2326,7 @@ void llama_context::rs_replay_commit(bool sync) {
             static const bool fb_force = getenv("LLAMA_RS_REPLAY_FALLBACK_FORCE") != nullptr && atoi(getenv("LLAMA_RS_REPLAY_FALLBACK_FORCE")) != 0;
             bool ok = !fb_force && ggml_gallocr_alloc_graph(e.ga.get(), gf);
             if (!ok && !fb_force && !rs_graphs.empty()) {
-                // k16-replay-oom: drop the cached graphs (their allocations) and retry
+                // drop the cached graphs (their allocations) and retry
                 ggml_backend_synchronize(rs_backend);
                 rs_graphs.clear();
                 rs_ga_bytes = 0;
@@ -2360,7 +2360,7 @@ void llama_context::rs_replay_commit(bool sync) {
         } else {
             ggml_backend_sched_reset(rs_sched.get());
             if (!ggml_backend_sched_alloc_graph(rs_sched.get(), gf)) {
-                // k16-replay-oom: drop the cached graphs and retry once (the scheduler holds one allocation: nothing else to free)
+                // drop the cached graphs and retry once (the scheduler holds one allocation: nothing else to free)
                 ggml_backend_sched_synchronize(rs_sched.get());
                 rs_graphs.clear();
                 rs_key.clear();
@@ -2385,12 +2385,12 @@ void llama_context::rs_replay_commit(bool sync) {
     rs_replay_us += ggml_time_us() - t0;
 }
 
-// k16-disk: runtime disk prefetch of host experts read through the file mappings (ggml/src/ggml-moe-prefetch.cpp, ported from
+// runtime disk prefetch of host experts read through the file mappings (ggml/src/ggml-moe-prefetch.cpp, ported from
 // ik_llama.cpp at e34d163a, author dmaivel, MIT). The host expert tensors of file mappings are registered with the engine; the CPU MUL_MAT_ID streams the
 // routed experts of each product with its worker threads, the scheduler streams the next MoE splits of a prompt whose uploads read
 // the mapping (not when the weight store reads them). Page cache only: the kernels read the same mapped bytes (exact).
 // LLAMA_MOE_DISK_PREFETCH: unset = on when those experts exceed 80% of the available RAM (cgroup-aware, the weight store's rule),
-// 0 = off (no threads, no madvise: k15 behaviour), 1 = on. LLAMA_MOE_DISK_PREFETCH_THREADS (8), LLAMA_MOE_DISK_PREFETCH_AHEAD (3
+// 0 = off (no threads, no madvise: behaviour), 1 = on. LLAMA_MOE_DISK_PREFETCH_THREADS (8), LLAMA_MOE_DISK_PREFETCH_AHEAD (3
 // MoE splits, 0 = kernel hook only; 0 by default beside a weight store), LLAMA_MOE_DISK_PREFETCH_MIB (lookahead bytes queued or in
 // flight, default min(2 GiB, 10% of the available RAM)), LLAMA_MOE_DISK_PREFETCH_RANDOM (MADV_RANDOM on the registered ranges, so a
 // fault the engine did not predict reads its page only, not a read-around window; default 1 beside a weight store or without a GPU,
@@ -2469,9 +2469,9 @@ llama_context::disk_range_ref::~disk_range_ref() {
     }
 }
 
-// k17-small: frees the device compute buffers of this context (an MTP drafter, for a layer-major prompt group of its target); the next
+// frees the device compute buffers of this context (an MTP drafter, for a layer-major prompt group of its target); the next
 // graph is built and allocated anew. Returns the bytes freed
-// kdp: the drafter's pinned host copy, made at its first lend (not at load: G4 fn4 24 GB never lends and its unrequantized drafter's
+// kdp: the drafter's pinned host copy, made at its first lend (not at load: RTX PRO 6000 4-bit 24 GB never lends and its unrequantized drafter's
 // copy was +2647 MiB RSS). It honours the host-RAM reserve of the pinned experts (llama_model_loader::pin_auto_budget: max(4 GiB,
 // 10% of MemTotal) left of the available RAM, cgroup limits included); no room, or the available RAM unknown: the lend is off (one WARN)
 bool llama_context::mtp_lend_warm() {
@@ -2483,7 +2483,7 @@ bool llama_context::mtp_lend_warm() {
     const double frac  = moe_cache->cache_frac();
     const size_t cache = frac > 0.0 ? (size_t) (frac*(double) llama_moe_cache::host_bytes(model)) : 0;
     size_t free_min = SIZE_MAX;
-    // discrete GPUs only (k19-igpu): lending copies the drafter's device weights to pinned host memory before it frees them, and on an
+    // discrete GPUs only: lending copies the drafter's device weights to pinned host memory before it frees them, and on an
     // integrated GPU (IGPU, unified memory) both are the same pool: the copy takes what the eviction gives back, so a lend frees nothing
     // (the device's free memory, the host's available memory there, would also be counted with the host copy's RAM reserve)
     for (auto & bk : backend_ptrs) {
@@ -2552,7 +2552,7 @@ bool llama_context::mtp_weights_restore() {
     if (!m.weights_evicted()) {
         return true;
     }
-    // k19-mtpkeep: a target that borrowed these weights for a released prompt ubatch still holds that ubatch's compute buffers in the
+    // a target that borrowed these weights for a released prompt ubatch still holds that ubatch's compute buffers in the
     // memory they need (its fit counted them as lent): they go first, its next graph allocates them again
     std::vector<llama_context *> tgts;
     {
@@ -2579,7 +2579,7 @@ bool llama_context::mtp_weights_restore() {
     return ok;
 }
 
-// k19-mtpkeep: before a prompt ubatch that runs with the banks released, the MTP drafters of this context's fit-credited lend give it
+// before a prompt ubatch that runs with the banks released, the MTP drafters of this context's fit-credited lend give it
 // their device weights (evictable buffers, as for a layer-major group: decode_layer_major) and compute buffers; their next pass maps the
 // weights back after place8_free_compute (llama_mtp_draft_weights_restore)
 void llama_context::place8_lend_now() {
@@ -2630,7 +2630,7 @@ size_t llama_context::place8_free_compute() {
     size_t freed = release_device_compute();
     ggml_backend_sched_free_prefetch_arenas(sched.get());
     const size_t trimmed = pool_mark_trim_dev(true);
-    // the CUDA graphs that used the pool memory given back are evicted with it (k19-df2pp, see tiny_rel_leave)
+    // the CUDA graphs that used the pool memory given back are evicted with it (see tiny_rel_leave)
     static const bool trim_evict = getenv("LLAMA_MOE_TRIM_EVICT") == nullptr || atoi(getenv("LLAMA_MOE_TRIM_EVICT")) != 0;
     if (trim_evict && trimmed > 0) {
         graph_evict_since_dev(tiny_rel_t_mark);
@@ -2643,7 +2643,7 @@ size_t llama_context::place8_free_compute() {
     return freed + trimmed;
 }
 
-// k19-fullcost: see release_device_compute / graph_reserve
+// see release_device_compute / graph_reserve
 static bool llama_graph_small_keep_buffers() {
     static const bool v = getenv("LLAMA_GRAPH_SMALL_KEEP_BUFFERS") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_KEEP_BUFFERS")) != 0;
     return v;
@@ -2667,7 +2667,7 @@ size_t llama_context::release_device_compute() {
         }
     }
     gf_res_prev_active = nullptr;
-    // k19-fullcost (LLAMA_GRAPH_SMALL_KEEP_BUFFERS=0: off): freeing the compute buffers (beside a MoE cache, around a long prompt that
+    // (LLAMA_GRAPH_SMALL_KEEP_BUFFERS=0: off): freeing the compute buffers (beside a MoE cache, around a long prompt that
     // stages in lent slots) does not invalidate the kept decode / verify graphs: freeing a buffer bumps the allocator's generation, so a
     // kept graph's saved plan is refused and its swap-in allocates it again (ggml_backend_sched_alloc_graph from its built state), the
     // same graph at new addresses; its CUDA graph is captured again under its warm key instead of a graph build, an eager pass and a
@@ -2718,7 +2718,7 @@ static std::vector<llama_context *> llama_mtp_ctxs_of(const llama_context * self
     return out;
 }
 
-// k19-tiny-ub: the banks are released for the graphs of ubatches larger than the cache was sized for. The CUDA pools of this context
+// the banks are released for the graphs of ubatches larger than the cache was sized for. The CUDA pools of this context
 // are marked first, so what the larger graphs make them grow is given back before the banks return (as for a released layer-major group)
 void llama_context::tiny_rel_enter(const char * why) {
     if (tiny_rel_held || !moe_cache || moe_cache->released()) {
@@ -2750,7 +2750,7 @@ void llama_context::tiny_rel_leave() {
     moe_cache_pos_next = -1;
     moe_cache->clear_seed_counts();
     // this context's compute buffers are freed as at the end of a released layer-major group (its graph results stay: this runs inside
-    // decode), the drafters' as for a layer-major group beside a kept drafter (release_device_compute, k17-small)
+    // decode), the drafters' as for a layer-major group beside a kept drafter (release_device_compute)
     size_t freed = 0;
     for (auto & bk : backend_ptrs) {
         ggml_backend_dev_t dev = ggml_backend_get_device(bk);
@@ -2760,7 +2760,7 @@ void llama_context::tiny_rel_leave() {
     }
     TINY_TRACE("%s: trace: free own compute (%.2f MiB)\n", __func__, freed/1048576.0);
     ggml_backend_sched_free_device_buffers(sched.get());
-    // k19-place8: the context reserved no staging arena (its graphs are reserved below the prefetched sizes), the prompt allocated one in
+    // the context reserved no staging arena (its graphs are reserved below the prefetched sizes), the prompt allocated one in
     // the memory of the released banks: it goes too, the next prefetched graph allocates it again (while the banks are released)
     if (place8_rel) {
         ggml_backend_sched_free_prefetch_arenas(sched.get());
@@ -2777,10 +2777,10 @@ void llama_context::tiny_rel_leave() {
     }
     TINY_TRACE("%s: trace: trim\n", __func__);
     const size_t trimmed = pool_mark_trim_dev(true);
-    // k19-df2pp: the CUDA graphs captured or replayed while the pools were above the mark hold pointers into the range the trim unmapped
+    // the CUDA graphs captured or replayed while the pools were above the mark hold pointers into the range the trim unmapped
     // (the temporaries the ops take from the pool are not graph nodes, so the replay check does not see them). A later window replayed
-    // one before its pool had grown back that far: G4 fn4 12 GB DFlash2, srv_kld long48, CUDA illegal address in the ubatch after a
-    // released layer-major group, the 6th 8200-token prompt in two runs (k19pp_k1 / d1); with the group's trim off the pool stayed large
+    // one before its pool had grown back that far: RTX PRO 6000 4-bit 12 GB DFlash2, srv_kld long48, CUDA illegal address in the ubatch after a
+    // released layer-major group, the 6th 8200-token prompt in two runs (/ d1); with the group's trim off the pool stayed large
     // enough and nothing failed. They are evicted with the trim (recaptured by the next window). LLAMA_MOE_TRIM_EVICT=0: kept, as before
     static const bool trim_evict = getenv("LLAMA_MOE_TRIM_EVICT") == nullptr || atoi(getenv("LLAMA_MOE_TRIM_EVICT")) != 0;
     if (trim_evict && trimmed > 0) {
@@ -2792,16 +2792,16 @@ void llama_context::tiny_rel_leave() {
         }
     }
     TINY_TRACE("%s: trace: restore\n", __func__);
-    // k19-kvsel (LLAMA_MOE_SHORT_REFILL_CAP_MIB, set by common where host chunks were granted): the banks come back after a prompt ubatch
+    // (LLAMA_MOE_SHORT_REFILL_CAP_MIB, set by common where host chunks were granted): the banks come back after a prompt ubatch
     // with at most that many MiB of the experts they held before, the other slots empty (misses fill them). The refill sits on the
-    // prompt's path, and the cache the host chunks enlarged holds more: G4 12 GB / 262K Flash-Next, a 42-token chat prompt refilled
+    // prompt's path, and the cache the host chunks enlarged holds more: RTX PRO 6000 12 GB / 262K Flash-Next, a 42-token chat prompt refilled
     // 2562 experts in 114 ms (TTFT 0.37 -> 0.48 s)
     if (const char * e_rc = getenv("LLAMA_MOE_SHORT_REFILL_CAP_MIB"); e_rc != nullptr && *e_rc != '\0' && atoll(e_rc) >= 0) {
         moe_cache->set_refill_cap_once((size_t) atoll(e_rc)*1024*1024);
     }
     moe_cache->restore();
     TINY_TRACE("%s: trace: restored\n", __func__);
-    // k19-place8: banks that did not allocate stay released (set_restore_soft): the next ubatches run as while released and the next
+    // banks that did not allocate stay released (set_restore_soft): the next ubatches run as while released and the next
     // small one tries again
     tiny_rel_held = place8_rel && moe_cache->released();
     if (tiny_rel_held) {
@@ -2815,7 +2815,7 @@ void llama_context::tiny_rel_leave() {
         for (auto & bk : backend_ptrs) {
             ggml_backend_dev_t dev = ggml_backend_get_device(bk);
             const enum ggml_backend_dev_type dev_type = dev != nullptr ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
-            if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) { // k19-igpu: logged there too
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) { // logged there too
                 ggml_backend_dev_memory(dev, &fr, &tot);
                 break;
             }
@@ -2826,8 +2826,8 @@ void llama_context::tiny_rel_leave() {
     }
 }
 
-// k19-t4small: the largest ubatch that runs beside the grown cache: the tiny-cache rule's, else one token below the batch from which the
-// CUDA backend copies host weights for an op (GGML_OP_OFFLOAD_MIN_BATCH, 32), as k19-place8
+// the largest ubatch that runs beside the grown cache: the tiny-cache rule's, else one token below the batch from which the
+// CUDA backend copies host weights for an op (GGML_OP_OFFLOAD_MIN_BATCH, 32), as
 int64_t llama_context::ext_ub() const {
     if (tiny_rel_ub > 0) {
         return tiny_rel_ub;
@@ -2839,7 +2839,7 @@ int64_t llama_context::ext_ub() const {
     return ub;
 }
 
-// k19-t4small: before a prompt ubatch the cache goes back to the slots the fit sized, so the prompt's compute buffers (and its MTP
+// before a prompt ubatch the cache goes back to the slots the fit sized, so the prompt's compute buffers (and its MTP
 // drafter's) find the memory the fit planned for them
 void llama_context::ext_park(const char * why) {
     if (!ext_grown || !moe_cache) {
@@ -2864,7 +2864,7 @@ void llama_context::ext_park(const char * why) {
     }
 }
 
-// k19-t4small: after a prompt, at the first decode step: this context's and its MTP drafters' device compute buffers are freed (their
+// after a prompt, at the first decode step: this context's and its MTP drafters' device compute buffers are freed (their
 // next graphs allocate what a decode step needs, as tiny_rel_leave does), then the cache grows into the free device memory less
 // LLAMA_MOE_DECODE_EXT_KEEP_MIB (384, in steps of 64 MiB)
 void llama_context::ext_unpark() {
@@ -2931,7 +2931,7 @@ void llama_context::gf_res_epoch_bump(int line) {
 
 llama_context::~llama_context() {
     nextn_join();
-    // k19-l4fill: the refill reads of the RAM tier that did not start are cancelled before the weight store goes (its destructor would
+    // the refill reads of the RAM tier that did not start are cancelled before the weight store goes (its destructor would
     // read every queued one)
     if (moe_cache) {
         moe_cache->fill_stop();
@@ -3248,12 +3248,12 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     //   heads), the cache holds the experts of at least LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS (4) tokens over all layers, and the
     //   uncached host experts are at most LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC (0.5) of the RAM; otherwise the default 2.
     //   LLAMA_MOE_PREFETCH_DEPTH_RULE=0 keeps the default 2 everywhere.
-    // Why (G4 RTX PRO 6000, 3 reps, A/A <= 0.3%): no draft, staging lent: gpt-oss-20B Q2_K 8 GB 2k / 8k prompt 10864 -> 12487 /
+    // Why (RTX PRO 6000 RTX PRO 6000, 3 reps, A/A <= 0.3%): no draft, staging lent: gpt-oss-20B Q2_K 8 GB 2k / 8k prompt 10864 -> 12487 /
     // 14409 -> 16276 tok/s, Qwen3.6-35B-A3B 8 GB 8k 9083 -> 10586, decode unchanged. With a drafter the depth-3 staging competes with
-    // the draft: Flash-Next UD-IQ4_XS 64 GB (Studio argv) 2k prompt 3647 -> 2291, chat decode 163 -> 142 (the depth falls back after the
-    // allocation and the cache is seeded empty instead of prefilled). A tiny cache (Flash-Next UD-IQ1_S 8 GB, the experts of 1.0 tokens)
+    // the draft: Flash-Next 4-bit quant 64 GB (Studio argv) 2k prompt 3647 -> 2291, chat decode 163 -> 142 (the depth falls back after the
+    // allocation and the cache is seeded empty instead of prefilled). A tiny cache (Flash-Next 1-bit quant 8 GB, the experts of 1.0 tokens)
     // pays the deeper staging with cache: n_ubatch 4096 -> 2048, prompt -1.8%, decode -1.5%. Uncached experts beyond the page cache read
-    // more from the disk at depth 3 (L4 52 GB RAM, Flash-Next UD-IQ4_XS: 2k decode 13.2 -> 10.2)
+    // more from the disk at depth 3 (L4 52 GB RAM, Flash-Next 4-bit quant: 2k decode 13.2 -> 10.2)
     if (moe_cache && moe_cache->cached_frac() >= 0.0 && moe_cache->cached_frac() < 0.98 && moe_cache->n_tokens_cached() >= 4) {
         const char * env_depth = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL");
         int depth_spill = 0;
@@ -3273,10 +3273,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             const double tokens = n_used > 0 ? moe_cache->cached_frac()*(double) model.hparams.n_expert/(double) n_used : 0.0;
             const uint64_t ram_total = llama_sysmem::total();
             const bool ram_ok = ram_total == 0 || moe_cache->host_uncached_bytes() <= ram_frac*(double) ram_total;
-            // k15-ov: a draft model that --fit dropped (common sets LLAMA_FIT_DRAFT_DROPPED=1: it does not fit beside the cache, so
+            // a draft model that --fit dropped (common sets LLAMA_FIT_DRAFT_DROPPED=1: it does not fit beside the cache, so
             // speculative decoding is off) leaves no draft to compete with a deeper staging: depth LLAMA_MOE_PREFETCH_DEPTH_DROPPED (4;
             // 0 = as before) where the cache holds the experts of at least LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS (10) tokens.
-            // G4 Flash-Next UD-IQ4_XS Studio argv (Q8_0 drafter dropped), 3 launches, A/A 0.4%, k15g4v1: 24 GB (14.6 tokens) depth 3 /
+            // RTX PRO 6000 Flash-Next 4-bit quant Studio argv (Q8_0 drafter dropped), 3 launches, A/A 0.4%, 24 GB (14.6 tokens) depth 3 /
             // 4: 8k 1.831 -> 1.780 / 1.716 s, 16k 3.562 -> 3.468 / 3.344 s, decode and pinned md5 unchanged; 16 GB (6.1 tokens) depth 3
             // reserved the staging in device memory at fit time, the cache fell under the hybrid gate's 10% (6735 -> 5463 MiB, no
             // layer-major groups): 8k 1.909 -> 4.200 s, hence the minimum
@@ -3285,18 +3285,18 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
                 std::max(0.0, atof(getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS"))) : 10.0;
             const bool draft_dropped = dropped_depth > 0 && cparams.spec_draft && getenv("LLAMA_FIT_DRAFT_DROPPED") != nullptr &&
                 atoi(getenv("LLAMA_FIT_DRAFT_DROPPED")) != 0;
-            // k15-up2: a draft that runs (a -md drafter on the device or MTP heads) gets the same depth beside a cache of at least
+            // a draft that runs (a -md drafter on the device or MTP heads) gets the same depth beside a cache of at least
             // LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS tokens' experts (LLAMA_MOE_PREFETCH_DEPTH_SPEC=0: depth 2 beside a running draft).
-            // G4 k15g4j1, Flash-Next UD-IQ4_XS Studio argv + the admitted Q8_0 drafter, 3 launches, A/A <= 0.7%: 24 GB (11.0 tokens) TTFT
+            // RTX PRO 6000, Flash-Next 4-bit quant Studio argv + the admitted Q8_0 drafter, 3 launches, A/A <= 0.7%: 24 GB (11.0 tokens) TTFT
             // 8k / 16k 2.002 -> 1.864 / 3.927 -> 3.675 s, 32 GB (18.4 tokens) 1.933 -> 1.817 / 3.726 -> 3.559 s; decode equal where the text
             // is (24 GB chat 142.7 / 142.3 tok/s), elsewhere it follows the accepted drafts of another text; same device memory in use
-            // at the end. (k15g4i1 lost decode only because the fit probe paid for the depth-4 arena, see below.)
+            // at the end. (lost decode only because the fit probe paid for the depth-4 arena, see below.)
             static const bool spec_env = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPEC") == nullptr || atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_SPEC")) != 0;
-            // not beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): local B200 Qwen3.6-35B-A3B UD-Q4_K_XL + MTP heads, 12 GB,
+            // not beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): local B200 Qwen3.6-35B-A3B 4-bit quant + MTP heads, 12 GB,
             // pinned + strict exact, depth 4 gave other text than depth 2 and no draft (chat a3c3e816 vs 19b8fd68, twice each), while a
             // dropped -md drafter at depth 4 kept it (not found why yet)
             const bool mtp_heads = getenv("LLAMA_SPEC_MTP_HEADS") != nullptr && atoi(getenv("LLAMA_SPEC_MTP_HEADS")) != 0;
-            // not in a memory probe (no_alloc): --fit then sized the cache with the depth-4 arena reserved (G4 k15g4i1, fn4 24 GB +
+            // not in a memory probe (no_alloc): --fit then sized the cache with the depth-4 arena reserved (RTX PRO 6000, 4-bit 24 GB +
             // Q8_0 drafter: cache 12233 -> 8836 MiB, 11.0 -> 8.0 tokens, so the context refused depth 4 after the cache had paid for
             // it: decode -5..-14%); the probe measures the default depth and the context decides on the cache it really has
             const bool spec_deep = spec_env && dropped_depth > 0 && cparams.spec_draft && !draft_dropped && !mtp_heads && tokens >= dropped_min &&
@@ -3306,9 +3306,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
                 tokens < min_tokens ? "the cache holds the experts of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS" :
                 !ram_ok ? "the uncached host experts are more than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC of the RAM" : nullptr;
             depth_spill = why == nullptr ? (draft_dropped || spec_deep ? dropped_depth : 3) : 0;
-            // k17-fndepth: a cache of at least LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_TOKENS (10) tokens' experts lends enough slots for
+            // a cache of at least LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_TOKENS (10) tokens' experts lends enough slots for
             // LLAMA_MOE_PREFETCH_DEPTH_DEEP (5; 0 = the depths above) splits in flight. Not in a memory probe (no_alloc: the fit would size
-            // the cache with the deeper arena reserved), not beside built-in MTP heads. G4 k17dp, Flash-Next UD-IQ4_XS, 24 GB, 2 launches:
+            // the cache with the deeper arena reserved), not beside built-in MTP heads. RTX PRO 6000, Flash-Next 4-bit quant, 24 GB, 2 launches:
             // no draft (13.6 tokens) depth 3 -> 5 TTFT 8k / 16k / 30k 1.712 -> 1.534 / 3.360 -> 3.021 / 6.416 -> 5.760 s (6: 3.145 at 16k,
             // 8: 3.187); the Q8_0 drafter forced to 5 by LLAMA_MOE_PREFETCH_DEPTH_SPILL (which the probe also sees: cache 11881 -> 8705 MiB)
             // 16k 3.646 -> 3.420 s
@@ -3316,7 +3316,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             static const double deep_min = getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_TOKENS") ?
                 std::max(0.0, atof(getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_TOKENS"))) : 10.0;
             // only for large expert banks (LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_BANK_MIB, 384: the largest expert tensor of a layer), whose
-            // per-split copies (10+ ms) the default depth cannot hide; smaller banks lose at depth 5 (k17fdepb: Flint UD-Q4_K_XL, 256 x
+            // per-split copies (10+ ms) the default depth cannot hide; smaller banks lose at depth 5 (Flint 4-bit quant, 256 x
             // ~170 MiB banks, 8k TTFT +3.6% / +6.5% at 12 / 16 GB), Flash-Next's 512-expert banks are ~620 MiB
             static const double deep_bank_mib = getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_BANK_MIB") ?
                 std::max(0.0, atof(getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_BANK_MIB"))) : 384.0;
@@ -3357,9 +3357,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     }
 }
 
-// k19-fnttft: after the load's part read of a PLE table that does not fit beside the host weights (k19-disktt), the page cache gives part
+// after the load's part read of a PLE table that does not fit beside the host weights, the page cache gives part
 // of it back before the first prompt: the loads that follow it (the MTP drafter, the warm-ups) and the process growing take their pages
-// from the oldest file pages. Colab A100 40 GB, fn4nd full card: an 8k prompt then reads ~50k random 4 KiB table pages from a disk capped
+// from the oldest file pages. A100 40 GB, the 4-bit model full card: an 8k prompt then reads ~50k random 4 KiB table pages from a disk capped
 // at ~3k reads/s (16-19 s of its 22 s TTFT, /proc/diskstats). Called once the load is over (llama_ple_topup: the server after the drafter
 // and the prewarm), this reads the table's missing pages back into the page cache, from the start of the table, up to what the reclaimable
 // RAM (MemAvailable minus the registered model pages, llama_sysmem::available_reclaimable) leaves after the part read's reserve
@@ -3520,7 +3520,7 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
-    // k19-tiny-ub: the graphs are reserved beside the whole cache (a reserved small batch reads its banks), at most at the n_ubatch the
+    // the graphs are reserved beside the whole cache (a reserved small batch reads its banks), at most at the n_ubatch the
     // cache was sized for (tiny_rel_res_ub); a larger ubatch grows the compute buffers while it runs with the banks released
     if (tiny_rel_held) {
         tiny_rel_leave();
@@ -3550,7 +3550,7 @@ void llama_context::sched_reserve() {
     static const bool lm_sched_pad = getenv("LLAMA_MOE_LAYER_MAJOR_SCHED_PAD") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SCHED_PAD")) != 0;
     sched_new(lm_enabled || (lm_sched_pad && moe_cache) ? max_nodes*(size_t) (lm_ub_max + 1) : max_nodes, cparams.pipeline_parallel);
     // the usual graphs (decode, a ubatch alone) keep a table of their own size: the table sized for a merged graph cost the decode
-    // 0.2-0.3% (G4, Qwen3.6-35B-A3B UD-Q3_K_M + MTP, LLAMA_MOE_LAYER_MAJOR_SCHED_PAD=1); decode_layer_major asks for the full one
+    // 0.2-0.3% (RTX PRO 6000, Qwen3.6-35B-A3B 3-bit quant + MTP, LLAMA_MOE_LAYER_MAJOR_SCHED_PAD=1); decode_layer_major asks for the full one
     // (LLAMA_MOE_LAYER_MAJOR_SMALL_HASH=0: the full table for every graph)
     static const bool lm_small_hash = getenv("LLAMA_MOE_LAYER_MAJOR_SMALL_HASH") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SMALL_HASH")) != 0;
     if ((lm_enabled || (lm_sched_pad && moe_cache)) && lm_small_hash) {
@@ -3639,11 +3639,11 @@ void llama_context::sched_reserve() {
         // left after the layers (the reserve drops the prefetch when the compute buffers do not fit with it or leave no headroom), so a fit
         // places the same layers as without the prefetch instead of moving one to the host for the staging copies
         // with the MoE cache the staging may live in lent cache slots and the cache sizing accounts for it: the measurement keeps it
-        // k15-fn: a draft model's measure keeps the copies of one split (LLAMA_FIT_STAGING_SPLIT=1, set by common around it, see
+        // a draft model's measure keeps the copies of one split (LLAMA_FIT_STAGING_SPLIT=1, set by common around it, see
         // common_draft_measure_env): without the arena the weights of a split are copied into the graph allocation instead. The main
         // model's measure without a MoE cache keeps leaving the whole arena out (the cache it sizes lends or holds the copies)
-        // k17-small: an MTP context without a MoE cache of its own (its share of the budget too small for one token) also keeps one
-        // split: on a small device its arena does not fit (Kaggle T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP at ctx 16384: measured 104
+        // an MTP context without a MoE cache of its own (its share of the budget too small for one token) also keeps one
+        // split: on a small device its arena does not fit (T4 4 GB, Qwen3.6-35B-A3B 4-bit quant + MTP at ctx 16384: measured 104
         // MiB of compute, the 320 MiB arena failed at load and the compute took 233 MiB with the copies of a split). Only with
         // LLAMA_FIT_MTP_PRICE=1 (common exports its default, see common_fit_mtp_price_on); LLAMA_FIT_STAGING_SPLIT=0: as before
         // LLAMA_FIT_STAGING_PRICE=1 (opt-in): the measure keeps the whole arena, so that the fit leaves room for it and the prefetch runs
@@ -3716,9 +3716,9 @@ void llama_context::sched_reserve() {
         }
     }
 
-    // k16-fit: a memory probe (no_alloc: the --fit measurements) prices the graph that seeds the MoE cache (sched_reserve_seed), which
+    // a memory probe (no_alloc: the --fit measurements) prices the graph that seeds the MoE cache (sched_reserve_seed), which
     // the loaded context reserves after the pp graph and which so far took its growth from the fit's free-memory target (Qwen3.8-Flash-Next
-    // UD-IQ1_S, 16 GB, Studio argv: 1092 -> 1459 MiB); the loaded context then reserves it without its own free-memory check (the fit made
+    // 1-bit quant, 16 GB, Studio argv: 1092 -> 1459 MiB); the loaded context then reserves it without its own free-memory check (the fit made
     // the room), see sched_reserve_seed. LLAMA_FIT_SEED_PRICE=0: not priced, the context reserves it only where it fits beside 512 MiB
     if (fit_seed_price_on() && model.hparams.no_alloc && moe_cache && moe_cache_seed_sync && n_tokens > llama_moe_cache::n_small_max &&
             (int64_t) n_tokens >= prefetch_min_batch && seed_price_wanted()) {
@@ -3738,7 +3738,7 @@ void llama_context::sched_reserve() {
     // the loaded context ends up with: the staging copies lent by the MoE cache (none of the arena), and the seed graph when it is larger
     // than the pp graph (a prompt ubatch that seeds the cache holds the expert copies of its cached layers in the graph allocation), which
     // a context with room for it reserves (see sched_reserve_seed). Measured with the staging and without the seed, the growth from
-    // n_ubatch 512 to 2048 was 390 MiB where the device sees 254 (Qwen3.6 UD-Q4_K_XL) and 794 where it sees 548 (gemma-4 26B-A4B)
+    // n_ubatch 512 to 2048 was 390 MiB where the device sees 254 (Qwen3.6 4-bit quant) and 794 where it sees 548 (gemma-4 26B-A4B)
     // LLAMA_MOE_MEASURE_LENT=auto:<bytes>: lent only if the staging copies are at least <bytes>, the share of the cache from which the cache
     // lends them (LLAMA_MOE_CACHE_LEND_MIN_FRAC, see llama_moe_cache lend_decide); else the copies stay in the measure, as an arena next to it.
     // The copies are those the cache was asked to lend (a measurement always lends them, the arenas stay empty) or those of an arena
@@ -3782,12 +3782,12 @@ void llama_context::sched_reserve() {
         }
     }
 
-    // k15-fn: the fit's measure (no LLAMA_MOE_MEASURE_LENT) leaves the staging arena out (see above: it only uses memory that is left).
+    // the fit's measure (no LLAMA_MOE_MEASURE_LENT) leaves the staging arena out (see above: it only uses memory that is left).
     // Where the cache lends because that frees memory (llama_moe_cache lend_saves, or LLAMA_MOE_CACHE_LEND=1) the loaded context has no
     // arena: the measure reports its bytes (mb.lend_freed, which the fit gives to the cache, see common_get_device_memory_data_impl),
     // so the memory left after the load is the same as with the arena. The seeding prompt's copies are not counted, as without lending: the seed graph is reserved
-    // only if the memory left holds it (see sched_reserve_seed), like a default context that cannot fit it. G4 Qwen3.8-Flash-Next
-    // UD-IQ4_XS + MTP at 32 GB: k15gl_g4 counted the seed growth (546 MiB) too, the cache got 721 MiB and every prompt seeded the
+    // only if the memory left holds it (see sched_reserve_seed), like a default context that cannot fit it. RTX PRO 6000 Qwen3.8-Flash-Next
+    // 4-bit quant + MTP at 32 GB: counted the seed growth (546 MiB) too, the cache got 721 MiB and every prompt seeded the
     // cache from its own ids: the 2k prompt lost 17% (2448 -> 2044 tok/s), the default does not seed there. Opt-in: LLAMA_MOE_CACHE_LEND_SAVE=1
     if (model.hparams.no_alloc) {
         backend_lend_freed.assign(backend_ptrs.size(), 0);
@@ -3881,17 +3881,17 @@ void llama_context::sched_reserve() {
 // LLAMA_MOE_CACHE_DEVSEED_FALLBACK_MAX_FRAC (0.5) of the host experts, and of at least LLAMA_MOE_CACHE_DEVSEED_FALLBACK_MIN_TOKENS (4)
 // tokens' experts over all layers, the large prompt ubatches (see min_ub below; never decode / verify) seed the cache on the device
 // from their staged copies instead (as LLAMA_MOE_CACHE_DEVSEED=1, on top of the prefill): no larger graph, no wait for the routing, no
-// lent slots. G4 (RTX PRO 6000) Flash-Next UD-IQ4_XS 32 GB, Studio argv (MTP drafter), 2k prompt + 256 decode: decode hit rate after
+// lent slots. RTX PRO 6000 (RTX PRO 6000) Flash-Next 4-bit quant 32 GB, Studio argv (MTP drafter), 2k prompt + 256 decode: decode hit rate after
 // the prompt 87.8% -> 90.3%, decode 95.7 -> 98.0 tok/s, prompt 2204 -> 2243; the host seed (lent at depth 3, or at depth 2) gets the same
 // decode but costs the prompt 11-14% (its uploads wait for the routing of each layer, the lent slots are refilled after the prompt).
 // A cache of most experts (Flash-Next 64 GB, 92%) keeps the prefill alone: there the decode reads 98.8% from it already.
 // LLAMA_MOE_CACHE_DEVSEED_FALLBACK=0 keeps the prefill without seeding; an explicit LLAMA_MOE_CACHE_DEVSEED or LLAMA_MOE_CACHE_SEED wins
 //
-// k19-devseed (host_seed_fits, LLAMA_MOE_CACHE_DEVSEED_PREFER, default 1): where the host seed fits but the fit did not price it (the cache
+// (host_seed_fits, LLAMA_MOE_CACHE_DEVSEED_PREFER, default 1): where the host seed fits but the fit did not price it (the cache
 // holds the experts of more than LLAMA_FIT_SEED_PRICE_MAX_TOKENS tokens, see seed_price_wanted), the same rule (share, tokens, min_ub)
 // turns the device seed on for the prompt ubatches of min_ub+ tokens only; smaller prompt ubatches keep the host seed (it fits), and nothing
 // is prefilled. Before, the choice followed whether the seed graph fit beside the fit's headroom, i.e. incidental free memory: L4 Flint
-// UD-Q4_K_XL 16 GB ctx 32768 pinned, the host seed fit at the default margin (2k prompt 1006 tok/s, 8k 1408) and did not with 768 MiB
+// 4-bit quant 16 GB ctx 32768 pinned, the host seed fit at the default margin (2k prompt 1006 tok/s, 8k 1408) and did not with 768 MiB
 // more cache (LLAMA_MOE_FIT_MARGIN_MIB=256: device seed, 1670 / 1878). The single-ubatch own-ids host seed makes the uploads of every
 // layer wait for its routing and admits nearly the whole cache again (see seed_price_wanted); the device seed needs no larger graph and
 // no memory beyond the seed plans. =0: the host seed wherever it fits, as before
@@ -3911,10 +3911,10 @@ void llama_context::moe_cache_devseed_fallback(bool host_seed_fits) {
             return;
         }
     }
-    // k16-seed: where the fit did not price the host seed (the token gate, or LLAMA_FIT_SEED_PRICE=0), a cache of up to
+    // where the fit did not price the host seed (the token gate, or LLAMA_FIT_SEED_PRICE=0), a cache of up to
     // LLAMA_MOE_CACHE_DEVSEED_UNPRICED_MAX_FRAC (0.75) of the host experts takes the device seed: above 0.5 it was only prefilled
-    // and its prompts did not seed it (G4 k16d_g4seed, Qwen3.6 UD-Q4_K_XL + MTP 16 GB, 51% of the host experts: decode hit rate 94.0%,
-    // priced 97.0%; k16d_g4seed2: that placement with the device seed beat the priced seed in all 6 prompts, mean request -2.6%)
+    // and its prompts did not seed it (RTX PRO 6000, Qwen3.6 4-bit quant + MTP 16 GB, 51% of the host experts: decode hit rate 94.0%,
+    // priced 97.0%; that placement with the device seed beat the priced seed in all 6 prompts, mean request -2.6%)
     const bool unpriced = !(fit_seed_price_on() && seed_price_wanted());
     double max_frac = unpriced ? 0.75 : 0.5;
     if (unpriced) {
@@ -3970,14 +3970,14 @@ void llama_context::moe_cache_devseed_fallback(bool host_seed_fits) {
     }
 }
 
-// k16-fit: set once a memory probe of this process priced a seed graph (sched_reserve): the fit then made room for it
+// set once a memory probe of this process priced a seed graph (sched_reserve): the fit then made room for it
 std::atomic<bool> llama_context::g_fit_seed_priced{false};
 
-// k19-df2reg: beside a DFlash2 drafter (common sets LLAMA_MOE_CACHE_SEED_OWN_DFLASH=1 for a target launched with --spec-type
+// beside a DFlash2 drafter (common sets LLAMA_MOE_CACHE_SEED_OWN_DFLASH=1 for a target launched with --spec-type
 // draft-dflash and a MoE cache), a prefetched ubatch without an earlier routing (a prompt of one large ubatch, e.g. a 640-token chat
 // turn) seeds the MoE cache from its own ids only from 1024 tokens on, as the device seed (moe_cache_devseed_fallback). The seed
 // graph fits beside the DFlash2 drafter's reserve since the one-node QSA selection mask (200 MiB smaller), and the seed of such a turn
-// replaced the cache and RAM-tier experts the decode after it reads: Colab L4 Flash-Next full card DFlash2 chat read 55% more from the
+// replaced the cache and RAM-tier experts the decode after it reads: L4 Flash-Next full card DFlash2 chat read 55% more from the
 // disk (8.2 vs 5.4 GB) and ran 14-19% slower with the same text. Smaller ubatches run as when the seed graph does not fit
 // (count_seed_skipped). Other contexts keep every such seed (Qwen3.6-35B-A3B MTP at L4 12 GB: the gate changed its 2k / 8k text).
 // LLAMA_MOE_CACHE_SEED_OWN_MIN=N: that minimum in every context (0: none); LLAMA_MOE_CACHE_SEED_OWN_DFLASH=0: no gate beside DFlash2
@@ -3997,12 +3997,12 @@ bool llama_context::fit_seed_price_on() {
     return on;
 }
 
-// k16-seed: whether the fit prices the host seed of a prompt (sched_reserve_seed) for this context's MoE cache. The host seed reads the
+// whether the fit prices the host seed of a prompt (sched_reserve_seed) for this context's MoE cache. The host seed reads the
 // routing of the prompt's last ubatch before its uploads (they no longer run ahead of the compute of each layer) and admits the experts
 // that ubatch uses. Where the cache holds the experts of many tokens, that ubatch admits nearly the whole cache again while its uploads
-// wait, and the prompt pays for it: G4 k16d_g4cut, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP (the experts of 9.6 / 16 tokens cached at 12 / 16 GB),
+// wait, and the prompt pays for it: RTX PRO 6000, Qwen3.6-35B-A3B 4-bit quant + MTP (the experts of 9.6 / 16 tokens cached at 12 / 16 GB),
 // 2k prompt 5528 -> 6547 / 6070 -> 7866 tok/s unpriced, decode within the A/A spread; where it holds few, the seed pays (Qwen3.8-Flash-Next
-// UD-IQ4_XS, 2.4 / 6.1 tokens: prompts +2.6%, 16 GB 8k decode +4.8% priced). Unpriced, the context seeds as before the price: the host seed
+// 4-bit quant, 2.4 / 6.1 tokens: prompts +2.6%, 16 GB 8k decode +4.8% priced). Unpriced, the context seeds as before the price: the host seed
 // where it fits beside the headroom, else the device seed (moe_cache_devseed_fallback) or none. LLAMA_FIT_SEED_PRICE_MAX_TOKENS (8): the
 // experts of at most that many tokens cached; LLAMA_FIT_SEED_PRICE=1 prices it always, =0 never
 bool llama_context::seed_price_wanted() const {
@@ -4028,7 +4028,7 @@ bool llama_context::seed_price_wanted() const {
 
 bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp) {
     // headroom for the memory the backends allocate while computing (e.g. the CUDA pool), which a larger compute buffer would take;
-    // k16-fit: at least the memory --fit left free (LLAMA_FIT_TARGET_MIB, set by common), which this optional graph must not take
+    // at least the memory --fit left free (LLAMA_FIT_TARGET_MIB, set by common), which this optional graph must not take
     const size_t margin = std::max<size_t>(512ull*1024*1024, getenv("LLAMA_FIT_TARGET_MIB") ? (size_t) atoll(getenv("LLAMA_FIT_TARGET_MIB"))*1024*1024 : 0);
 
     // the measure may release a graph allocator buffer that is too small for this graph, the free memory then includes it
@@ -4057,7 +4057,7 @@ bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint3
         ggml_backend_dev_memory(dev, &free, &total);
         free -= std::min(free, released);
         free -= std::min(free, i < mem_reserve.size() ? mem_reserve[i] : (size_t) 0);
-        // k11: the cache memory kept for layer-major graphs (common, LLAMA_MOE_LAYER_MAJOR_RESERVE_*) is not free for the seed
+        // the cache memory kept for layer-major graphs (common, LLAMA_MOE_LAYER_MAJOR_RESERVE_*) is not free for the seed
         // (LLAMA_MOE_LAYER_MAJOR_RESERVE_SEED=1: counted as free, as before)
         static const size_t lm_reserved = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVED_BYTES") != nullptr &&
             (getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_SEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_SEED")) == 0) ?
@@ -4104,7 +4104,7 @@ void llama_context::synchronize_outputs() {
     synchronize();
 }
 
-// k19-graph: the sampler's wait before it reads the outputs (common_sampler_sample); nothing queued, nothing to wait for (the decode
+// the sampler's wait before it reads the outputs (common_sampler_sample); nothing queued, nothing to wait for (the decode
 // stats are counted at the sync that follows the decode, which this does not skip)
 void llama_context::synchronize_pending() {
     if (!sync_pending && n_queued_tokens == 0 && llama_sync_skip_enabled()) {
@@ -4229,7 +4229,7 @@ bool llama_context::memory_update(bool optimize) {
                 res->reset();
             }
         }
-        // (k11: the kept small graphs stay: a swap-in allocates them in the scheduler again and checks them with can_reuse; a recurrent
+        // (the kept small graphs stay: a swap-in allocates them in the scheduler again and checks them with can_reuse; a recurrent
         // rollback after a rejected draft comes here every time, LLAMA_GRAPH_SMALL_KEEP_UPDATE=0 drops them as before)
         static const bool keep_update = getenv("LLAMA_GRAPH_SMALL_KEEP_UPDATE") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_KEEP_UPDATE")) != 0;
         gf_res_prev_active = nullptr;
@@ -4617,10 +4617,10 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
 
-    // k19-ttft (LLAMA_NEXTN_PREALLOC=0: at the first long prompt, as before): beside a MoE cache the unmasked next-n store (the target rows a
+    // (LLAMA_NEXTN_PREALLOC=0: at the first long prompt, as before): beside a MoE cache the unmasked next-n store (the target rows a
     // separate drafter reads) is pinned now, at n_batch rows, instead of at the first prompt longer than one ubatch. That allocation
     // (cudaMallocHost, 320 MiB at n_batch 8192) ran beside the layer-major group but held the driver lock, so the request's own launches
-    // waited on it: G4 Flash-Next UD-IQ4_XS + Q8_0 MTP drafter 48 GB, 42 ms of the first 8k / 30k request (cudaEventRecord blocked 42.6 ms).
+    // waited on it: RTX PRO 6000 Flash-Next 4-bit quant + Q8_0 MTP drafter 48 GB, 42 ms of the first 8k / 30k request (cudaEventRecord blocked 42.6 ms).
     // The same store the first long prompt would make (it never shrinks); without a MoE cache the prompt rows go to the device sink
     static const bool prealloc = getenv("LLAMA_NEXTN_PREALLOC") == nullptr || atoi(getenv("LLAMA_NEXTN_PREALLOC")) != 0;
     if (prealloc && value && !masked && moe_cache && (!buf_nextn || nextn_cap_rows < cparams.n_batch)) {
@@ -4642,7 +4642,7 @@ void llama_context::set_verify(bool value) {
 
 void llama_context::set_verify_exact(bool value) {
     if (cparams.verify_exact != value && moe_cache) {
-        // k19-fixB: the flag shapes the MoE graphs (the route tail skip, see build_moe_ffn), which a kept graph would not follow
+        // the flag shapes the MoE graphs (the route tail skip, see build_moe_ffn), which a kept graph would not follow
         gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
     }
     cparams.verify_exact = value;
@@ -4992,7 +4992,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
-        // k15-fn: a chain set before (the server's device greedy chain, back from a backend sampling request) is initialized once
+        // a chain set before (the server's device greedy chain, back from a backend sampling request) is initialized once
         if (!llama_sampler_chain_is_init(sampler)) {
             sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
         }
@@ -5084,13 +5084,13 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    llama_ple_busy_us.store(ggml_time_us(), std::memory_order_relaxed); // k15-fn: the PLE read-in waits while ubatches run
+    llama_ple_busy_us.store(ggml_time_us(), std::memory_order_relaxed); // the PLE read-in waits while ubatches run
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
-    // k17-small (lazy KV step 2): the MoE cache retired slots for the KV cache (llama_moe_cache::shrink): the graphs built before read the
+    // (lazy KV step 2): the MoE cache retired slots for the KV cache (llama_moe_cache::shrink): the graphs built before read the
     // old slot counts, they are built again
     if (moe_cache && moe_cache->take_graphs_stale()) {
         gf_res_prev_active = nullptr; gf_res_epoch++;
@@ -5098,12 +5098,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // hybrid MoE cache: the fetch share is measured with the threads of the small batches, before their first graph is built
     // (CPU misses: at the first ubatch of any size, with the decode threads, so that the first prompt can use the host path)
-    // k19-fixE: not while the tiny-ubatch rule has the banks released (a first prompt ubatch above it with no warmup decode before): the
+    // not while the tiny-ubatch rule has the banks released (a first prompt ubatch above it with no warmup decode before): the
     // probe uploads experts into the banks; it stays pending for the first ubatch with the banks back, and such ubatches use no bank
     if (moe_cache && moe_cache->hybrid_probe_pending() && (ubatch.n_tokens <= llama_moe_cache::n_small_max || moe_cache->cpu_miss_enabled()) &&
             backend_cpu != nullptr && !moe_cache->released()) {
         ggml_backend_sched_synchronize(sched.get());
-        // the calibration times the host with the threads that compute the missing experts (k11 host threads when on)
+        // the calibration times the host with the threads that compute the missing experts (host threads when on)
         compute_n_tokens = -1;
         set_compute_threads(moe_cache->cpu_miss_enabled() ? false : ubatch.n_tokens > 1);
         compute_n_tokens = 0;
@@ -5125,7 +5125,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         moe_cache->hybrid_tick(ubatch.n_tokens);
         ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
     }
-    // k15-pred r22b: short-prompt host path timing (opt-in), no change to the scheduler's overlap flag
+    // r22b: short-prompt host path timing (opt-in), no change to the scheduler's overlap flag
     if (moe_cache && moe_cache->prompt_auto_pending()) {
         moe_cache->prompt_auto_tick(ubatch.n_tokens);
     }
@@ -5134,34 +5134,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     int64_t t_tr_graph = 0;
     int64_t t_tr_set   = 0;
 
-    // k11-decode: LLAMA_UBATCH_TIMING=1 logs the host time of each small ubatch (graph build + alloc, inputs, compute launch)
+    // LLAMA_UBATCH_TIMING=1 logs the host time of each small ubatch (graph build + alloc, inputs, compute launch)
     static const bool ub_timing = getenv("LLAMA_UBATCH_TIMING") != nullptr && atoi(getenv("LLAMA_UBATCH_TIMING")) != 0;
     const int64_t t_ub0 = ub_timing ? ggml_time_us() : 0;
     bool ub_reused = false;
 
-    // k11-decode: a small output ubatch uses the kept graph of its size (see gf_res_small)
+    // a small output ubatch uses the kept graph of its size (see gf_res_small)
     // (only while n-gram drafting verifies exactly, see llama_set_verify_exact: without drafts the kept graphs bought nothing and cost
-    // the next short prompt 7-8% on G4; LLAMA_GRAPH_SMALL_CACHE=2 keeps them always, =0 never)
+    // the next short prompt 7-8% on RTX PRO 6000; LLAMA_GRAPH_SMALL_CACHE=2 keeps them always, =0 never)
     static const int  small_cache_mode = getenv("LLAMA_GRAPH_SMALL_CACHE") == nullptr ? 1 : atoi(getenv("LLAMA_GRAPH_SMALL_CACHE"));
-    // k13-fn: =3 also with a MoE cache (verify windows of changing size each keep their graph, so their CUDA graphs stay captured)
-    // k15-fn: also the MTP drafter's own context (no MoE cache): its single-token draft steps alternate with the catch-up batch of the
+    // =3 also with a MoE cache (verify windows of changing size each keep their graph, so their CUDA graphs stay captured)
+    // also the MTP drafter's own context (no MoE cache): its single-token draft steps alternate with the catch-up batch of the
     // accepted rows (1 .. n_max + 1 rows, kept per size too), which rebuilt the shared graph every round, so the step's CUDA graph was
     // re-captured instead of replayed
     // (LLAMA_GRAPH_SMALL_CACHE_DRAFT=0: as before)
     static const bool small_cache_draft = getenv("LLAMA_GRAPH_SMALL_CACHE_DRAFT") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_CACHE_DRAFT")) != 0;
-    // k19-handoff (LLAMA_GRAPH_SMALL_CACHE_DFLASH=0: off): the DFlash drafter's context too: its injection of the verify rows' features and
-    // its noise block alternate every pass, so the shared graph was built again twice per pass (~0.17 ms of host time on G4 Flash-Next
+    // (LLAMA_GRAPH_SMALL_CACHE_DFLASH=0: off): the DFlash drafter's context too: its injection of the verify rows' features and
+    // its noise block alternate every pass, so the shared graph was built again twice per pass (~0.17 ms of host time on RTX PRO 6000 Flash-Next
     // with the GPU idle); each keeps its graph per size instead
     static const bool small_cache_dflash = getenv("LLAMA_GRAPH_SMALL_CACHE_DFLASH") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_CACHE_DFLASH")) != 0;
     const bool small_cache_dft = small_cache_mode == 1 && small_cache_draft && moe_cache == nullptr &&
         (cparams.embeddings_nextn_masked || (small_cache_dflash && model.arch == LLM_ARCH_DFLASH && cparams.embeddings_nextn));
-    // k15-fn: with the saved allocations (LLAMA_SCHED_SIZE_CACHE=0: off) a target with a drafter keeps its decode and verify graphs
+    // with the saved allocations (LLAMA_SCHED_SIZE_CACHE=0: off) a target with a drafter keeps its decode and verify graphs
     // per size also with a MoE cache: a window of another size restores its own split, allocation and CUDA graph
     static const bool size_cache = getenv("LLAMA_SCHED_SIZE_CACHE") == nullptr || atoi(getenv("LLAMA_SCHED_SIZE_CACHE")) != 0;
     const bool small_cache_tgt = small_cache_mode == 1 && size_cache && cparams.spec_draft && (ubatch.n_tokens == 1 || cparams.verify);
     const bool small_cache_env = small_cache_mode == 2 || small_cache_mode == 3 || (small_cache_mode == 1 && cparams.verify_exact) || small_cache_dft ||
         small_cache_tgt;
-    // (single token decodes and speculative verify windows only: a prompt's short tail keeps the shared graph, as before; G4 LFM2.5
+    // (single token decodes and speculative verify windows only: a prompt's short tail keeps the shared graph, as before; RTX PRO 6000 LFM2.5
     // 32 GB: with the tails kept too, chat / code prompts were 3 / 9% slower)
     // (the drafter's catch-up batch has no outputs: it only writes the KV of the accepted rows)
     const uint32_t n_small = small_cache_env && (moe_cache == nullptr || small_cache_mode == 3 || small_cache_tgt) && !graph_reuse_disable && (n_outputs > 0 || small_cache_dft) &&
@@ -5171,9 +5171,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     uint32_t i_small = 0; // the kept graph used: n_small*GF_SMALL_WAYS + way
     if (n_small > 0) {
         int way = -1;
-        // k19-handoff: in the DFlash drafter's context the previous graph of this size is the other kind (injection vs noise block), so
+        // in the DFlash drafter's context the previous graph of this size is the other kind (injection vs noise block), so
         // it is taken only when it can be reused: else each would rebuild the other's way every pass
-        // k19-specpass (LLAMA_SPEC_ROW_GRAPH=0: off): the same in the target of a speculative decoder for single-token decodes, which
+        // (LLAMA_SPEC_ROW_GRAPH=0: off): the same in the target of a speculative decoder for single-token decodes, which
         // come in two kinds (a state in a rollback row after a verify is gathered, else read in place, see get_rs_alias): the previous
         // graph of the other kind was rebuilt in place instead of taking the kept way of this kind
         const bool dflash_ways = (small_cache_dflash && model.arch == LLM_ARCH_DFLASH) ||
@@ -5193,11 +5193,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 way = (int) w;
             }
         }
-        // k15-fn (LLAMA_GRAPH_SMALL_WARM_WAY=0: least recently used): no kept graph of this size can be reused (a new request or a grown
+        // (LLAMA_GRAPH_SMALL_WARM_WAY=0: least recently used): no kept graph of this size can be reused (a new request or a grown
         // KV view changed the parameters) and the most recently used one ran at least 8 times since it was built (a stable graph, so
         // not one of two alternating parameter sets): it is rebuilt in place. Its meta buffer gives the rebuilt graph the same first
         // node, so the backend's CUDA graph for it is captured again at once instead of an eager warm-up pass plus a capture under a
-        // new key (G4 Flash-Next: ~14 ms at each request's first verify)
+        // new key (RTX PRO 6000 Flash-Next: ~14 ms at each request's first verify)
         static const bool warm_way = getenv("LLAMA_GRAPH_SMALL_WARM_WAY") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_WARM_WAY")) != 0;
         // fndec (LLAMA_GRAPH_SMALL_WARM_VERIFY=0: 8 uses for verify windows too): a verify window rebuilds its most recently used kept
         // graph in place once that ran twice. With a variable window (p_min / n-gram drafts) each size runs only a few times between
@@ -5209,8 +5209,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // only a kept graph built with the sampler chains of this ubatch is rebuilt in place (LLAMA_GRAPH_SMALL_WARM_SAME_SMPL=0: any).
         // The server's verify graph prewarm runs every width with each device sampler chain of the slot in turn (greedy, masked greedy,
         // top-k); rebuilt in place, each chain's graphs replaced the previous chain's in the same way, so only the last chain's stayed
-        // kept and a request with another chain built and captured each width again in its first windows (Colab G4, Qwen3.8-Flash-Next
-        // UD-IQ4_XS + DFlash2 n6, 48 GB: 4 verify graph captures of ~7850 nodes in a 256-token chat request). Another chain now takes the
+        // kept and a request with another chain built and captured each width again in its first windows (RTX PRO 6000, Qwen3.8-Flash-Next
+        // 4-bit quant + DFlash2 n6, 48 GB: 4 verify graph captures of ~7850 nodes in a 256-token chat request). Another chain now takes the
         // least recently used way, so every chain keeps its graphs
         static const bool warm_same_smpl = getenv("LLAMA_GRAPH_SMALL_WARM_SAME_SMPL") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_WARM_SAME_SMPL")) != 0;
         if (way < 0 && warm_way) {
@@ -5261,14 +5261,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the copies of the experts are planned with the seed mode of the MoE cache (see sched_copy_all_experts)
     const int moe_cache_hybrid = moe_cache ? moe_cache->hybrid_mode() : 0;
 
-    // k11-decode: a kept small graph built for these parameters goes back into the scheduler: only its allocation is redone (the same
+    // a kept small graph built for these parameters goes back into the scheduler: only its allocation is redone (the same
     // graph allocates to the same addresses, so its CUDA graph is replayed as captured)
     auto small_swap_in = [&]() -> bool {
         if (n_small == 0 || gf == nullptr || !gf_res_small_built[i_small] || gf_res_small_epoch[i_small] != gf_res_epoch ||
                 moe_cache_seed_graph != moe_cache_seed || moe_cache_hybrid_graph != moe_cache_hybrid || moe_cache_devseed_graph != moe_cache_devseed ||
                 moe_inplace_graph != moe_inplace_ok ||
                 !res->can_reuse(gparams)) {
-            // k15-fn debug (LLAMA_GRAPH_SMALL_WHY=N): the first condition that refused the kept graph, for up to N refusals
+            // debug (LLAMA_GRAPH_SMALL_WHY=N): the first condition that refused the kept graph, for up to N refusals
             static int why_left = getenv("LLAMA_GRAPH_SMALL_WHY") ? atoi(getenv("LLAMA_GRAPH_SMALL_WHY")) : 0;
             if (n_small > 0 && gf != nullptr && why_left > 0) {
                 why_left--;
@@ -5280,10 +5280,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
             return false;
         }
-        gf_res_prev_active = nullptr; // (k11: not an invalidation of the kept small graphs)
+        gf_res_prev_active = nullptr; // (not an invalidation of the kept small graphs)
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
-        // k15-fn: the saved split and allocation of this graph: its tensors are as they were after that allocation (no other graph
+        // the saved split and allocation of this graph: its tensors are as they were after that allocation (no other graph
         // writes them), the split context and tables go back in place
         if (size_cache && gf_res_small_plan[i_small] != nullptr) {
             if (ggml_backend_sched_plan_restore(sched.get(), gf_res_small_plan[i_small])) {
@@ -5295,7 +5295,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             small_plan_free(i_small);
             n_plan_invalid++;
         }
-        // k19-mgpu3 (LLAMA_GRAPH_SMALL_BACKENDS=0: off): the scheduler was reset above, which drops the backends the graph builder assigned
+        // (LLAMA_GRAPH_SMALL_BACKENDS=0: off): the scheduler was reset above, which drops the backends the graph builder assigned
         // (ggml_backend_sched_set_tensor_backend). A kept graph allocated again without being built again (its first swap-in, which
         // also saves the plan every later swap-in restores, or a refused plan) was split by the scheduler's own rules: the get_rows of an
         // MoE cache slot map, a host weight, went to the CPU, so the slot map was never copied to the device, the copy callback that plans and uploads
@@ -5357,7 +5357,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (n_small == 0) {
             reserve_small_max(ubatch);
         }
-        gf_res_prev_active = nullptr; // (k11: not an invalidation of the kept small graphs)
+        gf_res_prev_active = nullptr; // (not an invalidation of the kept small graphs)
         if (n_small > 0) {
             small_plan_free(i_small); // its tensors go now
         }
@@ -5405,7 +5405,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 st.buffer = t->buffer;
                 st.extra  = t->extra;
                 st.flags  = t->flags;
-                st.backend = ggml_backend_sched_get_tensor_backend(sched.get(), t); // assigned by the graph builder (k19-mgpu3)
+                st.backend = ggml_backend_sched_get_tensor_backend(sched.get(), t); // assigned by the graph builder
                 sv.push_back(st);
             }
         };
@@ -5441,10 +5441,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
             alloc_ok = gf != nullptr && ggml_backend_sched_alloc_graph(sched.get(), gf);
         }
-        // k19-synclend (GGML_SCHED_HOST_OPS_FALLBACK=0 off): a graph that did not allocate (e.g. refused because the MoE cache did not lend
+        // (GGML_SCHED_HOST_OPS_FALLBACK=0 off): a graph that did not allocate (e.g. refused because the MoE cache did not lend
         // the SYNC copies of its host weights and the device cannot hold them, see ggml_backend_sched_alloc_graph) is built again with the
         // operations on host weights kept on the host, as for batches below the backend's offload size: no copies of those weights, the
-        // prefetch stays on for the graphs after it. G4 Qwen3.6 UD-Q4_K_XL 12 GB, LLAMA_MOE_FIT_MARGIN_MAX_RATIO=1.8: the 42-token chat
+        // prefetch stays on for the graphs after it. RTX PRO 6000 Qwen3.6 4-bit quant 12 GB, LLAMA_MOE_FIT_MARGIN_MAX_RATIO=1.8: the 42-token chat
         // prompt failed and with it every later prompt of the process
         if (!alloc_ok && gf != nullptr && ggml_backend_sched_host_fallback_on() && ggml_backend_sched_get_op_offload(sched.get())) {
             const size_t over = ggml_backend_sched_get_alloc_over(sched.get());
@@ -5530,7 +5530,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (moe_cache) {
         moe_cache->prepare(ubatch.n_tokens);
         if (moe_cache_devseed_on) {
-            // k15-fn (LLAMA_MOE_DEVSEED_SKIP=0: every ubatch): a disabled prepare only zeroes the seed plans of the graph (two walks of every
+            // (LLAMA_MOE_DEVSEED_SKIP=0: every ubatch): a disabled prepare only zeroes the seed plans of the graph (two walks of every
             // node); a reused graph whose plans a disabled prepare already zeroed since it was built keeps them zeroed (only prepare and
             // devseed_end write them, and devseed_end runs after an enabled prepare only)
             static const bool skip_env = getenv("LLAMA_MOE_DEVSEED_SKIP") == nullptr || atoi(getenv("LLAMA_MOE_DEVSEED_SKIP")) != 0;
@@ -5549,7 +5549,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     compute_n_tokens = ubatch.n_tokens;
     const int64_t t_ub2 = ub_timing ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    // k15-pp (debug): LLAMA_KQ_MASK_DUMP=1 counts the kept cells of each device-built KQ mask (marked as an output by the builder)
+    // (debug): LLAMA_KQ_MASK_DUMP=1 counts the kept cells of each device-built KQ mask (marked as an output by the builder)
     static const bool kq_mask_dump = getenv("LLAMA_KQ_MASK_DUMP") != nullptr;
     if (kq_mask_dump) {
         ggml_backend_sched_synchronize(sched.get());
@@ -5570,7 +5570,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 (int) t->ne[1], (long long) n_keep, (long long) n_drop, (long long) n_other, t->buffer ? ggml_backend_buffer_name(t->buffer) : "-");
         }
     }
-    // k19-g4tier (debug): LLAMA_MOE_ROUTE_DUMP=path appends, per decode / verify window (at most 16 tokens), the routed experts of each
+    // (debug): LLAMA_MOE_ROUTE_DUMP=path appends, per decode / verify window (at most 16 tokens), the routed experts of each
     // MoE layer ("R pass layer n_tokens n_used ids..."), the next-layer router's top 64 on this layer's MoE input ("P pass layer
     // n_tokens 64 ids...", see qwen4exp) and the MoE cache's fills of the layer ("F pass layer n_fill experts...")
     static const char * route_dump = getenv("LLAMA_MOE_ROUTE_DUMP");
@@ -5702,7 +5702,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     n_queued_tokens += n_tokens;
 
     // reserve output buffer
-    nextn_need_rows = n_tokens; // k15-pp: encode copies every row (see nextn_store_ensure)
+    nextn_need_rows = n_tokens; // encode copies every row (see nextn_store_ensure)
     if (output_reserve(n_tokens) < n_tokens) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
         return -2;
@@ -5949,15 +5949,15 @@ struct ple_decode_meter {
 };
 }
 
-// k11 (LLAMA_STATE_ASYNC_LAZY=1, opt-in): an asynchronous state save queued before a decode() call completes at the next synchronize() /
-// state call / llama_state_seq_async_wait() instead of when decode() returns. No gain measured (G4 Qwen3.6 32 GB chat / c400 within
+// (LLAMA_STATE_ASYNC_LAZY=1, opt-in): an asynchronous state save queued before a decode() call completes at the next synchronize() /
+// state call / llama_state_seq_async_wait() instead of when decode() returns. No gain measured (RTX PRO 6000 Qwen3.6 32 GB chat / c400 within
 // noise): the worker's copy into a fresh checkpoint buffer outlasts the 4-token decode it would overlap, so the sync for its logits waits anyway
 static bool state_async_lazy() {
     static const bool on = getenv("LLAMA_STATE_ASYNC_LAZY") != nullptr && atoi(getenv("LLAMA_STATE_ASYNC_LAZY")) != 0;
     return on;
 }
 
-// k19-host (diagnostic, LLAMA_DECODE_PHASE_LOG=1): host time of the phases of a decode of more than 64 tokens, ms since it started
+// (diagnostic, LLAMA_DECODE_PHASE_LOG=1): host time of the phases of a decode of more than 64 tokens, ms since it started
 static bool llama_phase_log_on() {
     static const bool on = getenv("LLAMA_DECODE_PHASE_LOG") != nullptr && atoi(getenv("LLAMA_DECODE_PHASE_LOG")) != 0;
     return on;
@@ -5973,16 +5973,16 @@ static void llama_phase(const char * what) {
     }
 }
 
-// k19-ttft4 (LLAMA_MOE_PROMPT_RUN, default 1; 0 = each call on its own, as before): the tokens of the prompt run this call belongs to. The
+// (LLAMA_MOE_PROMPT_RUN, default 1; 0 = each call on its own, as before): the tokens of the prompt run this call belongs to. The
 // server runs a prompt's last 4 tokens as a call of their own after its context checkpoint; that call is a prompt batch of 4 tokens,
-// which the MoE cache's short-prompt rule (llama_moe_cache::set_prompt_batch, k17-ttft / k19-l4poly: a chat turn of at most
+// which the MoE cache's short-prompt rule (llama_moe_cache::set_prompt_batch, a chat turn of at most
 // LLAMA_MOE_CPU_MISS_SHORT tokens computes its misses on the host where the cost model says so) did not count as part of the chat turn:
-// it kept those 4 tokens on the uploads of a pinned cache (k15), every routed miss of every layer copied for 4 tokens. Colab L4 LFM2.5
+// it kept those 4 tokens on the uploads of a pinned cache, every routed miss of every layer copied for 4 tokens. L4 LFM2.5
 // 4 GB (14.6% of the host experts cached), a 38-token chat prompt: the 34-token call 568 ms on the host path, the 4-token call 230 ms
 // of uploads. Counted as one run (same sequence, the next call starts where the last prompt call ended, no generation between them),
 // the 4-token call takes the short prompt's host path too. A call with an output for every token (generation, verify) ends a run
 int64_t llama_context::prompt_run_tokens(int64_t n_outputs_all, int64_t n_tokens_all) {
-    // k19-defaults1116: on by default again. With it the 4-token call computes its misses on the host (q8_K activations) instead of
+    // on by default again. With it the 4-token call computes its misses on the host (q8_K activations) instead of
     // uploading them: the same experts, rounded on another device (srv_kld short192 means and top-1 inside / better than the -fa off
     // band, single-position maxima above it: first token 1.41 vs 1.11, decode 1.42 vs 1.33). L4 LFM2.5 4 GB chat TTFT 0.840 -> 0.680 s
     static const bool on = getenv("LLAMA_MOE_PROMPT_RUN") == nullptr || atoi(getenv("LLAMA_MOE_PROMPT_RUN")) != 0;
@@ -6022,7 +6022,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     struct phase_end {
         ~phase_end() { llama_phase("return"); }
     } phase_end_guard;
-    // k19-vcost (diagnostic, with LLAMA_UBATCH_TIMING=1): the host time of the whole call for a small batch, beside process_ubatch's own line
+    // (diagnostic, with LLAMA_UBATCH_TIMING=1): the host time of the whole call for a small batch, beside process_ubatch's own line
     struct decode_timer {
         int64_t t0 = 0; size_t n = 0;
         ~decode_timer() {
@@ -6118,14 +6118,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
-    // k11 (LLAMA_LM_CKPT_MERGE): the breaks apply to this batch only
+    // (LLAMA_LM_CKPT_MERGE): the breaks apply to this batch only
     struct ubatch_breaks_reset {
         llama_batch_allocr * b;
         ~ubatch_breaks_reset() { b->ubatch_breaks.clear(); }
     } ubatch_breaks_reset_guard { balloc.get() };
     std::vector<int32_t> ub_breaks = std::move(ubatch_breaks_next);
     ubatch_breaks_next.clear();
-    // k15-pp: the captures asked for this decode (llama_set_state_capture); those of an earlier decode are dropped
+    // the captures asked for this decode (llama_set_state_capture); those of an earlier decode are dropped
     bool cap_active = false;
     for (auto & c : cap) {
         const bool act = c.pending;
@@ -6141,7 +6141,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         cap_active |= act;
     }
     cap_sel = -1;
-    // k15-pp2: a snapshot is overwritten only after the side stream has read it for the save of an earlier decode
+    // a snapshot is overwritten only after the side stream has read it for the save of an earlier decode
     if (cap_active && cap_side_pending) {
         if (ggml_backend_t be = cap_backend()) {
             ggml_backend_event_wait(be, cap_side_ev);
@@ -6181,7 +6181,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_INFO("%s: tail debug batch (%u tokens, %u outputs, ctx %p):%s\n", __func__, n_tokens_all, n_outputs_all, (void *) this, t.c_str());
     }
 
-    // k19-ptres (LLAMA_MOE_CORE=1): at a new request the core is checked and the routing profile written (llama_moe_cache::core_request)
+    // (LLAMA_MOE_CORE=1): at a new request the core is checked and the routing profile written (llama_moe_cache::core_request)
     if (moe_cache && moe_cache->core_wanted()) {
         bool fresh = true;
         for (const auto & tok : batch_inp.tokens) {
@@ -6206,7 +6206,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
         if (fresh) {
-            // k19-fixB: the banks the tiny-ubatch rule released after the last prompt come back first (the reset clears them)
+            // the banks the tiny-ubatch rule released after the last prompt come back first (the reset clears them)
             tiny_rel_leave();
             moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
@@ -6249,7 +6249,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // handle any pending shifts/copies
     memory_update(false);
 
-    // k11-decode: a prompt of several ubatches after a small graph re-planned the graph allocator restores the worst-case pp plan once
+    // a prompt of several ubatches after a small graph re-planned the graph allocator restores the worst-case pp plan once
     // (see restore_pp_plan); the server restores it when its slots go idle, so this is the fallback
     if (n_tokens_all > cparams.n_ubatch && !cparams.verify) {
         restore_pp_plan();
@@ -6260,25 +6260,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // speculative verify batches with LLAMA_MTP_EXACT=1 are computed batch invariant (see llama_set_verify)
     const bool exact_verify = cparams.verify && (llama_exact_verify_env() || cparams.verify_exact) && n_tokens_all > 1 && cparams.causal_attn && !output_all;
 
-    // k19-vgraph: with exact verify on, every ubatch (its single token decodes too) keeps the 256 cell n_kv that
+    // with exact verify on, every ubatch (its single token decodes too) keeps the 256 cell n_kv that
     // llm_graph_exact_row_n_kv splits the verify rows by
     if (auto * mem_idx = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
         mem_idx->set_n_kv_bucket_allowed(!(llama_exact_verify_env() || cparams.verify_exact));
-        // k19-graph: the device KV length is read by flash attention only
+        // the device KV length is read by flash attention only
         mem_idx->set_n_kv_bucket_dev_allowed(cparams.flash_attn);
-        // k19-fullcost (LLAMA_KV_BUCKET_DEV_STEP_MIN=N overrides): without a MoE cache, device KV buckets of at least 16384 cells (was
+        // (LLAMA_KV_BUCKET_DEV_STEP_MIN=N overrides): without a MoE cache, device KV buckets of at least 16384 cells (was
         // 2048), so a chat request and an 8k one share the bucket of the verify graphs the server prewarmed at load
-        // (server_spec_prewarm) and replay them instead of re-capturing each width (G4 fn4 full card, fc_r3: the width rule over every
+        // (server_spec_prewarm) and replay them instead of re-capturing each width (RTX PRO 6000 4-bit full card, fc_r3: the width rule over every
         // width 8k 264.9 -> 292.7 tok/s; at a fixed width the extra masked cells cost nothing there, MTP n2 chat / 8k 306.7 / 255.2 ->
         // 307.8 / 257.2 in fc_r1). Beside a MoE cache (no prewarm there) the 2048-cell step stays: fc_r4 16 / 32 GB were 2-4% slower
         // with 16384 (host input fill beside the host's expert work)
-        // (k19-bigverify: also beside a MoE cache that holds most of the experts, llama_moe_cache_wide_graphs)
+        // (also beside a MoE cache that holds most of the experts, llama_moe_cache_wide_graphs)
         mem_idx->set_n_kv_bucket_dev_wide(moe_cache == nullptr || llama_moe_cache_wide_graphs(this));
     }
 
-    // k19-placemid (LLAMA_MOE_PLACE8_CHUNK_MAX=N; default 64 on a mid-size device, 0 = off, at 8 GB opt-in): a short prompt of at most N
-    // tokens runs as ubatches of the decode size, served by the cache, instead of one ubatch with the banks released and refilled. G4
-    // fn4 + MTP, the 42-token chat prompt (k19pm_g4a): 16 GB TTFT 514 -> 286 ms (base 352; the refill of 7.7 GB of banks took 145 ms),
+    // (LLAMA_MOE_PLACE8_CHUNK_MAX=N; default 64 on a mid-size device, 0 = off, at 8 GB opt-in): a short prompt of at most N
+    // tokens runs as ubatches of the decode size, served by the cache, instead of one ubatch with the banks released and refilled. RTX PRO 6000
+    // 4-bit + MTP, the 42-token chat prompt: 16 GB TTFT 514 -> 286 ms (base 352; the refill of 7.7 GB of banks took 145 ms),
     // 12 GB 391 -> 359 ms (base 361), decode unchanged or better (12 GB 137.2 -> 137.8, 16 GB 150.5 -> 162.6 tok/s, other texts)
     static const int64_t place8_chunk_env = getenv("LLAMA_MOE_PLACE8_CHUNK_MAX") ? std::max(0, atoi(getenv("LLAMA_MOE_PLACE8_CHUNK_MAX"))) : -1;
     const int64_t place8_chunk_max = place8_chunk_env >= 0 ? place8_chunk_env : (place8_grow > 0 && !place8_lean ? 64 : 0);
@@ -6334,10 +6334,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_phase("split");
 
     // reserve output buffer
-    // k15-pp: the next-n rows this decode copies to the host (none where they go to the device sink, see mtp_dev_h_decode_begin)
+    // the next-n rows this decode copies to the host (none where they go to the device sink, see mtp_dev_h_decode_begin)
     nextn_decode_rows = (int64_t) balloc->get_batch().n_tokens;
     nextn_need_rows   = mtp_dev_h_this ? 0 : nextn_decode_rows;
-    // k19-fn16: a prompt batch longer than one ubatch may grow the next-n store on a thread (nextn_store_ensure)
+    // a prompt batch longer than one ubatch may grow the next-n store on a thread (nextn_store_ensure)
     nextn_async_ok = n_outputs_all < n_tokens_all && nextn_decode_rows > (int64_t) cparams.n_ubatch;
     const uint32_t n_res = output_reserve(n_outputs_all);
     nextn_async_ok = false;
@@ -6347,7 +6347,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -2;
     };
 
-    // k15: a prompt batch (some tokens without an output) keeps its ubatches off the CPU-miss host path of a pinned cache (see
+    // a prompt batch (some tokens without an output) keeps its ubatches off the CPU-miss host path of a pinned cache (see
     // llama_moe_cache::set_prompt_batch); generation and verify batches (an output for every token) keep it
     struct moe_prompt_mark {
         llama_moe_cache * mc;
@@ -6360,7 +6360,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
-    // k19-dsv4long far-token skip (LLAMA_DSV41_FAR_SKIP=0 off): the read ends of this batch for one sequence: its end, every output
+    // far-token skip (LLAMA_DSV41_FAR_SKIP=0 off): the read ends of this batch for one sequence: its end, every output
     // and every state capture (a later decode, a restored checkpoint, a rollback can only start at or after one of them)
     std::vector<llama_pos> far_ends;
     int64_t far_rows_all = 0;
@@ -6402,16 +6402,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
-    rows_ev_n = 0; // k15-pp3: no early nextn rows from this decode yet
+    rows_ev_n = 0; // no early nextn rows from this decode yet
 
-    // k19-t4small (decode extension): a prompt goes back to the fitted slots before anything of it runs, its layer-major groups
+    // (decode extension): a prompt goes back to the fitted slots before anything of it runs, its layer-major groups
     // included (they are built before the per-ubatch check below)
     if (ext_grown && moe_cache && moe_cache->ext_on() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && (int64_t) n_tokens_all > ext_ub()) {
         ext_park("prompt");
     }
 
     for (bool more = true; more; ) {
-        // k15-pp: the state before the ubatch that starts at the capture index (a layer-major group captures inside its graph)
+        // the state before the ubatch that starts at the capture index (a layer-major group captures inside its graph)
         for (int s = 0; s < cap_max; ++s) {
             if (cap[s].idx >= 0 && !cap[s].done && n_tokens_prev == cap[s].idx) {
                 cap_now(s, mctx->get_ubatch().pos[0] - 1);
@@ -6459,13 +6459,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             wstore->set_wrap(!(n_outputs > 0 && n_outputs < ubatch.n_tokens));
         }
 
-        // k19-t4small (decode extension): a prompt ubatch runs with the cache at its fitted slots (before the release below takes the
+        // (decode extension): a prompt ubatch runs with the cache at its fitted slots (before the release below takes the
         // banks); the first verify window after it, or a single-token step without a drafter, grows the cache (after the banks are back)
         const bool ext_here = moe_cache && moe_cache->ext_on() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && cparams.n_seq_max == 1;
         if (ext_here && ext_grown && (int64_t) ubatch.n_tokens > ext_ub()) {
             ext_park("prompt");
         }
-        // k19-tiny-ub: a ubatch of more than the default n_ubatch runs with the cache banks released, the next smaller one gets them back
+        // a ubatch of more than the default n_ubatch runs with the cache banks released, the next smaller one gets them back
         if (tiny_rel_ub > 0 && moe_cache) {
             if ((int64_t) ubatch.n_tokens > tiny_rel_ub) {
                 if (!moe_cache->released()) {
@@ -6503,7 +6503,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const bool large      = !moe_cache->small_batch(ubatch.n_tokens);
             const bool last_large = large && n_tokens_all - n_tokens_prev - ubatch.n_tokens <= llama_moe_cache::n_small_max;
             if (tiny_rel_now) {
-                // k19-tiny-ub: released banks take no seed (no slots to admit into); the last large ubatch records its routing for the
+                // released banks take no seed (no slots to admit into); the last large ubatch records its routing for the
                 // refill instead (see tiny_rel_leave)
                 const bool seed_on = moe_cache_seed_enabled;
                 moe_cache_seed_enabled = false;
@@ -6529,7 +6529,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
              (llama_tpp_cached_pos_min() >= 0 && ubatch.pos != nullptr && ubatch.pos[0] >= llama_tpp_cached_pos_min()) ||
              (ubatch.n_tokens >= (llama_verify4_cached_env() ? 4 : 5) && llama_verify_wide_cached_env()));
 
-        // k19-tiny-ub: with the banks released every layer is built as a large batch (an output-only last layer would read the banks
+        // with the banks released every layer is built as a large batch (an output-only last layer would read the banks
         // through a host lookup)
         if (tiny_rel_now) {
             moe_cache->set_force_large(true);
@@ -6550,16 +6550,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         cparams.verify_tag      = false;
 
         if (tiny_rel_record) {
-            // k19-tiny-ub: the slots that come back get the experts this ubatch routed most (read before its compute buffers are freed)
+            // the slots that come back get the experts this ubatch routed most (read before its compute buffers are freed)
             if (res && !moe_cache_ids.empty()) {
                 moe_cache->set_refill_routed_once(true);
-                // k19-autoprof2: the prompt's routing also to the RAM tier's refill and the profile (see moe_cache_released_counts)
+                // the prompt's routing also to the RAM tier's refill and the profile (see moe_cache_released_counts)
                 moe_cache_refill_from_ids(moe_cache_released_counts());
             }
             moe_cache_ids.clear();
             moe_cache_record = false;
         }
-        // k19-mgpu2: resident mode keeps the routing of each large ubatch for the fill at the prompt end (see moe_cache_resident_record)
+        // resident mode keeps the routing of each large ubatch for the fill at the prompt end (see moe_cache_resident_record)
         if (moe_cache && res && !moe_cache->small_batch(ubatch.n_tokens) && moe_cache->resident_fill_wanted()) {
             moe_cache_resident_record(res);
         }
@@ -6875,7 +6875,7 @@ bool llama_context::lm_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
         return mine || (lctx->cparams.cb_eval && lctx->cparams.cb_eval(t, true, lctx->cparams.cb_eval_user_data));
     }
     if (mine && lctx->lm_seed_async) {
-        // k15-pp: the nodes up to t are queued, not computed: read the routing behind them, the copy callback seeds the layer
+        // the nodes up to t are queued, not computed: read the routing behind them, the copy callback seeds the layer
         auto & L = it->second;
         L.done = true;
         const size_t nb = ggml_nbytes(L.ids);
@@ -6946,12 +6946,12 @@ bool llama_context::lm_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 // when the next ubatch of the group reads them in that layer, exactly as in the ubatch-by-ubatch order. Nothing of the math changes: the same
 // ops on the same shapes in the same order per ubatch (only interleaved with the other ubatches), so the outputs are bit-identical.
 // The prompt does not change the MoE cache (no seed, no lent slots): the decode after it finds the cache as it was.
-// k13-small: the hybrid gate's fixed share (a cache of at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts) computes the misses of
+// the hybrid gate's fixed share (a cache of at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts) computes the misses of
 // small batches only, the prompt ubatches a layer-major group runs copy their experts as before. A cache below LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC
-// (0.05) of the host experts runs its prompts layer-major too: G4 at 4 GB, Qwen3.6 Q3_K_M + MTP (0.7% cached) copied every host expert once
-// per 512-token ubatch, 55 GB of copies for a 2k prompt. LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0: k12
-// k16-parity: the line was 5%, inside the default gate's band (at most 10% cached, LLAMA_MOE_CACHE_HYBRID_MAX_FRAC): a cache between 5 and
-// 10% ran every prompt ubatch alone (G4 q3m 4 GB ctx 20480 with q8_0 K/V, 5.4% cached: 2k / 8k prompt 2000 / 2059 tok/s, where 4.0% cached
+// (0.05) of the host experts runs its prompts layer-major too: RTX PRO 6000 at 4 GB, Qwen3.6 Q3_K_M + MTP (0.7% cached) copied every host expert once
+// per 512-token ubatch, 55 GB of copies for a 2k prompt. LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0:
+// the line was 5%, inside the default gate's band (at most 10% cached, LLAMA_MOE_CACHE_HYBRID_MAX_FRAC): a cache between 5 and
+// 10% ran every prompt ubatch alone (RTX PRO 6000 3-bit 4 GB ctx 20480 with q8_0 K/V, 5.4% cached: 2k / 8k prompt 2000 / 2059 tok/s, where 4.0% cached
 // gave 5706 / 9436). Now 0.25, past the default band, so every share the default gate fixes runs its prompts layer-major.
 // LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0.05: the old line
 static bool lm_hybrid_frac_ok(double frac) {
@@ -6959,7 +6959,7 @@ static bool lm_hybrid_frac_ok(double frac) {
     return frac >= 0.0 && frac < max_frac;
 }
 
-// a cache below LLAMA_MOE_LM_RELEASE_FRAC (0.05) of the host experts (k13-small: see the release of the banks in decode_layer_major)
+// a cache below LLAMA_MOE_LM_RELEASE_FRAC (0.05) of the host experts (see the release of the banks in decode_layer_major)
 static bool lm_tiny_cache(double frac) {
     static const double max_frac = getenv("LLAMA_MOE_LM_RELEASE_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LM_RELEASE_FRAC"))) : 0.05;
     return frac >= 0.0 && frac < max_frac;
@@ -6979,7 +6979,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     const int64_t lm_t_start = ggml_time_us(); // the CUDA graphs used from here on are the group's (evicted with its host memory)
 
     // ubatches that can run layer-major: prompt ubatches whose host experts are prefetched whole (the copy is the same for every ubatch)
-    // k19-fixD: with replay rollback, not a ubatch short enough to leave a replay window (n_seq_tokens <= 1 + n_rs_seq, replay_mark):
+    // with replay rollback, not a ubatch short enough to leave a replay window (n_seq_tokens <= 1 + n_rs_seq, replay_mark):
     // the next member's graph applies it, after the in-graph state capture of build_merged copied the rows (cap_now commits the
     // window first, the merged capture cannot); only with GGML_SCHED_PREFETCH_MIN_BATCH lowered or --draft-max >= 255
     auto eligible = [&](const llama_ubatch & ub) {
@@ -6990,8 +6990,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (lm_refused_min <= 2) {
         return 0;
     }
-    // k19-df2pp: the layer inputs a DFlash drafter reads (embeddings_layer_inp) are extracted per member right after the graph that
-    // computed them (extract_upto), so such a target runs its prompts layer-major too (before: every ubatch alone, G4 Flash-Next 12 GB
+    // the layer inputs a DFlash drafter reads (embeddings_layer_inp) are extracted per member right after the graph that
+    // computed them (extract_upto), so such a target runs its prompts layer-major too (before: every ubatch alone, RTX PRO 6000 Flash-Next 12 GB
     // DFlash2 8k / 30k TTFT 2.7x the MTP arm's). LLAMA_MOE_LAYER_MAJOR_LAYER_INP=0: refused, as before
     static const bool lm_layer_inp = getenv("LLAMA_MOE_LAYER_MAJOR_LAYER_INP") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_LAYER_INP")) != 0;
     if (!moe_cache || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
@@ -7034,7 +7034,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         int64_t              n_tokens_before; // tokens of the batch before this ubatch
     };
     std::vector<lm_ub> group;
-    // k19-fixG: a failure after the memory of some ubatches was applied removes their entries (the group's and, if given, those of the
+    // a failure after the memory of some ubatches was applied removes their entries (the group's and, if given, those of the
     // ubatch being added), as decode does for a failed process_ubatch
     auto lm_rollback = [&](const llama_ubatch * cur) {
         llama_pos pos_min[LLAMA_MAX_SEQ];
@@ -7061,10 +7061,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
     };
 
-    // k19-fullcost (LLAMA_GRAPH_SMALL_KEEP_BUFFERS=0: off): the group builds its graphs in results of its own (lm_res) and only resets the
+    // (LLAMA_GRAPH_SMALL_KEEP_BUFFERS=0: off): the group builds its graphs in results of its own (lm_res) and only resets the
     // scheduler, lends cache slots and replaces compute buffers: the kept decode / verify graphs stay valid and are allocated again at
     // their swap-in (their saved plans check the allocator's generation and lent memory). Before, every long prompt beside a MoE cache
-    // made each verify width of the next decode rebuild its graph and capture its CUDA graph under a new key (G4 fn4 24 GB 8k: ~2 ms
+    // made each verify width of the next decode rebuild its graph and capture its CUDA graph under a new key (RTX PRO 6000 4-bit 24 GB 8k: ~2 ms
     // of host time per pass)
     gf_res_prev_active = nullptr;
     if (!llama_graph_small_keep_buffers()) {
@@ -7080,13 +7080,13 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     moe_cache_seed_prev = false;
     moe_cache_record    = false;
     moe_cache_devseed   = false;
-    moe_inplace_ok      = false; // k15-lfm2: layer-major prompts keep their staging copies
+    moe_inplace_ok      = false; // layer-major prompts keep their staging copies
     if (moe_cache) {
         moe_cache->prompt_ubatch(false);
     }
 
     // the arena is pinned only when it is made at load (LLAMA_MOE_LAYER_MAJOR_EAGER=1): made by a prompt, pinning it cost that prompt
-    // 2.6% (2k) / 3.5% (8k) on G4 (Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, 8 GB, fresh process per prompt), while the inputs it holds (mostly
+    // 2.6% (2k) / 3.5% (8k) on RTX PRO 6000 (Qwen3.6-35B-A3B 4-bit quant + MTP, 8 GB, fresh process per prompt), while the inputs it holds (mostly
     // KQ masks of a few MiB per ubatch) are copied synchronously either way; pageable memory is also not locked on a low-RAM machine.
     // LLAMA_MOE_LAYER_MAJOR_ARENA_PINNED=1 pins it anyway
     static const bool lm_pin = (getenv("LLAMA_MOE_LAYER_MAJOR_EAGER") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EAGER")) != 0) ||
@@ -7100,21 +7100,21 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 
     lm_arena_used = 0;
     lm_arena_old.clear();
-    // k19-fixF: the group ends with a member with outputs whose narrowed last layer reads the cache banks (a slot map or a device
+    // the group ends with a member with outputs whose narrowed last layer reads the cache banks (a slot map or a device
     // lookup; see the end of the loop below); such a group must not release the banks
-    // k19-fixG: any member, not only the output one: device seed plans and fills (MOE_CACHE_LOOKUP nodes on the banks, map and state)
+    // any member, not only the output one: device seed plans and fills (MOE_CACHE_LOOKUP nodes on the banks, map and state)
     // in large members, and device lookups of a member the CPU-miss path serves (GGML_SCHED_PREFETCH_MIN_BATCH <= 255)
     bool lm_out_banks = false;
     int64_t n_outputs_group = 0;
     int64_t n_tokens_group  = 0;
     int64_t t_build_us = 0, t_set_us = 0;
     more = true;
-    // k15-pp2 (LLAMA_LM_TAIL=1): the last ubatch of the batch, too short to be eligible (e.g. the server's last 4 prompt tokens, now in
+    // (LLAMA_LM_TAIL=1): the last ubatch of the batch, too short to be eligible (e.g. the server's last 4 prompt tokens, now in
     // the same decode as the rest), joins the group as its last member: built as a large ubatch (llama_moe_cache::set_force_large) with
     // its expert products on the device, it reads the host experts the group already copies for each layer instead of looking them up,
     // copying the misses and computing some on the host in a pass of its own
     // opt-in for now (LLAMA_LM_TAIL=1): exact without speculative decoding, but beside an MTP drafter the first verify after the prompt
-    // gives other logits (local B200, Qwen3.6 q4x 12 GB pinned: draft acceptance 33/58 -> 23/80 at 2k), cause not found yet
+    // gives other logits (local B200, Qwen3.6 the 4-bit model 12 GB pinned: draft acceptance 33/58 -> 23/80 at 2k), cause not found yet
     static const bool lm_tail_env = getenv("LLAMA_LM_TAIL") != nullptr && atoi(getenv("LLAMA_LM_TAIL")) != 0;
     // the device assignments of the tail member, set again after every scheduler reset (a refused allocation, a split of the group)
     std::vector<std::pair<ggml_tensor *, ggml_backend_t>> lm_tail_pins;
@@ -7159,7 +7159,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         auto * res = lm_res[k].get();
         res->reset();
         const int64_t tb0 = ggml_time_us();
-        // k19-fixF: a member with outputs narrows its last layer to them, and so few rows take the slot-map lookup of the cache banks.
+        // a member with outputs narrows its last layer to them, and so few rows take the slot-map lookup of the cache banks.
         // Where the group will release the banks (a tiny cache, the member is not the first: the group has 2+ members), that lookup
         // aborted ("the MoE cache is too small": one slot is left). Such a member is built as a large ubatch, as the tail and a ubatch
         // under the tiny-ubatch release are: the narrowed layer reads the host experts. Groups that keep their banks are unchanged
@@ -7183,7 +7183,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (tail) {
             moe_cache->set_force_large(false);
             // its ops on host weights run on the device as the large members' do (the backends would leave a short batch on the CPU)
-            // k19-igpu: an integrated GPU too (ggml-cuda's prop.integrated: Strix Halo gfx1151), whose layer-major groups have the tail as well
+            // an integrated GPU too (ggml-cuda's prop.integrated: Strix Halo gfx1151), whose layer-major groups have the tail as well
             ggml_backend_t be_dev = nullptr;
             for (const auto & b : backends) {
                 const enum ggml_backend_dev_type t = b.get() != backend_cpu ? ggml_backend_dev_type(ggml_backend_get_device(b.get())) : GGML_BACKEND_DEVICE_TYPE_CPU;
@@ -7268,9 +7268,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         auto & ib = lm_inp_buf[k];
         ib.reset();
         if (!lm_arena || lm_arena_used + inp_size > ggml_backend_buffer_get_size(lm_arena.get())) {
-            // k17 (LLAMA_MOE_LM_ARENA_FIT=0: the old sizing): the members this batch still has (at most lm_ub_max), each with an eighth more
+            // (LLAMA_MOE_LM_ARENA_FIT=0: the old sizing): the members this batch still has (at most lm_ub_max), each with an eighth more
             // for the inputs that grow with the cells it attends to; a regrow takes what the remaining members need instead of 1.5x the
-            // whole arena (q4x + MTP 12 GB, 16384 group: arenas of 129.6, 132.1 and 194.3 MiB held at once)
+            // whole arena (the 4-bit model + MTP 12 GB, 16384 group: arenas of 129.6, 132.1 and 194.3 MiB held at once)
             static const bool arena_fit = getenv("LLAMA_MOE_LM_ARENA_FIT") == nullptr || atoi(getenv("LLAMA_MOE_LM_ARENA_FIT")) != 0;
             const int64_t left_tok = std::max<int64_t>(1, (int64_t) n_tokens_all - n_tokens_prev - n_tokens_group);
             const int64_t left_ub  = std::max<int64_t>(1, std::min<int64_t>(lm_ub_max - k, (left_tok + cparams.n_ubatch - 1)/cparams.n_ubatch));
@@ -7451,7 +7451,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 
     // the merged graph of the members [a, b) of the group: piece s of every member (in ubatch order) before piece s + 1
     ggml_context_ptr ctx_m;
-    // k15-pp: the member that starts at the capture index, if a merged graph has to take the state before it
+    // the member that starts at the capture index, if a merged graph has to take the state before it
     int cap_k_group[cap_max];
     for (int c = 0; c < cap_max; ++c) {
         cap_k_group[c] = -1;
@@ -7496,7 +7496,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 n_cap_regions += cap[c].regions.size();
             }
         }
-        // k15-pp: the capture copies are tensors of this context too (a view of the state, the copy and its view of the snapshot)
+        // the capture copies are tensors of this context too (a view of the state, the copy and its view of the snapshot)
         const size_t meta = ggml_graph_overhead_custom(size, false) + (1 + 4*n_cap_regions)*ggml_tensor_overhead();
         if (lm_meta.size() < meta) {
             lm_meta.resize(meta);
@@ -7523,7 +7523,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                         if ((int) k != cap_k[c]) {
                             continue;
                         }
-                        // k15-pp: the state rows as the members before this one left them, before its first node that reads or writes them
+                        // the state rows as the members before this one left them, before its first node that reads or writes them
                         auto & rg = cap[c].regions;
                         for (int sj = 0; sj < GGML_MAX_SRC + 1; ++sj) {
                             const ggml_tensor * t = sj == 0 ? node : node->src[sj - 1];
@@ -7585,21 +7585,21 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // the seed of the MoE cache, as moe_cache_seed_begin plans it for the ubatch-by-ubatch order: the last large ubatch of the batch seeds,
     // from the routing of the ubatch before it if it has no outputs, else from its own (if its seed graph fits); every member of the group
     // is large and prefetched, so the seed copies from the shared expert copies (all experts staged)
-    // k13-small: a cache below LLAMA_MOE_LM_RELEASE_FRAC (0.05) of the host experts frees its banks while the group runs (the compute
+    // a cache below LLAMA_MOE_LM_RELEASE_FRAC (0.05) of the host experts frees its banks while the group runs (the compute
     // buffers grow in that memory), they are allocated again after it and refilled (see llama_moe_cache::release and the end of the group):
-    // the slots of so small a cache are too few to lend the growth (G4 at 4 GB, Qwen3.6 Q3_K_M + MTP: 111 MiB in three bank tails of at most
+    // the slots of so small a cache are too few to lend the growth (RTX PRO 6000 at 4 GB, Qwen3.6 Q3_K_M + MTP: 111 MiB in three bank tails of at most
     // 33 MiB, a 4-ubatch group grows by 68 MiB with 77 MiB free and 64 MiB of headroom, it was split in single ubatches: one pass over
     // every host expert per 512 tokens). The group does not seed the cache. LLAMA_MOE_LM_RELEASE=0 off
-    // k17-small (LLAMA_MOE_LM_DRAFT_RELEASE=0 off): beside a kept MTP drafter on a small device the drafter's device compute buffers are
+    // (LLAMA_MOE_LM_DRAFT_RELEASE=0 off): beside a kept MTP drafter on a small device the drafter's device compute buffers are
     // freed for the group (its next graph allocates them again; the target's compute buffers are freed after the group, so they have
-    // their memory back), so the merged graph grows in that memory too. T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, ctx 16384: with the
+    // their memory back), so the merged graph grows in that memory too. T4 4 GB, Qwen3.6-35B-A3B 4-bit quant + MTP, ctx 16384: with the
     // drafter's 233 MiB compute held, 157.8 MiB were free and the 16-ubatch group of an 8k prompt ran as 8 graphs of 2 (each streaming
     // every host expert, 477 tok/s) against one graph without a drafter (970 tok/s). Only with less than LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB
     // (512) free
     static const bool   lm_dft_rel_env  = getenv("LLAMA_MOE_LM_DRAFT_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_LM_DRAFT_RELEASE")) != 0;
     static const size_t lm_dft_rel_free = (size_t) (getenv("LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB"))) : 512) << 20;
     bool lm_dft_released = false;
-    // k19-igpu: an integrated GPU too: its free memory is the host's available memory (ggml-cuda's UMA path), and freeing the drafter's
+    // an integrated GPU too: its free memory is the host's available memory (ggml-cuda's UMA path), and freeing the drafter's
     // compute buffers gives memory back to that one pool without a host copy, so the rule reads the same there
     if (lm_dft_rel_env && gm != nullptr && cparams.spec_draft && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
         size_t free_min = SIZE_MAX;
@@ -7639,24 +7639,24 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     }
     const bool lm_release_env = lm_release_on();
     bool lm_released = false;
-    // k17-small: the release also where the cache is above LLAMA_MOE_LM_RELEASE_FRAC but the group's merged graph does not allocate in
-    // the free memory (it would be split): q3m 4 GB without MTP holds 5.1% of the host experts at ctx 16384 (699 MiB) and 4.5% at 20480;
-    // at 5.1% the 16-ubatch group of an 8k prompt was split in halves down to single ubatches (T4 8k prompt 440 vs 830 tok/s, G4 2063 vs
+    // the release also where the cache is above LLAMA_MOE_LM_RELEASE_FRAC but the group's merged graph does not allocate in
+    // the free memory (it would be split): 3-bit 4 GB without MTP holds 5.1% of the host experts at ctx 16384 (699 MiB) and 4.5% at 20480;
+    // at 5.1% the 16-ubatch group of an 8k prompt was split in halves down to single ubatches (T4 8k prompt 440 vs 830 tok/s, RTX PRO 6000 2063 vs
     // 8076). One trial allocation of the merged graph against the growth limit, without lending, before the seed is set up; if it does not
     // fit, the banks are released as for a tiny cache (no seed, refilled after the group). Only below LLAMA_MOE_LM_RELEASE_SPLIT_FRAC (0.10)
     // of the host experts cached (the hybrid gate's small-device range). LLAMA_MOE_LM_RELEASE_SPLIT=0: only the fixed share, as before
     static const bool   lm_rel_split      = getenv("LLAMA_MOE_LM_RELEASE_SPLIT") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE_SPLIT")) != 0;
     static const double lm_rel_split_frac = getenv("LLAMA_MOE_LM_RELEASE_SPLIT_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LM_RELEASE_SPLIT_FRAC"))) : 0.10;
     static const size_t lm_rel_grow_max   = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
-    // k19-placemid: the graphs are reserved at the decode size (LLAMA_MOE_PLACE8_MID), a merged group never fits beside the banks
-    // (k17-small, lazy KV step 2: the share of the cache's own slots, its shrink floor; the slots above it are the KV cache's and the
+    // the graphs are reserved at the decode size (LLAMA_MOE_PLACE8_MID), a merged group never fits beside the banks
+    // (lazy KV step 2: the share of the cache's own slots, its shrink floor; the slots above it are the KV cache's and the
     // placement of the prompt is that of the cache the fit sized beside the full-context KV)
     const double lm_cf   = moe_cache->release_frac();
     bool         lm_tiny = lm_tiny_cache(lm_cf) || place8_rel;
     if (lm_release_env && lm_rel_split && !lm_tiny && gm != nullptr && group.size() >= 2 && lm_cf >= 0.0 && lm_cf < lm_rel_split_frac) {
-        // k19 (LLAMA_MOE_LM_MEASURE_RESTORE=0 off): the measure allocates the merged graph when it fits, which sets the data of its
+        // (LLAMA_MOE_LM_MEASURE_RESTORE=0 off): the measure allocates the merged graph when it fits, which sets the data of its
         // nodes; the graph allocator takes a node with data as preallocated, so the allocation that runs the graph planned only the
-        // scheduler's new input copies, over the memory of the nodes the measure placed (Colab T4, Qwen3.6-35B-A3B + MTP at 6 GB with
+        // scheduler's new input copies, over the memory of the nodes the measure placed (T4, Qwen3.6-35B-A3B + MTP at 6 GB with
         // LLAMA_MOE_PREFILL_UB_TINY=0, 2k prompt: the attention, state and KV index copies were overwritten, get_rows read state row
         // 1056161495, the fused set_rows pair wrote out of bounds). The nodes get their state from before the measure back.
         static const bool lm_measure_restore = getenv("LLAMA_MOE_LM_MEASURE_RESTORE") == nullptr || atoi(getenv("LLAMA_MOE_LM_MEASURE_RESTORE")) != 0;
@@ -7700,7 +7700,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         ggml_backend_sched_use_full_hash(sched.get());
         moe_cache->set_graph(nullptr);
         if (!ok && over > 0 && lm_out_banks) {
-            // k19-fixF: a member reads the banks (a slot map, a device lookup or seed, built before this measure), so the banks stay
+            // a member reads the banks (a slot map, a device lookup or seed, built before this measure), so the banks stay
             // and the group is split as with LLAMA_MOE_LM_RELEASE_SPLIT=0 (releasing them aborted the narrowed lookup)
             static int n_log = 0;
             if (n_log++ < 4) {
@@ -7717,8 +7717,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             lm_tiny = true;
         }
     }
-    // k17-small: the CUDA memory pools grow into the memory the released banks free (the merged graph's temporaries) and keep it, so
-    // after restore() the device can be full (G4 4 GB q3m 16k, release-split: the prompt checkpoint after a released 707 MiB group
+    // the CUDA memory pools grow into the memory the released banks free (the merged graph's temporaries) and keep it, so
+    // after restore() the device can be full (RTX PRO 6000 4 GB 3-bit 16k, release-split: the prompt checkpoint after a released 707 MiB group
     // failed to create a CUDA stream). Each pool's size is marked before the release and what it grew past the mark is given back
     // before the banks return (graphs captured before keep their memory). LLAMA_MOE_LM_RELEASE_TRIM=0: off
     static const bool lm_rel_trim = getenv("LLAMA_MOE_LM_RELEASE_TRIM") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE_TRIM")) != 0;
@@ -7740,26 +7740,26 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             LLAMA_LOG_INFO("%s: a ubatch of the group of %zu reads the cache banks (a device seed or lookup): the banks are kept\n", __func__, group.size());
         }
     }
-    // k19-placemid: a group of one ubatch does not fit beside the banks either
+    // a group of one ubatch does not fit beside the banks either
     if (lm_release_env && (group.size() >= 2 || place8_rel) && lm_tiny && !lm_out_banks) {
         ggml_backend_sched_synchronize(sched.get());
         if (lm_rel_trim) {
             pool_mark_trim(false);
         }
         lm_released = moe_cache->release();
-        // k19-fn16 (LLAMA_MOE_LM_RELEASE_DEPTH, default 4; 0 = the usual depth): while the banks are released the group copies every host
+        // (LLAMA_MOE_LM_RELEASE_DEPTH, default 4; 0 = the usual depth): while the banks are released the group copies every host
         // expert of every layer, and the memory they freed holds a deeper staging arena next to the merged graph's buffers. The scheduler
         // takes the deepest depth up to this that fits (ggml_backend_sched_set_prefetch_depth_scope), the arena returns to its size before
-        // the banks come back. The decode depth, the cache and the fit are unchanged. G4, Qwen3.8-Flash-Next UD-IQ4_XS + Q8_0 MTP drafter,
-        // 16 GB, 8k prompt (k19fn_p1_g4): at depth 2 the splits waited 384 of 1647 ms for their copies (H2D 57.5 GB at 56 GB/s, 452 ms
+        // the banks come back. The decode depth, the cache and the fit are unchanged. RTX PRO 6000, Qwen3.8-Flash-Next 4-bit quant + Q8_0 MTP drafter,
+        // 16 GB, 8k prompt: at depth 2 the splits waited 384 of 1647 ms for their copies (H2D 57.5 GB at 56 GB/s, 452 ms
         // of it outside the kernels); depth 4 everywhere (LLAMA_MOE_PREFETCH_DEPTH_SPILL=4, whose fit paid with 2 GB of cache) waited 0.7 ms
         // and the group took 1329 instead of 1710 ms
         static const int lm_rel_depth = getenv("LLAMA_MOE_LM_RELEASE_DEPTH") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_RELEASE_DEPTH"))) : 4;
         if (lm_released && lm_rel_depth > 0) {
             ggml_backend_sched_set_prefetch_depth_scope(sched.get(), lm_rel_depth);
         }
-        // kdp (LLAMA_MTP_DRAFT_LEND=0 off): beside a separate MTP drafter (-md) the deeper staging arena does not fit (G4 Flash-Next
-        // UD-IQ4_XS 12 GB + the requantized Q8_0 drafter, ctx 32768: 2930 MiB free, depth 2, the splits waited 23% of each 8192-token
+        // kdp (LLAMA_MTP_DRAFT_LEND=0 off): beside a separate MTP drafter (-md) the deeper staging arena does not fit (RTX PRO 6000 Flash-Next
+        // 4-bit quant 12 GB + the requantized Q8_0 drafter, ctx 32768: 2930 MiB free, depth 2, the splits waited 23% of each 8192-token
         // group for their copies, 30k TTFT 7.65 s against 6.36 s without the drafter, whose cache freed 2759 MiB and ran at depth 4).
         // While no drafter pass is in flight (the server skips its pass over the batches before the prompt's last rows), the drafter's
         // device weights (evictable buffers, llama_model::weights_evict) and compute buffers give their memory to the group; the server
@@ -7768,16 +7768,16 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (lm_released && lm_rel_depth > 0 && llama_mtp_draft_lend_on() && cparams.spec_draft && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
                 nextn_hold_fn == nullptr && nextn_hold_free_fn == nullptr) {
             static const size_t lend_free = (size_t) (getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB"))) : 6144) << 20;
-            // k19-npkdp (LLAMA_MTP_DRAFT_LEND_ARENA=0 off): the staging arena the scheduler already holds on the device counts as free here,
+            // (LLAMA_MTP_DRAFT_LEND_ARENA=0 off): the staging arena the scheduler already holds on the device counts as free here,
             // since the deep arena of the group grows from it (ggml_backend_sched_prefetch: extra = staging - arena_size). Where the MoE cache
-            // lends the staging (G4 Flash-Next fn4 16 GB -np 1) it holds none and nothing changes; where the cache is too small to lend it
+            // lends the staging (RTX PRO 6000 Flash-Next 4-bit 16 GB -np 1) it holds none and nothing changes; where the cache is too small to lend it
             // (-np 4 --kv-unified: 1275 MiB arena of its own) the gate lent the drafter's weights though the depth-4 arena fit without them:
             // 5490 MiB free + 1275 held, the lazy pinned host copy (185 ms) on the first long prompt and a 23 ms remap per group, 8k TTFT
             // 1.886 vs 1.640 s at -np 1. Free memory counted as the deep arena sees it, -np 4 with one user lends where -np 1 does
             static const bool lend_arena_env = getenv("LLAMA_MTP_DRAFT_LEND_ARENA") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND_ARENA")) != 0;
             size_t free_min = SIZE_MAX;
             size_t arena_cr = 0;
-            // discrete GPUs only (k19-igpu): on an integrated GPU the lend's pinned host copy and the evicted weights are one pool, see
+            // discrete GPUs only: on an integrated GPU the lend's pinned host copy and the evicted weights are one pool, see
             // llama_context::mtp_lend_warm; no device found leaves free_min at SIZE_MAX, so nothing is lent there
             for (auto & bk : backend_ptrs) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(bk);
@@ -7836,16 +7836,16 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     lm_seeded.clear();
     moe_cache->clear_seed_counts();
     int seed_k = -1, src_k = -1;
-    // k13-pp: LLAMA_MOE_LAYER_MAJOR_SEED=0 (opt-in) turns the seed off. The seed reads the source routing of every layer in an eval callback,
+    // LLAMA_MOE_LAYER_MAJOR_SEED=0 (opt-in) turns the seed off. The seed reads the source routing of every layer in an eval callback,
     // which synchronizes the device once per layer, so the next layer's expert copies are queued only after its router has run and the copy
-    // engine idles through every layer's attention (G4, Qwen3.6-35B-A3B Q4 + MTP at 12 GB, 2k prompt: 42 gaps of ~2 ms in a 357 ms pass).
-    // Off: G4 12 GB 2k +7.1%, 8 GB 2k +10.9% / 8k +5.7%; but L4 8 GB 8k -4.5% (the prompt after an unseeded one misses more experts on a
+    // engine idles through every layer's attention (RTX PRO 6000, Qwen3.6-35B-A3B Q4 + MTP at 12 GB, 2k prompt: 42 gaps of ~2 ms in a 357 ms pass).
+    // Off: RTX PRO 6000 12 GB 2k +7.1%, 8 GB 2k +10.9% / 8k +5.7%; but L4 8 GB 8k -4.5% (the prompt after an unseeded one misses more experts on a
     // copy-bound link), so it stays opt-in until the seed reads the routing without a device sync
     static const bool lm_seed_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED")) != 0;
     // beside the device seed (seed_sync off: the host seed of a ubatch's own ids does not fit) only the seed from an earlier member's
     // routing, which needs no larger graph
     const bool lm_seed_dev = moe_cache_devseed_on && lm_devseed_seed;
-    // k11 (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY=1, opt-in, default off: no model / tier has passed the KLD gate with it yet
+    // (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY=1, opt-in, default off: no model / tier has passed the KLD gate with it yet
     // 3n; it acts wherever the checkpoint merge is on, which other branches may turn on by default): a group merged across a ubatch break
     // (llama_set_ubatch_breaks) whose last member is the only ubatch after it, a prefetched large one without outputs that would end its own
     // batch: run by themselves, the members before the break seed as the batch they were (host seed from the routing of an earlier member),
@@ -7854,7 +7854,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // have seen, so the cache ends up as with the separate batches
     static const bool lm_replay_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY")) != 0;
     size_t rp_k = 0; // members before the break (0: no replay)
-    // k14 merge: a group whose cache banks were released (k13-small) seeds nothing, so it replays nothing either
+    // merge: a group whose cache banks were released seeds nothing, so it replays nothing either
     if (!lm_released && lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
         const auto & last = group.back();
         const int64_t b = last.n_tokens_before;
@@ -7933,7 +7933,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         moe_cache_seed_prev = lm_seed_active;
         if (lm_seed_active) {
             ggml_backend_sched_set_eval_callback(sched.get(), lm_eval_cb, this);
-            // k15-pp: LLAMA_MOE_LM_SEED_ASYNC=0 reads the routing in the callback after a device sync (k14). The sync held back the next
+            // LLAMA_MOE_LM_SEED_ASYNC=0 reads the routing in the callback after a device sync. The sync held back the next
             // layer's expert copies until its router had run, so the copy engine idled through every layer's attention
             static const bool lm_async_env = getenv("LLAMA_MOE_LM_SEED_ASYNC") == nullptr || atoi(getenv("LLAMA_MOE_LM_SEED_ASYNC")) != 0;
             lm_seed_async = false;
@@ -7942,8 +7942,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             lm_copy_graph = nullptr;
             lm_async_used = 0;
             lm_async_nev  = 0;
-            // k15-pp2: a group with a tail member (LLAMA_LM_TAIL) seeds synchronously: with the asynchronous read the seed of some layers
-            // copied experts from staging memory already reused (Qwen3.6 q4x + MTP 12 GB: the cache after the prompt held wrong experts, the
+            // a group with a tail member (LLAMA_LM_TAIL) seeds synchronously: with the asynchronous read the seed of some layers
+            // copied experts from staging memory already reused (Qwen3.6 the 4-bit model + MTP 12 GB: the cache after the prompt held wrong experts, the
             // first MTP verify gave other logits); not found yet why the extra member breaks the "due" rule of lm_seed_resolve_due
             const bool lm_has_tail = !group.empty() && (int64_t) group.back().ub->n_tokens < prefetch_min_batch;
             if (lm_async_env && cparams.cb_eval == nullptr && !lm_has_tail) {
@@ -7953,8 +7953,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 for (const auto & a : lm_ask) {
                     need += GGML_PAD(ggml_nbytes(a.second.ids), 64);
                 }
-                // the device of the first GPU backend (the routing of an offloaded MoE layer is computed there). k19-igpu: an integrated
-                // GPU too (Strix Halo gfx1151 ran every group with the synchronous read of k14); the pinned host buffer holds only the routing
+                // the device of the first GPU backend (the routing of an offloaded MoE layer is computed there). an integrated
+                // GPU too (Strix Halo gfx1151 ran every group with the synchronous read of); the pinned host buffer holds only the routing
                 // ids of the group (4 bytes x experts used x tokens per MoE layer, a few MiB), not sized from free memory
                 for (const auto & b : backends) {
                     ggml_backend_dev_t d = ggml_backend_get_device(b.get());
@@ -8046,7 +8046,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits.data + n_outputs_prev*n_vocab, 0, n_outputs*n_vocab*sizeof(float));
             }
 
-            // k19-df2pp: the member's layer inputs (a DFlash drafter's target features), at its rows of the batch
+            // the member's layer inputs (a DFlash drafter's target features), at its rows of the batch
             bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
             if (extract_all_idxs) {
                 lm_layer_inp_rows += ubatch.n_tokens;
@@ -8211,8 +8211,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             LLAMA_LOG_INFO("%s: check: %zu index copies at %zu addresses, %d shared by different inputs\n", __func__, lm_sr.size(), at.size(), n_same);
         }
-        // k15-pp: the merged graph runs once (its nodes are freed after the group), so the backends skip their CUDA graph bookkeeping
-        // for it: G4 Flash-Next 16 GB, a 16384-token group recorded ~1 KB per node for a warmup that never completes (+30 MiB host
+        // the merged graph runs once (its nodes are freed after the group), so the backends skip their CUDA graph bookkeeping
+        // for it: RTX PRO 6000 Flash-Next 16 GB, a 16384-token group recorded ~1 KB per node for a warmup that never completes (+30 MiB host
         // memory at 55k nodes); same kernels, same order. LLAMA_MOE_LM_GRAPH_RECORDS=1 keeps it
         static const bool lm_graph_records = getenv("LLAMA_MOE_LM_GRAPH_RECORDS") != nullptr && atoi(getenv("LLAMA_MOE_LM_GRAPH_RECORDS")) != 0;
         auto lm_graph_skip = [&](bool on) {
@@ -8253,11 +8253,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     }
     // the compute buffers of a device may grow by at most LLAMA_MOE_LAYER_MAJOR_GROW_MIB (default 1024) for a merged graph, and must
     // leave the prefetch headroom free: a larger graph is split in two (and again), else its allocation would drop the prefetch for good
-    // (gpt-oss-20b MXFP4, G4 8 GB tier: 16 ubatches of 512 grew the compute buffer 455 -> 1164 MiB)
+    // (gpt-oss-20b MXFP4, RTX PRO 6000 8 GB tier: 16 ubatches of 512 grew the compute buffer 455 -> 1164 MiB)
     static const size_t lm_grow_max = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
-    // k16: after a group whose cache banks were released (lm_released) the compute buffers are freed back to what the next graph needs
+    // after a group whose cache banks were released (lm_released) the compute buffers are freed back to what the next graph needs
     // (ggml_backend_sched_free_device_buffers), so the next group's growth is measured from that small buffer, not from the one the
-    // previous group ran with: G4, Qwen3.8-Flash-Next UD-IQ4_XS 12 GB, Studio argv (-ub 2048, cache 4.65% of the host experts), the 8k
+    // previous group ran with: RTX PRO 6000, Qwen3.8-Flash-Next 4-bit quant 12 GB, Studio argv (-ub 2048, cache 4.65% of the host experts), the 8k
     // prompt grew 2520 -> 3285 MiB (765 MiB, ran as one group), the 16k prompt after it the same graph from 1544 MiB (1673 MiB > the cap,
     // with 4633 MiB free): split down to single ubatches with the banks released, then lm_refused_min = 2 turned layer-major off for every
     // later prompt (16k 1818 tok/s against 1935 without groups, 4313 at 8k). With the banks released the cap also allows the growth back
@@ -8274,9 +8274,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 }
             }
         }
-        // k19-placemid: the graphs were reserved at the decode size, so a released group grows its buffers from that size: the cap also
+        // the graphs were reserved at the decode size, so a released group grows its buffers from that size: the cap also
         // allows the memory the fit moved from the prompt compute buffers to the cache (whose banks the group released). Without it the
-        // first 8k group of G4 12 GB fn4 (1840 MiB of growth, 5668 MiB free) split down to single ubatches: 8k TTFT 1647 -> 3580 ms
+        // first 8k group of RTX PRO 6000 12 GB 4-bit (1840 MiB of growth, 5668 MiB free) split down to single ubatches: 8k TTFT 1647 -> 3580 ms
         if (place8_rel && lm_released) {
             back += place8_grow;
         }
@@ -8321,24 +8321,24 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         lm_merged_active = true;
         ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
-        // k11 (LLAMA_MOE_LM_LEND=0 off): a merged graph whose compute buffers would grow past the free memory borrows its allocation from the
+        // (LLAMA_MOE_LM_LEND=0 off): a merged graph whose compute buffers would grow past the free memory borrows its allocation from the
         // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
         // runs the same ubatches, only where its tensors live changes
         static const bool lm_lend = getenv("LLAMA_MOE_LM_LEND") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND")) != 0;
-        // k13-small: the graph borrows only once its growth did not fit: the lend scope places the whole graph allocation in cache slots,
-        // which were lent (and their experts refilled after the group) even where the compute buffers could grow in free memory. G4
+        // the graph borrows only once its growth did not fit: the lend scope places the whole graph allocation in cache slots,
+        // which were lent (and their experts refilled after the group) even where the compute buffers could grow in free memory. RTX PRO 6000
         // gemma-4 26B-A4B Q3_K_M + drafter at 8 GB, 2k: 393 instead of 241 slots lent, a different cache after the prompt (another text than
-        // k10) and 287 instead of 325 tok/s decode, prompt 4815 instead of 5014 (LLAMA_MOE_LM_LEND=0). LLAMA_MOE_LM_LEND_FIRST=1: lend at once (k12)
+        //) and 287 instead of 325 tok/s decode, prompt 4815 instead of 5014 (LLAMA_MOE_LM_LEND=0). LLAMA_MOE_LM_LEND_FIRST=1: lend at once
         static const bool lm_lend_first = getenv("LLAMA_MOE_LM_LEND_FIRST") != nullptr && atoi(getenv("LLAMA_MOE_LM_LEND_FIRST")) != 0;
         const bool lend_ok = lm_lend && moe_cache->lends_graph_any();
-        // k13-small round 7: the growth-first rule only up to LLAMA_MOE_LM_LEND_FIRST_GROW_MIB (256) of growth (0 = any growth, the round 1
+        // the growth-first rule only up to LLAMA_MOE_LM_LEND_FIRST_GROW_MIB (256) of growth (0 = any growth, the original
         // rule) and for groups starting before position LLAMA_MOE_LM_LEND_FIRST_POS (0 = any position); past either the group borrows at once
-        // (k12). G4 run k13r8: q4x + MTP 8 GB 30k (its groups grow 346 MiB and more) 247.3 tok/s and k12's text with the cap, 225.3 without
-        // (k12 247.7); gemma-4 8 GB 2k (120 MiB) keeps 326.5 (k12 288.2); POS=8192 does not fix 30k (230.2)
+        //. RTX PRO 6000 run the 4-bit model + MTP 8 GB 30k (its groups grow 346 MiB and more) 247.3 tok/s and 's text with the cap, 225.3 without
+        // (247.7); gemma-4 8 GB 2k (120 MiB) keeps 326.5 (288.2); POS=8192 does not fix 30k (230.2)
         static const size_t  lf_grow = (size_t) (getenv("LLAMA_MOE_LM_LEND_FIRST_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_LEND_FIRST_GROW_MIB"))) : 256) << 20;
         static const int64_t lf_pos  = getenv("LLAMA_MOE_LM_LEND_FIRST_POS") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_LEND_FIRST_POS"))) : 0;
         // a group refused by the cap is followed by groups at least as large and as far in the context: they borrow at once (the growth
-        // only rises with both), saving the refused attempt (G4 q4x 8 GB 30k prompt: 6821 tok/s with the attempt, k12 6927)
+        // only rises with both), saving the refused attempt (RTX PRO 6000 the 4-bit model 8 GB 30k prompt: 6821 tok/s with the attempt, 6927)
         const int64_t g_pos = group[a].ub->pos[0];
         const bool lf_known = lf_grow > 0 && g_pos >= lm_lf_refused_pos && (int64_t) (b - a) >= lm_lf_refused_n;
         bool lend_g = lend_ok && (lm_lend_first || (lf_pos > 0 && g_pos >= lf_pos) || lf_known);
@@ -8402,7 +8402,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                     lm_merged_peak[i] = std::max(lm_merged_peak[i], ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]));
                 }
-                // k16 (k15-pp): a merged graph of b - a ubatches ran, so a refusal recorded at that size or below is stale (measured from a
+                // a merged graph of b - a ubatches ran, so a refusal recorded at that size or below is stale (measured from a
                 // smaller buffer, at another position or before the banks were given back): later groups measure again from b - a + 1 up.
                 // LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET=0 keeps the refusal for the process
                 static const bool lm_refused_reset = getenv("LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET")) != 0;
@@ -8436,9 +8436,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             return GGML_STATUS_ALLOC_FAILED; // out of memory: the members not computed yet one by one, unseeded (below)
         }
         lm_n_split++;
-        // k16: a refusal measured while the cache banks were released (lm_released: the compute buffers were freed back first) does not
+        // a refusal measured while the cache banks were released (lm_released: the compute buffers were freed back first) does not
         // turn layer-major off for the process: it keeps lm_refused_min at LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN (4) ubatches or more, so a
-        // later prompt still tries groups of 3 (k15-pp: one growth measured from a shrunk buffer must not cost every later prompt)
+        // later prompt still tries groups of 3 (one growth measured from a shrunk buffer must not cost every later prompt)
         static const size_t lm_rel_min = getenv("LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN") ? (size_t) std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN"))) : 4;
         lm_refused_min = std::min(lm_refused_min, (lm_regrow && lm_released) ? std::max(lm_rel_min, b - a) : b - a);
         if (lm_verbose) {
@@ -8451,7 +8451,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     free_min = std::min(free_min, fr);
                 }
             }
-            // k15-fn: and what the cache could lend a merged graph at most (llama_moe_cache::graph_lend_capacity, the largest over the devices)
+            // and what the cache could lend a merged graph at most (llama_moe_cache::graph_lend_capacity, the largest over the devices)
             int32_t lc_max = 0, lc_slots = 0;
             size_t  lc_bytes = 0;
             for (auto & bk : backend_ptrs) {
@@ -8589,7 +8589,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     lm_seeded.clear();
     ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-    // k19-mgpu2: resident prompt fill on the layer-major path: the routing of the group's last member (its ffn routing outputs, read
+    // resident prompt fill on the layer-major path: the routing of the group's last member (its ffn routing outputs, read
     // before the compute buffers are freed) for the fill at the end of the prompt, here when the group ends it
     if (status == GGML_STATUS_SUCCESS && moe_cache->resident_fill_wanted() && !lm_record.empty()) {
         ggml_backend_sched_synchronize(sched.get());
@@ -8653,22 +8653,22 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     llama_phase("group computed");
     if (lm_released) {
         // the slots come back with the experts they held before; LLAMA_MOE_LM_RELEASE_ROUTED=1: with those the last ubatch of the group
-        // used most (its routing, read before the compute buffers are freed). G4 4 GB, Qwen3.6 Q3_K_M + MTP 2, 3 launches: decode 2k / 8k
+        // used most (its routing, read before the compute buffers are freed). RTX PRO 6000 4 GB, Qwen3.6 Q3_K_M + MTP 2, 3 launches: decode 2k / 8k
         // 136.1 / 150.0 tok/s held before, 138.0 / 146.1 routed (release off 133.6 / 149.3); long-prompt KLD against the all-device run,
-        // first token mean 0.00076 held before, 0.00134 routed (the -fa off band 0.00031, k12 0.00118)
-        // k15-small4: on by default without a draft model (no-draft layer-major prompts, LLAMA_MOE_LAYER_MAJOR_NODRAFT): the slots of a fresh
-        // cache held nothing before the group, so the held-before refill uploaded nothing and decode started from an empty cache (G4 4 GB,
+        // first token mean 0.00076 held before, 0.00134 routed (the -fa off band 0.00031, 0.00118)
+        // on by default without a draft model (no-draft layer-major prompts, LLAMA_MOE_LAYER_MAJOR_NODRAFT): the slots of a fresh
+        // cache held nothing before the group, so the held-before refill uploaded nothing and decode started from an empty cache (RTX PRO 6000 4 GB,
         // Qwen3.6 Q4_K_XL: 238 experts admitted by the prompts against 1399 ubatch by ubatch, decode -0.7..-2.2%). It changes only which
         // experts the cache holds. LLAMA_MOE_LM_RELEASE_ROUTED=0 off, =1 on with a draft too
         static const char * lm_rr_env = getenv("LLAMA_MOE_LM_RELEASE_ROUTED");
-        // k19-placemid: also with a draft where the graphs are reserved at the decode size (place8_grow, see the measurement there)
-        // (k19-pgroups2: not on the small device of k19-pgroups with LLAMA_MOE_PLACE8_GROUPS_LEAN=2, place8_lean_group)
+        // also with a draft where the graphs are reserved at the decode size (place8_grow, see the measurement there)
+        // (not on the small device of with LLAMA_MOE_PLACE8_GROUPS_LEAN=2, place8_lean_group)
         const bool lm_release_routed = lm_rr_env != nullptr ? atoi(lm_rr_env) != 0 : (!place8_lean_group && (!cparams.spec_draft || place8_grow > 0));
         if (lm_release_routed && status == GGML_STATUS_SUCCESS) {
             moe_cache->set_refill_routed_once(true);
             moe_cache_ids = lm_record;
             moe_ap_counted = false;
-            // k19-autoprof2: the group's routing also to the RAM tier's refill and the profile (see moe_cache_released_counts)
+            // the group's routing also to the RAM tier's refill and the profile (see moe_cache_released_counts)
             moe_cache_refill_from_ids(moe_cache_released_counts());
         }
         // the routing of the group is in its compute buffers, which are freed: no later seed reads it
@@ -8678,16 +8678,16 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         moe_cache->clear_seed_counts();
         // the compute buffers shrink back to what the next graph needs before the banks take their memory again
         ggml_backend_sched_free_device_buffers(sched.get());
-        // k19-fn16: and the staging arena to its size before the group (a no-op without LLAMA_MOE_LM_RELEASE_DEPTH)
+        // and the staging arena to its size before the group (a no-op without LLAMA_MOE_LM_RELEASE_DEPTH)
         ggml_backend_sched_set_prefetch_depth_scope(sched.get(), 0);
-        // k19-placemid: the graphs were reserved below the prefetched sizes, so the arena the group allocated lives in the memory of the
+        // the graphs were reserved below the prefetched sizes, so the arena the group allocated lives in the memory of the
         // released banks: it goes too (as in tiny_rel_leave), the next prefetched graph allocates it again
         if (place8_rel) {
             ggml_backend_sched_free_prefetch_arenas(sched.get());
         }
         if (lm_rel_trim) {
             const size_t trimmed = pool_mark_trim(true);
-            // k19-df2pp: as in tiny_rel_leave (the group's own graphs are evicted at its end unless LLAMA_MOE_LM_KEEP_HOST=1)
+            // as in tiny_rel_leave (the group's own graphs are evicted at its end unless LLAMA_MOE_LM_KEEP_HOST=1)
             static const bool trim_evict = getenv("LLAMA_MOE_TRIM_EVICT") == nullptr || atoi(getenv("LLAMA_MOE_TRIM_EVICT")) != 0;
             if (trim_evict && trimmed > 0) {
                 graph_evict_since_dev(lm_t_start);
@@ -8707,7 +8707,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 for (auto & bk : backend_ptrs) {
                     ggml_backend_dev_t dev = ggml_backend_get_device(bk);
                     const enum ggml_backend_dev_type dev_type = dev != nullptr ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
-                    if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) { // k19-igpu: logged there too
+                    if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) { // logged there too
                         continue;
                     }
                     size_t fr = 0, tot = 0;
@@ -8719,14 +8719,14 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         lm_n_released++;
     } else if (buf_after > buf_before || lm_dft_released) {
-        // (k17-small: after a group that freed the drafter's compute buffers the target's are freed too, so the drafter has its memory back)
-        // k13-small: a group that grew the compute buffers leaves them at its size, and the decode after it computes in what is left: G4 at
+        // (after a group that freed the drafter's compute buffers the target's are freed too, so the drafter has its memory back)
+        // a group that grew the compute buffers leaves them at its size, and the decode after it computes in what is left: RTX PRO 6000 at
         // 4 GB, Qwen3.6 Q3_K_M + MTP with LLAMA_MOE_LM_RELEASE=0, a fresh server's first request (2100 tokens): the group grew 502 -> 534 MiB
         // inside the 64 MiB headroom with 118 MiB left after it, the staging copies of the next graphs took the rest and the decode ran out
         // of device memory in the CUDA pool. With less than LLAMA_MOE_LM_SHRINK_FREE_MIB (192) free after the group the device compute
         // buffers are freed (the next graph allocates what it needs, as without the merge); the routing kept for the seed of the next ubatch
         // is copied to host memory first. At 512 the 8 GB cells (234-436 MiB left) shrank too, and the chat prompt after a long one lost
-        // 8-12% to the reallocation (G4 run k13s6). 0 off
+        // 8-12% to the reallocation (RTX PRO 6000 run). 0 off
         static const size_t lm_shrink_free = (size_t) (getenv("LLAMA_MOE_LM_SHRINK_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_SHRINK_FREE_MIB"))) : 192) << 20;
         size_t free_min = SIZE_MAX;
         for (auto & bk : backend_ptrs) {
@@ -8760,7 +8760,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 
     extract_upto(group.size()); // (none left: each graph extracts its members)
 
-    // k15-pp3: the group's nextn rows are queued for the host; with ubatches still to come in this decode, an event after them lets an
+    // the group's nextn rows are queued for the host; with ubatches still to come in this decode, an event after them lets an
     // MTP drafter read rows [0, n_tokens_prev) before the decode is done (llama_nextn_rows_wait)
     {
         static const bool rows_env = getenv("LLAMA_MTP_PROMPT_OVERLAP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_OVERLAP")) != 0;
@@ -8786,15 +8786,15 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
     }
 
-    // the next graph is built anew (k19-fullcost: the kept ones are allocated again, see the group's start)
+    // the next graph is built anew (the kept ones are allocated again, see the group's start)
     gf_res_prev_active = nullptr;
     if (!llama_graph_small_keep_buffers()) {
         gf_res_epoch_bump(__LINE__);
     }
 
-    // k15-small4: the host memory of the group (its input arena, mostly the KQ masks of every member, and the members' graph results) is
-    // freed after it instead of kept for the next prompt: kept, it stayed in the process after every long prompt (q3m 4 GB, 8k prompt:
-    // RssAnon +235 MiB against ubatch by ubatch, T4 / G4 +160-176 MiB after the bench cells). The routing kept for the seed of the next
+    // the host memory of the group (its input arena, mostly the KQ masks of every member, and the members' graph results) is
+    // freed after it instead of kept for the next prompt: kept, it stayed in the process after every long prompt (3-bit 4 GB, 8k prompt:
+    // RssAnon +235 MiB against ubatch by ubatch, T4 / RTX PRO 6000 +160-176 MiB after the bench cells). The routing kept for the seed of the next
     // ubatch is copied to host memory first (as when the compute buffers shrink). LLAMA_MOE_LM_KEEP_HOST=1 (or LLAMA_MOE_LAYER_MAJOR_EAGER=1)
     // keeps them
     static const bool lm_keep_host = (getenv("LLAMA_MOE_LM_KEEP_HOST") != nullptr && atoi(getenv("LLAMA_MOE_LM_KEEP_HOST")) != 0) ||
@@ -8803,7 +8803,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         ggml_backend_sched_synchronize(sched.get());
         lm_ids_host_keep();
         ggml_backend_sched_reset(sched.get());
-        // k17: the scheduler's per-tensor table, sized for the merged graph, gives the pages the group touched back (the usual graphs
+        // the scheduler's per-tensor table, sized for the merged graph, gives the pages the group touched back (the usual graphs
         // use its small part); LLAMA_MOE_LM_SCHED_TRIM=0 keeps them
         static const bool lm_sched_trim = getenv("LLAMA_MOE_LM_SCHED_TRIM") == nullptr || atoi(getenv("LLAMA_MOE_LM_SCHED_TRIM")) != 0;
         if (lm_sched_trim) {
@@ -8839,16 +8839,16 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 // output
 //
 
-// k19-host (LLAMA_NEXTN_CLEAR=1: cleared as before): a new next-n store is not cleared. Every row a reader takes is a row of the last
+// (LLAMA_NEXTN_CLEAR=1: cleared as before): a new next-n store is not cleared. Every row a reader takes is a row of the last
 // decode, written by that decode's copy to the host before the reader's wait (the drafter's process() rows [0, n_tokens) of the batch and
 // its verify copy of the first rows, get_embeddings_nextn_ith, output_reorder's swaps inside the outputs, the device-sink fallback), and a
-// growth throws the old rows away (no copy), so no reader can see what the clear wrote. G4 Flash-Next + Q8_0 MTP drafter 16 GB: 320 MiB memset
+// growth throws the old rows away (no copy), so no reader can see what the clear wrote. RTX PRO 6000 Flash-Next + Q8_0 MTP drafter 16 GB: 320 MiB memset
 static bool llama_nextn_clear() {
     static const bool on = getenv("LLAMA_NEXTN_CLEAR") != nullptr && atoi(getenv("LLAMA_NEXTN_CLEAR")) != 0;
     return on;
 }
 
-// k19-host: start the allocation of a growth nextn_store_ensure left pending (a prompt batch, LLAMA_NEXTN_ASYNC) on a thread. Called once the
+// start the allocation of a growth nextn_store_ensure left pending (a prompt batch, LLAMA_NEXTN_ASYNC) on a thread. Called once the
 // layer-major group's merged graph is allocated, so the pinning runs while the group computes instead of beside the member build, where
 // fa48ea65bc7's thread made the build ~40 ms slower (address-space lock contention); nextn_join() installs it before the first row is written
 void llama_context::nextn_launch() {
@@ -8910,8 +8910,8 @@ void llama_context::nextn_join() {
 bool llama_context::nextn_store_ensure(size_t rows) {
     const int64_t n_embd_out = model.hparams.n_embd_out();
     rows = std::min<size_t>(rows, cparams.n_batch);
-    // k19-fn16 (LLAMA_NEXTN_GROW_FULL=1, opt-in: up to n_batch - n_ubatch rows more host memory than the prompts need): a batch of more
-    // than n_ubatch rows (a long prompt) grows the store to n_batch at once, so a longer prompt does not reallocate it again (G4 Flash-Next
+    // (LLAMA_NEXTN_GROW_FULL=1, opt-in: up to n_batch - n_ubatch rows more host memory than the prompts need): a batch of more
+    // than n_ubatch rows (a long prompt) grows the store to n_batch at once, so a longer prompt does not reallocate it again (RTX PRO 6000 Flash-Next
     // + Q8_0 MTP drafter, 16 GB: the 8k prompt grew it to 8188 rows, the 16k prompt after it to 8192, 320 MiB of pinned memory each time)
     static const bool grow_full = getenv("LLAMA_NEXTN_GROW_FULL") != nullptr && atoi(getenv("LLAMA_NEXTN_GROW_FULL")) != 0;
     if (grow_full && rows > cparams.n_ubatch) {
@@ -8919,8 +8919,8 @@ bool llama_context::nextn_store_ensure(size_t rows) {
     }
     nextn_join();
     if (!buf_nextn || nextn_cap_rows < rows) {
-        // k19-host (LLAMA_NEXTN_ROUND_ROWS=N rows, default 256; 0 or 1 = the rows asked): a growth is rounded up to a multiple of N rows (at
-        // most n_batch), so a prompt a few rows longer than the last one does not reallocate the store: G4 Flash-Next + Q8_0 MTP drafter,
+        // (LLAMA_NEXTN_ROUND_ROWS=N rows, default 256; 0 or 1 = the rows asked): a growth is rounded up to a multiple of N rows (at
+        // most n_batch), so a prompt a few rows longer than the last one does not reallocate the store: RTX PRO 6000 Flash-Next + Q8_0 MTP drafter,
         // 16 GB, the 8k prompt grew it to 8188 rows (its [8188] [4] split), the 16k prompt after it to 8192, 320 MiB of pinned memory freed
         // and pinned again on the 16k request's path. At most N - 1 rows (10 MiB at 40 KiB a row) more than asked
         static const size_t round_rows = getenv("LLAMA_NEXTN_ROUND_ROWS") ? (size_t) std::max(0, atoi(getenv("LLAMA_NEXTN_ROUND_ROWS"))) : 256;
@@ -8936,7 +8936,7 @@ bool llama_context::nextn_store_ensure(size_t rows) {
         }
         nextn_hold_wait(); // the rows are freed below
         if (buf_nextn) {
-            // k19-host (LLAMA_NEXTN_SYNC_FULL=1: synchronize() as before): the old store is written only by this context's copies to the
+            // (LLAMA_NEXTN_SYNC_FULL=1: synchronize() as before): the old store is written only by this context's copies to the
             // host, so the scheduler's sync is what its free needs, plus the device reads of an asynchronous state save in flight; the save's
             // host copy into its prompt-cache entry (the previous request's, still running at the next long prompt) reads neither store
             static const bool sync_full = getenv("LLAMA_NEXTN_SYNC_FULL") != nullptr && atoi(getenv("LLAMA_NEXTN_SYNC_FULL")) != 0;
@@ -8956,7 +8956,7 @@ bool llama_context::nextn_store_ensure(size_t rows) {
         if (hb) {
             buft = hb;
         }
-        // k19-fn16 / k19-host (LLAMA_NEXTN_ASYNC, default 1; 0 = here): for a prompt batch the pinned allocation is made on a thread
+        // (LLAMA_NEXTN_ASYNC, default 1; 0 = here): for a prompt batch the pinned allocation is made on a thread
         // started once a layer-major group's merged graph is allocated (nextn_launch), else at the first use (nextn_join); the rows are
         // first written after the group computed. Same buffer type and size, only allocated off the request's path
         static const bool nextn_async = getenv("LLAMA_NEXTN_ASYNC") == nullptr || atoi(getenv("LLAMA_NEXTN_ASYNC")) != 0;
@@ -9023,7 +9023,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        // (k15-pp: in buf_nextn, see nextn_store_ensure, unless LLAMA_NEXTN_LAZY=0)
+        // (in buf_nextn, see nextn_store_ensure, unless LLAMA_NEXTN_LAZY=0)
         embd_nextn.size = nextn_sep ? 0 : (size_t) n_embd_out * n_batch;
     }
 
@@ -9341,15 +9341,15 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
     }
 
-    // k9-draft: recurrent per-token snapshots (n_rs_seq) add copies per recurrent layer and kept position; the 8 x n_tensors budget
+    // recurrent per-token snapshots (n_rs_seq) add copies per recurrent layer and kept position; the 8 x n_tensors budget
     // of e.g. LFM2 ran out at n_rs_seq 8 (ngram-suffix drafts of 8 tokens: GGML_ASSERT(obj_new) in build_moe_ffn)
     if (cparams.n_rs_seq > 0) {
         res += 16u * cparams.n_rs_seq * model.hparams.n_layer();
     }
 
-    // k18cov: LLAMA_EXACT_FA_GROUP=0 (kill switch of the k15-fv grouping) builds one attention per query of a batch invariant verify
+    // LLAMA_EXACT_FA_GROUP=0 (kill switch of grouping) builds one attention per query of a batch invariant verify
     // batch: 4 views, the mask copy, the attention and the concat per query and layer. The 8 x n_tensors budget of a small dense model
-    // ran out there (T4 Phi-4-mini Q4_K_M, the k15 kill-switch set, n-gram verify window: GGML_ASSERT(obj_new) in ggml_flash_attn_ext)
+    // ran out there (T4 Phi-4-mini Q4_K_M, kill-switch set, n-gram verify window: GGML_ASSERT(obj_new) in ggml_flash_attn_ext)
     static const bool fa_group_off = [] {
         const char * e = getenv("LLAMA_EXACT_FA_GROUP");
         return e != nullptr && atoi(e) == 0;
@@ -9457,14 +9457,14 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
-    // k19-fullcost (LLAMA_PP_RERESERVE_KEEP_SMALL=0: off): the idle re-reserve of the pp graph (restore_pp_plan) invalidated the kept
+    // (LLAMA_PP_RERESERVE_KEEP_SMALL=0: off): the idle re-reserve of the pp graph (restore_pp_plan) invalidated the kept
     // decode / verify graphs of every size at each request's start, so a request built every verify width again (graph build, an eager
-    // pass and a CUDA graph capture under a new key: ~47 ms per width on G4 Flash-Next; a width rule over every width paid 1.3-2 ms per
+    // pass and a CUDA graph capture under a new key: ~47 ms per width on RTX PRO 6000 Flash-Next; a width rule over every width paid 1.3-2 ms per
     // pass in chat / 8k, and the prewarmed widths of LLAMA_SPEC_PREWARM never matched a request). The reserve only plans the allocator's
     // addresses: a kept graph is invalid only if a buffer of the allocator was replaced, which the allocator's generation tells (the same
     // check ggml_backend_sched_plan_restore makes). So the kept graphs survive a re-reserve that replaced no buffer
     static const bool keep_small_env = getenv("LLAMA_PP_RERESERVE_KEEP_SMALL") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE_KEEP_SMALL")) != 0;
-    // k19-fullcost (LLAMA_GRAPH_SMALL_KEEP_BUFFERS=0: off): a reserve from any other caller that keeps the scheduler (beside a MoE cache:
+    // (LLAMA_GRAPH_SMALL_KEEP_BUFFERS=0: off): a reserve from any other caller that keeps the scheduler (beside a MoE cache:
     // around long prompts) keeps them too; there a replaced buffer only means the kept graphs are allocated again at their swap-in (the
     // saved plans check the allocator's generation), so no bump at all
     const bool     keep_any   = llama_graph_small_keep_buffers() && !reserve_keep_small && !split_only;
@@ -9542,7 +9542,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
 
-    // k16-draft (debug, LLAMA_RESERVE_TRACE=1): every reserve's device buffer sizes, also in a memory probe (whose log the fit silences)
+    // (debug, LLAMA_RESERVE_TRACE=1): every reserve's device buffer sizes, also in a memory probe (whose log the fit silences)
     static const bool trace = getenv("LLAMA_RESERVE_TRACE") != nullptr && atoi(getenv("LLAMA_RESERVE_TRACE")) != 0;
     if (trace) {
         fprintf(stderr, "reserve-trace: %s tokens %u seqs %u outputs %u split_only %d seed %d:", model.hparams.no_alloc ? "probe" : "real",
@@ -9558,8 +9558,8 @@ ggml_cgraph * llama_context::graph_reserve(
 }
 
 std::map<llama_seq_id, llama_sampler *> llama_context::graph_samplers() const {
-    // k15-fn: a sequence copying its raw logits (llama_set_sampler_raw_logits) has no sampler in the graph: its argmax chains cost ~1%
-    // of a G4 Flash-Next decode step and nothing reads them. The reserve keeps every sampler (the largest graph)
+    // a sequence copying its raw logits (llama_set_sampler_raw_logits) has no sampler in the graph: its argmax chains cost ~1%
+    // of a RTX PRO 6000 Flash-Next decode step and nothing reads them. The reserve keeps every sampler (the largest graph)
     if (sampling.raw.empty() || graph_reserving) {
         return sampling.samplers;
     }
@@ -9601,7 +9601,7 @@ llm_graph_params llama_context::graph_params(
     };
 }
 
-// k19-dsv4long far-token skip (LLAMA_DSV41_FAR_SKIP=0 off). From layer c = hparams.dsv41_far_layer on, a row leaves only its own
+// far-token skip (LLAMA_DSV41_FAR_SKIP=0 off). From layer c = hparams.dsv41_far_layer on, a row leaves only its own
 // window K rows behind (no compressor, no Engram past c: compressed rows, index keys and candidate blocks of layers >= c come from kv
 // sources < c, which every row still computes; queries, top-k and block picks are per row). A window row at position s is visible to
 // queries at s .. s + n_swa - 1 only, so a wrong (or never written) row at layer L can reach the hidden state of layer L + 1 only n_swa
@@ -9646,21 +9646,21 @@ uint32_t llama_context::dsv41_far_rows(const llama_ubatch & ubatch, const std::v
     return (uint32_t) far;
 }
 
-// k11-decode: a small graph (a speculative verify window has its own node count) re-plans the graph allocator, so the ubatches of the
-// next prompt would each re-plan it again as the KV view grows, every time with a synchronization of all backends (G4: prompts 2-7%
+// a small graph (a speculative verify window has its own node count) re-plans the graph allocator, so the ubatches of the
+// next prompt would each re-plan it again as the KV view grows, every time with a synchronization of all backends (RTX PRO 6000: prompts 2-7%
 // slower with n-gram drafting on). This restores the worst-case pp plan of sched_reserve once. The allocator only plans addresses:
 // outputs cannot change. LLAMA_PP_RERESERVE=0: off.
 bool llama_context::restore_pp_plan(bool idle) {
-    // k13-fn: the slots are idle: the MoE cache's pending re-calibration of the CPU-miss host timings runs now, not inside a reply
-    // k15-idlewait (LLAMA_MOE_RECAL_YIELD=0: runs to the end, as before): a request that arrives meanwhile (llama_set_idle_abort) stops it
-    // before the next timing repetition and it stays pending for the next idle time; it changes nothing until it completes. G4 q4x 12 GB:
+    // the slots are idle: the MoE cache's pending re-calibration of the CPU-miss host timings runs now, not inside a reply
+    // (LLAMA_MOE_RECAL_YIELD=0: runs to the end, as before): a request that arrives meanwhile (llama_set_idle_abort) stops it
+    // before the next timing repetition and it stays pending for the next idle time; it changes nothing until it completes. RTX PRO 6000 the 4-bit model 12 GB:
     // the re-calibration of the target and the MTP head (~50 ms) ran after the chat reply, and the next request waited for all of it
-    // k19-fixE: the re-calibration uploads into the banks too: it waits while they are released
+    // the re-calibration uploads into the banks too: it waits while they are released
     if (moe_cache && backend_cpu != nullptr && moe_cache->recal_pending() && !moe_cache->released()) {
         static const bool yield = getenv("LLAMA_MOE_RECAL_YIELD") == nullptr || atoi(getenv("LLAMA_MOE_RECAL_YIELD")) != 0;
         bool (*abort)(void *) = yield && idle ? idle_abort_fn : nullptr;
         // a server (it set llama_set_idle_abort) serves it in its idle work only: the fallback call inside a long prompt's decode would
-        // put a re-calibration a request deferred into that request (G4 q4x 12 GB 2k back-to-back: +55 ms TTFT)
+        // put a re-calibration a request deferred into that request (RTX PRO 6000 the 4-bit model 12 GB 2k back-to-back: +55 ms TTFT)
         const bool skip = yield && !idle && idle_abort_fn != nullptr;
         if (!skip && (abort == nullptr || !abort(idle_abort_data))) {
             synchronize();
@@ -9680,8 +9680,8 @@ bool llama_context::restore_pp_plan(bool idle) {
         return false;
     }
     sched_plan_small = false;
-    // k15-idlewait: the reserve needs the device idle and the rows of a save in flight read, not the save's host copy into its
-    // destination (LLAMA_PP_RERESERVE_JOIN=1: synchronize(), which joins the save: G4 q4x chat, 16 ms ahead of a request posted meanwhile)
+    // the reserve needs the device idle and the rows of a save in flight read, not the save's host copy into its
+    // destination (LLAMA_PP_RERESERVE_JOIN=1: synchronize(), which joins the save: RTX PRO 6000 the 4-bit model chat, 16 ms ahead of a request posted meanwhile)
     static const bool pp_join = getenv("LLAMA_PP_RERESERVE_JOIN") != nullptr && atoi(getenv("LLAMA_PP_RERESERVE_JOIN")) != 0;
     if (pp_join) {
         synchronize();
@@ -9695,10 +9695,10 @@ bool llama_context::restore_pp_plan(bool idle) {
     }
     const uint32_t n_seqs_r    = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : cparams.n_seq_max;
     uint32_t       n_tokens_r  = std::min(cparams.n_ctx, cparams.n_ubatch);
-    // k19-a100chat (LLAMA_PP_RERESERVE_DFLASH_SPLIT=0: off): a DFlash drafter is reserved as at load (sched_reserve,
+    // (LLAMA_PP_RERESERVE_DFLASH_SPLIT=0: off): a DFlash drafter is reserved as at load (sched_reserve,
     // LLAMA_DFLASH_RESERVE_SPLIT): its feature batches at n_ubatch rows, its token graph at one noise block per sequence. The plain pp
-    // reservation here was a token graph of n_ubatch rows with the lm head on every row: 500 MiB for a drafter that runs 30 MiB (Colab
-    // A100 48 GB, fn4n DFlash2, n_ubatch 512). At every request end it freed the drafter's 30 MiB buffer to plan the 500 MiB one; with
+    // reservation here was a token graph of n_ubatch rows with the lm head on every row: 500 MiB for a drafter that runs 30 MiB (cloud host
+    // A100 48 GB, the 4-bit model DFlash2, n_ubatch 512). At every request end it freed the drafter's 30 MiB buffer to plan the 500 MiB one; with
     // the device nearly full that failed ("re-reserving the pp graph failed"), the next prompt's 512-row injection then needed its
     // 30 MiB again after the target's graphs had taken the memory, and its allocation failed: HTTP 500 (srv_kld long48, -fa on).
     // Where 500 MiB were free it took them from the target's graphs
@@ -9733,15 +9733,15 @@ bool llama_context::restore_pp_plan(bool idle) {
     return true;
 }
 
-// k19-uma: a ubatch of fewer than LLAMA_KQ_MASK_DEVICE_MIN_TOKENS tokens keeps the host KQ mask (k15-pp), so its graph has other nodes
+// a ubatch of fewer than LLAMA_KQ_MASK_DEVICE_MIN_TOKENS tokens keeps the host KQ mask, so its graph has other nodes
 // than the worst-case pp reservation (device-built masks) and the scheduler re-plans the graph allocator for it, sized for that ubatch.
 // A later larger small ubatch with the same nodes then did not fit that plan and re-planned again, with the same graph size
 // ("unexpected graph reallocation" with GGML_SCHED_DEBUG_REALLOC=1: test-llama-context rf on ROCm0 and CUDA, a 24-token decode after an
 // 8-token one; on CPU the allocator re-plans a single buffer silently). Such a graph (more tokens than the small plan the allocator
 // holds) reserves the largest host-mask ubatch first, with every cell as the pp reservation, so it and every later small ubatch fit one
 // plan (upstream: one plan fits every ubatch). The first small graph after a pp plan still re-plans for itself as before (the cheaper
-// plan: a reserve there cost every prompt's tail a graph build, G4 / L4 2k prompts -2..-3%). Only the allocation plan changes, not the
-// computation; the kept small graphs (k11-decode) keep their own plans. LLAMA_SMALL_PLAN_MAX=0: off
+// plan: a reserve there cost every prompt's tail a graph build, RTX PRO 6000 / L4 2k prompts -2..-3%). Only the allocation plan changes, not the
+// computation; the kept small graphs keep their own plans. LLAMA_SMALL_PLAN_MAX=0: off
 void llama_context::reserve_small_max(const llama_ubatch & ubatch) {
     static const bool env = getenv("LLAMA_SMALL_PLAN_MAX") == nullptr || atoi(getenv("LLAMA_SMALL_PLAN_MAX")) != 0;
     if (!env || sched_plan_small_tokens == 0 || ubatch.n_tokens <= sched_plan_small_tokens || !memory || moe_cache ||
@@ -9773,7 +9773,7 @@ void llama_context::reserve_small_max(const llama_ubatch & ubatch) {
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // k19-uma: the tokens of the small host-mask graph the allocator is re-planned for (see reserve_small_max), 0 for another graph
+    // the tokens of the small host-mask graph the allocator is re-planned for (see reserve_small_max), 0 for another graph
     {
         const uint32_t n_host = llm_graph_kq_mask_host_max_tokens(lctx->model.hparams, lctx->cparams);
         lctx->sched_plan_small_tokens = n_host > 0 && lctx->prefetch_n_tokens <= n_host ? (uint32_t) lctx->prefetch_n_tokens : 0;
@@ -9818,7 +9818,7 @@ void llama_context::ple_prefetch_ahead(const llama_ubatch & ubatch, const llama_
             out = ple.scratch;
         }
         if (ple_prefetcher) {
-            // k19-plerow: rows the row cache holds need no page
+            // rows the row cache holds need no page
             if (model.ple_row_cache && model.ple_row_cache->table == t) {
                 model.ple_row_cache->mask_cached(ple.scratch.data(), ple.scratch.size());
             }
@@ -9885,7 +9885,7 @@ void llama_context::vram_watch_sample(bool force) {
     }
     for (size_t i = 0; i < model.devices.size(); ++i) {
         ggml_backend_dev_t dev = model.devices[i].dev;
-        // k19-igpu: an integrated GPU too (its free memory is the host's available memory, ggml-cuda's UMA path)
+        // an integrated GPU too (its free memory is the host's available memory, ggml-cuda's UMA path)
         const enum ggml_backend_dev_type dev_type = dev != nullptr ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
         if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
             continue;
@@ -9900,7 +9900,7 @@ void llama_context::vram_watch_sample(bool force) {
     }
 }
 
-// LLAMA_MOE_HOST_PIN=1 (opt-in, k11; the dedicated pool idea from upstream llama.cpp): the host-miss ubatches run on an own ggml
+// LLAMA_MOE_HOST_PIN=1 (opt-in,; the dedicated pool idea from upstream llama.cpp): the host-miss ubatches run on an own ggml
 // threadpool, one worker per physical core (the first allowed SMT sibling, at most 32 and the cgroup quota), each pinned to its CPU
 // (strict_cpu), polling LLAMA_MOE_HOST_POLL (default 50) before it sleeps; GGML_CPU_PIN_CALLER=1 also pins the calling thread to
 // worker 0's CPU. Only builds without OpenMP use the pool's CPU masks (GGML_OPENMP=OFF); with OpenMP the team ignores them.
@@ -9926,11 +9926,11 @@ int32_t llama_context::host_threads_init() const {
         return n > (int32_t) cparams.n_threads ? n : 0;
     }
     if (env != nullptr) {
-        // =N: N threads (=0 off: the decode threads, as before k11)
+        // =N: N threads (=0 off: the decode threads, as before)
         const int32_t n = atoi(env);
         return n > 0 && n != (int32_t) cparams.n_threads ? n : 0;
     }
-    // opt-in: every usable logical CPU lost 8-9% decode on a G4 (48 vCPU, 24 -> 48 threads, Qwen3.6 UD-Q4_K_XL 8 GB + MTP, the same
+    // opt-in: every usable logical CPU lost 8-9% decode on a RTX PRO 6000 (48 vCPU, 24 -> 48 threads, Qwen3.6 4-bit quant 8 GB + MTP, the same
     // host experts and text); =auto takes them anyway
     return 0;
 }
@@ -10048,7 +10048,7 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
     if (lctx->moe_cache && lctx->moe_cache->is_slot_map(src)) {
         return GGML_BACKEND_SCHED_PREFETCH_NONE;
     }
-    // k15-lfm2: the prompt maps of in-place prompts: prefetched with the large ubatches (each staging slot of the copy queue has its own ring
+    // the prompt maps of in-place prompts: prefetched with the large ubatches (each staging slot of the copy queue has its own ring
     // of lent slots, see llama_moe_cache::prompt_copy), copied when the split starts otherwise
     if (lctx->moe_cache && lctx->moe_cache->prompt_layer(src) >= 0) {
         return lctx->prefetch_n_tokens >= lctx->prefetch_min_batch ? GGML_BACKEND_SCHED_PREFETCH_ASYNC : GGML_BACKEND_SCHED_PREFETCH_NONE;
@@ -10130,12 +10130,12 @@ bool llama_context::sched_copy_all_experts(const ggml_tensor * src, const ggml_t
     return ids->ne[1] >= prefetch_min_batch || ggml_nelements(ids) >= 8*src->ne[2];
 }
 
-// k15-pp: the seeds of the layer-major group whose routing the eval callback reads asynchronously are issued here, on the copy queue
+// the seeds of the layer-major group whose routing the eval callback reads asynchronously are issued here, on the copy queue
 // behind the layer's expert copies (as the synchronous seed issues them), see lm_seed_resolve_due
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
     if (!lctx->lm_seed_async || !lctx->lm_seed_active) {
-        // k19-l4held (LLAMA_MOE_PROMPT_DIAG=1): the whole callback's host time of a prompt (the diag counts only inside a prompt)
+        // (LLAMA_MOE_PROMPT_DIAG=1): the whole callback's host time of a prompt (the diag counts only inside a prompt)
         if (lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr) {
             const int64_t t0 = ggml_time_us();
             const bool ok = sched_copy_experts_body(backend, src, dst, graph, user_data);
@@ -10160,7 +10160,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // k15-lfm2: the prompt maps of in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1)
+    // the prompt maps of in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1)
     if (lctx->moe_cache) {
         const int32_t pil = lctx->moe_cache->prompt_layer(src);
         if (pil >= 0) {
@@ -10187,7 +10187,7 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     // the ids must be computed before the split starts. The product that reads the copy usually is the first node of the split, but a
     // backend may reorder the nodes of a split: the CUDA side-stream plan (ggml_cuda_side_mv_plan) moves a few-row product whose sources
     // come from an earlier split (e.g. the shared expert gate of Qwen3-Next style models) to its front. Taking only the first node then
-    // uploaded the whole down_exps tensor of every layer, cached experts included (Qwen3.8-Flash-Next UD-IQ4_XS, G4 32 GB: 46.6 instead of
+    // uploaded the whole down_exps tensor of every layer, cached experts included (Qwen3.8-Flash-Next 4-bit quant, RTX PRO 6000 32 GB: 46.6 instead of
     // 36.9 GB per prompt ubatch, 2k prompt -15%). So the split is searched for the product, and its ids must not be computed in the split.
     // LLAMA_MOE_COPY_SCAN=0: only the first node (as before)
     const int n_nodes = ggml_graph_n_nodes(graph);
@@ -10258,10 +10258,10 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
                     st.counts[id]++;
                 }
             }
-            // k19-l4ttft: the misses of every expert tensor of this layer are read now, in one batch (layers streamed through the RAM tier)
+            // the misses of every expert tensor of this layer are read now, in one batch (layers streamed through the RAM tier)
             if (lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr) {
                 lctx->moe_cache->prompt_layer_read(backend, src, st.used);
-                // k19-l4held (LLAMA_MOE_PROMPT_RANK=1): a prompt ubatch of 256+ tokens on this path also stages the experts held
+                // (LLAMA_MOE_PROMPT_RANK=1): a prompt ubatch of 256+ tokens on this path also stages the experts held
                 // nowhere that fit the layer's RAM quota, its routed misses ranked first (st.counts keeps the routing for the seed)
                 if (ids->ne[1] >= 256) {
                     lctx->moe_cache->prompt_rank_copy(src, st.used);
@@ -10272,7 +10272,7 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         st.ids = ids;
     }
 
-    // k15-pred: the experts uploaded ahead of this layer's routing are waited for, the next layer's are predicted (see llama_moe_cache)
+    // the experts uploaded ahead of this layer's routing are waited for, the next layer's are predicted (see llama_moe_cache)
     const bool ua = lctx->moe_cache && !st.all && !st.counts.empty() && lctx->moe_cache->get_experts(src) != nullptr;
     if (ua) {
         lctx->moe_cache->upload_ahead_begin(backend, src, ids, st.counts);
@@ -10338,7 +10338,7 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         }
         // fails (nothing copied) e.g. when the host weights are not pinned
         if (ua && lctx->moe_cache->upload_ahead_pending(src)) {
-            // k15-pred: the uploads of the misses first, they do not read the slots uploaded ahead; then the cached runs after the wait
+            // the uploads of the misses first, they do not read the slots uploaded ahead; then the cached runs after the wait
             if (n_cached == st.regions.size() || ggml_backend_tensor_copy_regions_async(backend, st.regions.data() + n_cached, st.regions.size() - n_cached)) {
                 lctx->moe_cache->upload_ahead_mark(backend, src);
                 lctx->moe_cache->upload_ahead_wait(backend, src);
@@ -10392,9 +10392,9 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         }
     }
     // layer-major graph: the routing that seeds this layer may come later, the seed then copies from this copy (see lm_eval_cb)
-    // k15-fn (LLAMA_MOE_LM_SEED_STAGED_ONLY=0 off): only from a prefetched copy in staging memory. A copy the graph allocator placed (the
+    // (LLAMA_MOE_LM_SEED_STAGED_ONLY=0 off): only from a prefetched copy in staging memory. A copy the graph allocator placed (the
     // host-weight prefetch turned off within the group, e.g. its staging arena failed to allocate after a lent graph) is overwritten by
-    // the later nodes of the graph before the routing resolves, and the seed filled cache slots with those bytes (G4 fn1 IQ1_S + MTP 16 GB
+    // the later nodes of the graph before the routing resolves, and the seed filled cache slots with those bytes (RTX PRO 6000 the 1-bit model IQ1_S + MTP 16 GB
     // 16k with GGML_SCHED_LEND_OWN=0: 118 + 21 slots wrong, the text and drafts off the no-draft run; locally GGML_SCHED_PREFETCH_FAIL_AT=1)
     static const bool lm_seed_staged_only = getenv("LLAMA_MOE_LM_SEED_STAGED_ONLY") == nullptr || atoi(getenv("LLAMA_MOE_LM_SEED_STAGED_ONLY")) != 0;
     if (lctx->lm_seed_active && lm_seed_staged_only && lctx->moe_cache->get_experts(src) != nullptr &&
@@ -10439,11 +10439,11 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
 }
 
 void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub, bool early) {
-    moe_inplace_ok = true; // k15-lfm2: unless this ubatch seeds (below)
+    moe_inplace_ok = true; // unless this ubatch seeds (below)
     moe_cache->prompt_ubatch(true);
     const bool large = !moe_cache->small_batch(ubatch.n_tokens);
     if (!moe_cache_seed_enabled) {
-        // k19-mgpu2: a server may run the last prompt token(s) as a separate small batch with the outputs: that one ends the prompt
+        // a server may run the last prompt token(s) as a separate small batch with the outputs: that one ends the prompt
         if (!large && n_outputs_ub != 0 && moe_cache->resident_fill_wanted() && moe_cache->has_resident_counts()) {
             moe_cache->resident_fill();
         }
@@ -10461,7 +10461,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
 
     // LLAMA_MOE_CACHE_SEED=2 (default): read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch
     // records newer ones without seeding
-    // k19-devseed: not for a ubatch that seeds on the device (moe_cache_devseed_min), which does not read them
+    // not for a ubatch that seeds on the device (moe_cache_devseed_min), which does not read them
     const bool devseed_ub = moe_cache_devseed_on && moe_cache_seed_sync && last_large && prefetch && (int64_t) ubatch.n_tokens >= moe_cache_devseed_min;
     if (moe_cache_seed_sync && cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || ((last_large || early) && prefetch)) && !devseed_ub) {
         ggml_backend_sched_synchronize(sched.get());
@@ -10510,7 +10510,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
         if (!prefetch) {
             moe_cache_seed = true;
         } else if (moe_cache_devseed_on && (!moe_cache_seed_sync || (int64_t) ubatch.n_tokens >= moe_cache_devseed_min)) {
-            // k19-devseed: beside the host seed only the ubatches the device seed plans (see moe_cache_devseed_fallback)
+            // beside the host seed only the ubatches the device seed plans (see moe_cache_devseed_fallback)
             moe_cache_devseed = true;
         } else if (moe_cache_seed_sync) {
             if (n_outputs_ub == 0 && moe_cache->has_seed_counts()) {
@@ -10524,7 +10524,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
         }
         moe_seed_early = 0;
     } else if (early && prefetch && moe_cache_seed_sync && n_outputs_ub == 0 && moe_cache->has_seed_counts()) {
-        // k15-lfm2 (LLAMA_MOE_CPU_MISS_PER_REQUEST=1): the request began with an empty cache, so every ubatch of the batch before its
+        // (LLAMA_MOE_CPU_MISS_PER_REQUEST=1): the request began with an empty cache, so every ubatch of the batch before its
         // last uploads all of its experts; a prefetched ubatch without outputs seeds from the routing of the one before it (no larger
         // graph, no serialized uploads), the ubatches after it copy those experts from the cache. The prompt computes on the device
         // either way (same bytes), so its logits do not change. =1: the second large ubatch only, =2: every one up to the end of the batch
@@ -10537,7 +10537,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
         moe_cache_seed = true;
         moe_seed_early = 0;
     }
-    // k15-lfm2: a ubatch that seeds the cache from its own routing keeps the staging copies (the seed reads them), the others may read in
+    // a ubatch that seeds the cache from its own routing keeps the staging copies (the seed reads them), the others may read in
     // place; one that seeds from the routing of an earlier ubatch plans its seeds before the graph (see prompt_seed_plan)
     moe_inplace_ok = !(moe_cache_seed || moe_cache_devseed || (moe_cache_seed_prev && lm_seed_active));
     moe_cache->prompt_ubatch(moe_inplace_ok, moe_cache_seed_prev);
@@ -10585,10 +10585,10 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
     moe_cache_seed_prev = false;
     moe_cache_record    = false;
 
-    // k19-devseed (LLAMA_MOE_CACHE_DEVSEED_REFILL_ROUTED, default 1): a ubatch that seeded on the device beside the host seed (see
+    // (LLAMA_MOE_CACHE_DEVSEED_REFILL_ROUTED, default 1): a ubatch that seeded on the device beside the host seed (see
     // moe_cache_devseed_fallback) leaves the lent slots to the experts they held before the prompt, where the host seed refills them with
     // the next most used experts of the ubatch: they get the experts its routing used most instead (the same number of uploads when the
-    // slots come back, see llama_moe_cache unlend). G4 Flint UD-Q4_K_XL 16 GB, defaults (CPU misses on): decode hit rate 89.8% held before
+    // slots come back, see llama_moe_cache unlend). RTX PRO 6000 Flint 4-bit quant 16 GB, defaults (CPU misses on): decode hit rate 89.8% held before
     // vs 90.9% with the host seed. =0: the experts held before
     if (devseeded && moe_cache_seed_sync && recorded && !moe_cache_ids.empty()) {
         static const bool refill_env = getenv("LLAMA_MOE_CACHE_DEVSEED_REFILL_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_CACHE_DEVSEED_REFILL_ROUTED")) != 0;
@@ -10601,7 +10601,7 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
     // the prompt ends at a ubatch with outputs (or a failed one), the next one may belong to another prompt
     if (n_outputs_ub != 0 || ubatch.n_seqs_unq != 1) {
         if (n_outputs_ub > 0 && moe_cache->resident_fill_wanted() && moe_cache->has_resident_counts()) {
-            moe_cache->resident_fill(); // k19-mgpu2: the prompt's routed experts into each card's slots
+            moe_cache->resident_fill(); // the prompt's routed experts into each card's slots
         }
         if (n_outputs_ub != 0 && recorded && !moe_cache_seeded && !moe_cache_ids.empty() && moe_cache->refills_routed()) {
             moe_cache_refill_from_ids();
@@ -10652,10 +10652,10 @@ void llama_context::lm_ids_host_keep() {
     lm_ids_buf = std::move(buf);
 }
 
-// k19-l4fill: the routing of the recorded ubatch (the last large one of a prompt) to the RAM tier's refill of its freed slots
+// the routing of the recorded ubatch (the last large one of a prompt) to the RAM tier's refill of its freed slots
 void llama_context::moe_cache_fill_from_ids() {
     const bool fill = moe_cache->fill_wants_counts();
-    // k19-autoprof: the same routing goes into the self-learned profile
+    // the same routing goes into the self-learned profile
     const bool ap   = moe_cache->autoprof_wants_counts();
     if (moe_cache_ids.empty() || (!fill && !ap)) {
         return;
@@ -10691,7 +10691,7 @@ void llama_context::moe_cache_fill_from_ids() {
     }
 }
 
-// k19-autoprof: the routing of a large ubatch inside a prompt (read at the start of the next ubatch of the same prompt, before its graph
+// the routing of a large ubatch inside a prompt (read at the start of the next ubatch of the same prompt, before its graph
 // replaces the outputs) into the self-learned profile; the prompt's last ubatch goes through moe_cache_fill_from_ids
 void llama_context::moe_cache_autoprof_from_ids() {
     if (moe_cache_ids.empty() || moe_ap_counted || !moe_cache->autoprof_wants_counts()) {
@@ -10718,7 +10718,7 @@ void llama_context::moe_cache_autoprof_from_ids() {
     }
 }
 
-// k19-mgpu2: the routing of a large ubatch in resident mode (its ffn_moe_topk_out-<il> outputs on every card), kept per layer for the
+// the routing of a large ubatch in resident mode (its ffn_moe_topk_out-<il> outputs on every card), kept per layer for the
 // fill at the end of the prompt (the last large ubatch wins)
 void llama_context::moe_cache_resident_record(const llm_graph_result * res) {
     ggml_cgraph * gf = res->get_gf();
@@ -10755,15 +10755,15 @@ void llama_context::moe_cache_resident_record(const llm_graph_result * res) {
     }
 }
 
-// k19-autoprof2 (LLAMA_MOE_RELEASE_COUNTS): a prompt whose large ubatches run with the cache banks released (the tiny-cache
-// rule / k19-place8 / k19-placemid: a capped or small card, e.g. Colab L4 @12 GB or a T4 with Flash-Next) skips moe_cache_seed_begin's
+// (LLAMA_MOE_RELEASE_COUNTS): a prompt whose large ubatches run with the cache banks released (the tiny-cache
+// rule / a capped or small card, e.g. L4 @12 GB or a T4 with Flash-Next) skips moe_cache_seed_begin's
 // recording (released banks take no seed) and its layer-major groups clear the routing without counting it, so the RAM tier's idle
-// refill (k19-l4fill) and the self-learned profile (k19-autoprof) never got a count there ("0 prompts counted ... 0 read"). The routed
+// refill and the self-learned profile never got a count there ("0 prompts counted... 0 read"). The routed
 // refill of the banks reads that routing after the ubatch / group anyway (one sync, one read of the ids per prompt): the counts come
 // from that same read, no extra sync or device read, nothing on the decode path. Counting only orders RAM-tier placement: exact.
 // =1 (default): the refill's counts, plus the self-learned profile on a disk tier (moe_cache_disk_counts); =2: also the self-learned
 // profile on every tier (opt-in: with a fair base, i.e. base with its PLE profile,
-// using the MoE profile there gave decode +3..+19% but TTFT +7..+15% on a Colab T4 (Flash-Next IQ1_S, 30 GiB) and +11% on the L4 @12
+// using the MoE profile there gave decode +3..+19% but TTFT +7..+15% on T4 (Flash-Next IQ1_S, 30 GiB) and +11% on the L4 @12
 // GB MTP 8k, level on L4 @12 no drafter); =0: as before
 static int moe_cache_release_counts_mode() {
     static const int m = [] { const char * e = getenv("LLAMA_MOE_RELEASE_COUNTS"); return e == nullptr ? 1 : atoi(e); }();
@@ -10776,9 +10776,9 @@ static bool moe_cache_released_counts() {
 // On a disk tier (the RAM tier is on, exclusive, and the mapped host weights exceed the available RAM) the released-bank prompts are
 // also counted into the self-learned routing profile by default, so a later launch fills the RAM tier hottest first: there every prompt
 // of a capped card runs with released banks, and without these counts the profile stayed empty. Placement only: exact.
-// Colab L4 12 GB, Flash-Next UD-IQ4_XS from the disk, a profile recorded on texts disjoint from the measured ones, 3 interleaved
+// L4 12 GB, Flash-Next 4-bit quant from the disk, a profile recorded on texts disjoint from the measured ones, 3 interleaved
 // launches on one VM: chat TTFT 17.38 -> 14.94 s, chat decode 4.87 -> 5.47 tok/s, 8k level, same text.
-// Only on CUDA devices of compute capability 8.0 or higher: on a Colab T4 (7.5, Flash-Next IQ1_S from the disk under a 30 GiB RAM
+// Only on CUDA devices of compute capability 8.0 or higher: on T4 (7.5, Flash-Next IQ1_S from the disk under a 30 GiB RAM
 // cap, a profile recorded the same way, read only) the chat TTFT got worse (20.5 / 19.6 s against 15.7 / 17.3 s without the counts),
 // so older cards keep the refill counts only. LLAMA_MOE_AUTOPROF_DISK_COUNTS=0 off (LLAMA_MOE_RELEASE_COUNTS=2 still counts them on every tier, =0 never)
 static bool moe_cache_disk_counts() {
@@ -11414,7 +11414,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
-    state_async_wait_reads(); // k15-idlewait: as state_seq_set_data
+    state_async_wait_reads(); // as state_seq_set_data
     llama_io_read_host io(src, size);
     try {
         return state_read_data(io);
@@ -11444,7 +11444,7 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
     if (flags & LLAMA_STATE_SEQ_FLAGS_CAPTURED) {
-        // k15-pp: the captured rows and position in place of the current ones for the whole write, then back (synchronous)
+        // the captured rows and position in place of the current ones for the whole write, then back (synchronous)
         int cs = cap_sel >= 0 && cap[cap_sel].done && cap[cap_sel].seq == seq_id && !cap[cap_sel].regions.empty() ? cap_sel : -1;
         if (cs < 0) {
             for (int c = 0; c < cap_max; ++c) {
@@ -11509,10 +11509,10 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         synchronize();
     }
 
-    // k15-ov: a host save reads its device rows in a few large copies through pinned halves (state_get_bounced) instead of one synchronous
-    // copy per row: G4 Flash-Next UD-IQ4_XS, the server's prompt-cache save at a request's start was 118 synchronous 2 MiB copies at
+    // a host save reads its device rows in a few large copies through pinned halves (state_get_bounced) instead of one synchronous
+    // copy per row: RTX PRO 6000 Flash-Next 4-bit quant, the server's prompt-cache save at a request's start was 118 synchronous 2 MiB copies at
     // ~3 GB/s (60 ms before an 8k prompt, ~120 ms before a 16k one). The same bytes reach the destination. Opt-in (LLAMA_STATE_BOUNCE=1):
-    // G4 k15g4z1 (3 launches) 16k TTFT -0.7..-1.3% (fn4 16 / 24 GB, q4x 12 GB), 2k / chat within the spread, for 2 x 16 MiB of pinned host
+    // RTX PRO 6000 (3 launches) 16k TTFT -0.7..-1.3% (4-bit 16 / 24 GB, the 4-bit model 12 GB), 2k / chat within the spread, for 2 x 16 MiB of pinned host
     // memory per backend; most of the save is the first touch of a fresh cache entry, not the copies
     static const bool bounce_env = getenv("LLAMA_STATE_BOUNCE") != nullptr && atoi(getenv("LLAMA_STATE_BOUNCE")) != 0;
     if (bounce_env && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
@@ -11554,7 +11554,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
-    // k15-idlewait: the rows are written with synchronous copies off the compute stream: an asynchronous save still queued there must
+    // the rows are written with synchronous copies off the compute stream: an asynchronous save still queued there must
     // have read them first (it was joined by the first memory call before; LLAMA_STATE_ASYNC_SPLIT_WAIT=0: the whole save here too)
     state_async_wait_reads();
     std::unique_ptr<llama_io_read_i> io;
@@ -11755,7 +11755,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 
     // the next batches continue the state read, not the batches before: see llama_moe_cache::hybrid_reset
     if (moe_cache) {
-        tiny_rel_leave(); // k19-fixB: released banks come back before the reset clears them
+        tiny_rel_leave(); // released banks come back before the reset clears them
         moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
         gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
@@ -11790,9 +11790,9 @@ void llama_context::state_async_wait() {
     }
 }
 
-// k15-idlewait: what a sequence change (llama_memory_seq_rm / seq_cp / clear) has to wait for is the read of the device rows, so the
+// what a sequence change (llama_memory_seq_rm / seq_cp / clear) has to wait for is the read of the device rows, so the
 // change cannot reach them first; the host copy from the pinned staging into the save's destination (the prompt-cache entry: 77 MiB
-// for a 640-token Qwen3.6 chat, about 15 ms of the next request's G4 TTFT when it was waited for here) goes on on the worker. The
+// for a 640-token Qwen3.6 chat, about 15 ms of the next request's RTX PRO 6000 TTFT when it was waited for here) goes on on the worker. The
 // destination is still waited for in full where it is read or freed (state_async_wait: the next save, llama_state_seq_async_wait,
 // synchronize, the end of decode)
 void llama_context::state_async_wait_reads() {
@@ -11967,13 +11967,13 @@ size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
     return total;
 }
 
-// k19-host30k (LLAMA_STATE_ASYNC_EXT=0: off): a whole-state save larger than the staging (the server's prompt-cache save of the previous
-// prompt at a request, or at idle) read the rows past the staging synchronously into fresh host memory: G4 Qwen3.8-Flash-Next UD-IQ4_XS
+// (LLAMA_STATE_ASYNC_EXT=0: off): a whole-state save larger than the staging (the server's prompt-cache save of the previous
+// prompt at a request, or at idle) read the rows past the staging synchronously into fresh host memory: RTX PRO 6000 Qwen3.8-Flash-Next 4-bit quant
 // 24 / 32 GB, the 600 MiB save of the 16k prompt held the next (30k) request 175-360 ms before its first ubatch (and the 381 MiB save
 // of the 8k prompt held the 16k one 74-133 ms). The server asks at load for staging that holds a whole-sequence save at most (the
 // device bytes of the memory's buffers); it is pinned then and added after the staging, and every save that fits reads its rows
 // asynchronously (the same rows into the same destination). Pinned on a thread while a slot generated instead, cudaMallocHost cost that
-// decode 5-17% (k19hx_g4). At most LLAMA_STATE_ASYNC_EXT_MAX_MIB (2048) of staging in all, only while free memory (MemFree, so no
+// decode 5-17%. At most LLAMA_STATE_ASYNC_EXT_MAX_MIB (2048) of staging in all, only while free memory (MemFree, so no
 // page cache is evicted for it) keeps max(4 GiB, 5% of MemTotal) after it, one async backend only (one GPU); kept with the context
 static bool state_async_ext_on() {
     static const bool on = [] {
@@ -12030,8 +12030,8 @@ void llama_context::state_async_ext_request(size_t need) {
         avail = std::min<uint64_t>(avail, mem_free);
     }
 #endif
-    // k19-host30k: the share of MemTotal kept free is LLAMA_STATE_ASYNC_EXT_KEEP_PCT (5) percent, at least 4 GiB. At 10% the G4 at 24 /
-    // 32 GB (12.3 GiB free after load of 176 GiB) never pinned (k19hx2_g4). LLAMA_STATE_ASYNC_EXT_TOTAL_MIB (test only) stands in for
+    // the share of MemTotal kept free is LLAMA_STATE_ASYNC_EXT_KEEP_PCT (5) percent, at least 4 GiB. At 10% the RTX PRO 6000 at 24 /
+    // 32 GB (12.3 GiB free after load of 176 GiB) never pinned. LLAMA_STATE_ASYNC_EXT_TOTAL_MIB (test only) stands in for
     // MemTotal, to see the decision of a smaller host
     static const uint64_t keep_pct = (uint64_t) std::max(0, getenv("LLAMA_STATE_ASYNC_EXT_KEEP_PCT") ? atoi(getenv("LLAMA_STATE_ASYNC_EXT_KEEP_PCT")) : 5);
     static const uint64_t total_mem = getenv("LLAMA_STATE_ASYNC_EXT_TOTAL_MIB") ? (uint64_t) std::max(0, atoi(getenv("LLAMA_STATE_ASYNC_EXT_TOTAL_MIB"))) << 20 : llama_sysmem::total();
@@ -12059,7 +12059,7 @@ void llama_context::state_async_ext_request(size_t need) {
 // backend (reused across saves); a worker thread waits on an event per backend and copies them to dst, so the host is
 // free to prepare the next ubatch meanwhile. Rows in host buffers, or on a device without async copies and events,
 // take the synchronous path instead.
-// k15-ov: the rows of a synchronous host save, read through two pinned halves per device backend: the copies of one half are queued on
+// the rows of a synchronous host save, read through two pinned halves per device backend: the copies of one half are queued on
 // the backend (in stream order after its queued work, as ggml_backend_tensor_get) while the host copies the previous half to the
 // destination. Returns false (nothing read) when a row is not on an async-capable device backend or the halves cannot be allocated
 bool llama_context::state_get_bounced(const std::vector<llama_state_write_info> & winfos) {
@@ -12207,14 +12207,14 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
     // allocation, drained the queued ubatch and left the GPU idle for the whole cudaMallocHost of the new one.
     std::vector<ggml_backend_buffer_ptr> retired;
 
-    // k15-idlewait (LLAMA_STATE_ASYNC_PARTIAL=0: all synchronous then): with ASYNC_NO_GROW, a save larger than the staging the context
-    // holds reads the rows that fit there asynchronously and the rest synchronously into dst (G4 fn4 16 GB: the checkpoint staging
+    // (LLAMA_STATE_ASYNC_PARTIAL=0: all synchronous then): with ASYNC_NO_GROW, a save larger than the staging the context
+    // holds reads the rows that fit there asynchronously and the rest synchronously into dst (RTX PRO 6000 4-bit 16 GB: the checkpoint staging
     // holds the 112.6 MiB of recurrent rows, the save is 131.8 MiB with the KV rows)
     static const bool partial_env = getenv("LLAMA_STATE_ASYNC_PARTIAL") == nullptr || atoi(getenv("LLAMA_STATE_ASYNC_PARTIAL")) != 0;
     std::vector<uint8_t> partial(state_async.size(), 0);
     std::vector<uint8_t> sync_row(winfos.size(), 0);
 
-    // k19-host30k: a save larger than the staging, with a staging extension (state_async_ext_request): the rows go first fit into the
+    // a save larger than the staging, with a staging extension (state_async_ext_request): the rows go first fit into the
     // staging and the extension's buffers; rows that fit nowhere are read synchronously where the save may not grow, as the partial path
     std::vector<uint8_t>   ext_b(state_async.size(), 0);
     std::vector<uint8_t *> ext_at(winfos.size(), nullptr);
@@ -12336,9 +12336,9 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
     std::vector<copy_job> jobs;
     jobs.reserve(winfos.size());
 
-    // k15-pp2: a captured state (every row a snapshot of capture cap_save, on one device) is read on a side stream after the
+    // a captured state (every row a snapshot of capture cap_save, on one device) is read on a side stream after the
     // event recorded right after its snapshot copies, so the reads overlap the ubatches queued since and the output wait of the
-    // decode does not wait for them (LLAMA_STATE_CAPTURE_SIDE=0: on the compute stream, as k15-pp)
+    // decode does not wait for them (LLAMA_STATE_CAPTURE_SIDE=0: on the compute stream, as)
     static const bool side_env = getenv("LLAMA_STATE_CAPTURE_SIDE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE_SIDE")) != 0;
     ggml_backend_t side = nullptr;
     if (side_env && cap_save >= 0 && cap[cap_save].ev_set && !winfos.empty()) {
@@ -12443,7 +12443,7 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    // k15-pp debug (LLAMA_CAP_DEBUG=1): per layer hashes of the recurrent rows a partial state write reads
+    // debug (LLAMA_CAP_DEBUG=1): per layer hashes of the recurrent rows a partial state write reads
     static const bool cap_debug = getenv("LLAMA_CAP_DEBUG") != nullptr && atoi(getenv("LLAMA_CAP_DEBUG")) != 0;
     auto debug_rows = [&](const char * what) {
         if (!cap_debug || !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) || dynamic_cast<llama_io_write_dummy *>(&io) != nullptr) {
@@ -12481,7 +12481,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
             LLAMA_LOG_INFO("%s: cap_debug %s seq %d cell %u row %u pos %d:%s\n", __func__, what, seq_id, i, row, rec->cells[i].pos, line.c_str());
         }
     };
-    // k15-pp: a size query of the captured state: its rows have the sizes of the current ones (state_seq_get_data reads the snapshots)
+    // a size query of the captured state: its rows have the sizes of the current ones (state_seq_get_data reads the snapshots)
     flags &= ~LLAMA_STATE_SEQ_FLAGS_CAPTURED;
     debug_rows("current");
     if (memory) {
@@ -12493,7 +12493,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (moe_cache) {
-        tiny_rel_leave(); // k19-fixB: released banks come back before the reset clears them
+        tiny_rel_leave(); // released banks come back before the reset clears them
         moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
         gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
@@ -12544,7 +12544,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
             ret[buft].context += size;
         }
-        // k17-small (lazy KV step 2): the KV bytes a lazy KV cache leaves unbacked (of a measurement: at load)
+        // (lazy KV step 2): the KV bytes a lazy KV cache leaves unbacked (of a measurement: at load)
         for (llama_kv_cache * kv : llama_memory_kv_caches(memory.get())) {
             for (const auto & [buft, size] : kv->lazy_unbacked()) {
                 ret[buft].kv_lazy += size;
@@ -12553,7 +12553,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
                 ret[buft].kv_sel += size;
             }
         }
-        // k19-kvsel: the split indexer cache's raw keys in host chunks
+        // the split indexer cache's raw keys in host chunks
         if (const auto * hi = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get()); hi != nullptr && hi->get_mem_idx() != nullptr) {
             for (const auto & [buft, size] : hi->get_mem_idx()->sel_host()) {
                 ret[buft].kv_sel += size;
@@ -12565,7 +12565,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    // k15-pp3 (LLAMA_FIT_CAPTURE=0 off): the state capture snapshots, allocated at the first capture (cap_prepare), after fit placed
+    // (LLAMA_FIT_CAPTURE=0 off): the state capture snapshots, allocated at the first capture (cap_prepare), after fit placed
     // the model: planned in a context that only measures memory, the allocated ones otherwise
     {
         ggml_backend_buffer_type_t cb = nullptr;
@@ -12946,7 +12946,7 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    // k19-kvwin: the recent-window ring is read by flash attention
+    // the recent-window ring is read by flash attention
     {
         const llama_kv_win_params wp = llama_kv_win_params_from(params);
         if (wp.n_win >= 0 && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
@@ -13058,7 +13058,7 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
 }
 
-// k19-rollback: see llama_rs_snap_save
+// see llama_rs_snap_save
 llama_memory_recurrent * llama_context::rs_snap_mem() const {
     if (!memory || model.hparams.no_alloc) {
         return nullptr;
@@ -13204,7 +13204,7 @@ bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
 }
 
-// k19-fitfaoff: whether this context runs attention with flash attention (after the auto resolution at context creation)
+// whether this context runs attention with flash attention (after the auto resolution at context creation)
 bool llama_get_flash_attn(const llama_context * ctx) {
     return ctx->get_cparams().flash_attn;
 }
@@ -13271,7 +13271,7 @@ void llama_context::set_ubatch_breaks(const int32_t * breaks, int32_t n) {
     ubatch_breaks_next.assign(breaks, breaks + std::max(0, n));
 }
 
-// k15-pp: llama_set_state_capture
+// llama_set_state_capture
 bool llama_context::state_capture_supported() const {
     static const bool env = getenv("LLAMA_STATE_CAPTURE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE")) != 0;
     if (!env || memory == nullptr || cap_count() == 0) {   // no snapshots (--fit, n_state_capture = 0): the server checkpoints as without capture
@@ -13293,7 +13293,7 @@ bool llama_context::set_state_capture(llama_seq_id seq_id, int32_t i_batch) {
     if (rec == nullptr || (hyb && model.hparams.swa_type != LLAMA_SWA_TYPE_NONE)) {
         return false;
     }
-    // k15-pp2: one slot per (sequence, index) for the next decode, up to cap_max (LLAMA_STATE_CAPTURE_MAX=1: one, as k15-pp)
+    // one slot per (sequence, index) for the next decode, up to cap_max (LLAMA_STATE_CAPTURE_MAX=1: one, as)
     const int n_max = cap_count();
     int s = -1;
     for (int c = 0; c < n_max && s < 0; ++c) {
@@ -13360,7 +13360,7 @@ ggml_backend_t llama_context::cap_backend() const {
     return nullptr;
 }
 
-// k15-pp2: an event on the compute stream right after the snapshot copies of capture s, for the side-stream read of its save
+// an event on the compute stream right after the snapshot copies of capture s, for the side-stream read of its save
 void llama_context::cap_record(int s, ggml_backend_t be) {
     auto & C = cap[s];
     C.ev_set = false;
@@ -13410,8 +13410,8 @@ size_t llama_context::cap_planned_bytes(ggml_backend_buffer_type_t * buft_out) c
     // a recurrent memory the server captures (llama_state_capture_supported, LLAMA_LM_CKPT_CAPTURE): one snapshot of a sequence's
     // recurrent rows per capture. The condition leaves out what fit varies between its measurements (the MoE cache size, n_ubatch), so
     // every measurement of one placement counts the same bytes: the n_ubatch rule compares two of them (common_fit_moe_cache)
-    // LLAMA_FIT_CAPTURE: off by default for now (=1 counts them; pending a decision: +124.5 MiB headroom at q4x 12 GB for 1-8% default
-    // decode). Off, the snapshots are allocated at the first capture, uncounted, as in k15-pp2
+    // LLAMA_FIT_CAPTURE: off by default for now (=1 counts them; pending a decision: +124.5 MiB headroom at the 4-bit model 12 GB for 1-8% default
+    // decode). Off, the snapshots are allocated at the first capture, uncounted, as in
     static const bool fit_env = getenv("LLAMA_FIT_CAPTURE") != nullptr && atoi(getenv("LLAMA_FIT_CAPTURE")) != 0;
     static const bool srv_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
     static const bool lm_env  = getenv("LLAMA_MOE_LAYER_MAJOR") == nullptr || strcmp(getenv("LLAMA_MOE_LAYER_MAJOR"), "auto") == 0 ||
@@ -13503,7 +13503,7 @@ bool llama_context::cap_prepare(int s) {
     if (rg.empty()) {
         return false;
     }
-    // the buffer may come from the context's creation (k15-pp3: allocated where fit counted it, see cap_planned_bytes)
+    // the buffer may come from the context's creation (allocated where fit counted it, see cap_planned_bytes)
     if (!C.buf || ggml_backend_buffer_get_size(C.buf.get()) < total + 4096 || ggml_backend_buffer_get_type(C.buf.get()) != buft) {
         C.buf.reset(ggml_backend_buft_alloc_buffer(buft, total + 4096));
         if (!C.buf) {
@@ -13537,7 +13537,7 @@ void llama_context::cap_now(int s, llama_pos pos) {
         return;
     }
     auto & C = cap[s];
-    // k19-fixB: the replay window of the ubatch before (up to 1 + n_rs_seq tokens, replay_mark) is only applied to the state rows by
+    // the replay window of the ubatch before (up to 1 + n_rs_seq tokens, replay_mark) is only applied to the state rows by
     // the next ubatch's apply(), which runs after this capture: commit that cell's window first, or the checkpoint misses those tokens
     {
         auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
@@ -13581,7 +13581,7 @@ bool llama_context::layer_major_on() const {
 // a batch of n_before + n_after prompt tokens of one sequence, from the start of the batch, with a ubatch break after n_before: the first
 // ubatch after the break runs in the layer-major group of the one before it (decode_layer_major: every member eligible, at most lm_ub_max
 // per group). Otherwise the merge only drops the seed the separate batches made between them: a ubatch before the break that is too short
-// for a group (Qwen3.6 q4x 12 GB, -ub 512: a 640-token prompt runs [124] [512] [4]) or a group that ends at the break
+// for a group (Qwen3.6 the 4-bit model 12 GB, -ub 512: a 640-token prompt runs [124] [512] [4]) or a group that ends at the break
 bool llama_context::layer_major_spans(int64_t n_before, int64_t n_after) const {
     if (!layer_major_on() || lm_refused_min <= 2 || n_before <= 0 || n_after <= 0) {
         return false;
@@ -13631,10 +13631,10 @@ bool llama_exact_verify_enabled(void) {
     return llama_exact_verify_env();
 }
 
-// k17-strict: a verify ubatch of n tokens reads the MoE cache slots only while n * n_expert_used fits the slots of every cached group
+// a verify ubatch of n tokens reads the MoE cache slots only while n * n_expert_used fits the slots of every cached group
 // (llama_moe_cache::n_tokens_cached, the condition of the device lookup and of the host slot map); a larger one takes neither and its
 // MUL_MAT_ID runs on the layer's host expert tensors on the CPU (batch invariant per row there, but CPU kernels, while the single
-// token decode it must equal runs on the device). T4 Colab, gpt-oss-20b MXFP4, --cpu-moe, strict env (LLAMA_MTP_EXACT=1,
+// token decode it must equal runs on the device). T4 cloud host, gpt-oss-20b MXFP4, --cpu-moe, strict env (LLAMA_MTP_EXACT=1,
 // LLAMA_MOE_CPU_MISS=0, LLAMA_MOE_CACHE_HYBRID=0): --moe-cache-mib 256 holds 17 slots = 4 tokens, the n-gram windows of 5-8 tokens ran
 // on the CPU and the greedy text followed the cache size. The server caps its draft windows at this many tokens (LLAMA_SPEC_EXACT_DEVICE_CAP=0: off)
 int32_t llama_verify_device_max_tokens(const llama_context * ctx) {
@@ -13678,10 +13678,10 @@ static double llama_moe_cache_wide_graphs_frac() {
     return f;
 }
 
-// k19-widefix: the host experts the cache serves must also be at least LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB (default 32768; 0 = any size).
-// The share alone cannot tell the measured cases apart: Qwen3.6-35B-A3B UD-Q4_K_XL (q4x, 18726 MiB of host experts) on a Colab L4 full
-// card is 91.0% cached, more than the Qwen3.8-Flash-Next UD-IQ4_XS (57588 MiB) tiers the lever was measured on (G4 48 GB 70.7%, A100 80 GB
-// at 48 GB 67.0%). On the L4 q4x MTP n2 (k19-int3gpu, i3w_l4, 3 launches) the lever is compute-neutral (8k 103.31 -> 104.39 tok/s,
+// the host experts the cache serves must also be at least LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB (default 32768; 0 = any size).
+// The share alone cannot tell the measured cases apart: Qwen3.6-35B-A3B 4-bit quant (the 4-bit model, 18726 MiB of host experts) on L4 full
+// card is 91.0% cached, more than the Qwen3.8-Flash-Next 4-bit quant (57588 MiB) tiers the lever was measured on (RTX PRO 6000 48 GB 70.7%, A100 80 GB
+// at 48 GB 67.0%). On the L4 the 4-bit model MTP n2 (i3w_l4, 3 launches) the lever is compute-neutral (8k 103.31 -> 104.39 tok/s,
 // ms/pass 29.23 -> 29.13 in chat) but the 16384-cell device KV buckets move the verify numerics there: greedy chat changes text
 // (adea6176 -> ed7368de) and loses 2.2% on acceptance (115.25 -> 112.66 tok/s, 3.37 -> 3.28 tok/pass). The first-use capture cost the
 // prewarm removes (24-44 ms per width on Flash-Next) is a large-graph cost, so the lever stays where the host experts are large
@@ -13693,9 +13693,9 @@ static double llama_moe_cache_wide_graphs_min_bytes() {
     return b;
 }
 
-// k19-bigverify (see llama-ext.h). Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6 at a 48 GB cap (70.7% cached), bv_s1g: the first use of
+// (see llama-ext.h). RTX PRO 6000 Qwen3.8-Flash-Next 4-bit quant DFlash2 n6 at a 48 GB cap (70.7% cached), bv_s1g: the first use of
 // each verify width (graph build, eager pass, capture: 24-44 ms against 20 ms for a replayed 7-row window) took 19-21% of a chat
-// request; prewarmed: 224.5 -> 264.5 tok/s, same text. Below the share the 2048-cell step and no prewarm stay (k19-fullcost: 16 GB -20%,
+// request; prewarmed: 224.5 -> 264.5 tok/s, same text. Below the share the 2048-cell step and no prewarm stay (16 GB -20%,
 // the prewarmed 5-row graphs ran the single-graph host path; 16 / 32 GB 2-4% slower with 16384-cell buckets)
 bool llama_moe_cache_wide_graphs(const llama_context * ctx) {
     if (ctx == nullptr || ctx->get_moe_cache() == nullptr) {
@@ -13711,7 +13711,7 @@ bool llama_moe_cache_wide_graphs(const llama_context * ctx) {
         LLAMA_LOG_INFO("%s: the MoE cache holds %.1f%% of the host experts: verify graphs prewarmed and kept as without a cache "
             "(device KV buckets of 16384 cells; LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC=0: off)\n", __func__, 100.0*c);
     }
-    // k19-widefix: say once why a cache over the share stays on the 2048-cell step
+    // say once why a cache over the share stays on the 2048-cell step
     static std::atomic<bool> logged_small{false};
     if (f > 0.0 && c >= f && h < m && !logged_small.exchange(true)) {
         LLAMA_LOG_INFO("%s: the MoE cache holds %.1f%% of %.0f MiB of host experts, under LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB "
@@ -13743,12 +13743,12 @@ bool llama_moe_pin_small_set(llama_context * ctx, bool on) {
 static bool llama_moe_cache_fp_log();
 
 void llama_context::moe_request_begin() {
-    // k19-prewexact diagnostic: the state each request starts from (LLAMA_MOE_CACHE_FP_LOG=1)
+    // diagnostic: the state each request starts from (LLAMA_MOE_CACHE_FP_LOG=1)
     if (moe_cache != nullptr && llama_moe_cache_fp_log()) {
         llama_synchronize(this);
         moe_cache->fingerprint("request");
     }
-    // k19-fixD: the banks the tiny-ubatch rule released come back before the per-request reset (LLAMA_MOE_CPU_MISS_PER_REQUEST=1)
+    // the banks the tiny-ubatch rule released come back before the per-request reset (LLAMA_MOE_CPU_MISS_PER_REQUEST=1)
     // clears them: hybrid_reset skips a released device, so the request started from the previous request's cache
     if (moe_cache != nullptr && moe_cache->request_resets()) {
         tiny_rel_leave();
@@ -13791,7 +13791,7 @@ bool llama_moe_cpu_miss_drop_slow(llama_context * ctx) {
     return ctx != nullptr && ctx->moe_cpu_miss_drop_slow();
 }
 
-// k19-int3fix: see llama-ext.h
+// see llama-ext.h
 bool llama_qsa_allfit_capable(const llama_context * ctx) {
     const auto * mem_idx = ctx != nullptr ? dynamic_cast<const llama_memory_hybrid_idx *>(ctx->get_memory()) : nullptr;
     return mem_idx != nullptr && mem_idx->get_kpool_top() > 0;
@@ -13845,11 +13845,11 @@ void llama_set_verify_exact(llama_context * ctx, bool value) {
 
 bool llama_verify_exact_placement(const llama_context * ctx) {
     // a MoE cache computes misses on the host or reads them per batch, and host weights run CPU kernels whose batch path is not the
-    // single token path: verify rows there do not give the bytes of single token decodes (G4, LFM2.5 8 GB: other text)
+    // single token path: verify rows there do not give the bytes of single token decodes (RTX PRO 6000, LFM2.5 8 GB: other text)
     if (ctx == nullptr) {
         return false;
     }
-    // k13: a MoE cache whose host never computes an expert (no hybrid path, no CPU misses) runs every expert on the device from a slot,
+    // a MoE cache whose host never computes an expert (no hybrid path, no CPU misses) runs every expert on the device from a slot,
     // with the kernels of the resident case: its host expert tensors are only the source of the uploads (LLAMA_SPEC_EXACT_CACHE=0: off)
     bool cache_ok = false;
     if (ctx->moe_cache_active()) {
@@ -13858,8 +13858,8 @@ bool llama_verify_exact_placement(const llama_context * ctx) {
             return e == nullptr || atoi(e) != 0;
         }();
         // frozen small batches (the host computes the misses of small batches, nothing admitted) only with LLAMA_SPEC_EXACT_FROZEN=1:
-        // exact (k13, local B200, LFM2.5 5.5 GB cache: drafts = plain decode in chat / rep / 2k / 8k), opt-in because the frozen cache
-        // does not follow the decode (G4 LFM2.5 8 GB: chat +13%, 2k +16%, 8k -22% against the default)
+        // exact (local B200, LFM2.5 5.5 GB cache: drafts = plain decode in chat / rep / 2k / 8k), opt-in because the frozen cache
+        // does not follow the decode (RTX PRO 6000 LFM2.5 8 GB: chat +13%, 2k +16%, 8k -22% against the default)
         static const bool frozen_ok = [] {
             const char * e = getenv("LLAMA_SPEC_EXACT_FROZEN");
             return e != nullptr && atoi(e) != 0;
@@ -13978,7 +13978,7 @@ void llama_set_nextn_hold_free(llama_context * ctx, void (*fn)(void *), void * u
     ctx->set_nextn_hold_free(fn, user_data);
 }
 
-// k19-q4x262: the first few joins of a drafter pass by the free-only hold are logged (the engagement count of the fix)
+// the first few joins of a drafter pass by the free-only hold are logged (the engagement count of the fix)
 void llama_context::nextn_hold_free_log(double ms) {
     static std::atomic<int64_t> n{0};
     const int64_t k = ++n;
@@ -13988,10 +13988,10 @@ void llama_context::nextn_hold_free_log(double ms) {
     }
 }
 
-// k19-np12c (LLAMA_MTP_DRAFT_LEND_EAGER=0 off): the pinned host copy a drafter needs before its first lend (llama_context::mtp_lend_prepare)
+// (LLAMA_MTP_DRAFT_LEND_EAGER=0 off): the pinned host copy a drafter needs before its first lend (llama_context::mtp_lend_prepare)
 // is made at load where the target's prompt groups are expected to borrow its weights (the lend gate in decode_layer_major: free memory
 // once the cache banks are released, with the held staging arena, below LLAMA_MTP_DRAFT_LEND_FREE_MIB), instead of on the first long
-// prompt. G4 Flash-Next UD-IQ4_XS 12 GB, Studio's -np 4 with the q3_k drafter: 186 ms of that prompt's TTFT (8k 1.882 vs 1.545 s without
+// prompt. RTX PRO 6000 Flash-Next 4-bit quant 12 GB, Studio's -np 4 with the q3_k drafter: 186 ms of that prompt's TTFT (8k 1.882 vs 1.545 s without
 // a drafter). Where the gate is not expected to lend, nothing is copied (the RSS stays as before)
 bool llama_mtp_draft_lend_warm(llama_context * ctx) {
     static const bool eager_env = getenv("LLAMA_MTP_DRAFT_LEND_EAGER") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND_EAGER")) != 0;

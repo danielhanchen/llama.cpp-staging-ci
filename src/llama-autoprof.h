@@ -1,8 +1,8 @@
 #pragma once
 
-// k19-autoprof: a self-learned per-model profile (the MoE routing of the prompts and the PLE rows the gather reads), recorded while
-// serving and kept beside the persisted CPU-miss calibration (k19-determinism / k19-cmtpersist: the same directory, a model key of
-// the same kind as the k19-ptres core profile, written to a temporary file and renamed into place). A later launch of the same model
+// a self-learned per-model profile (the MoE routing of the prompts and the PLE rows the gather reads), recorded while
+// serving and kept beside the persisted CPU-miss calibration (the same directory, a model key of
+// the same kind as core profile, written to a temporary file and renamed into place). A later launch of the same model
 // orders the RAM tier's page-cache fill and admissions by it and makes the PLE row cache with it. Without a file every path is the
 // one of today.
 //
@@ -94,7 +94,7 @@ inline std::vector<std::string> shipped_dirs(const std::string & model_path) {
     return v;
 }
 
-// FNV-1a 64 of the model's identity (as the k19-ptres core profile: description | parameters | bytes)
+// FNV-1a 64 of the model's identity (as core profile: description | parameters | bytes)
 inline uint64_t model_hash(const std::string & desc, uint64_t n_elements, uint64_t size) {
     uint64_t h = 1469598103934665603ull;
     for (unsigned char c : desc + "|" + std::to_string(n_elements) + "|" + std::to_string(size)) {

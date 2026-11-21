@@ -47,7 +47,7 @@ llama_moe_host_plan llama_moe_host_decide(size_t e_bytes, size_t v_bytes, size_t
         return p;
     }
     if (host_mib < 0 && !force && p.tokens < LLAMA_MOE_HOST_MIN_TOKENS) {
-        // k19-disktier: the mapped host weights exceed what the tier may plan into (the page cache cannot hold the streamed experts
+        // the mapped host weights exceed what the tier may plan into (the page cache cannot hold the streamed experts
         // either): inclusive, so no miss costs a copy back (an explicitly forced exclusive policy keeps the old rule), where the budget
         // holds enough of the experts to beat the page cache it replaces
         if (disk_inclusive && token_bytes > 0 && mapped > avail && policy_env != LLAMA_MOE_HOST_EXCLUSIVE &&
@@ -264,7 +264,7 @@ void llama_moe_host_cache::set_layer_quota(bool on) {
     }
 }
 
-// k19-l4held: a slot of layer il for a reservation of a layer at its quota (see set_layer_quota): a duplicate first, then an unused
+// a slot of layer il for a reservation of a layer at its quota (see set_layer_quota): a duplicate first, then an unused
 // guess, then (allow_evict) the lowest count; never a slot pinned, leased or read / written by uncommitted copies (or too recent: min_age)
 int32_t llama_moe_host_cache::quota_victim(int32_t il, bool allow_evict, uint32_t min_age, bool take_spec, const std::vector<bool> * keep) {
     int32_t best = -1;
@@ -519,7 +519,7 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
         return -1;
     }
     int32_t s = -1;
-    // k19-l4held: a layer at its quota takes a free slot only when the layout keeps enough for the layers below theirs, else a slot of
+    // a layer at its quota takes a free slot only when the layout keeps enough for the layers below theirs, else a slot of
     // its own (see set_layer_quota)
     if (quota_on && n_key_layer[il] >= quota[il]) {
         int64_t deficit = 0;
@@ -574,7 +574,7 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
         st.evicted++;
         st.dup_taken++;
     }
-    // k19-ramprof2: an unused guess of a routing profile is as good as a free slot (see set_spec)
+    // an unused guess of a routing profile is as good as a free slot (see set_spec)
     if (s < 0 && take_spec && n_spec > 0) {
         s = spec_victim(il, min_age);
         if (s >= 0) {
@@ -583,7 +583,7 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
             st.spec_taken++;
         }
     }
-    // k19-l4held: no free slot, a reservation with keep (a prompt's routed expert) takes an expert of the same layer keep does not mark
+    // no free slot, a reservation with keep (a prompt's routed expert) takes an expert of the same layer keep does not mark
     if (s < 0 && keep != nullptr && !allow_evict) {
         s = quota_victim(il, false, min_age, take_spec, keep);
         if (s >= 0) {
@@ -592,7 +592,7 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
             st.evicted++;
         }
     }
-    // k19-ramevict: a prompt pass streaming layer stream_il takes its victims from the finished layers first (see set_stream_layer)
+    // a prompt pass streaming layer stream_il takes its victims from the finished layers first (see set_stream_layer)
     // the hand passes the other slots without lowering their counts
     const bool streaming = stream_il >= 0 && allow_evict;
     if (s < 0 && streaming && evict_done && c.n_alloc > 0) {

@@ -37,16 +37,16 @@ llama_memory_recurrent::llama_memory_recurrent(
     rs_idx.assign(n_seq_max, 0);
     rs_copied.assign(n_seq_max, 0);
 
-    // k16-draft: commit by replay for the delta-net models (see llama_memory_recurrent::replay). LLAMA_RS_REPLAY unset / auto: only
+    // commit by replay for the delta-net models (see llama_memory_recurrent::replay). LLAMA_RS_REPLAY unset / auto: only
     // when layer weights spill to host memory while others are on a device (a MoE cache / host experts: the memory the snapshot rows
     // would take goes to the cache there); with everything resident (or nothing offloaded) the snapshot rows stay, since the commit's
-    // second delta-net pass costs decode (B200, full card: fn1 -1.5%, Qwen3.6-35B-A3B -2.8%). =1 forces replay, =0 the snapshot rows.
+    // second delta-net pass costs decode (B200, full card: the 1-bit model -1.5%, Qwen3.6-35B-A3B -2.8%). =1 forces replay, =0 the snapshot rows.
     // The placement is read from the weights' buffers, which a no_alloc (fit probe) model also sets, so a probe sizes the same rows.
     {
         const char * e = getenv("LLAMA_RS_REPLAY");
         const int mode = e == nullptr || strcmp(e, "auto") == 0 ? -1 : (atoi(e) != 0 ? 1 : 0);
         const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP;
-        // k19-fixE: not under -sm tensor (a meta device): the commit graph's replay inputs are mirrored while the states are split,
+        // not under -sm tensor (a meta device): the commit graph's replay inputs are mirrored while the states are split,
         // and its views abort the meta graph allocation (ggml-backend-meta.cpp split_dim_view_src assert, Meta(CPU,CPU) with
         // LLAMA_RS_REPLAY=1); the snapshot rows move through host memory there (move_by_host)
         const bool any_meta = std::any_of(model.devices.begin(), model.devices.end(), [](const auto & d) { return d.is_meta; });
@@ -66,14 +66,14 @@ llama_memory_recurrent::llama_memory_recurrent(
                 (ggml_backend_buffer_is_host(t->buffer) ? on_host : on_dev) = true;
             }
             want = on_host && on_dev;
-            // k19-npmtp: several sequences (llama-server --parallel N) keep the snapshot rows. With replay a window waits uncommitted
-            // until the next ubatch of its cell, and find_slot moves cells to gather a multi-sequence ubatch: G4 Qwen3.8-Flash-Next +
+            // several sequences (llama-server --parallel N) keep the snapshot rows. With replay a window waits uncommitted
+            // until the next ubatch of its cell, and find_slot moves cells to gather a multi-sequence ubatch: RTX PRO 6000 Qwen3.8-Flash-Next +
             // MTP -np 4 --kv-unified, four overlapping requests, a later ubatch of the same decode moved the cell of a verify window
             // before its rollback (seq_rm refused, server abort), and the 8k reply differed from its single-slot text.
-            // k19-studio-np4 (LLAMA_RS_REPLAY_MULTI, default 1 now): the pending window of a cell moves with it (replay_scoped, see
+            // (LLAMA_RS_REPLAY_MULTI, default 1 now): the pending window of a cell moves with it (replay_scoped, see
             // find_slot / the rollback row move), so several sequences replay too and get the memory of the snapshot rows back:
-            // 2 more state rows per sequence, 823 MiB on G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at Studio's -np 4 --kv-unified (16 GB:
-            // MoE cache 3752 -> 4578 MiB). Same math as the snapshot rows (G4 fixed placement, np 4 replay = np 1 replay = np 1 snapshot
+            // 2 more state rows per sequence, 823 MiB on RTX PRO 6000 Qwen3.8-Flash-Next 4-bit quant + MTP at Studio's -np 4 --kv-unified (16 GB:
+            // MoE cache 3752 -> 4578 MiB). Same math as the snapshot rows (RTX PRO 6000 fixed placement, np 4 replay = np 1 replay = np 1 snapshot
             // md5). =0: the snapshot rows with several sequences (as before); LLAMA_RS_REPLAY_SCOPED=0 (the windows do not move) keeps them
             const char * em = getenv("LLAMA_RS_REPLAY_MULTI");
             const char * es = getenv("LLAMA_RS_REPLAY_SCOPED");
@@ -142,7 +142,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     rb_l.assign(n_layer, nullptr); // unused: gate and beta share rg_l
     rk_h.assign(n_layer, 0);
 
-    // k19-b33mv: the scratch units of rs_move_rows, one per buffer type and shape (several sequences only: a single one never moves)
+    // the scratch units of rs_move_rows, one per buffer type and shape (several sequences only: a single one never moves)
     const bool want_mv_tmp = n_rs_seq > 0 && n_seq_max > 1;
     for (auto * v : { &mv_tmp_r_l, &mv_tmp_s_l, &mv_tmp_p_l, &mv_tmp_k_l, &mv_tmp_v_l, &mv_tmp_g_l }) {
         v->assign(n_layer, nullptr);
@@ -230,15 +230,15 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    // k16-draft: a memory probe (no_alloc: the --fit measurements) allocated the states for real, so it both counted them (context) and
-    // saw them gone from the free memory it fits into: the fit gave them twice. G4 Qwen3.8-Flash-Next 16 GB, Studio argv (-np 4, MTP
+    // a memory probe (no_alloc: the --fit measurements) allocated the states for real, so it both counted them (context) and
+    // saw them gone from the free memory it fits into: the fit gave them twice. RTX PRO 6000 Qwen3.8-Flash-Next 16 GB, Studio argv (-np 4, MTP
     // draft 2: 3 rows per sequence): the main fit saw 14630 instead of 15982 MiB free (1352 MiB, the states at n_rs_seq 2), 15530 without
     // a draft (n_rs_seq 0, 452 MiB), so a draft was charged its rollback rows (900 MiB) twice.
     // The probe now sizes the tensors from a dummy buffer (as the KV cache does) and holds real memory only for the rows a context without
     // rollback snapshots has (mem_size): that copy is the slack every fit had so far, which covers the fit's compute estimate being short
-    // of the real buffer (local B200 fn1 16 GB: fit 1091 MiB, sched_reserve 1459 MiB; without the slack the server ended at 515-600 MiB
+    // of the real buffer (local B200 the 1-bit model 16 GB: fit 1091 MiB, sched_reserve 1459 MiB; without the slack the server ended at 515-600 MiB
     // free under the 1024 MiB target). Only the rollback rows (n_rs_seq) are no longer counted twice.
-    // k16-fit: the compute shortfall is the seed graph, which the probe now prices (llama_context::sched_reserve, LLAMA_FIT_SEED_PRICE),
+    // the compute shortfall is the seed graph, which the probe now prices (llama_context::sched_reserve, LLAMA_FIT_SEED_PRICE),
     // so by default (=2) the probe holds no real memory at all and every state is counted once.
     // LLAMA_RS_PROBE_DUMMY=0: allocate as before (all rows twice); =1: real memory for the base rows only (their slack kept)
     static const int probe_dummy = getenv("LLAMA_RS_PROBE_DUMMY") == nullptr ? 2 : atoi(getenv("LLAMA_RS_PROBE_DUMMY"));
@@ -278,7 +278,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
-    // k16-draft: the commit folded into the next window (ggml_gated_delta_net_replay), on the backends that implement it (CUDA, CPU);
+    // the commit folded into the next window (ggml_gated_delta_net_replay), on the backends that implement it (CUDA, CPU);
     // LLAMA_RS_REPLAY_FUSED=0: every commit through the commit graph (llama_context::rs_replay_commit)
     if (replay) {
         const char * e = getenv("LLAMA_RS_REPLAY_FUSED");
@@ -324,7 +324,7 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].src = -1;
         cells[i].tail = -1;
     }
-    // k19-npmtp: no window outlives its sequence (a commit no longer runs over every cell before the next ubatch)
+    // no window outlives its sequence (a commit no longer runs over every cell before the next ubatch)
     std::fill(pend_n.begin(),  pend_n.end(),  0);
     std::fill(pend_rb.begin(), pend_rb.end(), 0);
     std::fill(conv_rb.begin(), conv_rb.end(), 0);
@@ -386,10 +386,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     return true;
                 }
                 const llama_pos rollback = cell.pos - (p0 - 1);
-                // pending rollback is single-use (k19-rsbis: also one that rollback_copy put on the live row)
+                // pending rollback is single-use (also one that rollback_copy put on the live row)
                 const bool pending = rs_idx[seq_id] != 0 || rs_copied[seq_id] != 0;
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq && replay) {
-                    // k16-draft: the window is still uncommitted; the commit replays only its kept tokens
+                    // the window is still uncommitted; the commit replays only its kept tokens
                     const uint32_t c = (uint32_t) tail_id;
                     if (pend_n[c] == 0 || (uint32_t) rollback > pend_n[c] || pend_rb[c] != 0) {
                         return false;
@@ -399,7 +399,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     return true;
                 }
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
-                    // k15-rsr: the snapshot is copied onto the live row now, so the next decode reads its state from the same row as
+                    // the snapshot is copied onto the live row now, so the next decode reads its state from the same row as
                     // every other decode: its graph and CUDA graph are reused instead of rebuilt and re-captured twice (once for the
                     // snapshot row, once back); same bytes, same output. Else (LLAMA_RS_ROLLBACK_COPY=0) the next decode reads the snapshot row
                     if (rollback_copy((uint32_t) tail_id, (uint32_t) rollback)) {
@@ -460,7 +460,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 }
 
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    replay_commit_if_pending(); // k16-draft: the rows are current before they are read or copied
+    replay_commit_if_pending(); // the rows are current before they are read or copied
 
     if (seq_id_src == seq_id_dst) {
         return;
@@ -499,7 +499,7 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
-    replay_commit_if_pending(); // k16-draft: the rows are current before they are read or copied
+    replay_commit_if_pending(); // the rows are current before they are read or copied
 
     uint32_t new_head = size;
 
@@ -632,7 +632,7 @@ bool llama_memory_recurrent::has_pending() const {
     return false;
 }
 
-// k16-draft: after find_slot, whether this ubatch commits the stored windows of its cells itself (ggml_gated_delta_net_replay): a
+// after find_slot, whether this ubatch commits the stored windows of its cells itself (ggml_gated_delta_net_replay): a
 // window of every sequence in its own cell. The conv snapshot of a rollback is still copied by the commit graph (conv_rb)
 bool llama_memory_recurrent::replay_fuse(const llama_ubatch & ubatch) {
     rp_fused = false;
@@ -664,7 +664,7 @@ void llama_memory_recurrent::replay_commit_if_pending(bool sync) const {
     }
 }
 
-// k19-npmtp: commit the pending windows of the cells in `which` only. The others are held out of the commit graph (its builder and its
+// commit the pending windows of the cells in `which` only. The others are held out of the commit graph (its builder and its
 // graph key read pend_n / pend_rb / conv_rb) and put back after it, so they can still be rolled back
 void llama_memory_recurrent::replay_commit_cells(const std::vector<uint8_t> & which, bool sync) {
     if (!commit_cb || !has_pending()) {
@@ -700,7 +700,7 @@ void llama_memory_recurrent::replay_commit_cells(const std::vector<uint8_t> & wh
     }
 }
 
-// k19-npmtp: find_slot is about to move or share the rows of cell c (a cell swap, a shared tail copied): its window first
+// find_slot is about to move or share the rows of cell c (a cell swap, a shared tail copied): its window first
 void llama_memory_recurrent::replay_commit_cell(int32_t c) {
     if (!replay || in_prepare || c < 0 || (uint32_t) c >= size || (pend_n[c] == 0 && conv_rb[c] == 0)) {
         return;
@@ -710,9 +710,9 @@ void llama_memory_recurrent::replay_commit_cell(int32_t c) {
     replay_commit_cells(which, /*sync =*/ false);
 }
 
-// k19-npmtp: find_slot swaps cells a and b. A cell of a sequence of this ubatch commits its window first (it was rolled back before this
+// find_slot swaps cells a and b. A cell of a sequence of this ubatch commits its window first (it was rolled back before this
 // decode); a pending window of another sequence moves with its cell (rp_swaps, run by move_cb at the end of find_slot), so it can still
-// be rolled back after this decode (G4 -np 4: a ubatch of three sequences moved the cell of the fourth one's verify window)
+// be rolled back after this decode (RTX PRO 6000 -np 4: a ubatch of three sequences moved the cell of the fourth one's verify window)
 void llama_memory_recurrent::replay_swap(int32_t a, int32_t b, const std::vector<uint8_t> & in_ubatch) {
     if (in_prepare) {
         return;
@@ -750,7 +750,7 @@ void llama_memory_recurrent::replay_swap(int32_t a, int32_t b, const std::vector
     }
 }
 
-// k19-npmtp: before a ubatch, the windows of the cells it reads or copies: placed (after find_slot) the cells [head, head + n) and
+// before a ubatch, the windows of the cells it reads or copies: placed (after find_slot) the cells [head, head + n) and
 // their copy sources, else the tails of its sequences and every cell a copy is staged from or to (find_slot commits what it moves)
 void llama_memory_recurrent::replay_commit_ubatch(const llama_ubatch & ubatch, bool placed) {
     if (!commit_cb || !has_pending()) {
@@ -787,7 +787,7 @@ void llama_memory_recurrent::replay_commit_ubatch(const llama_ubatch & ubatch, b
     replay_commit_cells(which, /*sync =*/ false);
 }
 
-// k16-draft: after find_slot placed the ubatch's sequences in cells [head, head + n_seqs): a window (at most 1 + n_rs_seq tokens per
+// after find_slot placed the ubatch's sequences in cells [head, head + n_seqs): a window (at most 1 + n_rs_seq tokens per
 // sequence) is left uncommitted by the graph (build_recurrent_attn), a larger ubatch writes its final state
 void llama_memory_recurrent::replay_mark(const llama_ubatch & ubatch) {
     if (!replay) {
@@ -803,7 +803,7 @@ void llama_memory_recurrent::replay_mark(const llama_ubatch & ubatch) {
     }
 }
 
-// k19-rollback: the rows of `cell` in every state tensor (n_rs_seq 0: row = cell), packed back to back in the host copy
+// the rows of `cell` in every state tensor (n_rs_seq 0: row = cell), packed back to back in the host copy
 bool llama_memory_recurrent::snap_rows(int32_t cell, const std::function<void(ggml_tensor *, size_t, size_t, size_t)> & fn) const {
     if (cell < 0 || (uint32_t) cell >= size) {
         return false;
@@ -903,7 +903,7 @@ bool llama_memory_recurrent::rollback_copy(uint32_t cell, uint32_t group) {
         return false;
     }
     // only small states (LFM2.5's short convolutions: 16 KiB per layer): a copy synchronises once per tensor, so for large ones (the
-    // delta-net states of Flash-Next fn4, MiBs per layer) the copies cost more than the graph rebuild they save (G4 fn4 32 GB chat -0.35%)
+    // delta-net states of Flash-Next 4-bit, MiBs per layer) the copies cost more than the graph rebuild they save (RTX PRO 6000 4-bit 32 GB chat -0.35%)
     static const size_t max_bytes = [] {
         const char * e = getenv("LLAMA_RS_ROLLBACK_COPY_MAX_KB");
         return (size_t) (e != nullptr ? atof(e) : 1024.0)*1024;
@@ -919,7 +919,7 @@ bool llama_memory_recurrent::rollback_copy(uint32_t cell, uint32_t group) {
     if (bytes > max_bytes) {
         return false;
     }
-    // k19-fixB: the copy (a device copy on its own stream, or a memcpy) is not ordered after the decode that wrote the snapshot and the
+    // the copy (a device copy on its own stream, or a memcpy) is not ordered after the decode that wrote the snapshot and the
     // live row: seq_rm right after llama_decode, without a read of the outputs, is a legal order
     sync_cb();
     // views of the two rows of every state tensor, in a context of views only (no allocation)
@@ -1077,7 +1077,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     // can only process batches with an equal number of new tokens in each sequence
     GGML_ASSERT(ubatch.equal_seqs());
 
-    // k19-npmtp: the sequences of this ubatch (replay_swap)
+    // the sequences of this ubatch (replay_swap)
     std::vector<uint8_t> in_ubatch;
     if (!in_prepare) {
         grp_moved.assign(size, 0);
@@ -1289,7 +1289,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
     }
 
-    // k19-npmtp: the windows that moved with their cells (replay_swap)
+    // the windows that moved with their cells (replay_swap)
     if (!rp_swaps.empty()) {
         if (move_cb) {
             move_cb(rp_swaps);
@@ -1307,7 +1307,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     return n >= n_seqs;
 }
 
-// k19-b33mv: replays the swaps of find_slot, in order, on the rollback rows of the swapped cells: the snapshot groups 1..n_rs_seq of the
+// replays the swaps of find_slot, in order, on the rollback rows of the swapped cells: the snapshot groups 1..n_rs_seq of the
 // state (snapshot rows) and conv rows, and with replay the stored window slices of the cells. Each swap of two units is three copies
 // through the scratch unit of the same buffer type and shape (ggml_backend_tensor_copy on views): no graph and no allocation. The
 // caller (llama_context::rs_replay_move) waits for the graphs in flight first
@@ -1315,7 +1315,7 @@ void llama_memory_recurrent::rs_move_rows(const std::vector<std::pair<uint32_t, 
     if (swaps.empty()) {
         return;
     }
-    // k19-fixD: no views under -sm tensor (move_by_host): two units bounce through host memory on the parent tensor
+    // no views under -sm tensor (move_by_host): two units bounce through host memory on the parent tensor
     const size_t n_views = move_by_host ? 0 : 2 * swaps.size() * r_l.size() * (6 + 3 * (size_t) n_rs_seq) + 8;
     ggml_context_ptr ctx_own;
     if (!move_by_host) {
@@ -1438,7 +1438,7 @@ size_t llama_memory_recurrent::size_p_bytes() const {
 }
 
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    replay_commit_if_pending(); // k16-draft: the rows are current before they are read or copied
+    replay_commit_if_pending(); // the rows are current before they are read or copied
 
     GGML_UNUSED(flags);
 
@@ -1521,7 +1521,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    replay_commit_if_pending(); // k16-draft: the rows are current before they are read or copied
+    replay_commit_if_pending(); // the rows are current before they are read or copied
 
     GGML_UNUSED(flags);
 
@@ -1573,7 +1573,7 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
 }
 
 void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
-    // k15-pp: the captured row of a tensor (a single cell), see cap_map
+    // the captured row of a tensor (a single cell), see cap_map
     auto cap_tensor = [&](const ggml_tensor * t, size_t range_size) -> ggml_tensor * {
         if (cap_map == nullptr || range_size != 1) {
             return nullptr;
@@ -2002,10 +2002,10 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    // k16-draft: the previous window is committed before this ubatch reads (or copies) any state: by this ubatch's own graph when it
+    // the previous window is committed before this ubatch reads (or copies) any state: by this ubatch's own graph when it
     // is a window of the same cells (replay_fuse), else (and for the conv snapshots and the other cells) by the commit graph, queued
     // here on the same streams as the graph of this ubatch
-    // k19-npmtp: only the windows of the cells this ubatch reads, copies or moves (replay_commit_ubatch, find_slot); the other sequences'
+    // only the windows of the cells this ubatch reads, copies or moves (replay_commit_ubatch, find_slot); the other sequences'
     // windows stay pending, so a draft verified earlier in the same llama_decode can still be rolled back
     if (mem->replay && mem->replay_fused_ok) {
         mem->find_slot(ubatches[i_next]);
@@ -2016,7 +2016,7 @@ bool llama_memory_recurrent_context::apply() {
         mem->replay_commit_ubatch(ubatches[i_next], /*placed =*/ false);
         mem->find_slot(ubatches[i_next]);
     }
-    // k19-npmtp: whether a sequence of this ubatch reads its state from another row (LLAMA_RS_REPLAY_SCOPED=0: not written, as before)
+    // whether a sequence of this ubatch reads its state from another row (LLAMA_RS_REPLAY_SCOPED=0: not written, as before)
     mem->rp_moved = false;
     if (mem->replay && mem->replay_scoped) {
         const llama_ubatch & ub = ubatches[i_next];
@@ -2091,7 +2091,7 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
-// k19-specpass (LLAMA_SPEC_ROW_GRAPH=0: off): see get_rs_alias and llama_context::process_ubatch's kept-graph choice
+// (LLAMA_SPEC_ROW_GRAPH=0: off): see get_rs_alias and llama_context::process_ubatch's kept-graph choice
 bool llama_spec_row_graph_env() {
     static const bool v = [] {
         const char * e = getenv("LLAMA_SPEC_ROW_GRAPH");
@@ -2134,9 +2134,9 @@ int32_t llama_memory_recurrent_context::get_rs_alias(const llama_ubatch & ubatch
             }
         }
 
-        // k19-specpass: a state left in a rollback row by a verify (idx = accepted drafts) is gathered (s_copy), not read in place:
+        // a state left in a rollback row by a verify (idx = accepted drafts) is gathered (s_copy), not read in place:
         // the in-place row is part of the graph, so a single-token decode after a verify that kept another row than the last time
-        // rebuilt its graph and re-captured its CUDA graph (G4 Flash-Next: 1-row target passes 13.6-15.5 ms after verifies vs 8.3 in a
+        // rebuilt its graph and re-captured its CUDA graph (RTX PRO 6000 Flash-Next: 1-row target passes 13.6-15.5 ms after verifies vs 8.3 in a
         // row). The gather copies the same state (exact); it also returns the state to row 0 (s_copy clears idx), so the following
         // single-token decodes read in place again. LLAMA_SPEC_ROW_GRAPH=0: read in place from any row, as before
         if (idx != 0 && llama_spec_row_graph_env()) {
@@ -2172,7 +2172,7 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
             mem->rs_copied[seq] = 0;
         }
     }
-    // k19-npmtp: a cell that find_slot moved has its snapshot groups at its new place (rs_move), only the live row is read at src0
+    // a cell that find_slot moved has its snapshot groups at its new place (rs_move), only the live row is read at src0
     const bool moved = idx > 0 && cell_idx < mem->grp_moved.size() && mem->grp_moved[cell_idx];
     return (int32_t)(idx * mem->size) + (moved ? (int32_t) cell_idx : src0);
 }

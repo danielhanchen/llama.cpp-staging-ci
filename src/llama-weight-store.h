@@ -153,7 +153,7 @@ public:
     bool     host_done(uint64_t ticket); // true once its reads are complete (the ticket is then collected), never blocks
     void     host_wait(uint64_t ticket); // its reads that did not start move in front of the demand reads, then waits (collects it)
     bool     host_cancel(uint64_t ticket); // true: none of its reads had started, none will (collected); false: it completes as issued
-    // k19-l4fill: at most n IO threads read speculative reads at once (0: any number, the default); the others stay free for the demand
+    // at most n IO threads read speculative reads at once (0: any number, the default); the others stay free for the demand
     // reads, which the disk then serves after at most n speculative reads
     void     set_spec_parallel(int n);
 

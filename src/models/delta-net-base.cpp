@@ -561,7 +561,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
-    // k16-draft (LLAMA_RS_REPLAY, llama_memory_recurrent::replay): a window of at most K tokens per sequence leaves the state row as
+    // (LLAMA_RS_REPLAY, llama_memory_recurrent::replay): a window of at most K tokens per sequence leaves the state row as
     // it was and stores its inputs for the commit, which advances the row by the accepted tokens with this same op; a larger ubatch
     // writes its final state. One state row per cell instead of K
     if (mctx_cur->get_replay() && mctx_cur->get_rk_l(il) != nullptr && g->ne[0] == 1) {
@@ -613,7 +613,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             };
             mctx_cur->set_rk_h(il, (int32_t) k->ne[1]);
             if (inp->rs_moved) {
-                // k19-npmtp: a sequence that find_slot moved to another cell (or a new one) read its state from the old row (or the
+                // a sequence that find_slot moved to another cell (or a new one) read its state from the old row (or the
                 // zeroed one); the window leaves its own row as it is, and the commit advances that row: it gets the state read
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, s,
                         ggml_view_4d(ctx0, ssm_states_all, S_v, S_v, H_v, n_seqs, ggml_row_size(ssm_states_all->type, S_v),

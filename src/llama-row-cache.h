@@ -11,7 +11,7 @@
 struct ggml_context;
 struct ggml_tensor;
 
-// k19-plerow: a row-granular host cache in front of a lazily mapped embedding table (the Qwen3.8-Flash-Next PLE n-gram table:
+// a row-granular host cache in front of a lazily mapped embedding table (the Qwen3.8-Flash-Next PLE n-gram table:
 // 320M rows of 90 bytes, 16 random rows per token; DeepSeek-V4.1's Engram table goes through the same loader path). A row reached
 // through the mapping faults its whole 4 KiB page, so page-cache RAM spent on the table holds ~45x fewer useful bytes than the same
 // RAM spent on packed rows. The cache keeps
@@ -21,7 +21,7 @@ struct ggml_tensor;
 // The graph is unchanged: the CPU GET_ROWS of the table asks the cache for each row (ggml_backend_cpu_set_row_source) and dequantizes
 // the cached copy, or the mapping's bytes on a miss, with the same function: the bytes are the table's bytes, so the outputs are
 // bit-identical.
-// Rows below `skip_below` (the part of the table the page cache already holds, k19-disktt) are neither preloaded nor inserted.
+// Rows below `skip_below` (the part of the table the page cache already holds) are neither preloaded nor inserted.
 struct llama_row_cache {
     struct stats {
         std::atomic<uint64_t> n_lookups  {0};
@@ -32,7 +32,7 @@ struct llama_row_cache {
         std::atomic<uint64_t> n_filtered {0}; // hint / prefetch rows dropped because they were cached
         std::atomic<uint64_t> n_verified {0}; // LLAMA_PLE_ROW_CACHE_VERIFY=1: hits compared with the mapping
         std::atomic<uint64_t> n_verify_bad {0};
-        std::atomic<uint64_t> n_recorded {0};   // k19-autoprof: row reads counted by the recorder
+        std::atomic<uint64_t> n_recorded {0};   // row reads counted by the recorder
         std::atomic<uint64_t> n_rec_full {0};   // ... of new rows past the recorder's memory cap (not kept)
     };
 
@@ -50,7 +50,7 @@ struct llama_row_cache {
     // recorder on, the recorded rows (their reads of this launch) instead of the dynamic slots' counts
     bool save_profile(const std::string & path) const;
 
-    // k19-autoprof: a recorder of the rows the gather reads (every row of the table, also below skip_below and rows the cache holds):
+    // a recorder of the rows the gather reads (every row of the table, also below skip_below and rows the cache holds):
     // a count per row and a copy of its bytes taken at its first read (the bytes the gather reads anyway), at most max_bytes of memory
     // (rows first seen past it are not kept); written by save_profile. The cache itself may have no slots (record only): the gather
     // then reads every row from the mapping as without a cache
@@ -104,7 +104,7 @@ private:
         uint32_t n_static  = 0;   // slots [0, n_static) are static
         uint32_t n_used    = 0;   // slots in use (static + dynamic, filled from the front)
         uint32_t hand      = 0;   // clock hand over the dynamic slots
-        // k19-autoprof recorder: open addressing row -> entry
+        // recorder: open addressing row -> entry
         std::vector<uint32_t> rec_keys;
         std::vector<uint32_t> rec_vals;
         uint32_t rec_mask = 0;

@@ -1165,7 +1165,7 @@ static bool llama_mtp_borrow_io_env() {
     return e == nullptr || atoi(e) != 0;
 }
 
-// k19-pr374 (ported from LeoBorcherding's Qwen4Exp shared MTP heads, unslothai/llama.cpp, MIT): a shared MTP drafter ships neither
+// (ported from LeoBorcherding's Qwen4Exp shared MTP heads, unslothai/llama.cpp, MIT): a shared MTP drafter ships neither
 // token_embd nor output and borrows both from its target. LLAMA_MTP_BORROW_MISSING=0: such a drafter is refused at load (as before)
 static bool llama_mtp_borrow_missing_env() {
     const char * e = getenv("LLAMA_MTP_BORROW_MISSING");
@@ -1195,7 +1195,7 @@ ggml_type llama_model_loader::borrow_missing_type(llm_tensor t) const {
     return GGML_TYPE_COUNT;
 }
 
-// k16-draft (idea from ik_llama.cpp by ikawrakow, shared MTP companions without their own IO): a separate MTP draft model
+// (idea from ik_llama.cpp by ikawrakow, shared MTP companions without their own IO): a separate MTP draft model
 // (Qwen3.8-Flash-Next mtp-*.gguf) ships its own token_embd and output, the same weights the target already holds. With mtp_borrow_io
 // and the target as model_shared the draft uses the target's tensors instead: its own copies are neither allocated nor read (the
 // lm head was 644 MiB of device memory at Q8_0, the embeddings 644 MiB of mapped host memory). Only a draft verifies nothing: the
@@ -1208,7 +1208,7 @@ struct ggml_tensor * llama_model_loader::borrow_io(const llama_hparams & hparams
         return nullptr;
     }
     const std::string name = tn.str();
-    // w == nullptr: a shared drafter without its own copy (k19-pr374), which only the target's tensor can stand in for
+    // w == nullptr: a shared drafter without its own copy, which only the target's tensor can stand in for
     // (only a file with neither tensor is one: a drafter with its own token_embd and no output ties its head to that copy, as before)
     const llama_tensor_weight * w = get_weight(name.c_str());
     if (w == nullptr && (!llama_mtp_borrow_missing_env() || !shared_drafter_file())) {
@@ -1492,7 +1492,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return shared;
     }
 
-    // k19-pr374: the memory measurement (no_alloc) of a shared MTP drafter, no target loaded yet: token_embd / output, absent from its
+    // the memory measurement (no_alloc) of a shared MTP drafter, no target loaded yet: token_embd / output, absent from its
     // file, are priced as the borrowed copies of a self-contained drafter are (below and in the host branch of the output): in the
     // target's type, on the host, the device buffer type the output would take kept for the draft head made from it
     if (no_alloc && mtp_borrow_io && model_shared == nullptr && hparams.n_layer_nextn > 0 && !(flags & TENSOR_DUPLICATED) &&
@@ -1555,13 +1555,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
-    // k18 load-time requantization: an FFN / expert matrix (name with "ffn_"; not a router (gate_inp), norm or hyper-connection (hc_)
+    // load-time requantization: an FFN / expert matrix (name with "ffn_"; not a router (gate_inp), norm or hyper-connection (hc_)
     // matrix; 2-3 dims, rows of whole blocks of the target type) that a
     // device holds is stored as requant_type; it is converted while it is loaded (load_all_data). Host tensors keep the file's type
     // (they may be mapped from the file)
     const bool rq_out  = tn.tensor == LLM_TENSOR_OUTPUT && requant_output_type != GGML_TYPE_COUNT;
     ggml_type rq_t = rq_out ? requant_output_type : requant_type;
-    // k19: an FFN / expert matrix whose rows the requant type's blocks do not divide (Qwen3.8-Flash-Next's MTP head: ffn_down_exps
+    // an FFN / expert matrix whose rows the requant type's blocks do not divide (Qwen3.8-Flash-Next's MTP head: ffn_down_exps
     // rows of 640 against the 256 of q3_K) kept the file's type, 850 of the head's 1632 MiB at Q8_0. It is stored as
     // LLAMA_DRAFT_REQUANT_FALLBACK (default q4_0, 32-blocks; "off" keeps the file's type) instead, when that is smaller. A draft's
     // weights move only its acceptance: drafts are verified by the target
@@ -1614,7 +1614,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (buft == nullptr) {
         return nullptr;
     }
-    // k16-draft: the memory measurement of an MTP draft model that will borrow its lm head (no_alloc, the target not loaded yet:
+    // the memory measurement of an MTP draft model that will borrow its lm head (no_alloc, the target not loaded yet:
     // common_fit_draft_on_cpu, the main fit's extra model, common_draft_mem_reserve) counts it on the host; the draft head made from it
     // keeps the device buffer type (load_tensors_draft_head)
     if (no_alloc && mtp_borrow_io && model_shared == nullptr && hparams.n_layer_nextn > 0 && tn.tensor == LLM_TENSOR_OUTPUT &&
@@ -1964,7 +1964,7 @@ bool llama_model_loader::load_all_data(
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
-        // k18: a requantized tensor (see create_tensor): read as in the file, converted on the host threads, then uploaded
+        // a requantized tensor (see create_tensor): read as in the file, converted on the host threads, then uploaded
         if (auto rq = requant_src.find(ggml_get_name(cur)); rq != requant_src.end()) {
             const ggml_type t_src  = rq->second.first;
             const size_t    n_src  = rq->second.second;
@@ -2208,11 +2208,11 @@ void llama_model_loader::print_info() const {
 }
 
 // An expert tensor (read by GGML_OP_MUL_MAT_ID) kept in host memory while a GPU device exists (--cpu-moe, --fit, -ot ...=CPU, MoE cache):
-// every large batch (a prompt ubatch) uploads it to the GPU, and a mapped file uploads ~20% slower than pinned host memory (G4,
+// every large batch (a prompt ubatch) uploads it to the GPU, and a mapped file uploads ~20% slower than pinned host memory (RTX PRO 6000,
 // RTX PRO 6000, Flash-Next IQ4_XS: 45 vs 56 GB/s, from a tmpfs mapping). With mmap the tensor is then read into the host buffer of the
 // GPU device (pinned) instead of being mapped, as long as the pinned bytes stay within the available RAM less a reserve:
 // opt-in (it reads the experts at load instead of mapping them, ~9 s more for Flash-Next IQ4_XS, and pins up to the budget; the gain
-// was measured with the model in a tmpfs). On a Kaggle T4 (31 GB RAM) Qwen3.6-35B-A3B UD-Q5_K_XL with 22.7 GB pinned read prompts
+// was measured with the model in a tmpfs). On T4 (31 GB RAM) Qwen3.6-35B-A3B 5-bit quant with 22.7 GB pinned read prompts
 // 5-10% slower: the load evicts the tensors that stay mapped (see settle_pinned_cache).
 // LLAMA_MOE_PIN_EXPERTS=0: never; 1: Linux only, budget MemAvailable - max(4 GiB, 10% of MemTotal) (read once per load);
 // 2: always, without the RAM check; unset: auto, see pin_auto_budget
@@ -2234,9 +2234,9 @@ static bool llama_is_wsl() {
 #endif
 }
 
-// auto pinning (LLAMA_MOE_PIN_EXPERTS unset): pinned host experts upload ~20% faster than the registered mapping (G4, Flash-Next
-// UD-IQ4_XS at 32 GB, MTP off: 2k / 8k prompt +13% / +6%, decode +6% / +7%, output identical; H2D 46-49 -> 55-57 GB/s), but the pinned
-// copy is not reclaimable while the page cache still serves the rest of the files: on a Kaggle T4 (31 GB RAM) 22.7 GB pinned beside a
+// auto pinning (LLAMA_MOE_PIN_EXPERTS unset): pinned host experts upload ~20% faster than the registered mapping (RTX PRO 6000, Flash-Next
+// 4-bit quant at 32 GB, MTP off: 2k / 8k prompt +13% / +6%, decode +6% / +7%, output identical; H2D 46-49 -> 55-57 GB/s), but the pinned
+// copy is not reclaimable while the page cache still serves the rest of the files: on T4 (31 GB RAM) 22.7 GB pinned beside a
 // 26 GB file made prompts 5-10% slower (the load evicted the mapped tensors, see settle_pinned_cache), and a low-RAM box needs that RAM
 // for the MoE RAM tier. So auto pins only where the pinned experts and every model file outside tmpfs fit in the memory left after a
 // reserve, with avail = MemAvailable capped by the cgroup limits (llama_sysmem::available):
@@ -2326,7 +2326,7 @@ bool llama_model_loader::pin_expert(size_t nbytes) {
     return true;
 }
 
-// k19-fnttft: a model loaded after a lazy PLE table that did not fit in RAM (llama_sysmem::ple_page_cache_short; the MTP drafter of
+// a model loaded after a lazy PLE table that did not fit in RAM (llama_sysmem::ple_page_cache_short; the MTP drafter of
 // Flash-Next: 3.1 GB copied to the GPU, then never read again) leaves its file pages in the page cache, the youngest there, and the page
 // cache gives up the table's pages for them (the table's part was read before the drafter's load). The page cache of the tensors this
 // load copied into device buffers is dropped (POSIX_FADV_DONTNEED; pages still mapped are kept by the kernel); not for tmpfs. A model
@@ -2364,7 +2364,7 @@ void llama_model_loader::drop_device_cache() {
 // reclaimable), the page cache is left with the file pages the experts were copied from (never read again) and has evicted the tensors
 // that stay mapped (the token embeddings, read by the CPU at every prompt ubatch and decode step), which MAP_POPULATE had read.
 // Every ubatch then major-faults its embedding rows from disk while the GPU waits, and with free memory at the kswapd watermark the
-// pages are evicted again. Kaggle T4, 31 GB RAM, Qwen3.6-35B-A3B UD-Q5_K_XL, 22.7 GB pinned: 180 (2k) / 360 (8k) major faults per
+// pages are evicted again. T4, 31 GB RAM, Qwen3.6-35B-A3B 5-bit quant, 22.7 GB pinned: 180 (2k) / 360 (8k) major faults per
 // prompt (40-150 MB read), GPU idle +206 / +370 ms (nsys), prompt 5-10% slower than the mapped base; the H2D rate is the same for
 // pinned, registered-mapping and anonymous registered memory (11.8 GB/s).
 // When the pinned bytes plus the files exceed the RAM available when the pinning started, the ranges of the pinned experts are
@@ -2427,11 +2427,11 @@ void llama_model_loader::settle_pinned_cache() {
             __func__, experts_pin_avail/1024.0/1024.0, pinned_ranges.size(), n_dropped/1024.0/1024.0, mapped_ranges.size(), n_read/1024.0/1024.0,
             (ggml_time_us() - t0)/1000.0);
     }
-    // k19-flintl4: the rule above prices the steady state only. The load itself can still evict mapped tensors while it pins: L4
-    // (53 GB RAM), Flint UD-Q4_K_XL 16 GB (14.4 GB pinned beside a 23.9 GB file, 51.3 GB available) and Qwen3.6-35B-A3B UD-Q4_K_XL
+    // the rule above prices the steady state only. The load itself can still evict mapped tensors while it pins: L4
+    // (53 GB RAM), Flint 4-bit quant 16 GB (14.4 GB pinned beside a 23.9 GB file, 51.3 GB available) and Qwen3.6-35B-A3B 4-bit quant
     // 12 GB: in about half the launches the whole token embedding (311.6 / 515.3 MiB, the first tensor of the file, so the oldest
     // page-cache pages) is gone after the load. Every prompt then reads its rows from disk (40 / 90 MB at 2k / 8k), and those launches
-    // run 2k / 8k TTFT 1.54 / 4.85 s instead of 1.27 / 4.33 s (q4x 12 GB: 2.78 / 5.1 vs 2.58 / 4.73 s).
+    // run 2k / 8k TTFT 1.54 / 4.85 s instead of 1.27 / 4.33 s (the 4-bit model 12 GB: 2.78 / 5.1 vs 2.58 / 4.73 s).
     // When the drop above did not run, mincore() checks the tensors that stay mapped and reads back only those that lost pages
     // (MADV_POPULATE_READ, else a read per page). LLAMA_MOE_PIN_RESIDENT=0: off (as before)
     const char * env_res = getenv("LLAMA_MOE_PIN_RESIDENT");

@@ -25,7 +25,7 @@
 // llama_memory_hybrid_idx
 //
 
-// k19-kvwin experiment (off unless set): the indexer key cache in its own type, LLAMA_KV_IDX_TYPE=<ggml type name> (q8_0, f16, ...),
+// experiment (off unless set): the indexer key cache in its own type, LLAMA_KV_IDX_TYPE=<ggml type name> (q8_0, f16,...),
 // or with LLAMA_KV_IDX_TYPE=win the window type when a KV window is created (the attention type otherwise). Unset: the attention
 // type, as before. The indexer keys are stored without the Hadamard rotation the attention keys get, so a 4-bit indexer cache moves
 // the QSA block selection over the whole context, which no window of recent tokens repairs
@@ -55,7 +55,7 @@ static ggml_type idx_cache_type(ggml_type t) {
     return r;
 }
 
-// k19-kvsel: arm the attention cache built next (by llama_memory_hybrid) for host chunks (LLAMA_KV_SEL_HOST=1) when every attention
+// arm the attention cache built next (by llama_memory_hybrid) for host chunks (LLAMA_KV_SEL_HOST=1) when every attention
 // layer reads only the cells the indexer selects (QSA with an indexer cache); a dense attention layer would read every cell each token
 static uint32_t kv_sel_arm(const llama_model & model, const llama_memory_i::layer_filter_cb & filter_attn,
         const llama_memory_i::layer_filter_cb & filter_idx, uint32_t kv_size) {
@@ -103,7 +103,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
-        // k19-kvsel (LLAMA_KV_SEL_IDX=0 off): with the attention K/V in host chunks, the qwen4exp indexer cache splits its rows: the raw
+        // (LLAMA_KV_SEL_IDX=0 off): with the attention K/V in host chunks, the qwen4exp indexer cache splits its rows: the raw
         // keys (read only to pool the blocks a ubatch completes or regroups) go to an armed cache of their own with
         // LLAMA_KV_SEL_IDX_DEV_CELLS (4096) cells of every layer in device memory and the rest in host chunks, and the pooled keys
         // (every one read by the scoring of each row) to a per-cell device tensor beside it (aux_init). The same values are written and
@@ -145,15 +145,15 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                 "one row each)\n", __func__, mem_idx->sel_engaged() ? "host chunks past its device cells" : "all in device memory");
         }
     }
-    // k19-vgraph (LLAMA_KV_BUCKET=0: off, the 256 cell padding of every ubatch): a decode or verify ubatch of qwen4exp, whose every
+    // (LLAMA_KV_BUCKET=0: off, the 256 cell padding of every ubatch): a decode or verify ubatch of qwen4exp, whose every
     // attention layer is QSA, pads n_kv to an eighth of its octave instead of 256 cells, and the k-pool count with it, so its graph
-    // and CUDA graph are not rebuilt and captured again each time the context grows past 256 cells (G4 Flash-Next: 8-10 verify
+    // and CUDA graph are not rebuilt and captured again each time the context grows past 256 cells (RTX PRO 6000 Flash-Next: 8-10 verify
     // re-captures per 256 tokens, one per window size and boundary, 3-5 ms host each). Only where the bucket cannot change a result:
     // the attention gathers the selected cells (CUDA sparse flash attention: n_kv >= max(4096, 2*n_tokens*n_sel), a single
     // query tile up to 4 tokens), so its work list and split follow n_sel and not n_kv, the extra cells are masked and the extra
     // pools score -inf (top_k keeps the lowest of tied columns, which the padding at the end never is). =2 (opt-in, not exact:
     // the dense attention's KV split moves, a reassociation): any ubatch up to LLAMA_KV_BUCKET_MAX_TOKENS (8) tokens from 1024 cells.
-    // LLAMA_KV_BUCKET_DIV (8): buckets per octave (G4 fn4 d2 16k, 256-token requests that never cross a boundary: 4 per octave,
+    // LLAMA_KV_BUCKET_DIV (8): buckets per octave (RTX PRO 6000 4-bit d2 16k, 256-token requests that never cross a boundary: 4 per octave,
     // n_kv 20480 for 16640, cost 0.5% decode in the extra mask / indexer / top_k cells)
     static const int mode = getenv("LLAMA_KV_BUCKET") ? atoi(getenv("LLAMA_KV_BUCKET")) : 1;
     const auto & hp = model.hparams;
@@ -178,11 +178,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             bp.n_kv_min_per_token = 2*n_sel;
         }
         bp.div = getenv("LLAMA_KV_BUCKET_DIV") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KV_BUCKET_DIV"))) : 8;
-        // k19-graph (LLAMA_KV_BUCKET_DEV: unset = where the backend has it, 0 = off, 1 = forced, for CPU tests): the flash attention
+        // (LLAMA_KV_BUCKET_DEV: unset = where the backend has it, 0 = off, 1 = forced, for CPU tests): the flash attention
         // reads the live length on the device (ggml_flash_attn_ext_set_kv_len, ggml-cuda: the bits of the unpadded node), so the
         // bucket moves no sum and every ubatch of up to LLAMA_KV_BUCKET_DEV_MAX_TOKENS (8, a DFlash2 window of 7 drafts) is bucketed,
-        // LLAMA_KV_BUCKET_DEV_DIV (2) per octave, at least LLAMA_KV_BUCKET_DEV_STEP_MIN (16384, k19-fullcost; was 2048) cells: a verify width keeps its graph and
-        // CUDA graph from one request to the next and while the context grows, re-captured only where a bucket starts (G4
+        // LLAMA_KV_BUCKET_DEV_DIV (2) per octave, at least LLAMA_KV_BUCKET_DEV_STEP_MIN (16384,; was 2048) cells: a verify width keeps its graph and
+        // CUDA graph from one request to the next and while the context grows, re-captured only where a bucket starts (RTX PRO 6000
         // Flash-Next DFlash2 / MTP: 8-10 re-captures of each width per request, ~4 ms each, plus an eager pass and instantiation for a
         // rarely used width). Only while flash attention is on (llama_context, set_n_kv_bucket_dev_allowed)
         const char * e_dev = getenv("LLAMA_KV_BUCKET_DEV");
@@ -505,7 +505,7 @@ struct llama_memory_hybrid_idx::kpool_layout {
         // Where the pool scan stopped, so an append resumes instead of starting over.
         size_t j_next = 0;
 
-        // k19-vwidth: the number of leading pools no update changed (members, cells, stream) since set_input_kpool last wrote this
+        // the number of leading pools no update changed (members, cells, stream) since set_input_kpool last wrote this
         // sequence's pools into its kept arrays (it sets it back to pools.size())
         mutable size_t min_keep = 0;
     };
@@ -514,7 +514,7 @@ struct llama_memory_hybrid_idx::kpool_layout {
 
     uint32_t n_pool_real = 0;
 
-    // k19-vwidth (LLAMA_KPOOL_INPUT_INC=0: off): the pool cells, members and end positions set_input_kpool last wrote, per global
+    // (LLAMA_KPOOL_INPUT_INC=0: off): the pool cells, members and end positions set_input_kpool last wrote, per global
     // pool index, and where each sequence's pools started there and how many were written (unified KV only)
     mutable std::vector<int32_t>   c_pcell;
     mutable std::vector<int32_t>   c_pidx;
@@ -533,8 +533,8 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t n_pool_real = 0;
     uint32_t n_new       = 0;
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
-    uint32_t n_pool_g    = 0; // k19-vgraph: graph pool count when n_kv is bucketed (0: kpool_pad(n_pool_real))
-    bool     allfit      = false; // k19-p2qsa: see get_kpool_allfit
+    uint32_t n_pool_g    = 0; // graph pool count when n_kv is bucketed (0: kpool_pad(n_pool_real))
+    bool     allfit      = false; // see get_kpool_allfit
 };
 
 namespace {
@@ -590,7 +590,7 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         const auto & cells = mem_idx->get_cells(unified ? 0 : s);
         const auto & sp    = cells.seq_pos_get(s);
 
-        // k19-vwidth: the leading pools this update keeps as they were
+        // the leading pools this update keeps as they were
         size_t keep = sq.pools.size();
         if (sq.strm != (unified ? 0 : mem_idx->get_stream(s))) {
             keep = 0;
@@ -605,7 +605,7 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             }
         }
 
-        // k15-fn (LLAMA_KPOOL_INCREMENTAL=0: rebuild): an edit at p0 > pos_min (a rejected draft's seq_rm, every verify round) leaves
+        // (LLAMA_KPOOL_INCREMENTAL=0: rebuild): an edit at p0 > pos_min (a rejected draft's seq_rm, every verify round) leaves
         // the cells before p0 and every pool that ends before p0 as they were (mem_idx_stale_set), so the layout keeps that prefix
         // and rescans from the end of its last kept pool: the greedy scan's decisions there depend only on those cells. The rebuild
         // walked the whole position set (8k context: 8k set nodes per ubatch). LLAMA_KPOOL_INCREMENTAL=2 checks it against a rebuild
@@ -887,7 +887,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 // A seq_* edit regroups the pools from the edited position on, so it stales them and the first ubatch of the next batch
 // rebuilds them from the still-valid key | gate rows, rewriting the (possibly different) rep rows.
 // Orphaned pooled slots are never cleared, a slot is only ever read through pool_cells, which follows the current grouping.
-// k19-p2qsa: see llama_qsa_allfit_pause (llama-ext.h)
+// see llama_qsa_allfit_pause (llama-ext.h)
 static std::atomic<int> g_qsa_allfit_pause { 0 };
 
 void llama_qsa_allfit_pause(bool on) {
@@ -983,10 +983,10 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
 
-    // k19-vgraph: a bucketed n_kv brings the pools with it (they change with the cells, every 256 of them), so the indexer, its
+    // a bucketed n_kv brings the pools with it (they change with the cells, every 256 of them), so the indexer, its
     // top_k and the pool inputs keep their shapes too; the extra pools are padding (sentinel members, -inf scores)
     // (only once the selection holds its full top_k/kpool pools without them: else n_sel would follow the padding)
-    // (k19-graph: with the device KV length, always: the attention reads the selection over the live cells only, and the padded
+    // (with the device KV length, always: the attention reads the selection over the live cells only, and the padded
     // pools are dead slots of the selection, so a longer selection marks the same live cells)
     // (LLAMA_KV_BUCKET_DEV_POOLS=0: only once the selection is full, as for the sparse-exact buckets)
     static const bool dev_pools = getenv("LLAMA_KV_BUCKET_DEV_POOLS") == nullptr || atoi(getenv("LLAMA_KV_BUCKET_DEV_POOLS")) != 0;
@@ -996,7 +996,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
         st.n_pool_g = std::max(kpool_pad(st.n_pool_real), kpool_pad(n_kv/kpool));
     }
 
-    // k19-p2qsa: a token sees at most the pools of its sequence (set_input_kpool fill_mask), and the graph's pool count is above the real
+    // a token sees at most the pools of its sequence (set_input_kpool fill_mask), and the graph's pool count is above the real
     // one (kpool_pad, or the bucket above), so with at most top pools in each sequence of the ubatch the top_k of the indexer keeps every
     // visible pool: the selection is known without scoring (LLAMA_QSA_ALLFIT=0: always score)
     static const bool allfit_on = getenv("LLAMA_QSA_ALLFIT") == nullptr || atoi(getenv("LLAMA_QSA_ALLFIT")) != 0;
@@ -1029,9 +1029,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos, ggml_tensor * allfit_idx) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
-    // k19-pf: a graph that only writes the indexer cache (the qwen4exp MTP drafter's kv_only prompt pass) has no pool cells / idxs,
+    // a graph that only writes the indexer cache (the qwen4exp MTP drafter's kv_only prompt pass) has no pool cells / idxs,
     // mask or tail inputs (pass all four as nullptr): only the new pools' members, reps and positions are filled
-    // k19-p2qsa: an all-fit graph (allfit_idx) has none of the four either: the pools and the tail go to scratch, only allfit_idx is filled
+    // an all-fit graph (allfit_idx) has none of the four either: the pools and the tail go to scratch, only allfit_idx is filled
     const bool no_sel      = pool_cells == nullptr;
     const bool writes_only = no_sel && allfit_idx == nullptr;
     GGML_ASSERT(no_sel == (pool_idxs == nullptr) && no_sel == (pool_mask == nullptr) && no_sel == (tail_idxs == nullptr));
@@ -1113,7 +1113,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     float *  gm    = nullptr;
     uint32_t n_sel = 0;
     uint32_t n_top = 0; // Pools per token in the selection.
-    // k19-p2qsa: the selection of an all-fit ubatch (see get_kpool_allfit), filled with the pool mask and the tail below
+    // the selection of an all-fit ubatch (see get_kpool_allfit), filled with the pool mask and the tail below
     int32_t * af = nullptr;
     uint32_t  af_sel = 0;
     uint32_t  af_top = 0;
@@ -1143,7 +1143,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     std::vector<llama_pos> pool_end;
     pool_end.reserve(n_pool);
 
-    // writes_only: the pool cells / idxs to a scratch (the pad cells of the new pools read the reps); k19-p2qsa: all-fit too (allfit_idx
+    // writes_only: the pool cells / idxs to a scratch (the pad cells of the new pools read the reps); all-fit too (allfit_idx
     // copies the members)
     std::vector<int32_t> pcell_w, pidx_w;
     if (no_sel) {
@@ -1160,7 +1160,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         std::fill(npos, npos + 4*n_new_g, 0);
     }
 
-    // k19-vwidth (LLAMA_KPOOL_INPUT_INC=0: off): with a unified KV the leading pools of a sequence that no layout update changed since
+    // (LLAMA_KPOOL_INPUT_INC=0: off): with a unified KV the leading pools of a sequence that no layout update changed since
     // the last fill (lay.seqs[s].min_keep) and that start at the same global index are copied from the kept arrays instead of read
     // from the layout again; the rest are written as before and kept. LLAMA_KPOOL_INPUT_INC=2 checks the copies against the layout
     static const int inp_inc = getenv("LLAMA_KPOOL_INPUT_INC") ? atoi(getenv("LLAMA_KPOOL_INPUT_INC")) : 1;
@@ -1268,7 +1268,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
     if (n_new_g > n_new) {
-        // k15-fn (LLAMA_KPOOL_PAD_BITSET=0: sort): the reps as a bitset over the cells, the same smallest free cells as the sorted
+        // (LLAMA_KPOOL_PAD_BITSET=0: sort): the reps as a bitset over the cells, the same smallest free cells as the sorted
         // search, without sorting every rep of the context per ubatch
         static const bool pad_bits = getenv("LLAMA_KPOOL_PAD_BITSET") == nullptr || atoi(getenv("LLAMA_KPOOL_PAD_BITSET")) != 0;
         const int64_t n_cells_all = (int64_t) kv_size*n_stream_kv;
@@ -1341,7 +1341,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 std::fill(row + p0, row + p0 + nv, keep);
             }
 
-            // k19-p2qsa: the members of the nv visible pools (the finite scores the top_k keeps, all of them here), then dead slots
+            // the members of the nv visible pools (the finite scores the top_k keeps, all of them here), then dead slots
             if (af != nullptr) {
                 GGML_ASSERT(nv <= af_top);
                 int32_t * arow = af + (size_t) i*af_sel;
@@ -1361,7 +1361,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     };
     if (pool_mask == nullptr) {
-        fill_mask((float *) nullptr); // k19-p2qsa: all-fit, the visible pool counts only
+        fill_mask((float *) nullptr); // all-fit, the visible pool counts only
     } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {

@@ -1401,7 +1401,7 @@ llama_model::~llama_model() {
     }
 }
 
-// k19-fnttft: see device_cache; POSIX_FADV_DONTNEED per range (mapped pages are kept by the kernel), files in tmpfs left alone
+// see device_cache; POSIX_FADV_DONTNEED per range (mapped pages are kept by the kernel), files in tmpfs left alone
 void llama_model::drop_device_cache() const {
 #if defined(__linux__)
     static const int env = getenv("LLAMA_MODEL_DROP_DEVICE_CACHE") ? atoi(getenv("LLAMA_MODEL_DROP_DEVICE_CACHE")) : -1;
@@ -1779,10 +1779,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
     }
 
-    // k19-q38r2: a dense target that does not load its trailing NextN blocks (load_mtp off, e.g. beside a separate MTP drafter) gave
+    // a dense target that does not load its trailing NextN blocks (load_mtp off, e.g. beside a separate MTP drafter) gave
     // them an offload slot all the same: --fit counts the layers without them (hp_ngl = n_layer when load_mtp is off), so its "every
-    // layer" (-ngl n_layer + 1) left block 0 on the CPU and any partial count one real block fewer than the fit measured for (Kaggle T4,
-    // Qwen3.8-27B UD-Q3_K_XL + its MTP GGUF, squeezed drafter: block 0, 148 MiB, on 2 host threads, ~65 ms of every 190 ms verify
+    // layer" (-ngl n_layer + 1) left block 0 on the CPU and any partial count one real block fewer than the fit measured for (T4,
+    // Qwen3.8-27B 3-bit quant + its MTP GGUF, squeezed drafter: block 0, 148 MiB, on 2 host threads, ~65 ms of every 190 ms verify
     // pass). The unloaded blocks now take no slot: the offload counts run over the loaded blocks + output, and the NextN blocks go
     // where the output goes. MoE targets keep the old count. LLAMA_NGL_NEXTN_SLOT=1: as before
     const int n_nextn_skip = [&] {
@@ -2099,7 +2099,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // kdp: a separate MTP drafter's device weights in evictable buffers (llama_model::weights_evict)
                 using set_evictable_t = void (*)(bool);
                 set_evictable_t set_ev = nullptr;
-                // discrete GPUs only (k19-igpu): on an integrated GPU the lend frees nothing (llama_context::mtp_lend_warm), so its weights
+                // discrete GPUs only: on an integrated GPU the lend frees nothing (llama_context::mtp_lend_warm), so its weights
                 // stay in plain buffers
                 if (params.mtp_borrow_io && llama_mtp_draft_lend_on() && !ggml_backend_buft_is_host(buft) &&
                         ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_dev_backend_reg(dev) != nullptr) {
@@ -2189,7 +2189,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // k19-fnttft: the ranges of the tensors copied to a device that the loader did not drop yet (llama_model::drop_device_cache)
+    // the ranges of the tensors copied to a device that the loader did not drop yet (llama_model::drop_device_cache)
     if (ml.use_mmap) {
         for (const auto & r : ml.device_ranges) {
             if (r.idx < ml.file_paths.size()) {
@@ -2258,7 +2258,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-// k9-draft: restricted-vocabulary MTP draft head. A draft step of an MTP head projects onto the whole vocabulary (n_embd x
+// restricted-vocabulary MTP draft head. A draft step of an MTP head projects onto the whole vocabulary (n_embd x
 // n_vocab, 248k rows for Qwen3.5 / 3.6 / 3.8: more than the active weights of the MTP block on the A3B MoE models), while the
 // tokens a draft gets right are almost all frequent ones. The rows of the n most frequent tokens are copied into a head of their
 // own at load (from the model file, in the head's type and buffer type); the MTP graph projects onto it and scatters the logits
@@ -2267,7 +2267,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 // and the verifier's residual max(0, p - q) covers the target tokens outside it.
 //   LLAMA_MTP_DRAFT_VOCAB=n (default 65536, 0: off; 32768 lost 2-3% on Qwen3.6 8 GB chat), LLAMA_MTP_DRAFT_VOCAB_FILE=path
 //   (int32 token ids, as open-jet's draft_vocab_32k.bin), else the GGUF array tokenizer.ggml.draft_vocab, else llama_vocab::draft_vocab (merge rank / score)
-// k19-amxmtp: whether the rows of a weight in this buffer type read back in their plain layout (ggml_backend_tensor_get). A device
+// whether the rows of a weight in this buffer type read back in their plain layout (ggml_backend_tensor_get). A device
 // buffer and the plain CPU / pinned host buffers do; a CPU extra buffer type (AMX, CPU_REPACK, KleidiAI: not host memory, on the CPU
 // device) holds a repacked layout and AMX has no get_tensor at all (a null call: the MTP drafter segfaulted at load on AMX CPUs)
 static bool llama_buft_rows_readable(ggml_backend_buffer_type_t bt) {
@@ -2375,7 +2375,7 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     if (params.split_mode == LLAMA_SPLIT_MODE_ROW) {
         return;
     }
-    // k16-draft: a borrowed lm head (llama_model_loader::borrow_io) is the target's tensor, not in this file: its rows are read from it
+    // a borrowed lm head (llama_model_loader::borrow_io) is the target's tensor, not in this file: its rows are read from it
     const bool src_borrowed = src == output && ml.output_borrowed;
     if (src_borrowed) {
         ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(src->buffer);
@@ -2423,7 +2423,7 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     ggml_set_name(sub, "mtp_draft_head.weight");
     ggml_tensor * d2t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, n_sub);
     ggml_set_name(d2t, "mtp_draft_head.d2t");
-    // k19-dtopk: the token-ordered row map of the backend draft top-k (LLAMA_MTP_DRAFT_TOPK_FULL=1: none, the top-k runs over the
+    // the token-ordered row map of the backend draft top-k (LLAMA_MTP_DRAFT_TOPK_FULL=1: none, the top-k runs over the
     // full-vocabulary scatter as before)
     ggml_tensor * perm = nullptr;
     ggml_tensor * cand = nullptr;
@@ -2498,8 +2498,8 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
 }
 
-// k19-draftcost: the restricted draft head of a DFlash2 draft. The noise block projects onto the target's lm head (ctx_other), all 248320
-// rows for each of its 8 tokens, and the selector keeps only the top-k (16) of each row (G4 Flash-Next: the head is 0.36 of the 1.47 ms
+// the restricted draft head of a DFlash2 draft. The noise block projects onto the target's lm head (ctx_other), all 248320
+// rows for each of its 8 tokens, and the selector keeps only the top-k (16) of each row (RTX PRO 6000 Flash-Next: the head is 0.36 of the 1.47 ms
 // drafter graph). The rows of the restricted vocabulary (llama_draft_vocab_ids, plus the
 // LLAMA_MTP_DRAFT_VOCAB_CTX request rows of llama_model_draft_head_add) are copied from the target's head, in its type and on its
 // buffer type, into a head of the draft; the selector takes its top-k over them and maps it to token ids through d2t_i32 (dflash.cpp).
@@ -4656,7 +4656,7 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
     return n_tokens * (uint32_t) tensor->ne[0];
 }
 
-// k19-dtopk: the draft step's backend top-k over the restricted head's logits instead of their scatter into the full vocabulary
+// the draft step's backend top-k over the restricted head's logits instead of their scatter into the full vocabulary
 // (248320 columns on Qwen3.5 / 3.6, 3.6x the 69632 rows): LLAMA_MTP_DRAFT_TOPK_FULL=1 restores the full-vocabulary top-k
 bool llama_mtp_draft_topk_on() {
     static const bool on = [] {
@@ -4666,7 +4666,7 @@ bool llama_mtp_draft_topk_on() {
     return on;
 }
 
-// k19-dtopk: perm / cand list the rows that hold a token of their own in ascending token order (the frequent-token rows are sorted
+// perm / cand list the rows that hold a token of their own in ascending token order (the frequent-token rows are sorted
 // already, the request rows are merged in); the request rows not yet written (copies of row 0, see load_tensors_draft_head) map to
 // the -inf column n after them, so their duplicate of the first token is never a candidate
 void llama_model::draft_head_order_update() {
@@ -4703,7 +4703,7 @@ void llama_model::draft_head_order_update() {
     ggml_backend_tensor_set(dh.cand, cand.data(), 0, cand.size() * sizeof(int32_t));
 }
 
-// k9-draft: gives the request tokens that the restricted MTP draft head lacks a row of their own (see load_tensors_draft_head).
+// gives the request tokens that the restricted MTP draft head lacks a row of their own (see load_tensors_draft_head).
 // Call between decodes (no graph of the model in flight): the rows are written in place, so the graphs keep their shapes.
 int32_t llama_model_draft_head_add(const struct llama_model * model_c, const llama_token * tokens, int32_t n_tokens) {
     auto & dh = const_cast<llama_model *>(model_c)->draft_head;

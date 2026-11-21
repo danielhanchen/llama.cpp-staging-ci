@@ -592,7 +592,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the draft memory has no recurrent layer, but its input still has to be allocated
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
-    // k19-pf (LLAMA_MTP_PROMPT_KV_ONLY=0 off): a batch with no output row (the server's prompt passes and the catch-up after a verify,
+    // (LLAMA_MTP_PROMPT_KV_ONLY=0 off): a batch with no output row (the server's prompt passes and the catch-up after a verify,
     // every row output=false) is only read later through the caches it writes: the block's K / V and, for a QSA block, the indexer
     // keys and pooled keys. So the graph ends after those writes: no query, attention, output projection, FFN (512 Q8_0 experts) or
     // head. The written rows come from the same ops on the same rows, so the cache bytes, drafts and output are those of the full
@@ -601,7 +601,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the catch-up after a verify too (LLAMA_MTP_CATCHUP_KV_ONLY=0: only from 64 rows, LLAMA_MTP_PROMPT_KV_ONLY_MIN=N: from N rows). Its
     // rows' FFN output is never read: a single MTP block's next draft starts from the target's hidden row. With the drafter's experts
     // in host memory (the fit's host-expert placement) that FFN read the experts of every verified row from RAM (10 of 512 Q8_0
-    // experts of ~5 MiB per row): G4 Qwen3.8-Flash-Next UD-IQ4_XS 10 GB / 131K + its Q8_0 MTP drafter, 4.0 ms of a 30.6 ms pass. On
+    // experts of ~5 MiB per row): RTX PRO 6000 Qwen3.8-Flash-Next 4-bit quant 10 GB / 131K + its Q8_0 MTP drafter, 4.0 ms of a 30.6 ms pass. On
     // the device it is a few hundred microseconds per pass: 48 GB chat / 8k +1.7% / +2.5%, the same text and drafts (2 launches).
     // The small catch-up batches run mat-vec kernels that fuse adjacent products of one input where the full block reads Q
     // next to K and V; K and V are each still their own product of the same input rows, and the drafts matched the full block's on
@@ -609,7 +609,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     static const bool kv_only_catchup = getenv("LLAMA_MTP_CATCHUP_KV_ONLY") == nullptr || atoi(getenv("LLAMA_MTP_CATCHUP_KV_ONLY")) != 0;
     static const int64_t kv_only_min = getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN") ? std::max(1, atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN"))) :
         kv_only_catchup ? 1 : 64;
-    // k19-mtpkeep (LLAMA_MTP_PROMPT_KV_ONLY_UB=0 off): a drafter context whose n_ubatch is below that (the fit's host-expert MTP placement
+    // (LLAMA_MTP_PROMPT_KV_ONLY_UB=0 off): a drafter context whose n_ubatch is below that (the fit's host-expert MTP placement
     // runs at 16 rows, so its graphs fit the in-place q8_0 flash attention and keep no f16 copy of the whole K / V) writes full prompt
     // ubatches the same way, else every prompt ubatch would build the whole block with its experts on the host
     static const bool kv_only_ub = getenv("LLAMA_MTP_PROMPT_KV_ONLY_UB") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_UB")) != 0;
@@ -692,7 +692,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
-    // k15-mm2: both products of the input enter the graph next to each other, so the backend can run them as one multi-matrix
+    // both products of the input enter the graph next to each other, so the backend can run them as one multi-matrix
     // mat-vec (otherwise z is placed where it is first read, after the conv, and the allocator reuses its memory in between);
     // the same ops, only the node order changes. LLAMA_QWEN4EXP_PROJ_ADJACENT=0: z where it is first read
     if (proj_adjacent()) {
@@ -726,7 +726,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        // k19-pf: a kv_only graph (writes_only) has none of the four selection inputs (k19-p2qsa: nor an all-fit graph)
+        // a kv_only graph (writes_only) has none of the four selection inputs (nor an all-fit graph)
         const bool no_sel = writes_only || allfit;
         mctx->set_input_kpool(no_sel ? nullptr : pool_cells, no_sel ? nullptr : pool_idxs, no_sel ? nullptr : pool_mask,
                               no_sel ? nullptr : tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
@@ -750,7 +750,7 @@ public:
         // the scatter mask shape follows n_kv
         res &= n_kv              == idx->get_n_kv();
         res &= n_new             == mctx->get_n_kpool_new();
-        // k19-p2qsa: an all-fit graph has no indexer scoring, so a ubatch past the top pools needs the full graph and back
+        // an all-fit graph has no indexer scoring, so a ubatch past the top pools needs the full graph and back
         res &= allfit            == (!writes_only && mctx->get_kpool_allfit());
 
         return res;
@@ -765,13 +765,13 @@ public:
     ggml_tensor * new_pool_flat = nullptr; // I32 [kpool*n_new]    view of new_pool_idxs, shared by the QSA layers
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
     ggml_tensor * new_pool_pos  = nullptr; // I32 [4*n_new]        M-RoPE position of each new block's first member
-    ggml_tensor * allfit_idx    = nullptr; // I32 [n_sel, n_tokens] k19-p2qsa: the selection when the top_k keeps every visible pool
+    ggml_tensor * allfit_idx    = nullptr; // I32 [n_sel, n_tokens] the selection when the top_k keeps every visible pool
     ggml_tensor * allfit_idx3   = nullptr; // [n_sel, n_tokens, 1] view of allfit_idx, shared by the QSA layers
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
-    bool writes_only = false; // k19-pf: kv_only graph, only the new pools are filled (see graph_mtp)
-    bool allfit = false; // k19-p2qsa: allfit_idx replaces the indexer scoring (llama_memory_hybrid_idx_context::get_kpool_allfit)
+    bool writes_only = false; // kv_only graph, only the new pools are filled (see graph_mtp)
+    bool allfit = false; // allfit_idx replaces the indexer scoring (llama_memory_hybrid_idx_context::get_kpool_allfit)
     uint32_t n_new = 0; // padded to a stable bound, never below 1
     uint32_t n_sel = 0;
     uint32_t n_kv  = 0;
@@ -792,12 +792,12 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
 
-    // k19-p2qsa: every sequence of the ubatch within the top pools: the top_k would keep every visible pool, so the selection comes from
+    // every sequence of the ubatch within the top pools: the top_k would keep every visible pool, so the selection comes from
     // the host (allfit_idx: the members of the visible pools, then the tail) and build_qsa_sel scores nothing. The four scoring inputs
     // then stay out of the graph (only their shapes are read) and set_input does not fill them, as for kv_only
     inp->allfit = !kv_only && mctx_hyb->get_kpool_allfit();
 
-    // set_input fills them all, so keep them allocated even when no op reads them. k19-pf: a kv_only graph (only the scoring reads
+    // set_input fills them all, so keep them allocated even when no op reads them. a kv_only graph (only the scoring reads
     // them) leaves them out and set_input does not fill them: kept in the graph with no reader, their memory was not theirs (the CPU
     // backend handed it to the token ids; CPU test with a fake drafter)
     inp->writes_only = kv_only;
@@ -869,9 +869,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     // cache rows store raw key | pooled key: pooling precedes norm and rotation, so the raw key gets neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
-    // k15-mm2: the indexer q product next to k's (one multi-matrix mat-vec), see build_qkvz
-    // (k19-pf: kv_only reads no query; q_raw then stays out of the graph, no op uses it)
-    // (k19-p2qsa: nor does an all-fit graph, see inp_kpool->allfit)
+    // the indexer q product next to k's (one multi-matrix mat-vec), see build_qkvz
+    // (kv_only reads no query; q_raw then stays out of the graph, no op uses it)
+    // (nor does an all-fit graph, see inp_kpool->allfit)
     const bool allfit = inp_kpool->allfit;
     ggml_tensor * q_raw = allfit ? nullptr : build_lora_mm(model.layers[il].index_q_proj, cur);
     if (proj_adjacent() && !kv_only && !allfit) {
@@ -880,8 +880,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     }
     cb(k_raw, "indexer_k_raw", il);
 
-    // opt-in (LLAMA_QSA_HOIST=1): on G4 fn4 IQ4_XS 32 GB Studio (single-graph host misses) the first chat diverged and a verify graph hit
-    // an illegal memory access with it on (k15gb_g4); not found yet, the fn1 cells here are exact
+    // opt-in (LLAMA_QSA_HOIST=1): on RTX PRO 6000 4-bit IQ4_XS 32 GB Studio (single-graph host misses) the first chat diverged and a verify graph hit
+    // an illegal memory access with it on; not found yet, the the 1-bit model cells here are exact
     static const bool qsa_hoist = getenv("LLAMA_QSA_HOIST") != nullptr && atoi(getenv("LLAMA_QSA_HOIST")) != 0;
     ggml_tensor * pzero  = qsa_hoist ? qsa_c.pzero : nullptr;
     if (pzero == nullptr) {
@@ -892,7 +892,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
 
     if (kpool_cache.split()) {
-        // k19-kvsel: the raw key into the cache row, the zero pooled key into the pooled row of the same cell
+        // the raw key into the cache row, the zero pooled key into the pooled row of the same cell
         ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens), inp_kpool->k_idxs, il));
         ggml_build_forward_expand(gf, kpool_cache.set_pooled_rows(pzero, inp_kpool->k_idxs));
     } else {
@@ -924,7 +924,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // the older pools come from the rows earlier ubatches wrote
     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
     if (kv_only) {
-        return nullptr; // k19-pf: the cache writes only (graph_mtp)
+        return nullptr; // the cache writes only (graph_mtp)
     }
     if (allfit) {
         return build_qsa_sel_mask(inp_kpool, inp_kpool->allfit_idx3, kq_mask, il);
@@ -990,7 +990,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         dump = ggml_scale_bias(ctx0, ggml_cumsum(ctx0, ggml_fill(ctx0, live, 1.0f)), 1.0f, (float) (n_kv - 1));
         qsa_c.dump = dump;
     }
-    // k15-fn: live and dump before the map below, so the cast, sub, mul, add and cast back are consecutive graph nodes (one CUDA
+    // live and dump before the map below, so the cast, sub, mul, add and cast back are consecutive graph nodes (one CUDA
     // kernel, ggml_cuda_try_fuse_qsa_idx); the order of independent nodes only
     ggml_build_forward_expand(gf, live);
     ggml_build_forward_expand(gf, dump);
@@ -1002,7 +1002,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 }
 
 // the dense selection mask from the selected cells (I32 [n_sel, n_tokens, 1], every dead slot its own dump row >= n_kv): -inf, 0 at the
-// selected cells, plus the causal mask. k19-p2qsa: shared by the scored and the all-fit selection, so both are the same chain (the CUDA
+// selected cells, plus the causal mask. shared by the scored and the all-fit selection, so both are the same chain (the CUDA
 // maskless attention matches it, see ggml_cuda_qsa_maskless_plan)
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_mask(
         llm_graph_input_kpool * inp_kpool,
@@ -1013,7 +1013,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_mask(
     const int64_t n_kv  = inp_kpool->n_kv;
     GGML_ASSERT(sel_idx->ne[0] == n_sel && sel_idx->ne[1] == n_tokens);
 
-    // k19-kvwin: the KV window ring reads the same selection at its slots: the selected cells mapped to their ring slots (a cell
+    // the KV window ring reads the same selection at its slots: the selected cells mapped to their ring slots (a cell
     // without a live slot, and every dump row, to the ring's dump row n_slots) and scattered into an all -inf ring row, plus the ring
     // mask. Built before the dense selection below, so that the selection chain keeps a single reader and the CUDA maskless
     // attention still takes it (ggml_cuda_qsa_maskless_plan), and with per-ubatch inputs of n_kv + n_sel cells only
@@ -1050,7 +1050,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_mask(
         ggml_build_forward_expand(gf, qsa_c.win_mask);
     }
 
-    // k19-kvlong: the dense selection as one node where the layer's device runs it (no [n_kv + n_sel, n_tokens] scatter buffer, see
+    // the dense selection as one node where the layer's device runs it (no [n_kv + n_sel, n_tokens] scatter buffer, see
     // build_sel_mask_op); the window ring's mask above reads the selected cells, not the dense selection, so it is the same either way
     if (ggml_tensor * m = build_sel_mask_op(sel_idx, kq_mask, model.dev_layer(il))) {
         cb(m, "indexer_sel", il);
@@ -1129,7 +1129,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // k19-kvwin: the window ring as a second source, restricted to the selected cells: its mask (the window cells, moved out of the
+    // the window ring as a second source, restricted to the selected cells: its mask (the window cells, moved out of the
     // body mask, which sel is built from) plus the selection gathered at each slot's cell
     llm_graph_attn_src2 src2 = build_kv_win_src(inp->win, mctx_cur, k_cur, v_cur, il, 0);
     if (src2.k != nullptr) {
@@ -1141,7 +1141,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il, nullptr, src2.k ? &src2 : nullptr);
     cb(cur, "kqv_out", il);
 
-    // k19-kvsel: with K/V cells in host chunks (LLAMA_KV_SEL_HOST=1) and more cells than the device holds, a kernel that attends
+    // with K/V cells in host chunks (LLAMA_KV_SEL_HOST=1) and more cells than the device holds, a kernel that attends
     // densely would read every host cell: decode / verify rows below CUDA's sparse bound (2 x rows x n_sel cells), and on Ada and newer
     // the vector kernel of 1-2 row quantized decode at any length. Ask for the selected-cell gather (op_params[5] = 1, the sparse
     // preference). Off at n_kv <= the device cells, so the attention is then the default one; past them the kernel may change
@@ -1169,7 +1169,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     return cur;
 }
 
-// k19-pf: the K / V half of build_layer_attn for a kv_only graph: the same ops on the same rows (k / v projections, k norm,
+// the K / V half of build_layer_attn for a kv_only graph: the same ops on the same rows (k / v projections, k norm,
 // IMRoPE on k), then the cache writes of build_attn_qsa (QSA block) or build_attn (dense block)
 void llama_model_qwen4exp::graph::build_attn_kv_store(
         llm_graph_input_attn_kv * inp,
@@ -1229,10 +1229,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    qsa_c.win = qsa ? &inp->win : nullptr; // k19-kvwin: the ring mask of the selection (build_qsa_sel_mask)
+    qsa_c.win = qsa ? &inp->win : nullptr; // the ring mask of the selection (build_qsa_sel_mask)
     ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 
-    // k19-pf: only the K / V rows (kv_only, see graph_mtp)
+    // only the K / V rows (kv_only, see graph_mtp)
     if (kv_only) {
         build_attn_kv_store(inp, cur, inp_pos, sections, il);
         return nullptr;
@@ -1439,7 +1439,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    // k19-g4pref cross-layer prefetch (LLAMA_MOE_PREFETCH=N, see llama_moe_cache::prefetch): the next layer's router on this layer's MoE
+    // cross-layer prefetch (LLAMA_MOE_PREFETCH=N, see llama_moe_cache::prefetch): the next layer's router on this layer's MoE
     // input predicts its routing; its logits are a graph output, so their memory stays theirs while the cache's copy stream reads them
     // after the main stream has moved on. LLAMA_MOE_PREFETCH_DRY=1 (diagnostic): the logits only, no prefetch. Off: no node is added
     ggml_tensor * pf_logits = nullptr;
@@ -1453,7 +1453,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     }
 
     // shared experts, as in the Qwen3Next reference
-    // (k13-fn: built before the routed experts, as qwen35moe does, so that the MoE cache paths compute it while the missing experts are
+    // (built before the routed experts, as qwen35moe does, so that the MoE cache paths compute it while the missing experts are
     // copied or computed on the host, see moe_overlap_extra; same nodes, same values)
     ggml_tensor * ffn_shexp = nullptr;
     if (model.layers[il].ffn_up_shexp != nullptr) {
@@ -1479,7 +1479,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         moe_overlap_extra = ffn_shexp;
     }
 
-    // k19-g4tier (debug, LLAMA_MOE_ROUTE_DUMP=path): the next MoE layer's router run on this layer's MoE input, its top 64 experts kept as
+    // (debug, LLAMA_MOE_ROUTE_DUMP=path): the next MoE layer's router run on this layer's MoE input, its top 64 experts kept as
     // an output for the prefetch study (llama_context dumps them with the routed experts and the MoE cache's fills); decode / verify
     // windows only (at most 16 tokens). Off: no node is added
     static const bool route_dump = getenv("LLAMA_MOE_ROUTE_DUMP") != nullptr;
@@ -1516,7 +1516,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         cur = moe_out;
     }
 
-    // k19-g4pref: the prefetch of the next layer runs after this layer's FFN output (every read of this layer's slots is before it)
+    // the prefetch of the next layer runs after this layer's FFN output (every read of this layer's slots is before it)
     static const bool pf_dry = getenv("LLAMA_MOE_PREFETCH_DRY") != nullptr && atoi(getenv("LLAMA_MOE_PREFETCH_DRY")) != 0;
     if (pf_logits != nullptr && !pf_dry) {
         if (ggml_tensor * pf = moe_cache->prefetch(ctx0, il_pf, pf_logits, cur, n_tokens)) {
@@ -1557,7 +1557,7 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
-    std::vector<int32_t>     miss; // k19-plerow: the rows the row cache does not hold
+    std::vector<int32_t>     miss; // the rows the row cache does not hold
 };
 
 // the rows of the PLE table that a ubatch gathers, from its tokens and the n_gram - 1 predecessors of each token
@@ -1640,7 +1640,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
         const bool prefetch = model.can_prefetch.count(ple);
-        // k19-plerow: rows the row cache holds need no page: the hint and the prompt reads take only the others
+        // rows the row cache holds need no page: the hint and the prompt reads take only the others
         const int32_t * hint   = idx.data();
         size_t          n_hint = idx.size();
         if (prefetch && model.ple_row_cache && model.ple_row_cache->table == ple) {
@@ -1657,7 +1657,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         if (n_hint == 0) {
             // every row is cached
         } else if (reader) {
-            // k19-disktt: a prompt ubatch queues parallel preads of its rows' pages for the gather (opt-in LLAMA_PLE_PROMPT_READ=1)
+            // a prompt ubatch queues parallel preads of its rows' pages for the gather (opt-in LLAMA_PLE_PROMPT_READ=1)
             reader->read(hint, n_hint);
         } else if (prefetch) {
             llama_prefetch_rows(ple, hint, n_hint);
@@ -1715,7 +1715,7 @@ const ggml_tensor * llama_model_qwen4exp::ple_rows(const llama_ubatch & ub, cons
 
 // Read a conv history out of its own recurrent row and write the new tail back.
 // The shared build_conv_state cannot do this: qwen4exp has two such rows per layer.
-// channels_first (k19-fuse F4): x is [channels, n_seq_tokens, n_seqs] and the result [channels, state_cols + n_seq_tokens, n_seqs]
+// channels_first (F4): x is [channels, n_seq_tokens, n_seqs] and the result [channels, state_cols + n_seq_tokens, n_seqs]
 // (the state transposed, then x, one copy each), so a tap of the PLE conv is a plain view; the row keeps its [state_cols, channels]
 // layout, each slot's tail is written back through a transposed view (the same floats)
 ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
@@ -1779,7 +1779,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_input->nb[1], conv_input->nb[2],
                 ggml_row_size(conv_input->type, s_idx));
 
-        // k15-mm2: the slot row seen with the tail's shape takes a strided copy of the tail directly (a 2D copy on CUDA), the same
+        // the slot row seen with the tail's shape takes a strided copy of the tail directly (a 2D copy on CUDA), the same
         // bytes as making the tail contiguous and copying that; LLAMA_QWEN4EXP_CONV_CONT=1 restores the two copies
         static const bool conv_cont = getenv("LLAMA_QWEN4EXP_CONV_CONT") && atoi(getenv("LLAMA_QWEN4EXP_CONV_CONT")) != 0;
         if (conv_cont) {
@@ -1872,7 +1872,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    // k19-fuse F4: a prompt batch keeps the channels on ne[0] (build_conv_state_at channels_first), so each tap is a view of the
+    // F4: a prompt batch keeps the channels on ne[0] (build_conv_state_at channels_first), so each tap is a view of the
     // padded input instead of a transposed copy; the same products and sums in the same order. LLAMA_QWEN4EXP_PLE_CF=0: the
     // token-major input, every batch
     static const bool ple_cf = !getenv("LLAMA_QWEN4EXP_PLE_CF") || atoi(getenv("LLAMA_QWEN4EXP_PLE_CF")) != 0;

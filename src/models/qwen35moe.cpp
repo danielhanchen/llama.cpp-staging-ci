@@ -247,7 +247,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     res->t_logits = cur;
 }
 
-// k15-hostcut: the products of one input enter the graph next to each other in prompt batches (GDN qkv and z; attention q, k and v),
+// the products of one input enter the graph next to each other in prompt batches (GDN qkv and z; attention q, k and v),
 // so the q8_1 copy of the input that the norm writes (or the first product makes) is shared by all of them: otherwise z is placed
 // where it is first read (after the delta net) and k / v after the q norm and rope, and each quantizes the input again. The same ops,
 // only the node order changes; decode-size batches (8 tokens or fewer, mat-vec kernels) keep the old order.
@@ -257,9 +257,9 @@ static bool qwen35moe_proj_adjacent(int64_t n_tokens) {
     return on && n_tokens > 8;
 }
 
-// k15-idlewait: not in the MTP head's graph. There the adjacent order made the head's prompt graph and its decode-size graphs plan
+// not in the MTP head's graph. There the adjacent order made the head's prompt graph and its decode-size graphs plan
 // the allocator differently, so every reply re-planned it and the idle work re-reserved the prompt graph before the next request
-// (local q4x: re-plans 2 per launch with it, 1 without, as with LLAMA_QWEN35_PROJ_ADJACENT=0); the head is one layer, it saves one
+// (local the 4-bit model: re-plans 2 per launch with it, 1 without, as with LLAMA_QWEN35_PROJ_ADJACENT=0); the head is one layer, it saves one
 // q8_1 copy there. LLAMA_QWEN35_PROJ_ADJACENT_MTP=1: the adjacent order there too
 static bool qwen35moe_proj_adjacent_mtp(int64_t n_tokens) {
     static const bool on = getenv("LLAMA_QWEN35_PROJ_ADJACENT_MTP") != nullptr && atoi(getenv("LLAMA_QWEN35_PROJ_ADJACENT_MTP")) != 0;

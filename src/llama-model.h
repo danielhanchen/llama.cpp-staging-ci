@@ -745,14 +745,14 @@ struct llama_model {
         int32_t next   = 0;              // the request-token row written next (ring)
         std::vector<int64_t> ids;        // host copy of d2t
         std::vector<uint8_t> in;         // per token id: has a row
-        // k19-dtopk: the rows in ascending token order (I32 [n]): perm = row index (n: a -inf column, the request rows not yet
+        // the rows in ascending token order (I32 [n]): perm = row index (n: a -inf column, the request rows not yet
         // filled), cand = its token id. The backend draft top-k runs over get_rows(logits, perm) and maps through cand, which
         // keeps the full-vocabulary top-k's selection and order (see llm_graph_context::draft_topk_rows); null: off
         ggml_tensor * perm = nullptr;
         ggml_tensor * cand = nullptr;
     } draft_head;
 
-    // k19-dtopk: rewrites draft_head.perm / cand from draft_head.ids (call between decodes)
+    // rewrites draft_head.perm / cand from draft_head.ids (call between decodes)
     void draft_head_order_update();
 
     // see llama_model_set_attn_rot
@@ -900,7 +900,7 @@ struct llama_model {
     };
     std::unordered_map<const ggml_tensor *, lazy_file> lazy_files;
 
-    // k19-fnttft: file ranges of the tensors this load copied from the mapping into device buffers (their page cache is never read
+    // file ranges of the tensors this load copied from the mapping into device buffers (their page cache is never read
     // again); dropped by drop_device_cache when a lazy PLE table of this model is short of RAM (llama_context), then cleared
     struct device_file_range {
         std::string path;
@@ -910,20 +910,20 @@ struct llama_model {
     mutable std::vector<device_file_range> device_cache;
     void drop_device_cache() const;
 
-    // k19-disktt: parallel page reads of the PLE rows of prompt ubatches before their gather (llama_ple_prompt_reader_make), made at the
+    // parallel page reads of the PLE rows of prompt ubatches before their gather (llama_ple_prompt_reader_make), made at the
     // first prompt ubatch (the mapping is set by then); nullptr where it does not apply; freed in ~llama_model before the descriptors
     llama_ple_prompt_reader * ple_prompt_reader() const;
     mutable std::once_flag ple_reader_once;
     mutable std::unique_ptr<llama_ple_prompt_reader> ple_reader;
     // set once the whole PLE table was read into RAM (LLAMA_PLE_RESIDENT): the prompt reads are skipped from then on
     mutable std::atomic<bool> ple_table_resident {false};
-    // k19-plerow: the row cache in front of the lazy PLE / Engram table (llama_row_cache), made by the residency rule of the first
+    // the row cache in front of the lazy PLE / Engram table (llama_row_cache), made by the residency rule of the first
     // context (llama_context); the CPU gather of the table reads through it. Freed (and its profile saved where asked) in ~llama_model
     mutable std::unique_ptr<llama_row_cache> ple_row_cache;
     mutable std::atomic<bool> ple_res_done {false}; // the residency rule of the PLE table ran (llama_context)
     mutable std::string ple_row_profile_save;
 
-    // k16 dense host pin (llama_context::dense_host_pin): mappings of the memory-mapped buffers that hold the weights of layers left in
+    // dense host pin (llama_context::dense_host_pin): mappings of the memory-mapped buffers that hold the weights of layers left in
     // system memory, registered once per model for the copies of offloaded prompt ops; released in ~llama_model, before the buffers
     mutable std::mutex host_pin_mutex;
     mutable bool       host_pin_done = false;
@@ -978,12 +978,12 @@ struct llama_model {
     bool   weights_evicted() const;
     bool   weights_evictable() const;       // false once the lend is disabled (the buffers can still be restored)
     size_t weights_evictable_bytes() const; // the host copy the lend needs
-    // k19-draftcost: a DFlash2 draft (which projects with the target's lm head, ctx_other) gets the restricted draft head cut from
+    // a DFlash2 draft (which projects with the target's lm head, ctx_other) gets the restricted draft head cut from
     // that head (draft_head; LLAMA_DFLASH_DRAFT_VOCAB, see llama_model::draft_head_from_target); true if made. Call once, before the
     // draft context reserves its graphs
     bool draft_head_from_target(const llama_model & tgt);
 
-    // k19-fixG: the target model whose token_embd / output an MTP draft model borrows (llama_model_params::model_shared), or null
+    // the target model whose token_embd / output an MTP draft model borrows (llama_model_params::model_shared), or null
     const llama_model * model_shared() const { return params.model_shared; }
     void   weights_lend_disable();
     bool   weights_prepared() const;
@@ -1027,7 +1027,7 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params);
 
 // model must inherit from this
-// k19-dtopk: false with LLAMA_MTP_DRAFT_TOPK_FULL=1 (the draft top-k over the full-vocabulary scatter, as before)
+// false with LLAMA_MTP_DRAFT_TOPK_FULL=1 (the draft top-k over the full-vocabulary scatter, as before)
 bool llama_mtp_draft_topk_on();
 
 struct llama_model_base : public llama_model {

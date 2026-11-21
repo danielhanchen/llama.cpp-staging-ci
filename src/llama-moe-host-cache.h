@@ -27,14 +27,14 @@ enum llama_moe_host_policy {
 // into RAM: the pinned slots then mostly replace the page cache the run had and the copies cost what the RAM hits save (L4, the experts of
 // 1.4 tokens on the device: 38% device hits, 84% RAM hits, SSD bytes -3..-5%, 28k copies back, decode after 8k -14%; the experts of 6.9
 // tokens: 71% device hits, SSD bytes -25%, 8k prompt -27%, decode +22..93%; 10.7 and 12.4 tokens: 8k prompt -48% / -40%)
-// k19-disktier: that loss is the exclusive policy's copies back. Below the minimum, where the streamed experts do not fit the RAM the tier may
+// that loss is the exclusive policy's copies back. Below the minimum, where the streamed experts do not fit the RAM the tier may
 // plan into (mapped > avail: the disk tier, the page cache cannot hold them either), the tier goes on with the INCLUSIVE policy instead (no
 // copies back; misses are read into RAM slots, the prompt's uploads only fill free slots). Without it the decode reads its misses through
-// the page cache, whose LRU churns on a working set larger than itself: Colab L4 12 GB, Flash-Next UD-IQ4_XS 94 GB, 52 GB RAM (3.3 / 3.9
+// the page cache, whose LRU churns on a working set larger than itself: L4 12 GB, Flash-Next 4-bit quant 94 GB, 52 GB RAM (3.3 / 3.9
 // tokens, tier off): MTP n2 chat 80.4 / 8k 1.95 tok/s, DFlash2 chat 4.0 / 8k 41.8, 31-87 GB read per request; the same VM with the tier
 // on (5.2 tokens, plain decode): 39.2 / 32.9. Only where the budget holds at least LLAMA_MOE_HOST_DISK_MIN_FRAC of the streamed
 // experts: with the tier on its misses are read unbuffered, so it replaces the page cache instead of adding to it, and a small tier
-// loses to it (Kaggle T4, Qwen3.6-35B-A3B UD-Q4_K_XL under a RAM cap, 1.1-1.2 tokens: inclusive at 23% / 33% of the experts = the page
+// loses to it (T4, Qwen3.6-35B-A3B 4-bit quant under a RAM cap, 1.1-1.2 tokens: inclusive at 23% / 33% of the experts = the page
 // cache within -8..+9%; at 42% / 52%: +38% / +31% chat, +22% / +39% 2k, same md5). disk_inclusive = false
 // (LLAMA_MOE_HOST_DISK_INCLUSIVE=0): off below the minimum, as before
 #define LLAMA_MOE_HOST_MIN_TOKENS 4
@@ -94,7 +94,7 @@ public:
     // evict = false: only a free slot (or memory still in the budget); min_age > 0: never evicts a slot read or written by the last
     // min_age commits (the reservation then never waits for the device)
     // take_spec: a slot set_spec marked (filled from a routing profile, not used since) counts as free (see set_spec)
-    // keep (k19-l4held, a layer at its quota): a non-evicting reservation may also take a slot of the same layer whose expert keep does
+    // keep (a layer at its quota): a non-evicting reservation may also take a slot of the same layer whose expert keep does
     // not mark (e.g. not routed by the prompt that offers e), lowest count first
     int32_t reserve(int32_t il, int32_t e, bool evict = true, uint32_t min_age = 0, bool take_spec = true, const std::vector<bool> * keep = nullptr);
     void    publish(int32_t s);  // the slot holds its expert
@@ -116,7 +116,7 @@ public:
     // experts routed by the current call: never evicted until the next begin_call
     void begin_call();
     void pin(int32_t s);
-    // k19-mgpu2: slot s (a held expert of the same slot class) now holds expert e of layer il instead: the caller orders the copies (the
+    // slot s (a held expert of the same slot class) now holds expert e of layer il instead: the caller orders the copies (the
     // old expert's last read before the new bytes are written, on one stream) and marks the write; false if the key is held or the class differs
     bool rekey(int32_t s, int32_t il, int32_t e);
 
@@ -136,11 +136,11 @@ public:
     // exclusive: a held slot whose expert the device also holds (a duplicate) is the first a reservation takes, before the CLOCK;
     // set_dup(s, false) once RAM holds the only copy again (the device evicted it)
     void set_dup(int32_t s, bool dup);
-    // k19-ramevict: the layer a prompt pass is streaming (-1: none, e.g. decode). While set, an evicting reservation that finds no
+    // the layer a prompt pass is streaming (-1: none, e.g. decode). While set, an evicting reservation that finds no
     // duplicate takes its victim first from the experts of the layers the pass has finished (layer <= il: not needed again until the
     // next pass), by the CLOCK over them, and only then from any layer (the plain CLOCK). Placement only: what a slot holds is unchanged.
-    // Idea from Straydog (MIT). Off by default, LLAMA_MOE_HOST_EVICT_DONE=1 on (the counters below count either way). Kaggle T4, Qwen3.6-35B-A3B
-    // UD-Q4_K_XL, tier 8 under a 15 GiB RAM cap (exclusive tier, disk misses), 3 launches each: same md5, the upcoming-layer evictions of the
+    // Idea from Straydog (MIT). Off by default, LLAMA_MOE_HOST_EVICT_DONE=1 on (the counters below count either way). T4, Qwen3.6-35B-A3B
+    // 4-bit quant, tier 8 under a 15 GiB RAM cap (exclusive tier, disk misses), 3 launches each: same md5, the upcoming-layer evictions of the
     // prompt seeds 1057-1122 -> 11-13 per launch, disk bytes per request 8k -2.1%, 16k -3.2%, but TTFT 8k / 16k within the A/A spread and
     // decode after 8k -3% (the finished layers' experts are what the decode reads next)
     void set_stream_layer(int32_t il) { stream_il = il; }
@@ -148,7 +148,7 @@ public:
     bool is_dup(int32_t s) const { return slots[s].dup != 0; }
     bool is_async(int32_t s) const { return slots[s].async != 0; }
 
-    // k19-ramprof2: a held slot filled from a routing profile (a guess, LLAMA_MOE_HOST_PROFILE) is marked until it is used (a touching
+    // a held slot filled from a routing profile (a guess, LLAMA_MOE_HOST_PROFILE) is marked until it is used (a touching
     // find, a read by a copy, a write) or replaced. A reservation (take_spec) takes a marked slot when no slot is free and no duplicate
     // can go, before any eviction by the CLOCK, so a full tier of guesses still keeps what the prompts and misses read (as free slots
     // would); the layers a prompt pass has finished go first (see set_stream_layer), then the layers before the reserving one, coldest
@@ -156,10 +156,10 @@ public:
     void   set_spec(int32_t s);
     bool   is_spec(int32_t s) const { return slots[s].spec != 0; }
     size_t n_spec_slots() const { return n_spec; }
-    // k19-l4held: per-layer share of a layout's slots (LLAMA_MOE_HOST_LAYER_QUOTA, set by the MoE cache: exclusive tier by default).
+    // per-layer share of a layout's slots (LLAMA_MOE_HOST_LAYER_QUOTA, set by the MoE cache: exclusive tier by default).
     // Every reservation fills the free slots of its layout, so the experts of the layers that come first in a fill (the page-cache
     // fill at load, the uploads of the first prompt, both in layer order) took a layout's slots and the layers after them kept only
-    // their device slots: Colab L4 full card, Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk, 42-token chat after a 640-token prompt:
+    // their device slots: L4 full card, Qwen3.8-Flash-Next 4-bit quant from the VM disk, 42-token chat after a 640-token prompt:
     // layers 0-3 missed 55-96 of their ~120 routed experts, 30 of 48 layers none, 760 misses of 5741 where 8% of the experts held
     // nowhere at random would give ~460. With the quota a layer holds at most ceil(slots of its layout / its layers) slots: a
     // reservation of a layer at its quota takes a free slot only when the layout keeps enough free slots for the layers below theirs,
@@ -174,7 +174,7 @@ public:
 
     // slots without an expert (free, or not allocated yet within the budget)
     int32_t n_free() const;
-    // k19-l4fill: a non-evicting reservation of layer il would find a slot whose memory is already allocated: a free one or a duplicate
+    // a non-evicting reservation of layer il would find a slot whose memory is already allocated: a free one or a duplicate
     // of a device-held expert that no current call / plan / uncommitted copy uses (never a guess, never memory still to be pinned)
     bool    can_take_alloc(int32_t il) const;
     // ... the number of such duplicates over every layout (the diagnostics)
@@ -215,7 +215,7 @@ public:
         uint64_t stream_evicted = 0; // evictions while a prompt layer was set (see set_stream_layer)
         uint64_t done_evicted   = 0; // ... taken by the finished-layer rule
         uint64_t ahead_evicted  = 0; // ... of an expert of a layer the pass has not reached yet (the plain CLOCK; the rule's fallback)
-        uint64_t spec_set   = 0; // k19-ramprof2: slots marked by set_spec
+        uint64_t spec_set   = 0; // slots marked by set_spec
         uint64_t spec_used  = 0; // ... used while marked (the guess was right)
         uint64_t spec_taken = 0; // ... taken by a reservation while still unused
         uint64_t spec_dropped = 0; // ... released by drop_spec while still unused
@@ -287,7 +287,7 @@ private:
     size_t   n_spec     = 0;
 
     std::vector<int32_t> n_key_layer; // [n_layer] slots whose key is of the layer (any state but free)
-    std::vector<int32_t> quota;       // [n_layer] k19-l4held layer quota
+    std::vector<int32_t> quota;       // [n_layer] layer quota
     bool     quota_on   = false;
     int32_t  quota_victim(int32_t il, bool allow_evict, uint32_t min_age, bool take_spec, const std::vector<bool> * keep);
 

@@ -17,7 +17,7 @@ struct llama_cparams {
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
-    // k19-p3topk: build_sampling may run the leading backend top-k of a sequence's chains once over all its rows of the ubatch (the
+    // build_sampling may run the leading backend top-k of a sequence's chains once over all its rows of the ubatch (the
     // output device's top-k gives each row of a multi-row input the result of that row alone; LLAMA_DEV_TOPK_BATCH=0: off)
     bool     topk_batch = false;
     int64_t  topk_batch_min_cols = 0;  // the narrowest row it engages for (CUDA: past the one-block path's 32768 columns)
@@ -42,11 +42,11 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool verify;                  // the caller marks the next batches as speculative verify batches (llama_set_verify)
-    bool verify_exact;            // k11-decode: verify batches are computed batch invariant without LLAMA_MTP_EXACT (llama_set_verify_exact)
+    bool verify_exact;            // verify batches are computed batch invariant without LLAMA_MTP_EXACT (llama_set_verify_exact)
     bool batch_invariant;         // the current ubatch is a verify batch computed batch invariant (LLAMA_MTP_EXACT=1)
-    bool verify_tag;              // k19-tpp: the current ubatch is a verify batch of 2+ tokens, not batch invariant: its nodes carry GGML_TENSOR_FLAG_VERIFY
+    bool verify_tag;              // the current ubatch is a verify batch of 2+ tokens, not batch invariant: its nodes carry GGML_TENSOR_FLAG_VERIFY
     uint32_t exact_split;         // batch invariant ubatch: rows whose attention sees fewer KV cells (llm_graph_exact_split)
-    uint32_t dsv41_far = 0;       // k19-dsv4long: leading rows of the current ubatch that stop before hparams.dsv41_far_layer (0 = none)
+    uint32_t dsv41_far = 0;       // leading rows of the current ubatch that stop before hparams.dsv41_far_layer (0 = none)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

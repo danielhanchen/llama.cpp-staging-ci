@@ -514,7 +514,7 @@ public:
         has_shift = true;
     }
 
-    // k19-vwidth: a log of the cells whose position, sequences or 2D position changed, for consumers that keep a result derived from
+    // a log of the cells whose position, sequences or 2D position changed, for consumers that keep a result derived from
     // the cells (the incremental KQ mask row, llama_kv_cache::set_input_kq_mask) and recompute only the cells logged since they read
     // it. mod_base() counts the entries dropped from the front of the log: a consumer whose position is below it recomputes everything,
     // as after reset() / resize() (the log is dropped there too)

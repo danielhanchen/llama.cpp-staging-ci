@@ -43,8 +43,8 @@ void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_
         mr.push_back({ base + (size_t) rows[i] * tensor->nb[1], row_bytes });
     }
 
-    // k15-ov: the advice (madvise WILLNEED per page run) is issued by a worker thread, off the caller's path. Setting the inputs of a
-    // ubatch waited for it: Flash-Next PLE, 2048 tokens, one syscall per run of rows, ~12 ms per ubatch on G4 (49 ms of host inputs
+    // the advice (madvise WILLNEED per page run) is issued by a worker thread, off the caller's path. Setting the inputs of a
+    // ubatch waited for it: Flash-Next PLE, 2048 tokens, one syscall per run of rows, ~12 ms per ubatch on RTX PRO 6000 (49 ms of host inputs
     // before a layer-major group of 4 started) and 21-110 ms on a loaded host. It is a hint only (the rows are gathered by the graph
     // either way), so the order and the outputs do not change. A queue of more than 4 requests drops the oldest.
     // LLAMA_PREFETCH_ROWS_ASYNC=0: in the caller, as before

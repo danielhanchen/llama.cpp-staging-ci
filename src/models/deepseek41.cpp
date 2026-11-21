@@ -12,7 +12,7 @@
 
 // ref: deepseek-ai/DeepSeek-V4.1-Flash-1017 inference/model.py, engram.py
 // reference path: compressed layers attend densely over [window | all compressed rows], top-k as a mask
-// k19-dsv4 sparse path (LLAMA_DSV41_SPARSE=0 restores the reference path): fused lightning indexer over the strided compressed
+// sparse path (LLAMA_DSV41_SPARSE=0 restores the reference path): fused lightning indexer over the strided compressed
 // rows, and at decode each query attends over [window | its sorted top-k rows] only (gathered), as upstream b12128
 
 static constexpr int64_t DSV41_ENGRAM_DEAD = -1;
@@ -119,7 +119,7 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         hparams.dsv41_hist_len = engram_max_ngram > 0 ? (uint32_t) engram_max_ngram - 1 : 0;
     }
 
-    // k19-dsv4long far-token skip: from layer c on, no layer owns a compressor (its compressed rows come from a kv source < c) and
+    // far-token skip: from layer c on, no layer owns a compressor (its compressed rows come from a kv source < c) and
     // none has Engram, so a row's work at layers >= c leaves only its own window K rows behind (the indexer queries, top-k and
     // candidate picks are per query). A row whose window K rows no later query that matters can see may stop after layer c - 1
     // (see llama_context::dsv41_far_rows). Every layer from c on must also be a compressed one (ratio-0 layers use their own mask).
@@ -296,7 +296,7 @@ public:
     ggml_tensor * engram_keep = nullptr;    // 0 for embedding (image) tokens; only in mixed ubatches
     ggml_tensor * cand_pin = nullptr;
     bool cand_csa = false;
-    ggml_tensor * out_near = nullptr;   // k19-dsv4long: output rows of the cut graph (ubatch row - far)
+    ggml_tensor * out_near = nullptr;   // output rows of the cut graph (ubatch row - far)
     int64_t       far      = 0;         // cparams.dsv41_far the graph was built for
 
     const llama_model_deepseek41 & model;
@@ -321,7 +321,7 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
             all.insert(all.end(), ids[e].begin(), ids[e].end());
         }
         if (model.can_prefetch.count(model.per_layer_tok_embd)) {
-            // k19-plerow: rows the row cache holds need no page
+            // rows the row cache holds need no page
             size_t n_hint = all.size();
             if (model.ple_row_cache && model.ple_row_cache->table == model.per_layer_tok_embd) {
                 n_hint = model.ple_row_cache->filter_uncached(all.data(), all.size());
@@ -436,7 +436,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     return ggml_add(ctx0, x, ggml_mul(ctx0, ggml_repeat_4d(ctx0, value, n_embd, hc, nt, 1), gate));
 }
 
-// k19-dsv4long: the rows far_r0 .. n_tokens - 1 of a per-token tensor (the token dim is the outermost one of n_tokens entries); a
+// the rows far_r0.. n_tokens - 1 of a per-token tensor (the token dim is the outermost one of n_tokens entries); a
 // view, contiguous when the tensor is (the dims past the token dim are 1)
 ggml_tensor * llama_model_deepseek41::graph::cut_tok(ggml_tensor * t) const {
     const int64_t r0 = cparams.dsv41_far;
@@ -502,7 +502,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     kv = rope(ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt), inp_pos, n_embd_head_nope);
     cb(kv, "kv", il);
 
-    // k19-dsv4long: past the far-token cut the per-token inputs are viewed at the kept rows (a copy of the pointers)
+    // past the far-token cut the per-token inputs are viewed at the kept rows (a copy of the pointers)
     auto ci                 = ratio == 2 ? inp_dsv4->get_csa()             : inp_dsv4->get_hca();
     if (far_r0 > 0) {
         GGML_ASSERT(hparams.dsv41_kv_src[il] != il && ci.kq_mask);
@@ -574,7 +574,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         const int64_t n_stream = comp_all->ne[3];
 
         ggml_tensor * top_k = topk_of[hparams.dsv41_topk_src[il]];
-        // k19-dsv4p (LLAMA_DSV41_TOPK_ALL=0 off): with at most indexer_top_k compressed rows the top-k keeps every row, so the
+        // (LLAMA_DSV41_TOPK_ALL=0 off): with at most indexer_top_k compressed rows the top-k keeps every row, so the
         // indexer scores, the top-k (and the candidate-block pick, whose top-k of n_comp / block_size <= top_k / block_size
         // blocks keeps every block too) are skipped and the selection is the rows in order: the ids the gather path sorts to,
         // and the same mask for the dense path, so the output keeps its bytes. Consumers of a skipped candidate source share
@@ -627,7 +627,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
             const int32_t cand_src = hparams.dsv41_cand_src;
             const int64_t bs       = hparams.dsv41_cand_block_size;
-            // k19-dsv4p (LLAMA_DSV41_CAND_ALL=0 off): with at most candidate_top_k_blocks blocks (16k rows at 2048 x 8) the block
+            // (LLAMA_DSV41_CAND_ALL=0 off): with at most candidate_top_k_blocks blocks (16k rows at 2048 x 8) the block
             // pick keeps every block, so its consumers' block mask is +0 everywhere: skip the pick and the masks (the consumers
             // see cand_sel == nullptr and score every row, as the all-zero mask let them)
             const bool    cand_all = cand_all_env && cand_src == il && cand_pin &&
@@ -642,7 +642,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             }
             const bool    pick_blk = cand_src == il && cand_pin && !cand_all;  // level one: pick the candidate blocks
             const bool    use_blk  = cand_src >= 0 && cand_src < il && cand_sel; // level two: score inside them
-            // k19-p6dsv (LLAMA_DSV41_CAND_SCORE=0 off): the fused indexer takes the candidate blocks (src[4], block size in
+            // (LLAMA_DSV41_CAND_SCORE=0 off): the fused indexer takes the candidate blocks (src[4], block size in
             // op_params[0]) and scores only their rows, every other row is -inf: the bytes of score + the 0 / -inf block mask
             // (rows inside: s + 0 = s, s is never -0; outside: -inf for every finite or -inf s), without the mask
             static const bool cand_score_env = dsv41_env_on("LLAMA_DSV41_CAND_SCORE");
@@ -813,7 +813,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     raw_k = ggml_repeat_4d(ctx0, raw_k, n_embd_head, 1, n_raw, nt);
                 }
             }
-            // k19-dsv4p window gather: the raw cache holds n_swa + n_ubatch cells (2304 with -ub 2048) of which a query sees at most
+            // window gather: the raw cache holds n_swa + n_ubatch cells (2304 with -ub 2048) of which a query sees at most
             // n_swa (128); the dense window part made every gather layer copy the whole raw cache into k_all and run FA over all of
             // its cells. Instead the cells a query may see are picked once per graph (top-k of the shared raw mask: every visible
             // cell is 0, the rest -inf, and at most n_swa are visible, so the n_win >= n_swa picked cells hold all of them; the
@@ -886,7 +886,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             ggml_tensor * kq_mask  = ggml_concat(ctx0, raw_mask, sel_mask, 0);
             cb(kq_mask, "comp_kq_mask", il);
 
-            // k19-dsv4next (LLAMA_DSV41_PREFILL_SPARSE=0 off): a query row of this mask has at most n_swa finite window cells (the
+            // (LLAMA_DSV41_PREFILL_SPARSE=0 off): a query row of this mask has at most n_swa finite window cells (the
             // raw cache masks standard SWA) and at most k_sel finite compressed rows (the top-k picks, -inf where a pick is not
             // visible), so window + top-k bounds its finite entries. With the bound the CUDA FA may take its sparse kernel: per
             // query it compacts the finite columns (ascending) and gathers only those K rows, instead of reading every compressed
@@ -895,9 +895,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             const int64_t n_kv_max = sparse && prefill_sparse > 0 && hparams.n_swa > 0 ?
                 std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + k_sel : 0;
             out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
-            // k19-dsv4next (LLAMA_DSV41_PREFILL_SPARSE=1: the backend's own threshold only): prompt rows prefer the sparse gather.
+            // (LLAMA_DSV41_PREFILL_SPARSE=1: the backend's own threshold only): prompt rows prefer the sparse gather.
             // ggml-cuda's default rule (K >= 2 * 8 * n_kv_max, tuned for decode / verify rows) keeps 8k prompts on the dense kernel,
-            // where the gather was 8-10% faster in TTFT (A100, G4; neutral at 2k). op_params[5] = 1 on the attention node asks for
+            // where the gather was 8-10% faster in TTFT (A100, RTX PRO 6000; neutral at 2k). op_params[5] = 1 on the attention node asks for
             // the gather from K >= 2 * n_kv_max (backends without a sparse kernel ignore it). With flash attention off there is
             // no FLASH_ATTN_EXT node (soft_max path): nothing to tag, the hint does not apply.
             if (n_kv_max > 0 && prefill_sparse > 1) {
@@ -958,7 +958,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
 
-    // k19-dsv4long far-token skip: the leading cparams.dsv41_far rows (prompt rows no output, later query or captured state can
+    // far-token skip: the leading cparams.dsv41_far rows (prompt rows no output, later query or captured state can
     // see past layer c, see llama_context::dsv41_far_rows) stop after layer c - 1. A layer >= c without visible compressed rows
     // would take the window-only path over the whole raw mask: no cut then.
     const int32_t far_c   = hparams.dsv41_far_layer;
