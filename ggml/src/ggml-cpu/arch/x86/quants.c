@@ -505,71 +505,142 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 // placeholder implementation for Apple targets
 // The Q8_K activations of every K-quant / IQ vec_dot (the host experts' up / gate rows: each host thread quantizes its
 // batch's tokens, 100 us of a 2.3 ms batch on a Colab A100 VM's Xeon with the reference) in AVX2, the reference's bytes: the first
-// element of the largest magnitude sets the scale, each value is the float product iscale*x rounded to the nearest integer, ties to
-// even (the reference's 1.5*2^23 trick does the same for these magnitudes), at most 127, and the 16-value sums. A block with a NaN or
-// an infinity, and an all-zero block (the reference leaves its sums as they were), take the reference. GGML_CPU_Q8K_SIMD=0: the reference
+// element of the largest magnitude sets the scale, each value is iscale*x rounded to the nearest integer, ties to even, at most 127,
+// and the 16-value sums. A block with a NaN or an infinity, and an all-zero block (the reference leaves its sums as they were), take
+// the reference. GGML_CPU_Q8K_SIMD=0: the reference.
+// How the reference rounds depends on how ggml-base was compiled: built with FMA available (-march=x86-64-v3 or newer, a distro
+// default ISA level, CFLAGS) the compiler contracts nearest_int(iscale*x) = iscale*x + 1.5*2^23 into one fused multiply-add, which
+// rounds the exact product; without FMA the product is rounded to float first, and the two differ next to half-integer ties. The
+// first call quantizes probe blocks with the reference and keeps the SIMD path only for the rule the reference was seen to follow
+// (and only when this build has that rule); a reference matching neither keeps the reference.
 #if defined(__AVX2__)
-static int ggml_q8k_simd_on(void) {
-    static int on = -1;
-    if (on < 0) {
-        const char * e = getenv("GGML_CPU_Q8K_SIMD");
-        on = e == NULL || atoi(e) != 0;
+enum { GGML_Q8K_REF = 0, GGML_Q8K_MUL = 1, GGML_Q8K_FMA = 2 };
+
+static void ggml_q8k_block_simd(const float * GGML_RESTRICT x, block_q8_K * GGML_RESTRICT y, int fused) {
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    const __m256i top = _mm256_set1_epi32(127);
+    const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    __m256 vmax = _mm256_setzero_ps();
+    __m256 bad  = _mm256_setzero_ps();
+    for (int j = 0; j < QK_K; j += 8) {
+        const __m256 v = _mm256_loadu_ps(x + j);
+        vmax = _mm256_max_ps(vmax, _mm256_andnot_ps(sign, v));
+        bad  = _mm256_or_ps(bad, _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
     }
-    return on;
+    __m128 m4 = _mm_max_ps(_mm256_extractf128_ps(vmax, 1), _mm256_castps256_ps128(vmax));
+    m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+    m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+    const float amax = _mm_cvtss_f32(m4);
+    if (_mm256_movemask_ps(bad) != 0 || !isfinite(amax) || amax == 0.0f) {
+        quantize_row_q8_K_ref(x, y, QK_K);
+        return;
+    }
+    const __m256 va = _mm256_set1_ps(amax);
+    int jm = 0;
+    for (int j = 0; j < QK_K; j += 8) {
+        const int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_andnot_ps(sign, _mm256_loadu_ps(x + j)), va, _CMP_EQ_OQ));
+        if (m != 0) {
+            int b = 0;
+            while (!((m >> b) & 1)) {
+                ++b;
+            }
+            jm = j + b;
+            break;
+        }
+    }
+    const float iscale = -127.f/x[jm];
+    const __m256 vs = _mm256_set1_ps(iscale);
+#if defined(__FMA__)
+    // the reference's own trick on the fused value: one rounding of iscale*x + 1.5*2^23, the integer in the low mantissa bits
+    const __m256  magic = _mm256_set1_ps(12582912.f);
+    const __m256i lowm  = _mm256_set1_epi32(0x007fffff);
+    const __m256i bias  = _mm256_set1_epi32(0x00400000);
+#endif
+    for (int j = 0; j < QK_K; j += 32) {
+        __m256i q[4];
+        for (int u = 0; u < 4; ++u) {
+            const __m256 v = _mm256_loadu_ps(x + j + 8*u);
+            __m256i r;
+#if defined(__FMA__)
+            if (fused) {
+                r = _mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(_mm256_fmadd_ps(vs, v, magic)), lowm), bias);
+            } else
+#endif
+            {
+                r = _mm256_cvtps_epi32(_mm256_mul_ps(vs, v));
+            }
+            q[u] = _mm256_min_epi32(r, top);
+        }
+        y->bsums[j/16]     = (int16_t) hsum_i32_8(_mm256_add_epi32(q[0], q[1]));
+        y->bsums[j/16 + 1] = (int16_t) hsum_i32_8(_mm256_add_epi32(q[2], q[3]));
+        const __m256i b8 = _mm256_packs_epi16(_mm256_packs_epi32(q[0], q[1]), _mm256_packs_epi32(q[2], q[3]));
+        _mm256_storeu_si256((__m256i *) (y->qs + j), _mm256_permutevar8x32_epi32(b8, perm));
+    }
+    y->d = 1/iscale;
+    GGML_UNUSED(fused);
+}
+
+// Probe blocks of quarter-integer values (largest magnitude a few units, both signs tied): products of iscale*x land next to
+// half-integer ties often enough that the rounded-product and fused rules give different bytes in every probe block.
+static int ggml_q8k_probe(void) {
+    int seen_mul = 0, seen_fma = 0;
+    uint32_t st = 12345u;
+    for (int t = 0; t < 64; ++t) {
+        float x[QK_K];
+        for (int j = 0; j < QK_K; ++j) {
+            st = st*1664525u + 1013904223u;
+            x[j] = (float) ((int) ((st >> 9) % (uint32_t) (9 + 2*t)) - (4 + t)) * 0.25f;
+        }
+        block_q8_K r, m, f;
+        memset(&r, 0, sizeof(r)); memset(&m, 0, sizeof(m)); memset(&f, 0, sizeof(f));
+        quantize_row_q8_K_ref(x, &r, QK_K);
+        ggml_q8k_block_simd(x, &m, 0);
+        const int is_mul = memcmp(&r, &m, sizeof(r)) == 0;
+#if defined(__FMA__)
+        ggml_q8k_block_simd(x, &f, 1);
+        const int is_fma = memcmp(&r, &f, sizeof(r)) == 0;
+#else
+        const int is_fma = 0;
+        GGML_UNUSED(f);
+#endif
+        if (!is_mul && !is_fma) {
+            return GGML_Q8K_REF;
+        }
+        if (is_mul && !is_fma) {
+            seen_mul = 1;
+        } else if (is_fma && !is_mul) {
+            seen_fma = 1;
+        }
+    }
+    if (seen_mul && !seen_fma) {
+        return GGML_Q8K_MUL;
+    }
+    if (seen_fma && !seen_mul) {
+        return GGML_Q8K_FMA;
+    }
+    return GGML_Q8K_REF;
+}
+
+static int ggml_q8k_simd_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * e = getenv("GGML_CPU_Q8K_SIMD");
+        mode = (e == NULL || atoi(e) != 0) ? ggml_q8k_probe() : GGML_Q8K_REF;
+    }
+    return mode;
 }
 #endif
 
 void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
 #if defined(__AVX2__)
-    if (ggml_q8k_simd_on()) {
+    const int mode = ggml_q8k_simd_mode();
+    if (mode != GGML_Q8K_REF) {
         assert(k % QK_K == 0);
         block_q8_K * GGML_RESTRICT y = vy;
         const int64_t nb = k / QK_K;
-        const __m256 sign = _mm256_set1_ps(-0.0f);
-        const __m256i top = _mm256_set1_epi32(127);
-        const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-        for (int64_t i = 0; i < nb; ++i, x += QK_K) {
-            __m256 vmax = _mm256_setzero_ps();
-            __m256 bad  = _mm256_setzero_ps();
-            for (int j = 0; j < QK_K; j += 8) {
-                const __m256 v = _mm256_loadu_ps(x + j);
-                vmax = _mm256_max_ps(vmax, _mm256_andnot_ps(sign, v));
-                bad  = _mm256_or_ps(bad, _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
-            }
-            __m128 m4 = _mm_max_ps(_mm256_extractf128_ps(vmax, 1), _mm256_castps256_ps128(vmax));
-            m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
-            m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
-            const float amax = _mm_cvtss_f32(m4);
-            if (_mm256_movemask_ps(bad) != 0 || !isfinite(amax) || amax == 0.0f) {
-                quantize_row_q8_K_ref(x, y + i, QK_K);
-                continue;
-            }
-            const __m256 va = _mm256_set1_ps(amax);
-            int jm = 0;
-            for (int j = 0; j < QK_K; j += 8) {
-                const int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_andnot_ps(sign, _mm256_loadu_ps(x + j)), va, _CMP_EQ_OQ));
-                if (m != 0) {
-                    int b = 0;
-                    while (!((m >> b) & 1)) {
-                        ++b;
-                    }
-                    jm = j + b;
-                    break;
-                }
-            }
-            const float iscale = -127.f/x[jm];
-            const __m256 vs = _mm256_set1_ps(iscale);
-            for (int j = 0; j < QK_K; j += 32) {
-                __m256i q[4];
-                for (int u = 0; u < 4; ++u) {
-                    q[u] = _mm256_min_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(vs, _mm256_loadu_ps(x + j + 8*u))), top);
-                }
-                y[i].bsums[j/16]     = (int16_t) hsum_i32_8(_mm256_add_epi32(q[0], q[1]));
-                y[i].bsums[j/16 + 1] = (int16_t) hsum_i32_8(_mm256_add_epi32(q[2], q[3]));
-                const __m256i b8 = _mm256_packs_epi16(_mm256_packs_epi32(q[0], q[1]), _mm256_packs_epi32(q[2], q[3]));
-                _mm256_storeu_si256((__m256i *) (y[i].qs + j), _mm256_permutevar8x32_epi32(b8, perm));
-            }
-            y[i].d = 1/iscale;
+        const int fused = mode == GGML_Q8K_FMA;
+        for (int64_t i = 0; i < nb; ++i) {
+            ggml_q8k_block_simd(x + i*QK_K, y + i, fused);
         }
         return;
     }
@@ -3916,6 +3987,12 @@ void ggml_cpu_iq_kernels_log(void) {
 #if defined(GGML_KQ_AVX512)
     GGML_LOG_INFO("ggml-cpu: Q4_K / Q5_K / Q6_K / IQ4_XS dot products on the %s (GGML_CPU_KQ_AVX512=%d)\n",
         ggml_kq_avx512_on() ? "AVX-512 kernels" : "AVX2 kernels", ggml_kq_avx512_on());
+#endif
+#if defined(__AVX2__)
+    const int q8k = ggml_q8k_simd_mode();
+    GGML_LOG_INFO("ggml-cpu: Q8_K quantization %s\n",
+        q8k == GGML_Q8K_MUL ? "in AVX2, rounded products like the reference" :
+        q8k == GGML_Q8K_FMA ? "in AVX2, fused multiply-adds like the reference" : "by the reference");
 #endif
 }
 
