@@ -412,6 +412,25 @@ static __global__ void moe_cache_assign(
         n_take = pf.max_fill;
         __syncthreads();
     }
+    // a prefetch admits at most the slots its hits leave unpinned (its top-n predictions may outnumber the slots, which a lookup's
+    // distinct ids never do); the rest stay uncached
+    if (pf.is_pf) {
+        int n_pin = n_hit;
+        for (int off = MOE_CACHE_LANES/2; off > 0; off >>= 1) {
+            n_pin += __shfl_xor_sync(full, n_pin, off, MOE_CACHE_LANES);
+        }
+        const int n_room = max(0, n_slots - lo - n_pin);
+        if (n_take > n_room) {
+            for (int j = n_room + lane; j < n_take; j += MOE_CACHE_LANES) {
+                row[take_e[j]] = -1;
+            }
+            if (lane == 0) {
+                pf.stat[MOE_PF_STAT_CAPPED] += (unsigned long long) (n_take - n_room);
+            }
+            n_take = n_room;
+            __syncthreads();
+        }
+    }
 
     // victims: CLOCK sweep, 32 slots at a time, the slots used by this lookup are skipped
     // there are enough unpinned slots because the number of distinct ids is at most the number of slots
