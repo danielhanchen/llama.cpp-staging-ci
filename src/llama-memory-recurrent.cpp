@@ -664,6 +664,37 @@ void llama_memory_recurrent::replay_commit_if_pending(bool sync) const {
     }
 }
 
+// a state save or restore of one sequence commits the windows of its own cells (and the rows they read from) only: the pending
+// verify window of another sequence stays pending, so it can still be rolled back after the restore (llama-server --parallel N, one
+// slot restores its checkpoint while another rolls back a partly rejected draft). All sequences (seq_id < 0) or
+// LLAMA_RS_REPLAY_SCOPED=0: every window, as before
+void llama_memory_recurrent::replay_commit_seq(llama_seq_id seq_id) const {
+    if (!commit_cb || !has_pending()) {
+        return;
+    }
+    if (seq_id < 0 || !replay_scoped) {
+        commit_cb(/*sync =*/ true);
+        return;
+    }
+    std::vector<uint8_t> which(size, 0);
+    auto mark = [&](int32_t c) {
+        if (c >= 0 && (uint32_t) c < size) {
+            which[c] = 1;
+        }
+    };
+    if ((uint32_t) seq_id < size) {
+        mark(cells[seq_id].tail);
+    }
+    for (uint32_t c = 0; c < size; ++c) {
+        if (cells[c].has_seq_id(seq_id)) {
+            mark((int32_t) c);
+            mark(cells[c].src);
+        }
+    }
+    // the held windows are put back unchanged, only the marked cells are committed
+    const_cast<llama_memory_recurrent *>(this)->replay_commit_cells(which, /*sync =*/ true);
+}
+
 // commit the pending windows of the cells in `which` only. The others are held out of the commit graph (its builder and its
 // graph key read pend_n / pend_rb / conv_rb) and put back after it, so they can still be rolled back
 void llama_memory_recurrent::replay_commit_cells(const std::vector<uint8_t> & which, bool sync) {
@@ -1438,7 +1469,7 @@ size_t llama_memory_recurrent::size_p_bytes() const {
 }
 
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    replay_commit_if_pending(); // the rows are current before they are read or copied
+    replay_commit_seq(seq_id); // the rows are current before they are read or copied
 
     GGML_UNUSED(flags);
 
@@ -1521,7 +1552,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    replay_commit_if_pending(); // the rows are current before they are read or copied
+    replay_commit_seq(seq_id); // the rows are current before they are read or copied
 
     GGML_UNUSED(flags);
 
