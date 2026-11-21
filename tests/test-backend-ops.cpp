@@ -13372,6 +13372,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // as is a view whose experts are strided by more rows than it uses
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 8,  1, 64, 1.0f, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 2, false, 8, 16, 64, 1.0f, 64));
+    // F32 / F16 / BF16 experts with expert ids on mul_mat_f (up to 16 tokens), K over 2 and 4 warps (the F32 case of 9 tokens and
+    // K = 128 hit an illegal memory access on sm_100 built with nvcc 13.1)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (bool b : {false, true}) {
+            for (int n : {3, 9, 13}) {
+                for (int k : {128, 256}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 2, b, 64, n, k));
+                }
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));

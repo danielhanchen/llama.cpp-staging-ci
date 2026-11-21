@@ -173,8 +173,15 @@ static __global__ void mul_mat_f(
     // so that a warp with few chunks (small batches: the 4-token prompt tail, K = 2048 over 8 warps) does not wait for the
     // memory latency once per chunk. The values written to shared memory, the mma sequence and the reduction are unchanged.
     // GGML_CUDA_MMF_PREFETCH=0 (compile time) restores the plain loop.
+    // The plain loop is the default for sm_10x device code from nvcc 13: nvcc 13.1 miscompiles the prefetch loop there (B200, F32
+    // weights with expert ids: out-of-bounds and misaligned shared memory stores in the loop, an illegal memory access), while nvcc 12.8
+    // for sm_100 and nvcc 13.1 for sm_80 / sm_89 / sm_120 run it correctly. GGML_CUDA_MMF_PREFETCH=1 forces it on.
 #ifndef GGML_CUDA_MMF_PREFETCH
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1100 && defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
+#define GGML_CUDA_MMF_PREFETCH 0
+#else
 #define GGML_CUDA_MMF_PREFETCH 1
+#endif
 #endif // GGML_CUDA_MMF_PREFETCH
     using y_load_t = std::conditional_t<std::is_same_v<T, float>, float, float2>;
     [[maybe_unused]] T        xa_next[GGML_CUDA_MMF_PREFETCH ? ntA : 1][tile_A::I];
