@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
 
 // threadgroups needed to fill the GPU
 // TODO: dedup
@@ -3383,6 +3384,22 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
     //    return 0;
     //}
+    // except where no batch size can use it: the F16 dequant pass only runs for these K types (use_kv_f16), and the cache types of a
+    // graph do not change between batch sizes, so this cannot reallocate graphs (an F16 KV cache of 32k cells with 8 heads of 128
+    // reserved 128 MiB it never used); GGML_METAL_FA_KV_F16_RESERVE=1: always reserve, as before
+    static const bool reserve_all = getenv("GGML_METAL_FA_KV_F16_RESERVE") != nullptr && atoi(getenv("GGML_METAL_FA_KV_F16_RESERVE")) != 0;
+    if (!reserve_all) {
+        switch (op->src[1]->type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:
+                break;
+            default:
+                return 0;
+        }
+    }
 
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
 
