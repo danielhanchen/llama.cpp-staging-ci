@@ -263,9 +263,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --models "${MODEL_DIR}"
     )
     # abort on graph reallocations that the initial reserve should have covered
+    # every architecture and case: several minutes on a 3-4 vCPU runner, so it holds 4 slots and its own timeout
     set_tests_properties(test-llama-context PROPERTIES
         FIXTURES_REQUIRED generate-models
         ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+        PROCESSORS 4
+        TIMEOUT 2400
     )
 
     # the same with an accelerator device that takes host buffers but no op (as BLAS does): every graph must still run on a
@@ -282,6 +285,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-llama-context-accel PROPERTIES
         FIXTURES_REQUIRED generate-models
+        PROCESSORS 2
+        TIMEOUT 1800
     )
 
     # recurrent single-token decodes (states read in place) equal one prompt of the same tokens on the CPU
