@@ -11010,6 +11010,17 @@ struct llama_moe_cache::impl {
         }();
         return b;
     }
+    // A replayed firm "off" record whose host was slower than calibrated runs its trial with the host path off in every block
+    // (llama_moe_tp::replay_off_fetch; LLAMA_MOE_CPU_MISS_REPLAY_OFF_FETCH=0: its two "on" blocks compute their misses on the host as the
+    // recording launch did). The replay never times a verdict, so those blocks only slowed the request they fell in: Colab A100 80 GB
+    // (12 vCPU), Qwen3.8-Flash-Next at 4 bits with its DFlash2 drafter capped at 48 GB (70.5% cached), recorded t_on / t_off 2.0-2.6:
+    // the "on" blocks fell in the chat request (25-31 ms per small batch off, 62-72 ms on; their 4-row windows on the mailbox, 43 -> 32
+    // ms), chat 113.3 -> 119.9 tok/s (56 GB: 137.3 -> 144.7), same text. Its MTP head (t_on / t_off 1.10-1.17) keeps them: there the
+    // host products of the "on" blocks steer the long request's text (fetched instead: another text, 8k 102.8 -> 79.5 tok/s)
+    static bool cmt_replay_off_fetch_on() {
+        static const bool on = llama_moe_tp::env_on(getenv("LLAMA_MOE_CPU_MISS_REPLAY_OFF_FETCH"));
+        return on;
+    }
     // LLAMA_MOE_CPU_MISS_FIRM_SKIP=0: a first trial made firm "on" by agreeing marginal timings replays its blocks (see cm_skip_trials)
     static bool cmt_firm_skip_on() {
         static const bool on = llama_moe_tp::env_on(getenv("LLAMA_MOE_CPU_MISS_FIRM_SKIP"));
@@ -11312,7 +11323,12 @@ struct llama_moe_cache::impl {
             return;
         }
         const int blk = cmt_done/cmt_block;
-        const int arm = blk == 2 || blk == 3;
+        const bool off_fetch = replay && llama_moe_tp::replay_off_fetch(cmt_replay_off_fetch_on(), cmt_rec[cmt_n]);
+        if (off_fetch && cmt_done == 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: a firm \"off\" record is replayed with the host path off in every block "
+                "(LLAMA_MOE_CPU_MISS_REPLAY_OFF_FETCH=0: its \"on\" blocks run as recorded)\n", tag, cmt_n + 1);
+        }
+        const int arm = (blk == 2 || blk == 3) && !off_fetch;
         if (arm != cmt_arm || cmt_done == 0) {
             cmt_skipn = cmt_skip;
         }
