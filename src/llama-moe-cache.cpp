@@ -4052,6 +4052,20 @@ struct llama_moe_cache::impl {
                 ggml_backend_synchronize(d.be);
             }
         }
+        for (group & g : groups) {
+            for (ggml_backend_event_t * ev : { &g.rf_ev0, &g.rf_ev1 }) {
+                if (*ev != nullptr) {
+                    ggml_backend_event_free(*ev);
+                    *ev = nullptr;
+                }
+            }
+        }
+        for (rf_dev_t & d : rf_devs) {
+            if (d.be != nullptr) {
+                ggml_backend_free(d.be);
+                d.be = nullptr;
+            }
+        }
         if (rfs.async > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: asynchronous refills: %llu (%.2f MiB), synchronous %llu, compute-stream waits %llu\n", tag,
                 (unsigned long long) rfs.async, rfs.bytes/1048576.0, (unsigned long long) rfs.sync, (unsigned long long) rfs.joins);
@@ -7846,21 +7860,17 @@ struct llama_moe_cache::impl {
         plr.p_t0 = 0;
     }
 
-    // k19-d2hstream: the copies back of a host lookup (exclusive tier) go out on a second stream of the device, in chunks with an event
-    // each, and the uploads into the evicted slots of a chunk wait for its event only: the D2H of chunk c+1 runs beside the H2D of chunk
-    // c (PCIe is full duplex; on one stream every copy back finished before the first upload began). The side stream starts where the
-    // compute stream is (event), every upload into a slot waits for that slot's copy back, and the compute stream has waited for every
-    // chunk before the RAM tier commits, so the bytes, slots and their order per slot are unchanged: exact by construction.
-    // On by default on CUDA devices (k19-d2h3; LLAMA_MOE_D2H_STREAM=0: on the compute stream as before; =1: on any device whose backend
-    // gives a second instance and events, e.g. ROCm / Vulkan / Metal / SYCL, which keep the compute stream unless asked: not measured
-    // there); LLAMA_MOE_D2H_STREAM_CHUNKS=N (default 4, 2..16)
-    // Asynchronous refill (LLAMA_MOE_REFILL_ASYNC, default on; =0: synchronous, as before). When a prompt gives its lent slots back (unlend),
-    // the uploads that refill them run on a second stream of the device instead of the compute stream, so the graph after the prompt
-    // (the tail of a prompt, a decode) computes while they run: each assign of a small batch waits on the device for the refill of its
-    // own layer before it reads hits, and for the layer of a victim's expert before it gives that slot to another (ggml_cuda_moe_refill_*).
-    // Every slot is read and written after the refill as before: the same slots, contents and outputs. The compute stream waits for the
-    // whole refill at the next ubatch (prepare), and before anything else touches the slots (lend, unlend, uploads, copies, seeds).
-    // Only for groups with device lookups, experts in pinned host memory (no RAM tier, no weight store) and CUDA
+    // Asynchronous refill (LLAMA_MOE_REFILL_ASYNC, default on; =0: synchronous, as before). When a prompt gives its lent slots back to the
+    // graph of a small batch (the tail of the prompt, a decode), the uploads that refill them run on a second stream of the device instead
+    // of the compute stream, so that graph computes while they run. On the device (ggml_cuda_moe_refill_*), an assign that reads a hit
+    // in the refilled slots waits for the refill of its layer, and one that evicts a refilled slot waits for the layer of the expert the
+    // slot holds, so every refilled slot is read and written after its upload as before: the same slots, contents and outputs. The
+    // compute stream waits for the whole refill at the next ubatch (prepare), and before anything else touches the slots of the group
+    // (a lend with copies, unlend, its uploads, copies and seeds of large batches). Only for groups with device lookups and experts in
+    // pinned host memory (no RAM tier, no weight store), on CUDA.
+    // The first launch of a kernel that was never loaded (lazy module loading) waits for the device to go idle, the upload stream
+    // included: in the first long prompt of a process the overlap ends at the first such kernel of its tail (G4, Qwen3.8-Flash-Next
+    // UD-IQ4_XS at 48 GB: the indexer kernel of long contexts, 57 ms); later long prompts overlap the whole tail (8k TTFT -56 ms there)
     bool rf_on = [] {
         const char * e = getenv("LLAMA_MOE_REFILL_ASYNC");
         return e == nullptr || atoi(e) != 0;
@@ -7950,6 +7960,14 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // k19-d2hstream: the copies back of a host lookup (exclusive tier) go out on a second stream of the device, in chunks with an event
+    // each, and the uploads into the evicted slots of a chunk wait for its event only: the D2H of chunk c+1 runs beside the H2D of chunk
+    // c (PCIe is full duplex; on one stream every copy back finished before the first upload began). The side stream starts where the
+    // compute stream is (event), every upload into a slot waits for that slot's copy back, and the compute stream has waited for every
+    // chunk before the RAM tier commits, so the bytes, slots and their order per slot are unchanged: exact by construction.
+    // On by default on CUDA devices (k19-d2h3; LLAMA_MOE_D2H_STREAM=0: on the compute stream as before; =1: on any device whose backend
+    // gives a second instance and events, e.g. ROCm / Vulkan / Metal / SYCL, which keep the compute stream unless asked: not measured
+    // there); LLAMA_MOE_D2H_STREAM_CHUNKS=N (default 4, 2..16)
     struct d2h_dev_t {
         bool tried = false;
         ggml_backend_t be = nullptr;
