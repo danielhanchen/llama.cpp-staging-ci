@@ -842,6 +842,28 @@ int ggml_cuda_flash_attn_ext_src2_codes(const int device, const ggml_tensor * ds
             return 0;
         }
     }
+    // the two-source in-place kernels exist for tiles of up to 16 query columns: more than 16 rows with fewer than 4 query heads per
+    // tile (ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2 / _ncols1) is a wider tile, staged to f16
+    const ggml_tensor * Q = dst->src[0];
+    if (Q->ne[1] > 16) {
+        const ggml_tensor * K    = dst->src[1];
+        const ggml_tensor * V    = dst->src[2];
+        const ggml_tensor * mask = dst->src[3];
+        float max_bias = 0.0f;
+        memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+        bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+        for (const ggml_tensor * t : {Q, K, V, mask}) {
+            if (t == nullptr || ggml_is_quantized(t->type)) {
+                continue;
+            }
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                use_gqa_opt = use_gqa_opt && t->nb[i] % 16 == 0;
+            }
+        }
+        if (!use_gqa_opt || Q->ne[2] / K->ne[2] <= 2) {
+            return 0;
+        }
+    }
     return code1 | (1 << 8);
 }
 
