@@ -102,6 +102,9 @@ int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, in
 // from size_ok + grow, at most size_cap (the requested --moe-cache-mib), down by what each measurement misses the margin by, at most
 // 3 measurements and at least 128 MiB above size_ok. measure(req, over) sets over = free - total - margin of the measurement
 // at req and returns false where it failed; ctx_ub is the context memory the measurement does not hold at run time. -1: no larger cache
+// the growth of a decode-sized placement from its measurements at the full and at the small ubatch (bytes): ctx_ub, the context memory
+// that grows with n_ubatch (the SWA cache, the KV window ring: created at the full n_ubatch at run time), and grow, the rest of the difference
+void    common_fit_place8_grow_of(int64_t total_full, int64_t ctx_full, int64_t total_rel, int64_t ctx_rel, int64_t & grow, int64_t & ctx_ub);
 int64_t common_fit_place8_grow_size(int64_t size_ok, int64_t size_cap, int64_t grow, int64_t ctx_ub,
         const std::function<bool(int64_t req, int64_t & over)> & measure);
 

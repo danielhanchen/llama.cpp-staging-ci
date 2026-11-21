@@ -1,4 +1,4 @@
-// test-fit-place8-grow: the MoE cache size of a decode-sized --fit placement (common_fit_place8_grow_size, common/fit.h)
+// test-fit-place8-grow: the MoE cache size of a decode-sized --fit placement (common_fit_place8_grow_of / _size, common/fit.h)
 //
 // The planner measures the placement through llama_model_load with no_alloc (a model file and a real device), so this simulates
 // the measurements: total(cache) = rest + cache, over = free - total - margin.
@@ -6,6 +6,7 @@
 #include "fit.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 
 static int n_fail = 0;
@@ -76,6 +77,46 @@ int main() {
     {
         const int64_t req = common_fit_place8_grow_size(136*MiB, cap_auto, 1700*MiB, 0, [](int64_t, int64_t &) { return false; });
         CHECK(req == -1);
+    }
+
+    // Gemma 4 26B-A4B (25 of 30 layers SWA, n_swa 1024, 8 KV heads x 256, f16 K/V: 200 KiB per SWA cell), one sequence, -c 32768 -ub 2048:
+    // the SWA cache holds GGML_PAD(min(n_ctx, n_swa + n_ubatch), 256) cells (llama_kv_cache_iswa), 3072 at the full ubatch, 1280
+    // at the 31 tokens of the measurement. The context is created at the full ubatch, only the graphs are reserved at 31 tokens
+    {
+        auto swa_cells = [](int64_t n_ctx, int64_t n_swa, int64_t ub) {
+            const int64_t n = std::min(n_ctx, n_swa + ub);
+            return (n + 255) / 256 * 256;
+        };
+        const int64_t cell    = 25*2*8*256*2;
+        const int64_t free    = 7264*MiB; // the full-ubatch placement meets the margin exactly
+        const int64_t model   = 4200*MiB;
+        const int64_t kv_full = 5*2*2*512*2*32768; // the 5 full-attention layers, 2 KV heads x 512
+        const int64_t margin  = 384*MiB;
+        auto ctx = [&](int64_t ub) { return kv_full + swa_cells(32768, 1024, ub)*cell; };
+        auto cmp = [&](int64_t ub) { return ub > 31 ? int64_t(1300)*MiB : int64_t(80)*MiB; };
+        const int64_t size_ok = 140*MiB;
+        const int64_t ctx_full = ctx(2048) + size_ok; // the cache is counted as context
+        const int64_t ctx_rel  = ctx(31)   + size_ok;
+        const int64_t tot_full = model + ctx_full + cmp(2048);
+        const int64_t tot_rel  = model + ctx_rel  + cmp(31);
+        CHECK(ctx(2048) - ctx(31) == 1792*cell); // 350 MiB
+        CHECK(free - tot_full >= margin);
+        int64_t grow = 0, ctx_ub = 0;
+        common_fit_place8_grow_of(tot_full, ctx_full, tot_rel, ctx_rel, grow, ctx_ub);
+        CHECK(ctx_ub == 350*MiB);
+        CHECK(grow == 1220*MiB);
+        sim s = { free, model + ctx(31) + cmp(31), margin };
+        const int64_t req = grow_size(size_ok, cap_auto, grow, ctx_ub, s);
+        CHECK(req > size_ok);
+        // at run time: the context at the full ubatch, the graphs at 31 tokens
+        const int64_t used = model + ctx(2048) + req + cmp(31);
+        printf("Gemma 4 SWA -ub 2048: cache %lld -> %lld MiB, %lld MiB free at run time (margin %lld)\n", (long long) (size_ok/MiB),
+            (long long) (req/MiB), (long long) ((free - used)/MiB), (long long) (margin/MiB));
+        CHECK(free - used >= margin);
+        // without the SWA growth charged (the difference counted as compute) the run time leaves less than the margin
+        sim s0 = { free, model + ctx(31) + cmp(31), margin };
+        const int64_t req0 = grow_size(size_ok, cap_auto, tot_full - tot_rel, 0, s0);
+        CHECK(free - (model + ctx(2048) + req0 + cmp(31)) < margin);
     }
 
     if (n_fail > 0) {

@@ -301,6 +301,11 @@ int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, in
     return std::min(reserve_mib, cache_mib - floor_mib);
 }
 
+void common_fit_place8_grow_of(int64_t total_full, int64_t ctx_full, int64_t total_rel, int64_t ctx_rel, int64_t & grow, int64_t & ctx_ub) {
+    ctx_ub = std::max<int64_t>(0, ctx_full - ctx_rel);
+    grow   = total_full - total_rel - ctx_ub;
+}
+
 int64_t common_fit_place8_grow_size(int64_t size_ok, int64_t size_cap, int64_t grow, int64_t ctx_ub,
         const std::function<bool(int64_t req, int64_t & over)> & measure) {
     constexpr int64_t MiB = 1024*1024;
@@ -2134,12 +2139,12 @@ static void common_params_fit_impl(
                             return true;
                         };
                         dmds_t d_s;
-                        // context that grows with n_ubatch (the KV window ring holds n_ubatch slots beside its window) keeps the
+                        // context that grows with n_ubatch (the SWA cache and the KV window ring hold n_ubatch cells beside their window) keeps the
                         // size of the full n_ubatch at run time (only the graphs are reserved at ub_rel): not part of the growth, added back below
                         int64_t ctx_ub = 0;
                         if (measure8(size_ok, d_s)) {
-                            ctx_ub = kv_win_on ? std::max<int64_t>(0, int64_t(dmds_ok[0].mb.context) - int64_t(d_s[0].mb.context)) : 0;
-                            grow   = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total()) - ctx_ub;
+                            common_fit_place8_grow_of(int64_t(dmds_ok[0].mb.total()), int64_t(dmds_ok[0].mb.context),
+                                int64_t(d_s[0].mb.total()), int64_t(d_s[0].mb.context), grow, ctx_ub);
                         }
                         // a host-bound device takes even a smaller difference (LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB, 256 as elsewhere)
                         static const int64_t hb_min = int64_t(getenv("LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB") != nullptr ?
@@ -2346,22 +2351,25 @@ static void common_params_fit_impl(
                         return true;
                     };
                     dmds_t d_s;
+                    int64_t ctx_ub = 0; // context that keeps its full-n_ubatch size at run time, as in the small-device branch
                     if (measure_mid(size_ok, d_s)) {
-                        grow = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total());
+                        common_fit_place8_grow_of(int64_t(dmds_ok[0].mb.total()), int64_t(dmds_ok[0].mb.context),
+                            int64_t(d_s[0].mb.total()), int64_t(d_s[0].mb.context), grow, ctx_ub);
                     }
                     if (grow >= 256*MiB && double(grow) >= placemid_min_frac*double(size_ok)) {
                         dmds_t dm;
-                        const int64_t req = common_fit_place8_grow_size(int64_t(size_ok), size_cap, grow, 0,
+                        const int64_t req = common_fit_place8_grow_size(int64_t(size_ok), size_cap, grow, ctx_ub,
                             [&](int64_t r, int64_t & over) {
                                 if (!measure_mid(size_t(r), dm)) {
                                     return false;
                                 }
                                 over = int64_t(dm[0].free) - int64_t(dm[0].mb.total()) - margins[0];
                                 LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
-                                    " MiB over the margin\n", __func__, ub_rel, r/MiB, (size_t) (dm[0].mb.compute/MiB), over/MiB);
+                                    " MiB over the margin\n", __func__, ub_rel, r/MiB, (size_t) (dm[0].mb.compute/MiB), (over - ctx_ub)/MiB);
                                 return true;
                             });
                         if (req >= 0) {
+                            dm[0].mb.context += size_t(ctx_ub);
                             dmds_cpu_moe = dm;
                             got = true;
                         }
