@@ -1217,6 +1217,11 @@ struct server_slot {
             return 0;
         }
 
+        // post-sampling probabilities are read from the sampler after each token, but a verify window samples all its rows first
+        if (task->params.sampling.n_probs > 0 && task->params.post_sampling_probs) {
+            return 0;
+        }
+
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
