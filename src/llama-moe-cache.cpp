@@ -12164,12 +12164,19 @@ struct llama_moe_cache::impl {
         }
         // the copies of an earlier graph may have used the slots kept free of copies for the host lookups (see place): the lookups read a little
         // past the end of a slot, they find cleared memory there
-        if (guard && g.lru.n_lent > 0) {
+        auto clear_guard = [&]() {
             ggml_backend_synchronize(devices[id].backend);
             for (ggml_tensor * bank : g.banks) {
                 ggml_backend_tensor_memset(bank, 0, (size_t) (g.n_slots - n_lend)*bank->nb[2], bank->nb[2]);
                 ggml_backend_tensor_memset(bank, 0, (size_t) g.n_slots*bank->nb[2], bank->nb[2]);
             }
+        };
+        // a growing lend whose RAM tier keeps a copy of the newly lent slots: the guard slot is one of them and may still hold an
+        // expert, so it is cleared only after the copy back below (cleared first, the tier would keep zeros as that expert)
+        const bool guard_after_shadow = guard && g.lru.n_lent > 0 && n_lend > g.lru.n_lent && host &&
+            (size_t) (&g - groups.data()) < host_group.size() && host_group[&g - groups.data()];
+        if (guard && g.lru.n_lent > 0 && !guard_after_shadow) {
+            clear_guard();
         }
         // a seed is planned and committed within one graph (see llama_context::graph_compute), none is open here
         // closing it anyway keeps its rollback snapshot from outliving the slots it describes
@@ -12191,6 +12198,9 @@ struct llama_moe_cache::impl {
                     }
                     shadow_slots(backend, g, evicted_tmp);
                 }
+            }
+            if (guard_after_shadow) {
+                clear_guard();
             }
             g.lru.set_lent(n_lend);
             LLAMA_LOG_INFO("%s: %s: MoE cache lends %d of %d slots (%.2f MiB) to the staging copies of large batches (LLAMA_MOE_CACHE_LEND=0 to disable)\n",
