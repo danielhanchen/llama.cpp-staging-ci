@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
 
 // threadgroups needed to fill the GPU
 // TODO: dedup
@@ -895,7 +896,9 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     if (pipeline.cnt) {
         const int n = pipeline.c4 ? ggml_nelements(op)/4 : ggml_nelements(op);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, 1, 1, 1);
+        const int nth = MIN(256, n);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
     } else {
         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
         const int nth = MIN(args.ne00, nth_max);
@@ -948,7 +951,9 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
 
     const int64_t nrows = ggml_nrows(op->src[0]);
 
-    const int32_t nth = std::max(1, std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne00/2));
+    // split each row over several threadgroups: with a single row (decode) one threadgroup would run on one GPU core
+    const int32_t nth = std::max(1, std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), std::min(256, ne0)));
+    const int32_t nk  = (ne0 + nth - 1)/nth;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -960,7 +965,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     }
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, nk, nrows, 1, nth, 1, 1);
 
     return 1;
 }
@@ -3383,6 +3388,22 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
     //    return 0;
     //}
+    // except where no batch size can use it: the F16 dequant pass only runs for these K types (use_kv_f16), and the cache types of a
+    // graph do not change between batch sizes, so this cannot reallocate graphs (an F16 KV cache of 32k cells with 8 heads of 128
+    // reserved 128 MiB it never used); GGML_METAL_FA_KV_F16_RESERVE=1: always reserve, as before
+    static const bool reserve_all = getenv("GGML_METAL_FA_KV_F16_RESERVE") != nullptr && atoi(getenv("GGML_METAL_FA_KV_F16_RESERVE")) != 0;
+    if (!reserve_all) {
+        switch (op->src[1]->type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:
+                break;
+            default:
+                return 0;
+        }
+    }
 
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
 
@@ -4236,7 +4257,9 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
 
     if (pipeline.cnt) {
-        ggml_metal_encoder_dispatch_threadgroups(enc, args.ne0, ggml_nrows(op), 1, 1, 1, 1);
+        const int nth = MIN(256, args.ne0);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne0 + nth - 1)/nth, ggml_nrows(op), 1, nth, 1, 1);
     } else {
         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 

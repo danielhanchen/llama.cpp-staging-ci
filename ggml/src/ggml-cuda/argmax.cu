@@ -64,8 +64,9 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
         }
     }
 
+    // a row without a value above -FLT_MAX (all -inf or NaN) gives column 0, as the CPU backend
     if (warp_id == 0 && lane_id == 0) {
-        dst[row] = argmax;
+        dst[row] = argmax < 0 ? 0 : argmax;
     }
 }
 
@@ -144,7 +145,7 @@ static __global__ void argmax_f32_join(const float * __restrict__ part_val, cons
         argmax_merge(maxval, argmax, val, col);
     }
     if (threadIdx.x == 0) {
-        dst[row] = argmax;
+        dst[row] = argmax < 0 ? 0 : argmax;
     }
 }
 

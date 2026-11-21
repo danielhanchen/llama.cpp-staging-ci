@@ -49,6 +49,7 @@ struct llama_cparams {
     uint32_t dsv41_far = 0;       // leading rows of the current ubatch that stop before hparams.dsv41_far_layer (0 = none)
     bool causal_attn;
     bool offload_kqv;
+    bool kq_mask_dev = true;   // every device of the model runs GGML_OP_KQ_MASK (llm_graph's device KQ mask)
     bool flash_attn;
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)

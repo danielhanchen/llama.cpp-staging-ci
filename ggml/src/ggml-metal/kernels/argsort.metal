@@ -468,12 +468,17 @@ kernel void kernel_moe_reduce_f32(
         return;
     }
 
-    const int n_expert_used = FC_moe_reduce_n_expert_used;
+    // the values of the unfused MUL and ADD chain: each product rounded, then added in expert order from the first product
+    // (no fused multiply-add, no reassociation under fast math)
+    {
+#pragma clang fp contract(off) reassociate(off)
+        const int n_expert_used = FC_moe_reduce_n_expert_used;
 
-    const int64_t base = token * (int64_t) n_expert_used * args.ne00 + col;
-    float sum = 0.0f;
-    FOR_UNROLL (int e = 0; e < n_expert_used; ++e) {
-        sum += experts[base + e * args.ne00] * weights[token * n_expert_used + e];
+        const int64_t base = token * (int64_t) n_expert_used * args.ne00 + col;
+        float sum = experts[base] * weights[token * n_expert_used];
+        FOR_UNROLL (int e = 1; e < n_expert_used; ++e) {
+            sum += experts[base + e * args.ne00] * weights[token * n_expert_used + e];
+        }
+        dst[token * args.ne00 + col] = sum;
     }
-    dst[token * args.ne00 + col] = sum;
 }

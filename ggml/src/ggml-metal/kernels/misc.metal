@@ -1,5 +1,7 @@
 #include "common.h"
 
+#define ARGMAX_NONE 0x7fffffff
+
 kernel void kernel_argmax_f32(
         constant ggml_metal_kargs_argmax & args,
         device   const char * src0,
@@ -12,8 +14,10 @@ kernel void kernel_argmax_f32(
         uint    ntg[[threads_per_threadgroup]]) {
     device const float * x_row = (device const float *) ((device const char *) src0 + tgpig * args.nb01);
 
+    // the lowest column of the maximum, as the CPU backend and the host greedy sampler; NaN never compares greater, and a row
+    // without a value above -inf (all -inf or NaN) gives column 0
     float   lmax = -INFINITY;
-    int32_t larg = -1;
+    int32_t larg = ARGMAX_NONE;
 
     for (int i00 = tpitg; i00 < args.ne00; i00 += ntg) {
         if (x_row[i00] > lmax) {
@@ -24,7 +28,7 @@ kernel void kernel_argmax_f32(
 
     // find the argmax value in the block
     float max_val = simd_max(lmax);
-    int32_t arg_val = simd_max(select(-1, larg, lmax == max_val));
+    int32_t arg_val = simd_min(select(ARGMAX_NONE, larg, lmax == max_val));
 
     device int32_t * dst_i32 = (device int32_t *) dst;
 
@@ -34,7 +38,7 @@ kernel void kernel_argmax_f32(
     if (ntg > N_SIMDWIDTH) {
         if (sgitg == 0) {
             shared_maxval[tiisg] = -INFINITY;
-            shared_argmax[tiisg] = -1;
+            shared_argmax[tiisg] = ARGMAX_NONE;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -50,14 +54,14 @@ kernel void kernel_argmax_f32(
         arg_val = shared_argmax[tiisg];
 
         float max_val_reduced   = simd_max(max_val);
-        int32_t arg_val_reduced = simd_max(select(-1, arg_val, max_val == max_val_reduced));
+        int32_t arg_val_reduced = simd_min(select(ARGMAX_NONE, arg_val, max_val == max_val_reduced));
 
-        dst_i32[tgpig] = arg_val_reduced;
+        dst_i32[tgpig] = arg_val_reduced == ARGMAX_NONE ? 0 : arg_val_reduced;
 
         return;
     }
 
-    dst_i32[tgpig] = arg_val;
+    dst_i32[tgpig] = arg_val == ARGMAX_NONE ? 0 : arg_val;
 }
 
 kernel void kernel_diag_f32(
