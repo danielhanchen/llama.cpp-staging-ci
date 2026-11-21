@@ -1755,6 +1755,8 @@ static size_t ggml_backend_cuda_buffer_move(ggml_backend_buffer_t buffer, size_t
             return SIZE_MAX;
         }
         CUDA_CHECK(cudaMemcpy((void *) tmp, (const void *) at, ctx->lazy_gran, cudaMemcpyDeviceToDevice));
+        // a device-to-device cudaMemcpy may return before the copy has finished: wait for it before either mapping goes away
+        CUDA_CHECK(cudaDeviceSynchronize());
         CU_CHECK(cuMemUnmap(tmp, ctx->lazy_gran));
         CU_CHECK(cuMemUnmap(at, ctx->lazy_gran));
         CU_CHECK(cuMemRelease(ctx->chunks[i]));
