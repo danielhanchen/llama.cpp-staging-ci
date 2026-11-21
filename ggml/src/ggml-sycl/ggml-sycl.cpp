@@ -5271,7 +5271,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 }
 
 // {mul_mat(gate), mul_mat(up), GLU} over the standard (non-reorder) weight layout,
-// for quant pairs the reorder kernel does not cover (mixed gate/up types, e.g. UD-Q4_K_XL's
+// for quant pairs the reorder kernel does not cover (mixed gate/up types, e.g. 4-bit's
 // iq4_xs gate + q5_K up). Two launches replace five: one shared q8_1 quantization and one
 // dual-GEMV+GLU.
 static bool ggml_sycl_mul_mat_glu_mmvq_plain(ggml_backend_sycl_context & ctx, ggml_tensor * glu,

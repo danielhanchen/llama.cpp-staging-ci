@@ -505,18 +505,18 @@ struct ggml_gallocr {
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
 
-    // k15-fn: incremented whenever a buffer of the allocator is replaced or lent memory changes (ggml_gallocr_get_generation)
+    // incremented whenever a buffer of the allocator is replaced or lent memory changes (ggml_gallocr_get_generation)
     uint64_t gen;
 
     // memory lent by the user for a buffer (see ggml_gallocr_set_external)
     struct gallocr_external {
         ggml_backend_buffer_t buffer;
-        ggml_backend_buffer_t bufs[GGML_GALLOCR_MAX_EXTERNAL]; // k15-fn: the buffer of each region (ggml_gallocr_set_external_bufs)
+        ggml_backend_buffer_t bufs[GGML_GALLOCR_MAX_EXTERNAL]; // the buffer of each region (ggml_gallocr_set_external_bufs)
         size_t offset[GGML_GALLOCR_MAX_EXTERNAL]; // regions of buffer, chunk c of the plan goes to region c
         size_t size  [GGML_GALLOCR_MAX_EXTERNAL];
         int    n;
         bool   used; // the current allocation is in it, the own buffer is not grown for it
-        bool   last_free; // k15-fn: the last region does not limit the plan (only checked against it), see ggml_gallocr_set_external_last_free
+        bool   last_free; // the last region does not limit the plan (only checked against it), see ggml_gallocr_set_external_last_free
     } * ext; // [n_buffers]
     bool ext_changed; // the next allocation must be planned again
 };
@@ -901,7 +901,7 @@ static void ggml_gallocr_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
 }
 
 // the buffer type of buffer i is not shared with another buffer id (its allocator plans only its tensors)
-// k15-fn: an own buffer about to be freed may be a region of the external memory (ggml_gallocr_get_own_region): the external memory is dropped
+// an own buffer about to be freed may be a region of the external memory (ggml_gallocr_get_own_region): the external memory is dropped
 static void ggml_gallocr_ext_drop_vbuffer(ggml_gallocr_t galloc, const struct vbuffer * vb) {
     if (vb == NULL || galloc->ext == NULL) {
         return;
