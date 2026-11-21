@@ -14907,6 +14907,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 2));
     // Keep the WebGPU dispatch below 65535 workgroups (32 per token for this shape).
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
+    // the same shapes with K > 1 snapshot slots (rollback): every slot is compared
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 2, false, false, /*K=*/3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 2, 2, false, false, /*K=*/2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 1, 1, false, false, /*K=*/4));
 
     // token-tiled kernel window (16+ tokens the chunked kernel does not take): H = 16 / 32 / 48 value heads, head size 128,
     // q / k heads 16 (the models' layout, MMA-eligible from 64 tokens on NVIDIA) and != 16 (never MMA), 1 and 2 sequences
