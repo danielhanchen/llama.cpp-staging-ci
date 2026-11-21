@@ -7770,9 +7770,10 @@ static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const gg
 static bool ggml_cuda_gdn_sigmoid_deferred(const ggml_cgraph * cgraph, int i);
 
 // no node between i and j writes over the bytes of t (the allocator may reuse them once their last planned reader ran); a beta
-// sigmoid that its gated_delta_net applies itself (ggml_cuda_gdn_sigmoid_deferred) writes nothing
+// sigmoid that its gated_delta_net applies itself (ggml_cuda_gdn_sigmoid_deferred) writes nothing. The consumer j itself is checked
+// too: it reads t while it writes its own output, so its output may not have been placed over the freed bytes of t either
 static bool ggml_cuda_kept_until(const ggml_cgraph * cgraph, int i, int j, const ggml_tensor * t, bool skip_deferred = false) {
-    for (int m = i + 1; m < j; ++m) {
+    for (int m = i + 1; m <= j; ++m) {
         const ggml_tensor * n = cgraph->nodes[m];
         if (ggml_cuda_is_view_or_noop(n) || n->data == nullptr) {
             continue;
