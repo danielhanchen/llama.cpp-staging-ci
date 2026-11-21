@@ -10782,7 +10782,8 @@ struct llama_moe_cache::impl {
         for (int r = 0; r <= n_rep; ++r) {
             int32_t tmp[16];
             const int64_t t0 = ggml_time_us();
-            ggml_backend_tensor_get(g.state, tmp, 0, sizeof(tmp));
+            // a group of 1-2 slots (top-1 / top-2 MoE at a tiny budget) has a state smaller than the probe
+            ggml_backend_tensor_get(g.state, tmp, 0, std::min(sizeof(tmp), ggml_nbytes(g.state)));
             if (r > 0) {
                 trt.push_back(ggml_time_us() - t0);
             }
