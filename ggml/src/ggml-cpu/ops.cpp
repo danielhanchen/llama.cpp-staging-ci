@@ -5060,7 +5060,7 @@ static void ggml_compute_forward_scale_bf16(
     }
 }
 
-// k19-ewchain-cpu: the CPU device claims SCALE for every type (supports_op default), so F16 needs a kernel too (test-backend-ops
+// the CPU device claims SCALE for every type (supports_op default), so F16 needs a kernel too (test-backend-ops
 // EW_CHAIN F16 scale+silu aborted the CPU run here); computed in f32 per element, as the BF16 path
 static void ggml_compute_forward_scale_f16(
         const ggml_compute_params * params,
@@ -5338,7 +5338,7 @@ void ggml_compute_forward_cont(
 
 // ggml_compute_forward_get_rows
 
-// k19-plerow: row sources of GET_ROWS (ggml_backend_cpu_set_row_source); the count is checked before any lookup, so a gather of a
+// row sources of GET_ROWS (ggml_backend_cpu_set_row_source); the count is checked before any lookup, so a gather of a
 // table without a source runs as before
 namespace {
 struct ggml_cpu_row_source_entry {
@@ -5432,7 +5432,7 @@ static void ggml_compute_forward_get_rows_q(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
-    // k19-plerow: a registered row source (llama_row_cache) hands the bytes of each row, its own copy or the table's
+    // a registered row source (llama_row_cache) hands the bytes of each row, its own copy or the table's
     const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(src0);
     alignas(64) uint8_t rs_tmp[GGML_CPU_ROW_SOURCE_MAX_BYTES];
 
@@ -5482,7 +5482,7 @@ static void ggml_compute_forward_get_rows_f16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
-    // k19-plerow: a registered row source (llama_row_cache), as in get_rows_q
+    // a registered row source (llama_row_cache), as in get_rows_q
     const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(src0);
     alignas(64) uint8_t rs_tmp[GGML_CPU_ROW_SOURCE_MAX_BYTES];
 
@@ -5532,7 +5532,7 @@ static void ggml_compute_forward_get_rows_bf16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
-    // k19-plerow: a registered row source (llama_row_cache), as in get_rows_q
+    // a registered row source (llama_row_cache), as in get_rows_q
     const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(src0);
     alignas(64) uint8_t rs_tmp[GGML_CPU_ROW_SOURCE_MAX_BYTES];
 
@@ -5582,7 +5582,7 @@ static void ggml_compute_forward_get_rows_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
-    // k19-plerow: a registered row source (llama_row_cache), as in get_rows_q
+    // a registered row source (llama_row_cache), as in get_rows_q
     const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(src0);
     alignas(64) uint8_t rs_tmp[GGML_CPU_ROW_SOURCE_MAX_BYTES];
 
@@ -9101,7 +9101,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
-    // k19-kvwin: second KV source (ggml_flash_attn_ext_set_src2), attended after the first one in the same online softmax
+    // second KV source (ggml_flash_attn_ext_set_src2), attended after the first one in the same online softmax
     const ggml_tensor * k2    = dst->src[6];
     const ggml_tensor * v2    = dst->src[7];
     const ggml_tensor * mask2 = dst->src[8];
@@ -9234,7 +9234,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        // k19-kvwin: the first source, then (two) the second one, in one online softmax
+        // the first source, then (two) the second one, in one online softmax
         for (int isrc = 0; isrc < (two ? 2 : 1); ++isrc) {
             const ggml_tensor * ks  = isrc == 0 ? k : k2;
             const ggml_tensor * vsr = isrc == 0 ? v : v2;
@@ -9770,7 +9770,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    // k19-kvwin: a second KV source runs the reference row loop (one online softmax over both sources)
+    // a second KV source runs the reference row loop (one online softmax over both sources)
     const bool two_src = dst->src[6] != nullptr;
     const bool use_split_kv_path = !use_ref && !two_src && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 

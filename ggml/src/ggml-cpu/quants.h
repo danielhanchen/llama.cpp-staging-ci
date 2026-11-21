@@ -65,13 +65,13 @@ void ggml_vec_dot_iq2_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const 
 void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq1_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq1_m_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
-// k15-fn: nc (<= 8) columns of one weight row, each bit-identical to the single-column vec_dot (NULL: none for the type, or off)
+// nc (<= 8) columns of one weight row, each bit-identical to the single-column vec_dot (NULL: none for the type, or off)
 typedef void (*ggml_vec_dot_multi_t)(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
 #if defined(__AVX2__)
 ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type);
 #endif
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-// k19-hostrow: logs which IQ3_S kernel runs (AVX-512 or AVX2; nothing in builds without AVX-512)
+// logs which IQ3_S kernel runs (AVX-512 or AVX2; nothing in builds without AVX-512)
 void ggml_cpu_iq_kernels_log(void);
 #endif
 void ggml_vec_dot_iq4_nl_q8_0 (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

@@ -1583,7 +1583,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     GGML_UNUSED(use_ref); // no multi-column kernels without AVX2
 
 #if defined(__AVX2__)
-    // k15-fn: an expert routed to 2 or more rows of the batch: each weight row is decoded once for up to 8 of them (results
+    // an expert routed to 2 or more rows of the batch: each weight row is decoded once for up to 8 of them (results
     // bit-identical to the loop below; GGML_CPU_MMID_MULTI=0: the loop). The reference backend (use_ref) takes the loop.
     const ggml_vec_dot_multi_t vdm = !use_ref && ir1_end - ir1_start >= 2 ? ggml_cpu_vec_dot_multi(type) : NULL;
     if (vdm != NULL) {
@@ -1649,14 +1649,14 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     }
 }
 
-// ---- k18: the host experts of one single-graph MoE mailbox batch (llama_moe_cache, LLAMA_MOE_SINGLE) in one parallel region -------
+// ---- the host experts of one single-graph MoE mailbox batch (llama_moe_cache, LLAMA_MOE_SINGLE) in one parallel region -------
 // The graph it replaces is mul_mat_id(up, x, ids), mul_mat_id(gate, x, ids), swiglu_split(gate, up), mul_mat_id(down, act, ids): four
-// nodes, seven barriers and a plan per batch, for 1-4 tokens and a few experts (Flash-Next UD-IQ4_XS at 12 / 16 GB on G4: 2.2-2.9
+// nodes, seven barriers and a plan per batch, for 1-4 tokens and a few experts (Flash-Next 4-bit at 12 / 16 GB on an RTX PRO 6000: 2.2-2.9
 // experts per batch, 76-95 us per batch, of which 20-35 us does not depend on the number of experts). Here every thread quantizes the
 // activations itself (no barrier), computes its share of the up and gate rows (shares of equal weight: a row counts once per pair it serves), waits at the one barrier, then forms the SwiGLU rows
 // (and their quantization) of the pairs its down rows need and computes those down rows. Each output is the same vec_dot (or, for an
 // expert routed to 2+ rows, the same multi-column kernel, bit-identical to vec_dot per column) of the same quantized rows as in the graph,
-// so the result is the graph's bit for bit. Rows of id -1 are left as they are (k19-overlap; GGML_MOE_HOST_LEAN=0: 0, as the graph
+// so the result is the graph's bit for bit. Rows of id -1 are left as they are (GGML_MOE_HOST_LEAN=0: 0, as the graph
 // writes them): the mailbox merge reads only the host rows.
 // false (not handled: no OpenMP, a type or layout the path does not take, the tiled kernels forced): the caller computes the graph.
 #define GGML_MOE_HOST_MAX_PAIRS 256
@@ -1678,7 +1678,7 @@ static int64_t ggml_moe_host_per_thread(const struct ggml_tensor * up, const str
            GGML_MOE_HOST_COLS*ggml_moe_host_pad((int64_t) ggml_row_size(type_traits_cpu[down->type].vec_dot_type, n_ff));
 }
 
-// k18: item index at weight B, items laid out group by group (rows items per group), an item of group g weighing its columns (pairs):
+// item index at weight B, items laid out group by group (rows items per group), an item of group g weighing its columns (pairs):
 // the threads take equal weight, not equal items (a group of an expert routed to 4 rows costs 4 single rows)
 static int64_t ggml_moe_host_item_at(const int32_t * gstart, int n_grp, int64_t rows, int64_t b) {
     int64_t cum = 0;
@@ -1702,7 +1702,7 @@ size_t ggml_cpu_moe_host_ffn_wsize(const struct ggml_tensor * up, const struct g
     return (size_t) (2*rows + qact + ggml_moe_host_per_thread(up, gate, down, n_tokens)*n_threads + 64);
 }
 
-// k19-l4b: the shared state of one batch, read by every thread that computes it (the OpenMP region or the host team below)
+// the shared state of one batch, read by every thread that computes it (the OpenMP region or the host team below)
 struct ggml_moe_host_job {
     const struct ggml_tensor * up;
     const struct ggml_tensor * gate;
@@ -1729,9 +1729,9 @@ struct ggml_moe_host_job {
     ggml_vec_dot_t       dot_u, dot_g, dot_d;
     ggml_from_float_t    q_u, q_g, q_d;
     ggml_vec_dot_multi_t vdm_u, vdm_g, vdm_d;
-    bool qshare; // k19-overlap: the gate activations are the up activations' bytes (same type), quantized once
+    bool qshare; // the gate activations are the up activations' bytes (same type), quantized once
     // the up / gate rows and the down rows are each cut into n_task ranges of equal weight; a thread takes the next free range until
-    // none is left. With n_task = the threads every thread gets one range when all of them run (the k18 ranges); with more, a thread
+    // none is left. With n_task = the threads every thread gets one range when all of them run (the original ranges); with more, a thread
     // that is descheduled holds back less. Each output is computed once with the same kernel whichever thread takes it.
     int n_task;
     atomic_int next_gu;
@@ -2021,14 +2021,14 @@ static void ggml_moe_host_ffn_thread_impl(struct ggml_moe_host_job * j, int ith,
     }
 }
 
-// ---- k19-l4b: the host team of ggml_cpu_moe_host_ffn_team (GGML_MOE_HOST_TEAM, default on; 0 = the OpenMP region of k18) -------------
-// Colab L4 (12 vCPUs, 6 cores) LFM2.5 4 GB: the host experts take most of a decode step (5 threads, 661 us per batch).
+// ---- the host team of ggml_cpu_moe_host_ffn_team (GGML_MOE_HOST_TEAM, default on; 0 = the OpenMP region) -------------
+// L4 host (12 vCPUs, 6 cores) LFM2.5 4 GB: the host experts take most of a decode step (5 threads, 661 us per batch).
 // A larger OpenMP team does not get there: libgomp counts every OpenMP thread of the process (the decode team as well) and,
-// with more of them than CPUs, stops spinning between regions, so each batch waits for its threads to wake up (k16_l4g: an 11-thread team
+// with more of them than CPUs, stops spinning between regions, so each batch waits for its threads to wake up (an 11-thread team
 // lost 9-34%, 2.7-4.9 cores busy). These threads are the batch's own: the caller is thread 0, the others spin on a counter between
 // batches and sleep after GGML_MOE_HOST_TEAM_SPIN_US (2000) without one. Up to GGML_MOE_TEAM_MAX threads; one batch at a time.
 #define GGML_MOE_TEAM_MAX 64
-// k19-hostadapt: the batch word (gen) carries the batch's thread count in its low bits, so a worker the batch does not use reads
+// the batch word (gen) carries the batch's thread count in its low bits, so a worker the batch does not use reads
 // both at once and leaves it alone (it does not count down, spin for it or wake up for it): the caller may run a batch on fewer
 // threads than the team has without the idle ones taking CPU time
 #define GGML_MOE_TEAM_NBITS 7
@@ -2132,7 +2132,7 @@ static int ggml_moe_host_team_mode(void) {
     return mode;
 }
 
-// k19-hostovl: the default without GGML_MOE_HOST_TEAM_SPIN_US, set by the caller before the first batch (ggml_cpu_moe_host_team_set_spin_us)
+// the default without GGML_MOE_HOST_TEAM_SPIN_US, set by the caller before the first batch (ggml_cpu_moe_host_team_set_spin_us)
 static atomic_llong ggml_moe_host_team_spin_default = 2000;
 
 static int64_t ggml_moe_host_team_spin_us(void) {
@@ -2463,10 +2463,10 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
         return false;
     }
 
-    // k19-overlap GGML_MOE_HOST_LEAN (bits, default 3; 0 = the k18 form): 1 = rows of id -1 are not written (the mailbox merge reads
-    // only the host rows; the k18 form zeroed up to 7 of every 8 rows of the mapped mailbox on the calling thread before the region),
+    // GGML_MOE_HOST_LEAN (bits, default 3; 0 = the earlier form): 1 = rows of id -1 are not written (the mailbox merge reads
+    // only the host rows; the earlier form zeroed up to 7 of every 8 rows of the mapped mailbox on the calling thread before the region),
     // 2 = the gate activations reuse the up activations' quantized bytes when both have the same vec_dot type (the same bytes). Every
-    // host row keeps its bytes. Colab G4 Flash-Next UD-IQ4_XS 24 / 32 GB (ov_r1): 106 -> 88 us per 3-row host batch, decode +0.5..+3.3%,
+    // host row keeps its bytes. RTX PRO 6000 Flash-Next 4-bit 24 / 32 GB: 106 -> 88 us per 3-row host batch, decode +0.5..+3.3%,
     // md5 equal in all 8 cells
     static int lean = -1;
     if (lean < 0) {
@@ -2569,7 +2569,7 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
     atomic_store_explicit(&job.next_dn, 0, memory_order_relaxed);
     atomic_store_explicit(&job.done_gu, 0, memory_order_relaxed);
     // GGML_MOE_HOST_DEP: the per-group counters (the barrier form: NULL). Only the range form uses them (the sliced form
-    // keeps its barriers). Colab A100 VM (6 cores / 12 threads, 10 host threads), Flash-Next 7-row host batches: the barrier was 8% of
+    // keeps its barriers). A100 host (6 cores / 12 threads, 10 host threads), Flash-Next 7-row host batches: the barrier was 8% of
     // each thread's batch time
     static int dep_mode = -1;
     if (dep_mode < 0) {
@@ -2608,7 +2608,7 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
         }
     }
 #if defined(GGML_USE_OPENMP)
-    // k18 ranges: one per thread
+    // ranges: one per thread
     job.n_task = n_threads;
     #pragma omp parallel num_threads(n_threads)
     {
@@ -2621,13 +2621,13 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
 #endif
 }
 
-// the OpenMP region (k18)
+// the OpenMP region
 bool ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
         const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize) {
     return ggml_moe_host_ffn_impl(up, gate, down, x, ids, out, n_used, n_tokens, n_threads, wbuf, wsize, false);
 }
 
-// k19-l4b: the host team (GGML_MOE_HOST_TEAM=0: the OpenMP region)
+// the host team (GGML_MOE_HOST_TEAM=0: the OpenMP region)
 bool ggml_cpu_moe_host_ffn_team(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
         const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize) {
     return ggml_moe_host_ffn_impl(up, gate, down, x, ids, out, n_used, n_tokens, n_threads, wbuf, wsize, ggml_moe_host_team_mode() == 1);
@@ -2654,7 +2654,7 @@ static void ggml_compute_forward_mul_mat_id(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // k16-disk: the routed experts of a host expert tensor in a file mapping are read by the disk prefetch workers while the threads
+    // the routed experts of a host expert tensor in a file mapping are read by the disk prefetch workers while the threads
     // below start on them (page cache only, same bytes; a no-op unless the engine is on, see ggml-moe-prefetch.h)
     ggml_moe_prefetch_kernel_hook(dst, ith);
 
@@ -2846,7 +2846,7 @@ static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * pa
         return false;
     }
     struct ggml_tensor * src1 = tensor->src[1];
-    // k15-fv: an attention node over several queries of one KV length (llama-graph, exact verify): one query at a time, as the
+    // an attention node over several queries of one KV length (llama-graph, exact verify): one query at a time, as the
     // node of that query alone (the tiled kernel takes 8+ queries)
     if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
         struct ggml_tensor * q    = tensor->src[0];
@@ -2924,7 +2924,7 @@ static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * pa
     return false;
 }
 
-// k19-handoff: GGML_OP_DFLASH2_CONV (see ggml_dflash2_conv), the rows split over the threads; every multiply and add is rounded on
+// GGML_OP_DFLASH2_CONV (see ggml_dflash2_conv), the rows split over the threads; every multiply and add is rounded on
 // its own, as the add / mul ops it replaces (no contraction into a fused multiply-add)
 #if defined(__clang__)
 #define GGML_DFLASH2_NO_CONTRACT
@@ -2972,7 +2972,7 @@ static void ggml_compute_forward_dflash2_conv(const struct ggml_compute_params *
     }
 }
 
-// k15-pp: GGML_OP_KQ_MASK (see ggml_kq_mask), the rows split over the threads
+// GGML_OP_KQ_MASK (see ggml_kq_mask), the rows split over the threads
 static bool ggml_kq_mask_swa_masked(int32_t swa_type, int32_t n_swa, int32_t p0, int32_t p1) {
     switch (swa_type) {
         case 1: return p1 - p0 >= n_swa;                                    // LLAMA_SWA_TYPE_STANDARD
@@ -2991,7 +2991,7 @@ static void ggml_compute_forward_kq_mask(const struct ggml_compute_params * para
     const int64_t dr = (n_rows + params->nth - 1)/params->nth;
     const int64_t r0 = dr*params->ith, r1 = MIN(r0 + dr, n_rows);
     const ggml_fp16_t keep16 = GGML_CPU_FP32_TO_FP16(0.0f), drop16 = GGML_CPU_FP32_TO_FP16(-INFINITY);
-    // k19-kvwin (ggml_kq_mask_win): 1 = without the window cells that have a ring copy (flags), 2 = the ring's window cells only
+    // (ggml_kq_mask_win): 1 = without the window cells that have a ring copy (flags), 2 = the ring's window cells only
     const int32_t win_mode = ggml_get_op_params_i32(dst, 8), n_win = ggml_get_op_params_i32(dst, 9), n_sinks = ggml_get_op_params_i32(dst, 10);
     const struct ggml_tensor * flags = win_mode == 1 ? dst->src[2] : NULL;
     GGML_ASSERT(win_mode == GGML_KQ_MASK_KIND_PLAIN || win_mode == GGML_KQ_MASK_KIND_WIN_BODY || win_mode == GGML_KQ_MASK_KIND_WIN_RING);
@@ -3033,7 +3033,7 @@ static void ggml_compute_forward_kq_mask(const struct ggml_compute_params * para
     }
 }
 
-// k19-kvlong: GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL (ggml_sel_mask), the rows split over the threads: every cell kq_mask - INFINITY, then the selected
+// GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL (ggml_sel_mask), the rows split over the threads: every cell kq_mask - INFINITY, then the selected
 // cells kq_mask + 0, each rounded as the f16 add of the chain it replaces
 static void ggml_compute_forward_sel_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     const struct ggml_tensor * idx = dst->src[0];
@@ -4359,7 +4359,7 @@ struct ggml_cplan ggml_graph_plan(
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         cur += MAX(prefill, decode);
-                        // k19-kvwin: the second converted Q of a two-source node (one per thread, the row loop's scratch)
+                        // the second converted Q of a two-source node (one per thread, the row loop's scratch)
                         if (node->src[6] != NULL) {
                             cur += sizeof(float)*n_tasks*(2*DK + 2*DV + CACHE_LINE_SIZE_F32);
                         }

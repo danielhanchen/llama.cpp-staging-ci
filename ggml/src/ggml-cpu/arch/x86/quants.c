@@ -504,7 +504,7 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 
 // placeholder implementation for Apple targets
 // The Q8_K activations of every K-quant / IQ vec_dot (the host experts' up / gate rows: each host thread quantizes its
-// batch's tokens, 100 us of a 2.3 ms batch on a Colab A100 VM's Xeon with the reference) in AVX2, the reference's bytes: the first
+// batch's tokens, 100 us of a 2.3 ms batch on a A100 host's Xeon with the reference) in AVX2, the reference's bytes: the first
 // element of the largest magnitude sets the scale, each value is iscale*x rounded to the nearest integer, ties to even, at most 127,
 // and the 16-value sums. A block with a NaN or an infinity, and an all-zero block (the reference leaves its sums as they were), take
 // the reference. GGML_CPU_Q8K_SIMD=0: the reference.
@@ -2241,9 +2241,9 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
-// k19-l4poly: AVX-512 forms of the single-column Q4_K / Q5_K / Q6_K / IQ4_XS dot products, bit-identical to the AVX2 kernels below.
-// The host experts of a MoE whose cache holds a small share of them (LFM2.5-24B-A2B UD-Q4_K_XL at 4 GB, Flint UD-Q4_K_XL at 16 GB on a
-// Colab L4: Xeon @ 2.2 GHz cascadelake) are bound by these kernels, not by DRAM (7-10 GB/s per thread against 66 GB/s, k19-hostrow
+// AVX-512 forms of the single-column Q4_K / Q5_K / Q6_K / IQ4_XS dot products, bit-identical to the AVX2 kernels below.
+// The host experts of a MoE whose cache holds a small share of them (LFM2.5-24B-A2B 4-bit at 4 GB, Flint 4-bit at 16 GB on a
+// L4 host: Xeon @ 2.2 GHz cascadelake) are bound by these kernels, not by DRAM (7-10 GB/s per thread against 66 GB/s
 // XSTAGE). One 512-bit maddubs / madd covers the two 32-weight sub-blocks the AVX2 kernel runs as two 256-bit ones (the same byte
 // pairs, so the same int16 results with the same saturation, and the same int32 products); the int32 lanes of the two halves are
 // added at the end of the super-block instead of after each pair (integer adds: the same sums), and the float part is the AVX2
@@ -2461,7 +2461,7 @@ static void ggml_vec_dot_iq4_xs_q8_K_avx512(int n, float * GGML_RESTRICT s, cons
     }
     *s = hsum_float_8(accum);
 }
-#endif // k19-l4poly AVX-512
+#endif // AVX-512
 
 void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
@@ -3830,8 +3830,8 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #endif
 }
 
-// ---- k19-hostrow: an AVX-512 IQ3_S dot product (single and multi-column), bit-identical to the AVX2 kernel -------------------------
-// The host experts of a spilled MoE (Flash-Next UD-IQ4_XS at 8 GB: gate / up IQ3_S, down IQ4_NL, ~0.2% of the experts on the device)
+// ---- an AVX-512 IQ3_S dot product (single and multi-column), bit-identical to the AVX2 kernel -------------------------
+// The host experts of a spilled MoE (Flash-Next 4-bit at 8 GB: gate / up IQ3_S, down IQ4_NL, ~0.2% of the experts on the device)
 // are bound by the IQ3_S decode, not by DRAM: with 24 threads the AVX2 kernel reads 73 GB/s of weights from the LLC and 60-72 GB/s from
 // DRAM against a 141-195 GB/s read roofline (Xeon 8559C; IQ4_NL runs 210-230 GB/s from the LLC),
 // so every verified row of a draft window costs about one more token of host time. Here the 16 grid entries of 64 weights come from
@@ -3975,9 +3975,9 @@ static void ggml_vec_dot_iq3_s_q8_K_multi_avx512(int n, float * GGML_RESTRICT s,
     }
 }
 
-#endif // k19-hostrow AVX-512
+#endif // AVX-512
 
-// k19-hostrow: once per process (ggml_cpu_init), which IQ3_S kernel this CPU variant runs
+// once per process (ggml_cpu_init), which IQ3_S kernel this CPU variant runs
 void ggml_cpu_iq_kernels_log(void) {
 #if defined(GGML_IQ_AVX512)
     const int m = ggml_iq_avx512_mode();
@@ -4736,7 +4736,7 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
-// ---- k15-fn: multi-column dot products for MUL_MAT_ID's stock path (an expert routed to 2-8 rows of a small batch) -------------------
+// ---- multi-column dot products for MUL_MAT_ID's stock path (an expert routed to 2-8 rows of a small batch) -------------------
 // Each is the AVX2 ggml_vec_dot_X kernel above run for nc columns at once: the weight decode (grid lookups, sign masks, nibble
 // lookups) is done once per block and shared, and every column then runs the same instruction sequence on its own accumulators as the
 // single-column kernel, so each result is bit-identical to ggml_vec_dot_X(column). GGML_CPU_MMID_MULTI=0: the stock loop, as before.
@@ -4836,8 +4836,8 @@ GGML_VDM_INLINE void ggml_vec_dot_iq3_s_q8_K_multi_n(int n, float * GGML_RESTRIC
 
 // Q5_0 (q8_0 activations) for an expert routed to 2-8 rows: each block's weights decoded once (nibbles, 5th bits), then
 // for every column the single-column kernel's own sequence (the signed byte products summed per 4 bytes, the block's scale, one fma
-// per block in block order), so each result is ggml_vec_dot_q5_0_q8_0's bit for bit. Qwen3.8-Flash-Next UD-IQ4_XS keeps its down
-// experts in Q5_0 in most layers: 24% of the host batches' kernel time on a Colab A100 VM, 1.2-1.6x per column at 2-4 columns there
+// per block in block order), so each result is ggml_vec_dot_q5_0_q8_0's bit for bit. Qwen3.8-Flash-Next 4-bit keeps its down
+// experts in Q5_0 in most layers: 24% of the host batches' kernel time on a A100 host, 1.2-1.6x per column at 2-4 columns there
 GGML_VDM_INLINE void ggml_vec_dot_q5_0_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_q5_0 * GGML_RESTRICT x = vx;
     const int nb = n / QK5_0;
@@ -5149,10 +5149,10 @@ static void ggml_vec_dot_iq4_xs_q8_K_multi(int n, float * GGML_RESTRICT s, const
     }
 }
 
-// ---- k17-ttft: multi-column kernels for the K-quants, IQ3_XXS and MXFP4 (Qwen3.6 / LFM2.5 / Flint Q4_K-Q6_K experts, gemma-4
-// IQ3_XXS gate_up, gpt-oss MXFP4). Same contract as the k15-fn ones above: the weight decode of a block is shared, each column runs
+// ---- multi-column kernels for the K-quants, IQ3_XXS and MXFP4 (Qwen3.6 / LFM2.5 / Flint Q4_K-Q6_K experts, gemma-4
+// IQ3_XXS gate_up, gpt-oss MXFP4). Same contract as the ones above: the weight decode of a block is shared, each column runs
 // the single-column AVX2 kernel's instruction sequence on its own accumulators, so every result is bit-identical to ggml_vec_dot_X.
-// Before these, a short prompt's host expert paid almost a whole expert per further token (G4 Qwen3.6 UD-Q4_K_XL calibration:
+// Before these, a short prompt's host expert paid almost a whole expert per further token (RTX PRO 6000 Qwen3.6 4-bit calibration:
 // 21.7 us per expert, 12.5 us per further token), the host path for prompt ubatches lost to the uploads.
 GGML_VDM_INLINE void ggml_vec_dot_q4_K_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_q4_K * GGML_RESTRICT x = vx;
@@ -5522,7 +5522,7 @@ ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type) {
     }
     switch (type) {
 #if defined(GGML_IQ_AVX512)
-        // k19-hostrow: the AVX-512 kernels (GGML_CPU_IQ_AVX512=0: the AVX2 ones), bit-identical
+        // the AVX-512 kernels (GGML_CPU_IQ_AVX512=0: the AVX2 ones), bit-identical
         case GGML_TYPE_IQ3_S:  return ggml_iq_avx512_mode() != 0 ? ggml_vec_dot_iq3_s_q8_K_multi_avx512 : ggml_vec_dot_iq3_s_q8_K_multi;
 #else
         case GGML_TYPE_IQ3_S:  return ggml_vec_dot_iq3_s_q8_K_multi;
@@ -5531,7 +5531,7 @@ ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type) {
         case GGML_TYPE_IQ1_S:   return ggml_vec_dot_iq1_s_q8_K_multi;
         case GGML_TYPE_IQ2_XXS: return ggml_vec_dot_iq2_xxs_q8_K_multi;
         case GGML_TYPE_IQ4_XS:  return ggml_vec_dot_iq4_xs_q8_K_multi;
-        // k17-ttft (GGML_CPU_MMID_MULTI_K=0: these five on the stock loop again)
+        // (GGML_CPU_MMID_MULTI_K=0: these five on the stock loop again)
         case GGML_TYPE_Q4_K:    return on_k ? ggml_vec_dot_q4_K_q8_K_multi    : NULL;
         case GGML_TYPE_Q5_K:    return on_k ? ggml_vec_dot_q5_K_q8_K_multi    : NULL;
         case GGML_TYPE_Q6_K:    return on_k ? ggml_vec_dot_q6_K_q8_K_multi    : NULL;
