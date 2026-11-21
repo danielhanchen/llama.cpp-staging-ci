@@ -45,6 +45,14 @@ constexpr constant static float kvalues_mxfp4_f[16] = {
     0, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f
 };
 
+// log(1 + e) as before; only where 1 + e rounds to 1 (e <= 2^-24, x < -16.6, where it returned 0) it returns e = log1p(e) to F32 precision.
+// The test is on e, not on 1 + e == 1, which fast-math compilers may fold to e == 0
+template <typename T>
+static inline T softplus_tail(T x) {
+    const T e = exp(x);
+    return select(select(log(1.0f + e), e, e <= 5.9604644775390625e-8f), x, x > 20.0f);
+}
+
 static inline int best_index_int8(int n, constant float * val, float x) {
     if (x <= val[0]) return 0;
     if (x >= val[n-1]) return n-1;

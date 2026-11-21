@@ -19,8 +19,14 @@
 #define REQD_SUBGROUP_SIZE_64
 #endif
 
+// log(1 + e) as before; only where 1 + e rounds to 1 (e <= 2^-24, x < -16.6, where it returned 0) it returns e = log1p(e) to F32 precision.
+// The test is on e, not on 1 + e == 1, which fast-math compilers may fold to e == 0
 inline float softplus_f32(float x) {
-    return (x <= 20.0f) ? log(1.0f + exp(x)) : x;
+    if (x > 20.0f) {
+        return x;
+    }
+    const float e = exp(x);
+    return (e <= 5.9604644775390625e-8f) ? e : log(1.0f + e);
 }
 
 // d_state = 128 (most Mamba-2 models, e.g. mamba2-2.7B, Codestral-Mamba).
@@ -307,7 +313,7 @@ kernel void kernel_ssm_scan_f32(
         const float dt_value = *((global const float *) (dt_data + dt_idx));
         const float B_value  = *((global const float *) (B_data  + B_idx));
         const float C_value  = *((global const float *) (C_data  + C_idx));
-        const float dt_soft_plus = dt_value > 20.0f ? dt_value : log(1.0f + exp(dt_value));
+        const float dt_soft_plus = softplus_f32(dt_value);
         const float dA = exp(dt_soft_plus * A_value);
         const float x_dt = x_value * dt_soft_plus;
 
