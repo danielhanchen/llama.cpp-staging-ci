@@ -126,6 +126,8 @@ struct common_sampler {
 
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
+    std::vector<int32_t> q_pos; // rejection scratch: index of each token id in the draft's candidates, -1 when absent
+    std::vector<float>   q_cur; //                    the draft's probability of each target candidate
 
     // greedy_fast: the chain can only pick the highest biased logit (see common_sampler_greedy_fast), so common_sampler_sample
     // takes the argmax of the logits + bias_dense instead of building and sorting n_vocab candidates
@@ -811,6 +813,8 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937((sn_of_chain(chain) ? sn_of_chain(chain)->seed_cur : llama_sampler_get_seed(chain)) ^ 0x9e3779b9u),
+        /* .q_pos   = */ {},
+        /* .q_cur   = */ {},
         /* .greedy_fast = */ false,
         /* .bias_dense  = */ {},
         /* .bias_sparse = */ {},
@@ -967,6 +971,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
+        /* .q_pos   = */ {},
+        /* .q_cur   = */ {},
         /* .greedy_fast = */ gsmpl->greedy_fast,
         /* .bias_dense  = */ gsmpl->bias_dense,
         /* .bias_sparse = */ gsmpl->bias_sparse,
@@ -1636,6 +1642,49 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
     return 0.0f;
 }
 
+void common_sampler_prob_lookup(const llama_token_data * q, size_t n_q, const llama_token_data * cand, size_t n_cand, std::vector<int32_t> & pos, float * out) {
+    llama_token id_max = -1;
+    for (size_t k = 0; k < n_q; ++k) {
+        id_max = std::max(id_max, q[k].id);
+    }
+    if ((int64_t) pos.size() <= (int64_t) id_max) {
+        pos.resize((size_t) id_max + 1, -1);
+    }
+
+    // the first entry of an id wins, as in prob_of
+    for (size_t k = 0; k < n_q; ++k) {
+        const llama_token id = q[k].id;
+        if (id >= 0 && pos[id] < 0) {
+            pos[id] = (int32_t) k;
+        }
+    }
+
+    for (size_t k = 0; k < n_cand; ++k) {
+        const llama_token id = cand[k].id;
+        if (id < 0) {
+            out[k] = prob_of(q, n_q, id);
+        } else {
+            const int32_t j = (size_t) id < pos.size() ? pos[id] : -1;
+            out[k] = j >= 0 ? q[j].p : 0.0f;
+        }
+    }
+
+    for (size_t k = 0; k < n_q; ++k) {
+        if (q[k].id >= 0) {
+            pos[q[k].id] = -1;
+        }
+    }
+}
+
+// LLAMA_SAMPLE_REJECT_SCAN=1: look each candidate up in the draft's candidates by a linear scan (the old O(|p| x |q|) path)
+static bool rejection_scan() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SAMPLE_REJECT_SCAN");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
 // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
 // Preserves the target distribution exactly, and accepts more often than matching does when the
 // draft samples instead of taking its argmax.
@@ -1706,9 +1755,15 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
         // rejected: tokens outside q's support keep all of p
         residual.clear();
+        float * q_cur = nullptr;
+        if (!rejection_scan()) {
+            gsmpl->q_cur.resize(cur_p->size);
+            q_cur = gsmpl->q_cur.data();
+            common_sampler_prob_lookup(q.data(), q.size(), cur_p->data, cur_p->size, gsmpl->q_pos, q_cur);
+        }
         float sum = 0.0f;
         for (size_t k = 0; k < cur_p->size; ++k) {
-            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            const float r = p_of(k) - (q_cur ? q_cur[k] : prob_of(q.data(), q.size(), cur_p->data[k].id));
             if (r > 0.0f) {
                 residual.push_back({ cur_p->data[k].id, 0.0f, r });
                 sum += r;
