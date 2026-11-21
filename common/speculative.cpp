@@ -2297,6 +2297,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     const bool handoff_copy = common_mtp_handoff_on("COPY");
     // LLAMA_MTP_HANDOFF_VH=0: verify_h keeps every row of a prompt ubatch, as before
     const bool verify_h_trim = handoff_copy && common_mtp_handoff_on("VH");
+    // the fewest rows a trimmed verify_h keeps: accept() also runs for another drafter's window (is_other), whose accepted
+    // count can reach that drafter's n_max (ngram-mod up to 1024), so every enabled type's longest draft is kept
+    int32_t verify_h_keep_min = 256;
 
     // LLAMA_MTP_DEV_H=1 (opt-in: decode -0.7..-1.0% on Qwen3.6 at 32 GB, Flash-Next 8k prompt -8% on an RTX PRO 6000; default = host rows, as before):
     // (single-sequence batches of LLAMA_MTP_DEV_H_MIN = 64 tokens or more) they stay on the device (llama_mtp_dev_h_attach) and the
@@ -2427,6 +2430,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
+        verify_h_keep_min = std::max<int32_t>(256, common_speculative_n_max(&params) + 2);
 
         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
@@ -2986,7 +2990,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float * h_end = handoff_copy ? tgt_row(nextn_row_offset + i_batch_end[seq_id]) : nullptr;
             if (ext && handoff_copy) {
                 // the copy below row by row (the stash breaks the rows' contiguity): the same n_keep rows and pending row
-                const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(256, n_max + 2)) : n_rows;
+                const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(verify_h_keep_min, n_max + 2)) : n_rows;
                 verify_h_kept[seq_id] = n_keep;
                 if (verify_h[seq_id].size() < (size_t) n_keep * n_embd) {
                     verify_h[seq_id].resize((size_t) n_keep * n_embd);
@@ -3001,7 +3005,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // accept() reads row min(n_accepted, n_rows - 1) and n_accepted <= n_max: a prompt ubatch (thousands of rows,
                 // 160 MiB at 4096 x 10240 floats) keeps its first n_keep rows and the last one (in pending_h), not all of them;
                 // the copy ran on the main thread after the draft was queued, with the GPU idle (LLAMA_MTP_HANDOFF_VH=0: all rows)
-                const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(256, n_max + 2)) : n_rows;
+                const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(verify_h_keep_min, n_max + 2)) : n_rows;
                 verify_h_kept[seq_id] = n_keep;
                 if (verify_h[seq_id].size() < (size_t) n_keep * n_embd) {
                     verify_h[seq_id].resize((size_t) n_keep * n_embd);
