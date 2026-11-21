@@ -7888,6 +7888,14 @@ struct llama_moe_cache::impl {
     bool rf_any      = false; // some group has a refill pending
     bool in_prepare  = false;
     bool rf_allow    = false; // the unlend being run gives the slots back to a small batch's graph (the only case that refills beside a graph)
+    // only after a graph of at least this many tokens lent the slots (LLAMA_MOE_REFILL_ASYNC_MIN_TOKENS, default 1024): a short prompt's
+    // tail is too short to hide the refill, which then ran into the decode (G4 Qwen3.8-Flash-Next 32 GB, 42-token chat: decode -1.0 /
+    // -1.3% on two VMs with the chat TTFT unchanged); the 8k prompt's tail hides it (decode level)
+    int64_t rf_min_tokens = [] {
+        const char * e = getenv("LLAMA_MOE_REFILL_ASYNC_MIN_TOKENS");
+        return e != nullptr ? (int64_t) atoll(e) : (int64_t) 1024;
+    }();
+    int64_t rf_lend_tokens = 0; // tokens of the last graph that lent slots
     struct { uint64_t async = 0, sync = 0, joins = 0, bytes = 0; } rfs;
     std::vector<int32_t> rf_layers;
 
@@ -11869,6 +11877,7 @@ struct llama_moe_cache::impl {
         // where the refill itself starts) and a measurement do not touch the slots
         if (!dry && (n_copies > 0 || inplace_graph)) {
             rf_join_all();
+            rf_lend_tokens = n_tokens;
         }
 
         // k15-lfm2: a graph of in-place prompts lends one layer of slots for its missing experts; its other copies (if any) stay in the
@@ -12941,7 +12950,7 @@ struct llama_moe_cache::impl {
         const size_t budget0 = budget;
         // asynchronous refill (see rf_on): the uploads run on the upload stream after the clear above, a done flag after each layer's;
         // the layers are marked pending on the compute stream (with the first slot the refill writes) before the next graph
-        ggml_backend_t up = refill_enabled && rf_allow && rf_eligible(g) ? rf_backend(g.id) : nullptr;
+        ggml_backend_t up = refill_enabled && rf_allow && rf_lend_tokens >= rf_min_tokens && rf_eligible(g) ? rf_backend(g.id) : nullptr;
         const int32_t ep = g.rf_epoch + 1;
         int32_t rf_lo = g.n_slots;
         if (up != nullptr) {
