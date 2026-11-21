@@ -11054,8 +11054,13 @@ struct test_lightning_indexer : public test_case {
     const int64_t nm; // ne[3] of mask
 
     const ggml_type type_K;
+    const int64_t cand_bs; // candidate block size, 0 = no candidate blocks (src[4])
+    const int64_t n_cand;  // candidate blocks per token
 
     std::string vars() override {
+        if (cand_bs > 0) {
+            return VARS_TO_STR9(hsk, nh, kv, nb, ns, nm, type_K, cand_bs, n_cand);
+        }
         return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
     }
 
@@ -11068,8 +11073,9 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
+    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16,
+            int64_t cand_bs = 0, int64_t n_cand = 0)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), cand_bs(cand_bs), n_cand(n_cand) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
@@ -11089,6 +11095,12 @@ struct test_lightning_indexer : public test_case {
         ggml_set_name(m, "m");
 
         ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
+        if (cand_bs > 0) {
+            ggml_tensor * c = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_cand, nb, 1, ns);
+            ggml_set_name(c, "c");
+            out->src[4]       = c;
+            out->op_params[0] = (int32_t) cand_bs;
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -11098,6 +11110,14 @@ struct test_lightning_indexer : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "c") == 0) {
+                // candidate block ids, every row of a token keeps n_cand of the kv/cand_bs blocks
+                const int64_t n_blk = (kv + cand_bs - 1)/cand_bs;
+                std::vector<int32_t> ids(ggml_nelements(t));
+                for (size_t i = 0; i < ids.size(); i++) {
+                    ids[i] = (int32_t) ((i*7 + (i/t->ne[0])*3) % n_blk);
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -14907,6 +14927,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 2));
     // Keep the WebGPU dispatch below 65535 workgroups (32 per token for this shape).
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
+    // the same shapes with K > 1 snapshot slots (rollback): every slot is compared
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 2, false, false, /*K=*/3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 2, 2, false, false, /*K=*/2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 1, 1, false, false, /*K=*/4));
 
     // token-tiled kernel window (16+ tokens the chunked kernel does not take): H = 16 / 32 / 48 value heads, head size 128,
     // q / k heads 16 (the models' layout, MMA-eligible from 64 tokens on NVIDIA) and != 16 (never MMA), 1 and 2 sequences
@@ -15017,6 +15041,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
+    }
+
+    // candidate blocks (src[4]): rows outside a token's blocks are -inf
+    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 1024, 4, 1, 1, type_K, 64, 4));
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 1000, 1, 1, 1, type_K, 128, 3));
     }
 
     // MUL_MAT_ID over a sparse bank (the MoE cache read in place: 64 of 2091 / 512 slots routed), with the op param 2 hint that

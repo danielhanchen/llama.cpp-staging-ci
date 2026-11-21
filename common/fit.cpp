@@ -301,6 +301,29 @@ int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, in
     return std::min(reserve_mib, cache_mib - floor_mib);
 }
 
+void common_fit_place8_grow_of(int64_t total_full, int64_t ctx_full, int64_t total_rel, int64_t ctx_rel, int64_t & grow, int64_t & ctx_ub) {
+    ctx_ub = std::max<int64_t>(0, ctx_full - ctx_rel);
+    grow   = total_full - total_rel - ctx_ub;
+}
+
+int64_t common_fit_place8_grow_size(int64_t size_ok, int64_t size_cap, int64_t grow, int64_t ctx_ub,
+        const std::function<bool(int64_t req, int64_t & over)> & measure) {
+    constexpr int64_t MiB = 1024*1024;
+    int64_t req = std::min(size_ok + grow, size_cap);
+    for (int it = 0; it < 3 && req >= size_ok + 128*MiB; it++) {
+        int64_t over = 0;
+        if (!measure(req, over)) {
+            return -1;
+        }
+        over -= ctx_ub;
+        if (over >= 0) {
+            return req;
+        }
+        req += over - 16*MiB;
+    }
+    return -1;
+}
+
 // (lazy KV): the MoE cache sizes a fit raised by the unbacked KV, and by how much (every fit of the process)
 static std::vector<std::pair<size_t, size_t>> g_kv_lazy_grants;
 
@@ -1850,6 +1873,11 @@ static void common_params_fit_impl(
         if (fit_moe_cache) {
             // order: the dense weights of all layers, then the cache (up to the requested size), then experts in device memory
             const size_t size_before = cparams->moe_cache_size;
+            // the decode-sized placements below grow the cache up to the requested size, the margin part included
+            const int64_t size_cap = int64_t(std::min<size_t>(size_before, size_t(INT64_MAX)));
+            auto cap_gain = [&]() {
+                g_moe_margin_gain = std::max<int64_t>(0, std::min<int64_t>(g_moe_margin_gain, size_cap - int64_t(cparams->moe_cache_size)));
+            };
             dmds_t dmds_cpu_moe_req = dmds_cpu_moe; // the measurement at the requested cache size, for the retry below
             fit_moe_cache_size(dmds_cpu_moe, mparams, true);
             bool fits_per_device = cparams->moe_cache_size > 0;
@@ -2111,37 +2139,39 @@ static void common_params_fit_impl(
                             return true;
                         };
                         dmds_t d_s;
-                        // context that grows with n_ubatch (the KV window ring holds n_ubatch slots beside its window) keeps the
+                        // context that grows with n_ubatch (the SWA cache and the KV window ring hold n_ubatch cells beside their window) keeps the
                         // size of the full n_ubatch at run time (only the graphs are reserved at ub_rel): not part of the growth, added back below
                         int64_t ctx_ub = 0;
                         if (measure8(size_ok, d_s)) {
-                            ctx_ub = kv_win_on ? std::max<int64_t>(0, int64_t(dmds_ok[0].mb.context) - int64_t(d_s[0].mb.context)) : 0;
-                            grow   = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total()) - ctx_ub;
+                            common_fit_place8_grow_of(int64_t(dmds_ok[0].mb.total()), int64_t(dmds_ok[0].mb.context),
+                                int64_t(d_s[0].mb.total()), int64_t(d_s[0].mb.context), grow, ctx_ub);
                         }
                         // a host-bound device takes even a smaller difference (LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB, 256 as elsewhere)
                         static const int64_t hb_min = int64_t(getenv("LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB") != nullptr ?
                             std::max(1, atoi(getenv("LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB"))) : 256)*MiB;
                         if (grow >= (hostbound ? hb_min : 256*MiB)) {
-                            int64_t req = int64_t(size_ok) + grow;
-                            for (int it = 0; it < 3 && req >= int64_t(size_ok) + 128*MiB; it++) {
-                                dmds_t d8;
-                                if (!measure8(size_t(req), d8)) {
-                                    break;
-                                }
-                                const int64_t s8 = int64_t(d8[0].free) - int64_t(d8[0].mb.total()) - ctx_ub - margins[0];
-                                LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
-                                    " MiB over the margin\n", __func__, ub_rel, req/MiB, (size_t) (d8[0].mb.compute/MiB), s8/MiB);
-                                if (s8 >= 0) {
-                                    d8[0].mb.context += size_t(ctx_ub);
-                                    dmds_cpu_moe = d8;
-                                    got = true;
-                                    break;
-                                }
-                                req += s8 - 16*MiB;
+                            dmds_t d8;
+                            const int64_t req = common_fit_place8_grow_size(int64_t(size_ok), size_cap, grow, ctx_ub,
+                                [&](int64_t r, int64_t & over) {
+                                    if (!measure8(size_t(r), d8)) {
+                                        return false;
+                                    }
+                                    over = int64_t(d8[0].free) - int64_t(d8[0].mb.total()) - margins[0];
+                                    LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
+                                        " MiB over the margin\n", __func__, ub_rel, r/MiB, (size_t) (d8[0].mb.compute/MiB), (over - ctx_ub)/MiB);
+                                    return true;
+                                });
+                            if (req >= 0) {
+                                d8[0].mb.context += size_t(ctx_ub);
+                                dmds_cpu_moe = d8;
+                                got = true;
                             }
                         }
                         cparams->n_ubatch = ub_full;
                         p8_got = got;
+                        if (got) {
+                            cap_gain();
+                        }
                         if (got) {
                             LOG_INF("%s: small device: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> "
                                 "%zu MiB; ubatches of more than %u tokens run with the cache banks released (LLAMA_FIT_PLACE8=0 off)\n",
@@ -2321,29 +2351,32 @@ static void common_params_fit_impl(
                         return true;
                     };
                     dmds_t d_s;
+                    int64_t ctx_ub = 0; // context that keeps its full-n_ubatch size at run time, as in the small-device branch
                     if (measure_mid(size_ok, d_s)) {
-                        grow = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total());
+                        common_fit_place8_grow_of(int64_t(dmds_ok[0].mb.total()), int64_t(dmds_ok[0].mb.context),
+                            int64_t(d_s[0].mb.total()), int64_t(d_s[0].mb.context), grow, ctx_ub);
                     }
                     if (grow >= 256*MiB && double(grow) >= placemid_min_frac*double(size_ok)) {
-                        int64_t req = int64_t(size_ok) + grow;
-                        for (int it = 0; it < 3 && req >= int64_t(size_ok) + 128*MiB; it++) {
-                            dmds_t dm;
-                            if (!measure_mid(size_t(req), dm)) {
-                                break;
-                            }
-                            const int64_t sm = int64_t(dm[0].free) - int64_t(dm[0].mb.total()) - margins[0];
-                            LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
-                                " MiB over the margin\n", __func__, ub_rel, req/MiB, (size_t) (dm[0].mb.compute/MiB), sm/MiB);
-                            if (sm >= 0) {
-                                dmds_cpu_moe = dm;
-                                got = true;
-                                break;
-                            }
-                            req += sm - 16*MiB;
+                        dmds_t dm;
+                        const int64_t req = common_fit_place8_grow_size(int64_t(size_ok), size_cap, grow, ctx_ub,
+                            [&](int64_t r, int64_t & over) {
+                                if (!measure_mid(size_t(r), dm)) {
+                                    return false;
+                                }
+                                over = int64_t(dm[0].free) - int64_t(dm[0].mb.total()) - margins[0];
+                                LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
+                                    " MiB over the margin\n", __func__, ub_rel, r/MiB, (size_t) (dm[0].mb.compute/MiB), (over - ctx_ub)/MiB);
+                                return true;
+                            });
+                        if (req >= 0) {
+                            dm[0].mb.context += size_t(ctx_ub);
+                            dmds_cpu_moe = dm;
+                            got = true;
                         }
                     }
                     cparams->n_ubatch = ub_full;
                     if (got) {
+                        cap_gain();
                         common_fit_place8_env(ub_rel, true, grow/MiB, false, devs[0]);
                         LOG_INF("%s: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> %zu MiB; "
                             "ubatches of more than %u tokens run with the cache banks released, layer-major groups as before ("
@@ -3015,14 +3048,16 @@ std::vector<size_t> common_fit_margin_steps_mib(const char * spec) {
     return steps;
 }
 
-std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size_t> & margins, const std::vector<size_t> & steps) {
+std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size_t> & margins, const std::vector<size_t> & steps,
+                                                           const std::vector<size_t> & reserve) {
     std::vector<std::vector<size_t>> trials;
     for (const size_t step : steps) {
         std::vector<size_t> mg = margins;
         bool lower = false;
-        for (auto & m : mg) {
-            if (m > step) {
-                m = step;
+        for (size_t i = 0; i < mg.size(); i++) {
+            const size_t r = i < reserve.size() ? std::min(reserve[i], mg[i]) : 0;
+            if (mg[i] - r > step) {
+                mg[i] = step + r;
                 lower = true;
             }
         }

@@ -3317,6 +3317,10 @@ uma_restart:
     if (params.split_mode_auto) {
         params.split_mode      = LLAMA_SPLIT_MODE_LAYER;
         params.split_mode_auto = false;
+        if (params.moe_cache_size == 0 && params.moe_cache_size_auto > 0) {
+            params.moe_cache_size = params.moe_cache_size_auto;
+        }
+        params.moe_cache_size_auto = 0;
     }
 
     auto mparams = common_model_params_to_llama_impl(params, params.fit_params);
@@ -4724,8 +4728,15 @@ uma_restart:
                         "the margin stays (LLAMA_FIT_PLAIN_HEADLESS=1 steps it down)\n", __func__, mparams.n_gpu_layers, sig.c_str());
                 } else {
                     const char * e_m = getenv("LLAMA_FIT_PLAIN_SPILL_MARGINS_MIB");
+                    // memory added to the default margin before the fit (the server's multimodal projector, loaded after
+                    // the model) is kept on top of every step
+                    const std::vector<size_t> def_margins = common_params().fit_params_target;
+                    std::vector<size_t> reserve(margins_in.size(), 0);
+                    for (size_t i = 0; i < margins_in.size() && i < def_margins.size(); i++) {
+                        reserve[i] = margins_in[i] > def_margins[i] ? margins_in[i] - def_margins[i] : 0;
+                    }
                     const std::vector<std::vector<size_t>> trials = common_fit_margin_trials(margins_in,
-                        common_fit_margin_steps_mib(e_m != nullptr ? e_m : "512,448,256,192"));
+                        common_fit_margin_steps_mib(e_m != nullptr ? e_m : "512,448,256,192"), reserve);
                     for (const std::vector<size_t> & mgs : trials) {
                         llama_model_params   mps  = mparams_in;
                         llama_context_params cps  = cparams_in;
@@ -5162,6 +5173,7 @@ uma_restart:
                         mparams.tensor_buft_overrides = mparams_in.tensor_buft_overrides != nullptr && !params.tensor_buft_overrides.empty() ?
                             params.tensor_buft_overrides.data() : mparams_in.tensor_buft_overrides;
                         cparams.moe_cache_size = 0;
+                        params.moe_cache_size_auto = params.moe_cache_size;
                         params.moe_cache_size  = 0;
                     }
                     if (fits) {

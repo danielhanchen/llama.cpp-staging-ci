@@ -44,6 +44,20 @@ int main() {
         const auto tr4 = common_fit_margin_trials({1024*MiB}, common_fit_margin_steps_mib("512,512,256"));
         CHECK(tr4.size() == 2);
     }
+    // a reserve on top of the default margin (a 768 MiB projector loaded after the model) stays on top of every step
+    {
+        const std::vector<size_t> steps = common_fit_margin_steps_mib("512,448,256,192");
+        const auto tr = common_fit_margin_trials({(1024 + 768)*MiB}, steps, {768*MiB});
+        CHECK(tr.size() == 4);
+        CHECK(tr.size() == 4 && tr[0][0] == (512 + 768)*MiB && tr[1][0] == (448 + 768)*MiB && tr[2][0] == (256 + 768)*MiB &&
+              tr[3][0] == (192 + 768)*MiB);
+        // no reserve: the same trials as without the argument
+        const auto tr0 = common_fit_margin_trials({1024*MiB, 200*MiB}, steps, {0, 0});
+        CHECK(tr0 == common_fit_margin_trials({1024*MiB, 200*MiB}, steps));
+        // per device: only the device with the projector keeps it
+        const auto tr2 = common_fit_margin_trials({(1024 + 300)*MiB, 1024*MiB}, steps, {300*MiB, 0});
+        CHECK(tr2.size() == 4 && tr2[0][0] == (512 + 300)*MiB && tr2[0][1] == 512*MiB);
+    }
     // the display gate
     {
         CHECK( common_fit_plain_spill_gate({1}, nullptr));
