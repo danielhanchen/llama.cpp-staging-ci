@@ -13291,6 +13291,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 3, 2, 1}));
+    // BF16 weights of 20 Mi elements or more with 2..16 columns: the shapes the CUDA backend can route to cuBLAS
+    for (int n : {2, 5, 8, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 5120, n, 4096, {1, 1}, {1, 1}));
+    }
+    // one-channel weight broadcast over one-column src1 channels, at a width where the folded product leaves the vector kernel
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 5120, 1, 4096, {1, 1}, {8, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, 1, 4096, {1, 1}, {8, 1}));
 
     // BF16 in src1, as ggml_conv_1d_dw emits it for a BF16 kernel
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 1, 256, {1, 1}, {1, 1}));
