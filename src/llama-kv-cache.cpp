@@ -512,7 +512,8 @@ llama_kv_cache::llama_kv_cache(
                     if (!ok) {
                         // (the host chunks backed so far stay; the rest is device memory: a plain cache from here on)
                         LLAMA_LOG_WARN("%s: kv sel: host or device memory for the split K/V buffer failed, the rest is backed in device memory\n", __func__);
-                        if (sel_committed_fn == nullptr && !sp.commit(buf, 0, ggml_backend_buffer_get_size(buf))) {
+                        // checked for every buffer: an earlier buffer that engaged the split says nothing about this one
+                        if (!sp.commit(buf, 0, ggml_backend_buffer_get_size(buf))) {
                             throw std::runtime_error("failed to back the kv sel buffer");
                         }
                     } else {
