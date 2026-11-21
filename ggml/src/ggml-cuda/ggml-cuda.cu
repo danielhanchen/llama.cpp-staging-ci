@@ -2849,8 +2849,11 @@ static bool ggml_cuda_mmf_loses_to_cublas(const ggml_tensor * src0, const ggml_t
         return false;
     }
     // Small weights cannot amortise the cuBLAS launch and the F32->BF16 activation conversion.
-    // 4 Mi elements, chosen from a threshold sweep over 0, 1 Mi, 4 Mi and 16 Mi on both models.
-    return src0->ne[0]*src0->ne[1] >= 4*1024*1024;
+    // 20 Mi elements. A sweep over 0, 1, 4, 16, 20 and 32 Mi on both models shows the dense win
+    // is flat from 4 to 20 Mi and drops about 5 percent at 32 Mi, so this is the largest floor
+    // that costs nothing. It also leaves the MoE model bit-identical, since its widest routed
+    // weight is 16.8 Mi.
+    return src0->ne[0]*src0->ne[1] >= 20*1024*1024;
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
