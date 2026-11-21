@@ -13,7 +13,7 @@
 // into A fragments) follows llama.cpp's mmq-few.cu (llama.cpp authors, MIT), extended here with ids, gathered columns and a fused GLU.
 // GGML_CUDA_MOE_TC: 0 = off (the mul_mat_vec_q MoE kernels, byte for byte), 1 = verify windows (default), 2 = every 2..8-token
 // MUL_MAT_ID (bench); GGML_CUDA_MOE_TC_TYPES = comma list of type names or "all" (default q4_K,q5_K,q6_K; the others are opt-in); GGML_CUDA_MOE_TC_KW = warps
-// splitting K (1 / 2 / 4, bench); GGML_CUDA_MOE_TC_LOG=1: one line per launch ("k19-ampmoe:").
+// splitting K (1 / 2 / 4, bench); GGML_CUDA_MOE_TC_LOG=1: one line per launch ("int8 tensor-core MoE:").
 
 // whether the kernel takes this MUL_MAT_ID (type, K, tokens, device, fusion, verify window)
 bool ggml_cuda_moe_tc_ok(ggml_type type, int64_t ncols_x, int64_t ncols_dst, int cc, const ggml_cuda_mm_fusion_args_device & fusion);

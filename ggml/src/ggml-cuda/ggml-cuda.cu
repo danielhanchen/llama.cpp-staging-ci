@@ -9667,7 +9667,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     static bool logged[2] = { false, false };
                     if (!logged[silu_gate]) {
                         logged[silu_gate] = true;
-                        GGML_LOG_INFO("%s: k19 gated norm: rms_norm * w * %s(z)%s in one kernel (GGML_CUDA_DISABLE_GATED_NORM_Q8=1: off%s)\n",
+                        GGML_LOG_INFO("%s: gated norm: rms_norm * w * %s(z)%s in one kernel (GGML_CUDA_DISABLE_GATED_NORM_Q8=1: off%s)\n",
                                       __func__, silu_gate ? "silu" : "sigmoid", q8_1_out ? " + q8_1" : "",
                                       silu_gate ? "; GGML_CUDA_GATED_NORM_SILU=0: sigmoid only" : "");
                     }
@@ -9696,7 +9696,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 static bool logged = false;
                 if (!logged) {
                     logged = true;
-                    GGML_LOG_INFO("%s: k19 L2 norm pair: two rms_norm * scale in one launch (GGML_CUDA_DISABLE_L2_NORM_PAIR=1: off)\n", __func__);
+                    GGML_LOG_INFO("%s: L2 norm pair: two rms_norm * scale in one launch (GGML_CUDA_DISABLE_L2_NORM_PAIR=1: off)\n", __func__);
                 }
                 return ir + 1 - i;
             }

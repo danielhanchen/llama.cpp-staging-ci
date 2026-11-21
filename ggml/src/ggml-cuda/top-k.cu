@@ -1000,7 +1000,7 @@ static void top_k_radix_one_block_cuda(const float * src, int * dst, int ncols, 
         static bool logged_v2 = false;
         if (!logged_v2) {
             logged_v2 = true;
-            GGML_LOG_INFO("%s: k19 top-k radix select in one launch, 8 columns per thread (%lld rows of %d; GGML_CUDA_TOPK_ONEBLOCK_V2=0: off)\n",
+            GGML_LOG_INFO("%s: top-k radix select in one launch, 8 columns per thread (%lld rows of %d; GGML_CUDA_TOPK_ONEBLOCK_V2=0: off)\n",
                     __func__, (long long) nrows, ncols);
         }
         return;
@@ -1009,7 +1009,7 @@ static void top_k_radix_one_block_cuda(const float * src, int * dst, int ncols, 
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: k19 top-k radix select in one launch (%lld rows of %d; GGML_CUDA_TOPK_ONEBLOCK=0: off)\n", __func__, (long long) nrows, ncols);
+        GGML_LOG_INFO("%s: top-k radix select in one launch (%lld rows of %d; GGML_CUDA_TOPK_ONEBLOCK=0: off)\n", __func__, (long long) nrows, ncols);
     }
 }
 

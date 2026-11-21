@@ -2311,7 +2311,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     }
     const char * rule = force > 0 ? "forced" : lend_graph ? (spill_lend ? "experts spill, compute buffers lent from the cache (LLAMA_MOE_SPILL_LEND=0 to disable)" :
         fix2_lend ? "the growth would shrink a spilling cache, compute buffers lent from the cache (LLAMA_MOE_PREFILL_UB_SHRINK_LEND=0 to disable)" :
-        "LLAMA_MOE_CACHE_LEND=2") : rule_frac ? "LLAMA_MOE_PREFILL_UB_AUTO=1" : fix2_take ? "the growth taken from the cache (k5 rule, RAM gate)" :
+        "LLAMA_MOE_CACHE_LEND=2") : rule_frac ? "LLAMA_MOE_PREFILL_UB_AUTO=1" : fix2_take ? "the growth taken from the cache (RAM gate)" :
         rule_spill ? "experts spill, at most LLAMA_MOE_PREFILL_UB_SPILL_FRAC of the cache, no KV growth" : "every expert cached, no KV growth";
 
     uint32_t pick   = cands[0];
@@ -2352,7 +2352,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
         fix2_lend  = false;
         lend_graph = false;
         fix2_take  = true;
-        rule = "the growth taken from the cache (k5 rule: lending gives no larger n_ubatch)";
+        rule = "the growth taken from the cache (lending gives no larger n_ubatch)";
         COM_INF("MoE cache: lending gives no n_ubatch above %u: its growth is taken from the cache (LLAMA_MOE_PREFILL_UB_SHRINK_LEND=0 keeps "
             "n_ubatch %u)\n", cands[0], ub_def);
     }

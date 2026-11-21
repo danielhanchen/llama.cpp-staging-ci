@@ -3616,7 +3616,7 @@ static bool mul_mat_vec_q_tab_launch(
         static bool logged = false;
         if (!logged && getenv("GGML_CUDA_MMVQ_IQ_TAB_LOG") != nullptr) {
             logged = true;
-            GGML_LOG_INFO("%s: k19-%s %s in shared memory: %s, %d rows per block, ids %d, small_k %d\n", __func__,
+            GGML_LOG_INFO("%s: mat-vec %s: %s in shared memory: %s, %d rows per block, ids %d, small_k %d\n", __func__,
                 grid_type ? "iqsmem" : mmvq_tab_iq2_type(type) ? "iqsmem" : "dsv4p", grid_type ? "grid (MUL_MAT_ID rows)" : "codebook",
                 ggml_type_name(type), rpb, ids != nullptr, (int) small_k);
         }
