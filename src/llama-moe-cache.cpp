@@ -7869,8 +7869,8 @@ struct llama_moe_cache::impl {
     // (a lend with copies, unlend, its uploads, copies and seeds of large batches). Only for groups with device lookups and experts in
     // pinned host memory (no RAM tier, no weight store), on CUDA.
     // The first launch of a kernel that was never loaded (lazy module loading) waits for the device to go idle, the upload stream
-    // included: in the first long prompt of a process the overlap ends at the first such kernel of its tail (G4, Qwen3.8-Flash-Next
-    // UD-IQ4_XS at 48 GB: the indexer kernel of long contexts, 57 ms); later long prompts overlap the whole tail (8k TTFT -56 ms there)
+    // included: in the first long prompt of a process the overlap ends at the first such kernel of its tail (RTX PRO 6000, a 4-bit
+    // MoE at 48 GB: the indexer kernel of long contexts, 57 ms); later long prompts overlap the whole tail (8k TTFT -56 ms there)
     bool rf_on = [] {
         const char * e = getenv("LLAMA_MOE_REFILL_ASYNC");
         return e == nullptr || atoi(e) != 0;
