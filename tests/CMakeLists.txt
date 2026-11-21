@@ -183,7 +183,7 @@ llama_build(test-state-async.cpp)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp LINK llama)
-    llama_build_and_test(test-sampling.cpp LINK llama)
+    llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp LINK llama)
     llama_build_and_test(test-grammar-integration.cpp)
@@ -305,6 +305,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --rs-replay-sched -s 1
     )
+    # MTP draft contexts (qwen35, qwen35moe, deepseek4): a batch with no output row writes the cache bytes of the whole block
+    foreach(MKV_MODE "" "kill")
+        if (MKV_MODE STREQUAL "")
+            set(MKV_NAME test-mtp-kv-only)
+        else()
+            set(MKV_NAME test-mtp-kv-only-${MKV_MODE})
+        endif()
+        llama_test(test-llama-archs NAME ${MKV_NAME} LABEL main ARGS --mtp-kv-only -s 1)
+        if (MKV_MODE STREQUAL "kill")
+            set_tests_properties(${MKV_NAME} PROPERTIES ENVIRONMENT "LLAMA_MTP_KV_ONLY_QWEN35=0;LLAMA_MTP_KV_ONLY_DSV4=0")
+        endif()
+    endforeach()
     llama_test(
         test-llama-archs
         NAME test-small-backends

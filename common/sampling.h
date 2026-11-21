@@ -119,6 +119,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// out[k] = the probability of cand[k].id in q (the first entry with that id; 0 when absent), in O(n_q + n_cand).
+// pos is scratch indexed by token id: -1 everywhere on entry, and left that way (it may grow).
+void common_sampler_prob_lookup(const llama_token_data * q, size_t n_q, const llama_token_data * cand, size_t n_cand, std::vector<int32_t> & pos, float * out);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // shared-noise (Gumbel-max) sampling, LLAMA_SHARED_NOISE=1 (default off; 0 = off, the kill switch).

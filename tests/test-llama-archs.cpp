@@ -14,6 +14,9 @@
 #include "../src/llama-model-saver.h"
 #include "test-rpc-inproc.h"
 
+// src/llama-graph.h
+int64_t llama_graph_mtp_kv_only_count();
+
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -1106,6 +1109,132 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
     return 0;
 }
 
+// MTP draft contexts of qwen35 / qwen35moe / deepseek4: a batch with no output row builds only the block's cache writes
+// (llm_graph_context::mtp_kv_only). The cache it leaves must hold the bytes the whole block writes for the same rows (the same rows
+// decoded with every row an output), and the drafts after it the same logits: a prompt pass, then a catch-up of 3 rows, then 2 rows
+static int check_mtp_kv_only(const std::string & arch_filter, const size_t seed, const float stdev) {
+    int ret = 0;
+    for (const auto & [arch_id, moe] : std::vector<std::pair<llm_arch, bool>>{ { LLM_ARCH_QWEN35, false }, { LLM_ARCH_QWEN35MOE, true }, { LLM_ARCH_DEEPSEEK4, true } }) {
+        if (!arch_matches(arch_filter, arch_id)) {
+            continue;
+        }
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch_id, moe);
+        const std::string arch = llm_arch_name(arch_id);
+        const int64_t kid = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
+        GGML_ASSERT(kid >= 0);
+        const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), kid);
+        gguf_set_val_u32(gguf_ctx.get(), (arch + ".block_count").c_str(), n_layer + 1);
+        gguf_set_val_u32(gguf_ctx.get(), (arch + ".nextn_predict_layers").c_str(), 1);
+        if (arch_id == LLM_ARCH_DEEPSEEK4) {
+            const std::vector<uint32_t> ratios = { 0, 0, 4, 128, 0 }; // the MTP block attends densely
+            gguf_set_arr_data(gguf_ctx.get(), (arch + ".attention.compress_ratios").c_str(), GGUF_TYPE_UINT32, ratios.data(), ratios.size());
+        }
+
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+        model_params.devices         = devs.data();
+        model_params.use_extra_bufts = false;
+        model_params.load_mtp        = true;
+        tensor_data_params tensor_params = { seed, stdev };
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+        if (!model) {
+            fprintf(stderr, "%s: %s MTP: failed to create the model\n", __func__, arch.c_str());
+            ret = 1;
+            continue;
+        }
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const size_t  n_h     = llama_model_n_embd_out(model.get());
+
+        // two draft contexts: k (no output rows, cache writes only) and f (every row an output, the whole block)
+        llama_context_ptr ctx[2];
+        for (auto & c : ctx) {
+            llama_context_params ctx_params = llama_context_default_params();
+            ctx_params.n_ctx           = 256;
+            ctx_params.n_ubatch        = 64;
+            ctx_params.n_threads       = 4;
+            ctx_params.n_threads_batch = 4;
+            ctx_params.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
+            c.reset(llama_init_from_model(model.get(), ctx_params));
+        }
+        if (!ctx[0] || !ctx[1]) {
+            fprintf(stderr, "%s: %s MTP: failed to create the MTP contexts\n", __func__, arch.c_str());
+            ret = 1;
+            continue;
+        }
+
+        std::mt19937 gen(seed);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> h(256 * n_h);
+        for (auto & x : h) {
+            x = nd(gen);
+        }
+        std::vector<llama_token> tok(256);
+        for (auto & t : tok) {
+            t = (llama_token) (gen() % n_vocab);
+        }
+
+        // rows [p0, p0 + n) with the outputs of `out_k` on context k and all outputs on context f
+        bool ok = true;
+        auto run = [&](int32_t p0, int32_t n, bool out_k) {
+            for (int j = 0; j < 2; ++j) {
+                const bool out = j == 1 || out_k;
+                common_batch batch(ctx[j].get());
+                for (int32_t i = 0; i < n; ++i) {
+                    batch.add(tok[p0 + i], p0 + i, 0, out);
+                    batch.set_embd_state(i, { h.data() + (size_t) (p0 + i) * n_h, 1, n_h });
+                }
+                if (llama_process(ctx[j].get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                    ok = false;
+                }
+            }
+        };
+        auto same_cache = [&]() {
+            std::vector<uint8_t> st[2];
+            for (int j = 0; j < 2; ++j) {
+                st[j].resize(llama_state_seq_get_size(ctx[j].get(), 0));
+                st[j].resize(llama_state_seq_get_data(ctx[j].get(), st[j].data(), st[j].size(), 0));
+            }
+            return !st[0].empty() && st[0] == st[1];
+        };
+        auto same_logits = [&](int32_t n) {
+            for (int32_t i = 0; i < n; ++i) {
+                const float * a = llama_get_logits_ith(ctx[0].get(), i);
+                const float * b = llama_get_logits_ith(ctx[1].get(), i);
+                if (a == nullptr || b == nullptr || memcmp(a, b, n_vocab * sizeof(float)) != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const int64_t n_kv_only0 = llama_graph_mtp_kv_only_count();
+        run(0, 40, false);                       // prompt
+        const bool cache_prompt = ok && same_cache();
+        run(40, 2, true);                        // draft
+        const bool logits_draft = ok && same_logits(2);
+        run(42, 3, false);                       // catch-up after a verify
+        const bool cache_catchup = ok && same_cache();
+        run(45, 2, true);
+        const bool logits_next = ok && same_logits(2);
+        const int64_t n_kv_only = llama_graph_mtp_kv_only_count() - n_kv_only0;
+
+        // the kill switch keeps the whole block: then no graph is a cache-writes-only one
+        const char * kill = arch_id == LLM_ARCH_DEEPSEEK4 ? "LLAMA_MTP_KV_ONLY_DSV4" : "LLAMA_MTP_KV_ONLY_QWEN35";
+        const bool killed = (getenv(kill) && atoi(getenv(kill)) == 0) || (getenv("LLAMA_MTP_PROMPT_KV_ONLY") && atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY")) == 0);
+        const bool engaged = killed ? n_kv_only == 0 : n_kv_only >= 2;
+
+        const bool pass = ok && cache_prompt && logits_draft && cache_catchup && logits_next && engaged;
+        printf("|%15s|%30s|%6s|%15s|%9s| cache-writes-only graphs %lld%s, cache %s / %s, logits %s / %s\n", arch.c_str(), "MTP no-output batches", "-", "-",
+            pass ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m", (long long) n_kv_only, killed ? " (killed)" : "",
+            cache_prompt ? "equal" : "DIFF", cache_catchup ? "equal" : "DIFF", logits_draft ? "equal" : "DIFF", logits_next ? "equal" : "DIFF");
+        if (!pass) {
+            ret = 1;
+        }
+    }
+    return ret;
+}
+
 // qwen4exp MTP draft context (a separate drafter, LLAMA_CONTEXT_TYPE_MTP): the NextN block with compress ratio 4 runs QSA, with ratio 0
 // (the MTP/ sidecar of unsloth/Qwen3.8-Flash-Next-GGUF before 766911a6) it attends densely and must not build k-pool inputs that no op
 // reads (they stay unallocated and aborted in set_input with GGML_ASSERT(buffer)). Decodes 2 tokens on zero hidden states, as
@@ -1803,6 +1932,7 @@ int main(int argc, char ** argv) {
     bool rs_decode_parity = false;
     bool rs_replay_sched  = false; // delta-net replay commits of a split state
     bool small_backends   = false; // small backends
+    bool mtp_kv_only      = false; // MTP no-output batches
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1861,6 +1991,8 @@ int main(int argc, char ** argv) {
             rs_decode_parity = true;
         } else if (strcmp(argv[i], "--rs-replay-sched") == 0) {
             rs_replay_sched = true;
+        } else if (strcmp(argv[i], "--mtp-kv-only") == 0) {
+            mtp_kv_only = true;
         } else if (strcmp(argv[i], "--small-backends") == 0) {
             small_backends = true;
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
@@ -1905,6 +2037,9 @@ int main(int argc, char ** argv) {
         }
         if (small_backends) {
             return check_small_graph_backends(seed, stdev);
+        }
+        if (mtp_kv_only) {
+            return check_mtp_kv_only(arch_filter, seed, stdev);
         }
         int ret = 0;
         if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP) && target_backend == nullptr) {

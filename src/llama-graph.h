@@ -1109,6 +1109,9 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// MTP drafter graphs built as cache writes only (llm_graph_context::mtp_kv_only), in this process
+int64_t llama_graph_mtp_kv_only_count();
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1399,6 +1402,16 @@ struct llm_graph_context {
     // without a ring); n_embd_v_view > 0: V is a view of K (MLA)
     llm_graph_attn_src2 build_kv_win_src(const llm_graph_kv_win & w, const llama_kv_cache_context * mctx, ggml_tensor * k_cur,
             ggml_tensor * v_cur, int il, int64_t n_embd_v_view) const;
+
+    // MTP drafter graphs: true when this batch only has to write its cache rows (no output row, so the block's attention output,
+    // FFN and head have no reader). arch_on: the model's own switch; win_on: the cache keeps a window ring (then the full block runs)
+    bool mtp_kv_only(bool arch_on, bool win_on) const;
+
+    // the cache-write half of build_attn: rotation, then the K / V rows of this ubatch into the cache, the same ops in the same order
+    void build_attn_kv_store(llm_graph_input_attn_kv * inp, ggml_tensor * k_cur, ggml_tensor * v_cur, int il) const;
+
+    // the same for a K-only cache whose V is a view of K (llm_graph_input_attn_k_iswa)
+    void build_attn_k_store(llm_graph_input_attn_k_iswa * inp, ggml_tensor * k_cur, int il) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
