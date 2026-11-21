@@ -796,7 +796,7 @@ static bool ggml_cuda_ar_p2p_faster(ggml_cuda_ar_pipeline * p, double * us_p2p, 
 }
 #endif // !defined(GGML_USE_HIP)
 
-// Decides the P2P path: GGML_CUDA_AR_P2P=0 disables it, =1 uses it whenever the probe passes;
+// Decides the P2P path (never in a GGML_CUDA_NO_PEER_COPY build): GGML_CUDA_AR_P2P=0 disables it, =1 uses it whenever the probe passes;
 // unset (auto) also requires it to be faster than host staging (ggml_cuda_ar_p2p_faster). It is
 // only considered when both
 // directions report peer access, peer access can be enabled and the probe passes.
@@ -806,6 +806,15 @@ static bool ggml_cuda_ar_p2p_setup(ggml_cuda_ar_pipeline * p, char * why, size_t
     GGML_UNUSED(p);
     return false;
 #else
+#ifdef GGML_CUDA_NO_PEER_COPY
+    constexpr bool no_peer_copy = true;
+#else
+    constexpr bool no_peer_copy = false;
+#endif // GGML_CUDA_NO_PEER_COPY
+    if (no_peer_copy) {
+        snprintf(why, why_n, "disabled by GGML_CUDA_NO_PEER_COPY");
+        return false;
+    }
     const char * env = getenv("GGML_CUDA_AR_P2P");
     if (env != nullptr && strcmp(env, "0") == 0) {
         snprintf(why, why_n, "disabled by GGML_CUDA_AR_P2P=0");
