@@ -35,6 +35,17 @@ int llama_fit_params(int argc, char ** argv) {
     auto cparams = common_context_params_to_llama(params);
 
     if (!params.fit_params_print) {
+        // as common_init_from_params: an explicit -ub is kept by the fit without flash attention
+        common_fit_set_ubatch_user(params.n_ubatch_set);
+        common_fit_faoff_ubatch_reset();
+        // the small-device placement of the fit (LLAMA_FIT_PLACE8) sizes the MoE cache for prompt buffers that only this process
+        // shrinks (LLAMA_MOE_PLACE8_UB, set in its environment): the printed arguments cannot carry that, so a launch with them would
+        // reserve the full prompt buffers beside the larger cache. Off here unless set explicitly
+        if (getenv("LLAMA_FIT_PLACE8") == nullptr) {
+            common_set_env("LLAMA_FIT_PLACE8", "0");
+        }
+        const uint32_t n_batch_in  = cparams.n_batch;
+        const uint32_t n_ubatch_in = cparams.n_ubatch;
         const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
                 params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), params.fit_params_min_ctx,
                 nullptr,
@@ -78,6 +89,13 @@ int llama_fit_params(int argc, char ** argv) {
         } else if (params.moe_cache_size > 0) {
             // the fit may reduce the MoE cache, print the fitted size
             printf(" --moe-cache-mib %zu", cparams.moe_cache_size/(1024*1024));
+        }
+        if (cparams.n_batch != n_batch_in) {
+            printf(" -b %" PRIu32, cparams.n_batch);
+        }
+        if (cparams.n_ubatch != n_ubatch_in) {
+            // the fit chose a smaller n_ubatch (flash attention off): the placement above was measured at it
+            printf(" -ub %" PRIu32, cparams.n_ubatch);
         }
         printf("\n");
     } else {

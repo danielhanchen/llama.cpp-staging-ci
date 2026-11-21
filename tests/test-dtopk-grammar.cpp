@@ -36,6 +36,13 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+// POSIX environment helpers for the MSVC CRT (getenv sees _putenv_s; an empty value removes the variable)
+static int setenv(const char * name, const char * value, int overwrite) {
+    return !overwrite && getenv(name) != nullptr ? 0 : _putenv_s(name, value);
+}
+#endif
+
 static int g_fail = 0;
 static int g_lazy_modes = 0; // profile x mode pairs whose lazy grammar cases ran
 

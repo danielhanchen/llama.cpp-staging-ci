@@ -570,6 +570,8 @@ llama_build_and_test(test-fit-plain-spill.cpp)
 llama_build_and_test(test-fit-faoff.cpp)
 # --fit: the MoE cache size of a decode-sized placement, at most the size requested (common/fit.h)
 llama_build_and_test(test-fit-place8-grow.cpp)
+# --fit: the K/V cells of an all-sliding DFlash drafter, with and without --swa-full (common_fit_dflash_draft_bytes)
+llama_build_and_test(test-fit-dflash-swa.cpp)
 # token-tiled gated delta-net vs the AR kernel, byte for byte on the GPU backend (SKIP without one)
 llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 # the ops added here (KQ_MASK, MOE_CACHE_LOOKUP, the GDN replay window) are refused by the meta backend (-sm tensor) and RPC and run on the CPU
@@ -638,13 +640,17 @@ if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-moe-cache-tail-skip.cpp)
 endif()
 
-# CPU work buffer: every node stays inside the size ggml_graph_plan() reserved (guard page after the buffer)
-if (NOT WIN32)
+# CPU work buffer: every node stays inside the size ggml_graph_plan() reserved (guard page after the buffer); it calls the CPU
+# backend's graph API directly, which a loadable CPU backend (GGML_BACKEND_DL) does not link
+if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-cpu-wsize-guard.cpp LINK ggml)
 endif()
 # the assign standing in for the plain lookup keeps the lookup's cache state (GPU backend, skipped without one)
 if (NOT WIN32)
     llama_build_and_test(test-moe-cache-plain-assign.cpp)
+    # with the hybrid admission margin set: the share 1 assign still fetches every miss, as the lookup does
+    llama_test(test-moe-cache-plain-assign NAME test-moe-cache-plain-assign-margin LABEL main)
+    set_tests_properties(test-moe-cache-plain-assign-margin PROPERTIES ENVIRONMENT "LLAMA_MOE_CACHE_ADMIT_MARGIN=1.25")
 endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately

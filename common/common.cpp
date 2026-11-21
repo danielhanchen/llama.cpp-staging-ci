@@ -2492,7 +2492,8 @@ static size_t common_fit_dflash_estimate(const std::string & path_dft, const lla
     const int64_t n_seq = std::max<int64_t>(1, cp.n_seq_max);
     const int64_t n_ub  = std::max<int64_t>(1, std::min<int64_t>(cp.n_ubatch, cp.n_ctx));
     int64_t cells = cp.n_ctx;
-    if (all_swa) {
+    // --swa-full: the sliding layers get the full context too (llama_kv_cache_iswa)
+    if (all_swa && !cp.swa_full) {
         cells = std::min<int64_t>(cp.n_ctx, GGML_PAD(n_swa*n_seq + n_ub, 256));
     }
     const double kv_row = (double) n_head_kv*((double) d_k*ggml_type_size(cp.type_k)/ggml_blck_size(cp.type_k) +
@@ -3101,16 +3102,31 @@ static void common_draft_mem_reserve(const common_params & params, const llama_m
         const size_t kv = has_draft && mparams_dft.n_gpu_layers != 0 ? common_fit_dflash_estimate(params_dft.model.path, cparams_dft, compute, params.model.path, cparams.n_ubatch) : 0;
         ggml_backend_dev_t dev = nullptr;
         if (kv > 0) {
+            std::vector<ggml_backend_dev_t> cand;
             if (!params_dft.devices.empty()) {
-                dev = params_dft.devices[0]; // nullptr: the draft is not offloaded
+                for (ggml_backend_dev_t d : params_dft.devices) {
+                    if (d == nullptr) {
+                        break; // a leading nullptr: the draft is not offloaded
+                    }
+                    cand.push_back(d);
+                }
             } else {
-                for (size_t i = 0; i < ggml_backend_dev_count() && dev == nullptr; ++i) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                     ggml_backend_dev_t d = ggml_backend_dev_get(i);
                     if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                        dev = d;
+                        cand.push_back(d);
                     }
                 }
             }
+            // -sm none: the model loader keeps only device main_gpu of that list (llama_model_load_from_file_impl)
+            size_t idx = 0;
+            if (mparams_dft.split_mode == LLAMA_SPLIT_MODE_NONE && mparams_dft.main_gpu > 0 && (size_t) mparams_dft.main_gpu < cand.size()) {
+                idx = (size_t) mparams_dft.main_gpu;
+            }
+            if (mparams_dft.split_mode == LLAMA_SPLIT_MODE_NONE && mparams_dft.main_gpu < 0) {
+                cand.clear();
+            }
+            dev = idx < cand.size() ? cand[idx] : nullptr;
         }
         size_t weights = 0;
         if (dev != nullptr) {
@@ -3872,6 +3888,18 @@ uma_restart:
                 return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; })) {
             draft_needs_target = true;
         }
+        // a gemma-4 assistant reads the target's KV cache: the small-device placement above refuses it before it is measured,
+        // which is where it would be found to need its target
+        if (draft_cpu && !draft_needs_target && common_gguf_arch(params_dft.model.path) == "gemma4-assistant") {
+            draft_needs_target = true;
+        }
+        // a tool that cannot leave the draft out (no fit_can_drop: llama-speculative-simple, llama-dflash-tfa) keeps a draft that
+        // needs its target on its device placement: on the CPU it would abort in its first graph reservation
+        if (draft_cpu && draft_needs_target && !params.speculative.draft.fit_can_drop) {
+            COM_WRN("%s: --fit: the draft model does not fit beside the main model and its MoE cache, but it runs on the target's tensors "
+                "and cannot run on the CPU: it keeps its device placement\n", __func__);
+            draft_cpu = false;
+        }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
         // a draft that runs on the target's context (a gemma-4 assistant reads the target's KV cache) cannot run on the CPU
         // while that cache is on the device: T4 4 GB with LLAMA_FIT_DRAFT_CPU=1 aborted in its first graph reservation (a CPU context
@@ -4144,6 +4172,10 @@ uma_restart:
                     if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && !all_dev && step == 1 && n_layer_sq > 0 && n_tbo(tbo) == n_tbo(tbo_in) &&
                             mp.n_gpu_layers + 1 == n_layer_sq + 1 - (mp.load_mtp ? 0 : n_nextn_sq)) {
                         one_off = { mp, cp, ts, tbo, mg, st, true };
+                        // this step's tbo is freed at the end of the iteration: point the saved fit at the saved copy
+                        if (mp.tensor_buft_overrides != nullptr && mp.tensor_buft_overrides == tbo.data()) {
+                            one_off.mp.tensor_buft_overrides = one_off.tbo.data();
+                        }
                     }
                     const bool fits_all     = st == COMMON_PARAMS_FIT_STATUS_SUCCESS && all_dev;
                     const bool take_one_off = !fits_all && step == 2 && one_off.set;
