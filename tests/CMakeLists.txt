@@ -638,6 +638,9 @@ endif()
 # the assign standing in for the plain lookup keeps the lookup's cache state (GPU backend, skipped without one)
 if (NOT WIN32)
     llama_build_and_test(test-moe-cache-plain-assign.cpp)
+    # with the hybrid admission margin set: the share 1 assign still fetches every miss, as the lookup does
+    llama_test(test-moe-cache-plain-assign NAME test-moe-cache-plain-assign-margin LABEL main)
+    set_tests_properties(test-moe-cache-plain-assign-margin PROPERTIES ENVIRONMENT "LLAMA_MOE_CACHE_ADMIT_MARGIN=1.25")
 endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
