@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -500,7 +501,16 @@ static bool ggml_metal_fusion_check_topk_moe(
     return true;
 }
 
-#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 8
+#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 16
+
+// the largest expert count fused (2 to 16, default 16); GGML_METAL_MOE_REDUCE_MAX=8: up to 8 experts as before
+static int ggml_metal_moe_reduce_max_experts() {
+    static const int n = [] {
+        const char * e = getenv("GGML_METAL_MOE_REDUCE_MAX");
+        return e == nullptr ? GGML_METAL_MOE_REDUCE_MAX_EXPERTS : std::max(1, std::min(GGML_METAL_MOE_REDUCE_MAX_EXPERTS, atoi(e)));
+    }();
+    return n;
+}
 
 struct ggml_metal_moe_reduce_match {
     const ggml_tensor * experts;
@@ -525,7 +535,7 @@ static bool ggml_metal_fusion_match_moe_reduce(
     const int raw_count     = (int) ops_all.size();
     const int n_expert_used = raw_count / 2;
 
-    if (n_expert_used < 2 || n_expert_used > GGML_METAL_MOE_REDUCE_MAX_EXPERTS ||
+    if (n_expert_used < 2 || n_expert_used > ggml_metal_moe_reduce_max_experts() ||
         raw_count != 2 * n_expert_used) {
         return false;
     }
@@ -755,6 +765,22 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
     GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
 };
 
+// MUL, then n VIEWs, then n - 1 ADDs (9 to 16 experts: Qwen3.8-Flash-Next routes 10)
+static std::vector<ggml_op> ggml_metal_ops_moe_reduce(int n) {
+    std::vector<ggml_op> ops = { GGML_OP_MUL };
+    ops.insert(ops.end(), n, GGML_OP_VIEW);
+    ops.insert(ops.end(), n - 1, GGML_OP_ADD);
+    return ops;
+}
+static const std::vector<ggml_op> ops_moe_reduce_9 = ggml_metal_ops_moe_reduce(9);
+static const std::vector<ggml_op> ops_moe_reduce_10 = ggml_metal_ops_moe_reduce(10);
+static const std::vector<ggml_op> ops_moe_reduce_11 = ggml_metal_ops_moe_reduce(11);
+static const std::vector<ggml_op> ops_moe_reduce_12 = ggml_metal_ops_moe_reduce(12);
+static const std::vector<ggml_op> ops_moe_reduce_13 = ggml_metal_ops_moe_reduce(13);
+static const std::vector<ggml_op> ops_moe_reduce_14 = ggml_metal_ops_moe_reduce(14);
+static const std::vector<ggml_op> ops_moe_reduce_15 = ggml_metal_ops_moe_reduce(15);
+static const std::vector<ggml_op> ops_moe_reduce_16 = ggml_metal_ops_moe_reduce(16);
+
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
@@ -783,6 +809,14 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_6,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_9,          {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_10,         {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_11,         {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_12,         {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_13,         {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_14,         {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_15,         {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_16,         {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
 };
