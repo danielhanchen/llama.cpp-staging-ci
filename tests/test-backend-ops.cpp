@@ -2978,14 +2978,18 @@ struct test_norm_mrope : public test_case {
 struct test_argmax : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const int mode; // 0: unique values, 1: few distinct values (the maximum repeats), 2: as 1 with every other row all -inf
 
     std::string vars() override {
+        if (mode != 0) {
+            return VARS_TO_STR3(type, ne, mode);
+        }
         return VARS_TO_STR2(type, ne);
     }
 
     test_argmax(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 100, 1, 1})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 100, 1, 1}, int mode = 0)
+        : type(type), ne(ne), mode(mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -3002,11 +3006,11 @@ struct test_argmax : public test_case {
         std::default_random_engine rng(rd());
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
-                // initialize with unique values to avoid ties
+                // mode 0: unique values to avoid ties; modes 1 / 2: the lowest index of the maximum, 0 for an all -inf row
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<float> data(t->ne[0]);
                     for (int i = 0; i < t->ne[0]; i++) {
-                        data[i] = i;
+                        data[i] = mode == 0 ? i : (mode == 2 && r % 2 == 0) ? -INFINITY : (float) (i % 7) - 3.0f;
                     }
                     std::shuffle(data.begin(), data.end(), rng);
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
@@ -12631,6 +12635,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 1, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 7, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {40000,  3, 1, 1}));
+    // ties and all -inf rows
+    for (int mode : {1, 2}) {
+        for (int64_t ne0 : {32, 100, 1024, 5438, 248320}) {
+            test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {ne0, 7, 1, 1}, mode));
+        }
+        test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 1, 1, 1}, mode));
+    }
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
