@@ -12956,6 +12956,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (up != nullptr) {
+            rf_done_fn(up, g.state, -1, ep); // the whole refill: the assigns stop checking layers
             ggml_backend_event_record(g.rf_ev1, up);
             g.rf_pending = true;
             // a refill started by the lend of a graph (before its prepare) stays pending through that prepare; one started inside a
