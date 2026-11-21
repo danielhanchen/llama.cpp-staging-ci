@@ -4046,6 +4046,26 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     }
 
     if (backend_src != backend_dst) {
+        // the copy runs on the src stream, so it must wait for the work queued on the dst stream that may still read dst
+        // (a pipeline-parallel input slot is reused n_copies passes later; the scheduler's slot event is waited on the dst
+        // stream only). GGML_CUDA_COPY_WAIT_DST=0: off
+        static const bool wait_dst = getenv("GGML_CUDA_COPY_WAIT_DST") == nullptr || atoi(getenv("GGML_CUDA_COPY_WAIT_DST")) != 0;
+        // an event recorded outside a capture cannot order a capturing stream (and the reverse), skip it there
+        cudaStreamCaptureStatus cap_src = cudaStreamCaptureStatusNone;
+        cudaStreamCaptureStatus cap_dst = cudaStreamCaptureStatusNone;
+        if (wait_dst) {
+            CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx_src->stream(), &cap_src));
+            CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx_dst->stream(), &cap_dst));
+        }
+        if (wait_dst && cap_src == cudaStreamCaptureStatusNone && cap_dst == cudaStreamCaptureStatusNone) {
+            if (!cuda_ctx_dst->copy_event) {
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_dst->copy_event, cudaEventDisableTiming));
+            }
+            CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->copy_event, cuda_ctx_dst->stream()));
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_dst->copy_event, 0));
+        }
+
         // copy on src stream
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
