@@ -71,13 +71,23 @@ __device__ void sigmoid_warp_inplace(float (&vals)[experts_per_thread], const in
     }
 }
 
+// the SOFTPLUS op of unary.cu: log(1 + e), and e where 1 + e rounds to 1 (e <= 2^-24, x < -16.6), so a routing weight does not
+// become 0
+static __device__ __forceinline__ float topk_moe_softplus(float x) {
+    if (x > 20.0f) {
+        return x;
+    }
+    const float e = expf(x);
+    return (e <= 5.9604644775390625e-8f) ? e : logf(1.0f + e);
+}
+
 template <int experts_per_thread, bool use_limit>
 __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
         const int  idx    = lane + i * WARP_SIZE;
         const bool active = !use_limit || (idx < limit);
-        vals[i]           = active ? sqrtf(vals[i] > 20.0f ? vals[i] : logf(1.0f + expf(vals[i]))) : -INFINITY;
+        vals[i]           = active ? sqrtf(topk_moe_softplus(vals[i])) : -INFINITY;
     }
 }
 
