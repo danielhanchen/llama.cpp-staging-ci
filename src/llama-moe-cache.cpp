@@ -1074,7 +1074,7 @@ struct llama_moe_cache::impl {
 
     // CPU computes the misses [LLAMA_MOE_CPU_MISS] (see cm_calibrate and cm_rule): per batch size n (1..cm_max tokens), the host computes
     // the missing experts that are not fetched when a measured cost model says it is faster than fetching them all
-    //   t_cpu(n) = cm_t1 + (tbar(n) - 1)*cm_dt host time per missing expert, tbar(n) = tokens per distinct expert of a batch of n
+    //   t_cpu(n) = cm_t1 + (tbar(n) - 1)*cm_dt   host time per missing expert, tbar(n) = tokens per distinct expert of a batch of n
     //   share(n) = t_cpu/(t_cpu + cm_tup), on log levels 1/8, 1/4, 1/2, 3/4 (the device fetches that share, the host computes the rest)
     //   on(n): m(n)*(cm_tup - max(share*cm_tup, (1 - share)*t_cpu)) > cm_margin*cm_split, m(n) = missing experts per layer of a batch of n,
     //          from the measured miss rate of the distinct experts looked up (device counters: the same inputs give the same decisions)
@@ -1979,9 +1979,9 @@ struct llama_moe_cache::impl {
 
         auto init_ctx = [](size_t n_tensors) {
             ggml_init_params params = {
-                /*.mem_size =*/ n_tensors*ggml_tensor_overhead(),
+                /*.mem_size   =*/ n_tensors*ggml_tensor_overhead(),
                 /*.mem_buffer =*/ nullptr,
-                /*.no_alloc =*/ true,
+                /*.no_alloc   =*/ true,
             };
             ggml_context_ptr res(ggml_init(params));
             if (!res) {
@@ -8453,9 +8453,9 @@ struct llama_moe_cache::impl {
             return false;
         }
         ggml_init_params params = {
-            /*.mem_size =*/ 4*ggml_tensor_overhead(),
+            /*.mem_size   =*/ 4*ggml_tensor_overhead(),
             /*.mem_buffer =*/ nullptr,
-            /*.no_alloc =*/ true,
+            /*.no_alloc   =*/ true,
         };
         ggml_context_ptr ctx(ggml_init(params));
         // the largest batch whose experts fit in the slots (see use_device)
@@ -10498,9 +10498,9 @@ struct llama_moe_cache::impl {
         }
 
         ggml_init_params params = {
-            /*.mem_size =*/ (8 + 6*l.experts.size())*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(16, false),
+            /*.mem_size   =*/ (8 + 6*l.experts.size())*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(16, false),
             /*.mem_buffer =*/ nullptr,
-            /*.no_alloc =*/ true,
+            /*.no_alloc   =*/ true,
         };
         ggml_context_ptr ctx(ggml_init(params));
         ggml_tensor * ids_a = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, ka, 1);
@@ -11545,9 +11545,9 @@ struct llama_moe_cache::impl {
         const int     n_rep    = 7;
 
         ggml_init_params params = {
-            /*.mem_size =*/ (4 + 3*l.experts.size())*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(16, false),
+            /*.mem_size   =*/ (4 + 3*l.experts.size())*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(16, false),
             /*.mem_buffer =*/ nullptr,
-            /*.no_alloc =*/ true,
+            /*.no_alloc   =*/ true,
         };
         ggml_context_ptr ctx(ggml_init(params));
         ggml_tensor * ids_k = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, k, 1);
@@ -12483,9 +12483,9 @@ struct llama_moe_cache::impl {
                     n_banks += gi.banks.size();
                 }
                 ggml_init_params params = {
-                    /*.mem_size =*/ (n_banks + 1)*ggml_tensor_overhead(),
+                    /*.mem_size   =*/ (n_banks + 1)*ggml_tensor_overhead(),
                     /*.mem_buffer =*/ nullptr,
-                    /*.no_alloc =*/ true,
+                    /*.no_alloc   =*/ true,
                 };
                 ctx_banks_op.reset(ggml_init(params));
             }
@@ -12538,9 +12538,9 @@ struct llama_moe_cache::impl {
                     n_banks += gi.banks.size();
                 }
                 ggml_init_params params = {
-                    /*.mem_size =*/ (n_banks + 1)*ggml_tensor_overhead(),
+                    /*.mem_size   =*/ (n_banks + 1)*ggml_tensor_overhead(),
                     /*.mem_buffer =*/ nullptr,
-                    /*.no_alloc =*/ true,
+                    /*.no_alloc   =*/ true,
                 };
                 ctx_banks_op.reset(ggml_init(params));
             }
