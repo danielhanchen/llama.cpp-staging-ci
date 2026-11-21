@@ -13595,6 +13595,10 @@ bool llama_context::cap_prepare(int s) {
             return false;
         }
         r.view = ggml_view_1d(C.ctx.get(), r.t, (int64_t) (r.size/ggml_type_size(r.t->type)), r.off);
+        // the copy paths of backends without a view-aware async copy (CPU, Metal, SYCL) read the view's own buffer
+        if (ggml_backend_view_init(r.view) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
         off += r.size;
     }
     C.cell    = (uint32_t) cell;
