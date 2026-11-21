@@ -108,6 +108,13 @@ void    common_fit_place8_grow_of(int64_t total_full, int64_t ctx_full, int64_t 
 int64_t common_fit_place8_grow_size(int64_t size_ok, int64_t size_cap, int64_t grow, int64_t ctx_ub,
         const std::function<bool(int64_t req, int64_t & over)> & measure);
 
+// a lent extra model (common_fit_extra_model::lent) is left out of a measurement, except its context, unless the measurement is
+// decode-sized: the cache it sizes is resident at decode beside the extra model's device weights and compute buffers
+bool    common_fit_extra_lent_excluded(bool lent, bool decode_sized);
+// the mid-size placement (LLAMA_FIT_PLACEMID) measures decode-sized, as the small-device placement does: a lent drafter kept with it
+// (common_fit_place8()) is priced with its device weights and compute buffers. LLAMA_FIT_PLACEMID_DECODE_SIZED=0: measured lent as before
+bool    common_fit_placemid_decode_sized();
+
 // the margin beside a MoE cache without flash attention. The fit may take part of the default margin m for the cache
 // (m_reduced, LLAMA_MOE_FIT_MARGIN); without flash attention (flash_attn = false: -fa off, or auto resolved off at the measured
 // context) the full margin stays when keep_faoff (LLAMA_FIT_FAOFF_MARGIN, default 1): the KQ / KQV mat-muls take F16 copies of the
