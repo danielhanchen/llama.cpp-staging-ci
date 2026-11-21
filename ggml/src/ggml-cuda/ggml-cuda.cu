@@ -10296,6 +10296,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     cudaEvent_t join = cuda_ctx->side_mv_join[side_mv_n_events++];
                     CUDA_CHECK(cudaEventRecord(join, cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM)));
                     side_mv_pending.push_back({ side_chain_reader, join });
+                    cuda_ctx->q8_1_cache.invalidate_side();
+                    cuda_ctx->q8_1_cache.side_stream = false;
                     cuda_ctx->src1_memo.release();
                     cuda_ctx->src1_memo.share_next = false;
                     cuda_ctx->side_chain_active = false;
@@ -10330,6 +10332,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         cuda_ctx->src1_memo.share_next = false;
                         cuda_ctx->curr_stream_no    = GGML_CUDA_SIDE_MV_STREAM;
                         cuda_ctx->side_chain_active = true;
+                        cuda_ctx->q8_1_cache.side_stream = true;
                         cuda_ctx->side_chain_last   = it->second.first;
                         side_chain_reader  = it->second.second;
                         // the slot of x's q8_1 copy was handed out before the fork: counted from one claim earlier
@@ -10600,6 +10603,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 CUDA_CHECK(cudaEventRecord(cuda_ctx->side_mv_fork, cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM)));
                 CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(cuda_ctx->device, 0), cuda_ctx->side_mv_fork, 0));
                 cuda_ctx->side_chain_active = false;
+                cuda_ctx->q8_1_cache.invalidate_side();
+                cuda_ctx->q8_1_cache.side_stream = false;
                 cuda_ctx->side_chain_last   = -1;
                 cuda_ctx->curr_stream_no    = 0;
             }
