@@ -2419,22 +2419,40 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
         /*.no_alloc   =*/ true,
     };
     ggml_context_ptr ctx { ggml_init(ip) };
+    // a CPU extra buffer type (CPU_REPACK, KleidiAI: repacked weights) stores no integer tensors (its set_tensor repacks through
+    // traits that only weight types have): the token maps go to a plain CPU buffer there
+    ggml_backend_dev_t dev_buft = ggml_backend_buft_get_device(buft);
+    const bool maps_cpu = !dry && !can_read && !ggml_backend_buft_is_host(buft) && dev_buft != nullptr &&
+        ggml_backend_dev_type(dev_buft) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    ggml_context_ptr ctx_maps;
+    if (maps_cpu) {
+        ctx_maps.reset(ggml_init(ip));
+    }
+    ggml_context * ctx_m = maps_cpu ? ctx_maps.get() : ctx.get();
     ggml_tensor * sub = ggml_new_tensor_2d(ctx.get(), src->type, src->ne[0], n_sub);
     ggml_set_name(sub, "mtp_draft_head.weight");
-    ggml_tensor * d2t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, n_sub);
+    ggml_tensor * d2t = ggml_new_tensor_1d(ctx_m, GGML_TYPE_I64, n_sub);
     ggml_set_name(d2t, "mtp_draft_head.d2t");
     // the token-ordered row map of the backend draft top-k (LLAMA_MTP_DRAFT_TOPK_FULL=1: none, the top-k runs over the
     // full-vocabulary scatter as before)
     ggml_tensor * perm = nullptr;
     ggml_tensor * cand = nullptr;
     if (llama_mtp_draft_topk_on()) {
-        perm = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_sub);
+        perm = ggml_new_tensor_1d(ctx_m, GGML_TYPE_I32, n_sub);
         ggml_set_name(perm, "mtp_draft_head.perm");
-        cand = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_sub);
+        cand = ggml_new_tensor_1d(ctx_m, GGML_TYPE_I32, n_sub);
         ggml_set_name(cand, "mtp_draft_head.cand");
     }
 
     ggml_backend_buffer_ptr buf;
+    ggml_backend_buffer_ptr buf_maps;
+    if (maps_cpu) {
+        buf_maps.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_maps.get(), ggml_backend_cpu_buffer_type()));
+        if (!buf_maps) {
+            LLAMA_LOG_WARN("%s: cannot allocate the token maps of the MTP draft head, keeping the full-vocabulary head\n", __func__);
+            return;
+        }
+    }
     if (dry) {
         buf.reset(ggml_backend_buft_alloc_buffer(buft, 0)); // sized by memory_breakdown, as the other no_alloc weights
         if (!buf) {
@@ -2496,6 +2514,11 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     std::vector<ggml_backend_buffer_ptr> bufs;
     bufs.emplace_back(std::move(buf));
     pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+    if (maps_cpu) {
+        std::vector<ggml_backend_buffer_ptr> bufs_maps;
+        bufs_maps.emplace_back(std::move(buf_maps));
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx_maps), std::move(bufs_maps));
+    }
 }
 
 // the restricted draft head of a DFlash2 draft. The noise block projects onto the target's lm head (ctx_other), all 248320
