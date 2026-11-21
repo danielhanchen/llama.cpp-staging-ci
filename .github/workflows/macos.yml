@@ -71,6 +71,8 @@ jobs:
             else
               nproc
               cc --version | head -1
+              cc -Q --help=target 2>/dev/null | grep -E "^ +-march=|^ +-mfma |^ +-mavx2 " || true
+              echo | cc -dM -E - 2>/dev/null | grep -E "__FMA__|__AVX2__|__AVX512F__" || true
             fi
           } 2>&1 | tee ci-logs/sysinfo.txt
 
@@ -94,6 +96,9 @@ jobs:
           echo "build_rc=$rc" | tee -a ci-logs/summary.txt
           grep -n -E "warning:|error:" ci-logs/build.log > ci-logs/build_diags.txt 2>/dev/null || true
           echo "build_warnings=$(grep -c 'warning:' ci-logs/build_diags.txt || true) build_errors=$(grep -c 'error:' ci-logs/build_diags.txt || true)" | tee -a ci-logs/summary.txt
+          if [ "$(uname)" != "Darwin" ] && [ -f build/bin/libggml-base.so ]; then
+            echo "q8k_ref_fma_insns=$(objdump -d build/bin/libggml-base.so | awk '/<quantize_row_q8_K_ref>:/,/^$/' | grep -c fmadd || true)" | tee -a ci-logs/summary.txt
+          fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
 
       - name: ctest
