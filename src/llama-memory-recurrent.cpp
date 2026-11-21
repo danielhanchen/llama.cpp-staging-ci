@@ -222,8 +222,9 @@ llama_memory_recurrent::llama_memory_recurrent(
         mv_tmp_r_l[i] = mv_tmp(ctx, buft, r, r->ne[0]);
         mv_tmp_s_l[i] = replay ? nullptr : mv_tmp(ctx, buft, s, s->ne[0]);
         mv_tmp_p_l[i] = mv_tmp(ctx, buft, p_l[i], p_l[i] ? p_l[i]->ne[0] : 0);
-        for (auto [t, tmp] : { std::make_pair(rk_l[i], &mv_tmp_k_l[i]), std::make_pair(rv_l[i], &mv_tmp_v_l[i]),
-                               std::make_pair(rg_l[i], &mv_tmp_g_l[i]) }) {
+        const std::pair<ggml_tensor *, ggml_tensor **> win_tmp[] = {
+            { rk_l[i], &mv_tmp_k_l[i] }, { rv_l[i], &mv_tmp_v_l[i] }, { rg_l[i], &mv_tmp_g_l[i] } };
+        for (auto [t, tmp] : win_tmp) {
             *tmp = mv_tmp(ctx, buft, t, t ? ggml_nelements(t) / t->ne[3] : 0);
         }
     }
@@ -1348,8 +1349,9 @@ void llama_memory_recurrent::rs_move_rows(const std::vector<std::pair<uint32_t, 
     };
     for (size_t il = 0; il < r_l.size(); ++il) {
         // snapshot groups 1..n_rs_seq of the rows (replay keeps one state row per cell: no groups in s)
-        for (auto [t, tmp] : { std::make_pair(r_l[il], mv_tmp_r_l[il]), std::make_pair(s_l[il], mv_tmp_s_l[il]),
-                               std::make_pair(il < p_l.size() ? p_l[il] : nullptr, mv_tmp_p_l[il]) }) {
+        const std::pair<ggml_tensor *, ggml_tensor *> row_tmp[] = {
+            { r_l[il], mv_tmp_r_l[il] }, { s_l[il], mv_tmp_s_l[il] }, { il < p_l.size() ? p_l[il] : nullptr, mv_tmp_p_l[il] } };
+        for (auto [t, tmp] : row_tmp) {
             if (t == nullptr || tmp == nullptr || t->ne[1] <= (int64_t) size) {
                 continue;
             }
@@ -1362,9 +1364,11 @@ void llama_memory_recurrent::rs_move_rows(const std::vector<std::pair<uint32_t, 
         }
         // replay: the stored window inputs of the cells ([.., .., .., size]: one slice per cell)
         if (replay) {
-            for (auto [t, tmp] : { std::make_pair(il < rk_l.size() ? rk_l[il] : nullptr, mv_tmp_k_l[il]),
-                                   std::make_pair(il < rv_l.size() ? rv_l[il] : nullptr, mv_tmp_v_l[il]),
-                                   std::make_pair(il < rg_l.size() ? rg_l[il] : nullptr, mv_tmp_g_l[il]) }) {
+            const std::pair<ggml_tensor *, ggml_tensor *> win_tmp[] = {
+                { il < rk_l.size() ? rk_l[il] : nullptr, mv_tmp_k_l[il] },
+                { il < rv_l.size() ? rv_l[il] : nullptr, mv_tmp_v_l[il] },
+                { il < rg_l.size() ? rg_l[il] : nullptr, mv_tmp_g_l[il] } };
+            for (auto [t, tmp] : win_tmp) {
                 if (t == nullptr || tmp == nullptr) {
                     continue;
                 }
