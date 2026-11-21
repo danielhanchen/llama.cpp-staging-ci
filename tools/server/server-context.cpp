@@ -5792,16 +5792,22 @@ private:
                         // slots, where the text tokens are the tokens): the same vector, without copying the whole context every
                         // pass (8k context on a A100 host: ~17 us per pass, with the GPU idle)
                         static const bool incr_env = getenv("LLAMA_SPEC_PROMPT_INCR") == nullptr || atoi(getenv("LLAMA_SPEC_PROMPT_INCR")) != 0;
-                        const llama_tokens & cur = slot.prompt.tokens.get_tokens();
                         auto & sp = slot.spec_prompt;
-                        if (incr_env && !slot.prompt.tokens.has_mtmd && sp.size() <= cur.size() &&
-                                (sp.empty() || memcmp(sp.data(), cur.data(), sp.size()*sizeof(llama_token)) == 0)) {
-                            for (size_t k = sp.size(); k < cur.size(); ++k) {
-                                if (cur[k] != LLAMA_TOKEN_NULL) {
-                                    sp.push_back(cur[k]); // (as get_text_tokens: a prefix that matched holds no null token)
+                        bool sp_extended = false;
+                        // get_tokens() asserts on multimodal slots: only text-only slots take the incremental path
+                        if (incr_env && !slot.prompt.tokens.has_mtmd) {
+                            const llama_tokens & cur = slot.prompt.tokens.get_tokens();
+                            if (sp.size() <= cur.size() &&
+                                    (sp.empty() || memcmp(sp.data(), cur.data(), sp.size()*sizeof(llama_token)) == 0)) {
+                                for (size_t k = sp.size(); k < cur.size(); ++k) {
+                                    if (cur[k] != LLAMA_TOKEN_NULL) {
+                                        sp.push_back(cur[k]); // (as get_text_tokens: a prefix that matched holds no null token)
+                                    }
                                 }
+                                sp_extended = true;
                             }
-                        } else {
+                        }
+                        if (!sp_extended) {
                             sp = slot.prompt.tokens.get_text_tokens();
                         }
 
