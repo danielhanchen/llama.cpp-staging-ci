@@ -3919,6 +3919,9 @@ private:
             if (use_backend_sampling) {
                 slot.smpl_dev_set = false;
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                // the raw-logits mode of the device greedy chains (set at load and by earlier requests) leaves the sequence's
+                // sampler out of the graph, while the host chain skips the stages the backend initialized: no stage would pick a token
+                llama_set_sampler_raw_logits(ctx_tgt, slot.id, false);
             } else if (slot.smpl_dev) {
                 if (!slot.smpl_dev_set) {
                     // back from a backend sampling request: the largest chain is set for the reserve
