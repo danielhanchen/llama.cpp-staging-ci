@@ -6785,7 +6785,7 @@ private:
         }
         if (!seg_breaks.empty()) {
             llama_set_ubatch_breaks(ctx_tgt, seg_breaks.data(), (int32_t) seg_breaks.size());
-            SRV_DBG("k11 merged prompt batch of %d tokens, %zu ubatch breaks (first at %d)\n", batch.view.size(), seg_breaks.size(), seg_breaks[0]);
+            SRV_DBG("merged prompt batch of %d tokens, %zu ubatch breaks (first at %d)\n", batch.view.size(), seg_breaks.size(), seg_breaks[0]);
         }
         // the captured checkpoint is made before the wait for the batch's outputs, so its bookkeeping and the queued copies
         // overlap the ubatches still computing (made after the wait, the near checkpoint's merge cost RTX PRO 6000 Qwen3.6 32 GB chat 6 ms of TTFT);

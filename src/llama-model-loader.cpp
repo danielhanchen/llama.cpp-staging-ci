@@ -2471,7 +2471,7 @@ void llama_model_loader::settle_pinned_cache() {
             }
             b_read += r.size;
         }
-        LLAMA_LOG_INFO("%s: k19 resident check: %zu of %zu mapped tensors (%.2f MiB) lost %.2f MiB of page cache during the load, read "
+        LLAMA_LOG_INFO("%s: resident check: %zu of %zu mapped tensors (%.2f MiB) lost %.2f MiB of page cache during the load, read "
             "%.2f MiB back in %.0f ms (LLAMA_MOE_PIN_RESIDENT=0 off)\n", __func__, n_evicted, n_checked, b_checked/1024.0/1024.0,
             b_missing/1024.0/1024.0, b_read/1024.0/1024.0, (ggml_time_us() - t0)/1000.0);
     }
