@@ -1,5 +1,6 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "common.cuh"
+#include "preload.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
@@ -123,7 +124,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const auto kernel = ncols1 == 1       ? flash_attn_mask_to_sparse_indices<1, false> :
                         n_queries % 8 != 0 ? flash_attn_mask_to_sparse_indices<8, true>  :
                                              flash_attn_mask_to_sparse_indices<8, false>;
-    ggml_cuda_kernel_launch(kernel, launch_params,
+    ggml_cuda_kernel_launch_pl(kernel, launch_params,
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -304,7 +305,7 @@ void ggml_cuda_qsa_maskless_compact(
     const size_t nbytes_shared = size_t(n_kv + 31)/32*sizeof(uint32_t);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, nbytes_shared, stream);
     const auto kernel = ncols1 == 1 ? flash_attn_sel_to_sparse_indices<1> : flash_attn_sel_to_sparse_indices<8>;
-    ggml_cuda_kernel_launch(kernel, launch_params,
+    ggml_cuda_kernel_launch_pl(kernel, launch_params,
         (const int32_t *) idx->data, (const half *) kq->data, indices, counts, n_kv, int(idx->ne[0]), n_queries, n_kv_max,
         int64_t(idx->nb[1]/sizeof(int32_t)), int64_t(kq->nb[1]/sizeof(half)), int64_t(kq->nb[3]/sizeof(half)));
     CUDA_CHECK(cudaGetLastError());
@@ -324,7 +325,7 @@ void ggml_cuda_qsa_maskless_materialize(const ggml_cuda_qsa_maskless & qsa, half
     const dim3 blocks_num((kq->ne[0] + chunk - 1)/chunk, kq->ne[1], kq->ne[3]);
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
-    ggml_cuda_kernel_launch(flash_attn_sel_to_mask, launch_params,
+    ggml_cuda_kernel_launch_pl(flash_attn_sel_to_mask, launch_params,
         (const int32_t *) idx->data, (const half *) kq->data, mask, int(kq->ne[0]), int(idx->ne[0]), int(kq->ne[1]),
         int64_t(idx->nb[1]/sizeof(int32_t)), int64_t(kq->nb[1]/sizeof(half)), int64_t(kq->nb[3]/sizeof(half)), chunk);
     CUDA_CHECK(cudaGetLastError());
@@ -1578,6 +1579,35 @@ static ggml_cuda_fattn_probe ggml_cuda_fattn_run_probe(ggml_backend_cuda_context
     ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
     ggml_cuda_fattn_probe_cur = prev;
     return pr;
+}
+
+// the dry run of the node's dispatch (the padded node as built: the launch of a node with a KV length where its sparse plan holds)
+// loads the kernel of the launch; a sparse launch also loads the kernels that build its lists (both query tile widths), from the
+// selected cells where the node gathers them (QSA maskless), else from the mask
+void ggml_cuda_flash_attn_ext_preload(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_cuda_fattn_probe pr = ggml_cuda_fattn_run_probe(ctx, dst);
+    if (!pr.done) {
+        return;
+    }
+    ggml_cuda_preload_func(pr.kernel);
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * mask = dst->src[3];
+    if (!pr.use_sparse || mask == nullptr) {
+        return;
+    }
+    const auto it = ctx.qsa_maskless.find(dst);
+    const ggml_cuda_qsa_maskless * qsa = it != ctx.qsa_maskless.end() ? &it->second : nullptr;
+    const bool gather = qsa && !qsa->prompt && ggml_cuda_qsa_maskless_gather_ok(*qsa) && ggml_cuda_qsa_maskless_mode() == 1;
+    for (const int ncols1 : { 1, 8 }) {
+        if (gather) {
+            ggml_cuda_qsa_maskless_compact(*qsa, nullptr, nullptr, int32_t(Q->ne[1]), ncols1, 0, ctx.stream());
+        } else {
+            ggml_cuda_flash_attn_ext_compact_mask(mask, nullptr, nullptr, int32_t(Q->ne[1]), ncols1, 0, ctx.stream());
+        }
+    }
+    if (qsa && !gather) {
+        ggml_cuda_qsa_maskless_materialize(*qsa, nullptr, ctx.stream());
+    }
 }
 
 static ggml_cuda_fattn_kvl_plan ggml_cuda_fattn_kvl_get_plan(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {

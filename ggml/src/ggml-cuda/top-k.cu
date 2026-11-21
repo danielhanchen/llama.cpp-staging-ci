@@ -1,6 +1,7 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "argsort.cuh"
 #include "top-k.cuh"
+#include "preload.cuh"
 #include "cpy.cuh"
 
 // Adjusted implementation thresholds from #28547, can be overridden at build time
@@ -464,6 +465,9 @@ static __global__ void top_k_radix_gather(
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
+    if (ggml_cuda_preload_on()) {
+        return;
+    }
     constexpr int BLOCK_SIZE = 256;
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
@@ -961,6 +965,9 @@ static bool ggml_cuda_top_k_two_stage_enabled() {
 }
 
 static void top_k_two_stage_cuda(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
+    if (ggml_cuda_preload_on()) {
+        return;
+    }
     constexpr int BLOCK_SIZE = 256;
     const int blocks_per_row = (int) std::min<int64_t>(((int64_t) ncols + 1023) / 1024, 128);
     const int cols_per_block = (ncols + blocks_per_row - 1) / blocks_per_row;
@@ -995,6 +1002,11 @@ static bool ggml_cuda_top_k_one_block_enabled() {
 
 static void top_k_radix_one_block_cuda(const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
     constexpr int BLOCK_SIZE = 1024;
+    if (ggml_cuda_preload_on()) {
+        ggml_cuda_preload_func(ggml_cuda_top_k_one_block_v2_enabled() ? (const void *) top_k_radix_one_block_v2<BLOCK_SIZE, 8> :
+                                                                        (const void *) top_k_radix_one_block<BLOCK_SIZE>);
+        return;
+    }
     if (ggml_cuda_top_k_one_block_v2_enabled()) {
         top_k_radix_one_block_v2<BLOCK_SIZE, 8><<<(unsigned int) nrows, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k);
         static bool logged_v2 = false;
@@ -1017,6 +1029,9 @@ static void top_k_argsort_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int64_t nrows, int k, bool use_cub, cudaStream_t stream,
         bool tie_index = false) {
+    if (ggml_cuda_preload_on()) {
+        return;
+    }
     const int64_t chunk_nrows = ggml_cuda_chunk_nrows((size_t) ncols * sizeof(int), nrows);
 
     ggml_cuda_pool_alloc<int> tmp_alloc(pool, (size_t) ncols * chunk_nrows);
@@ -1102,6 +1117,10 @@ static void ggml_cuda_op_top_k_deterministic(ggml_cuda_pool & pool, const float 
 }
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // a kernel preload takes the one-block radix select only (the other selections allocate pool memory first)
+    if (ggml_cuda_preload_on() && !ggml_cuda_top_k_deterministic()) {
+        return;
+    }
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
     int *               dst_d  = (int *) dst->data;

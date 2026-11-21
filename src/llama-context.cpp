@@ -1913,6 +1913,8 @@ llama_context::llama_context(
         }
     }
 
+    tail_preload();
+
     // Initialize the full vocabulary token ids for backend samplers.
     {
         const int n_vocab = model.vocab.n_tokens();
@@ -2917,6 +2919,71 @@ void llama_context::ext_unpark() {
             "%.2f MiB of slots added (keep %.0f MiB), %.1f ms\n", __func__, freed/1048576.0, freed_dft/1048576.0, fr/1048576.0,
             grown/1048576.0, keep/1048576.0, (ggml_time_us() - t0)/1e3);
     }
+}
+
+// (LLAMA_TAIL_PRELOAD=0: off) CUDA loads a kernel at its first launch (lazy module loading, the CUDA 12 default), and the load waits for
+// the whole device. Beside a MoE cache that lends its slots to the prompt graphs, the first kernels of the 4-token tail after a long
+// prompt (the near checkpoint) are launched while the cache refills the slots on the upload stream and an MTP drafter runs its prompt
+// pass: on RTX PRO 6000 Qwen3.8-Flash-Next + MTP at 48 GB the first of them waited 62 ms for both, and about 8 later first launches
+// took ~2 ms each. Loading every kernel at start (CUDA_MODULE_LOADING=EAGER) took ~1 s more to load and device memory (the fit
+// and the text at 32 GB changed). Here, at load and after the fit, a graph of that tail (4 tokens, one output and every output) is
+// built and split as for a reserve, never allocated, and each CUDA backend loads the kernels its nodes' launches take
+// (ggml_backend_cuda_preload_graph: the dispatch of each node with the launch sites loading their function). Nothing runs; the
+// outputs do not change.
+void llama_context::tail_preload() {
+    static const bool on = getenv("LLAMA_TAIL_PRELOAD") == nullptr || atoi(getenv("LLAMA_TAIL_PRELOAD")) != 0;
+    if (!on || !moe_cache || !moe_cache->lends_graph_any() || !memory || model.hparams.no_alloc || cparams.training) {
+        return;
+    }
+    using preload_t = int (*)(ggml_backend_t, ggml_cgraph *, const bool *);
+    std::vector<std::pair<ggml_backend_t, preload_t>> devs;
+    for (ggml_backend_t b : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b);
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto fn = reg != nullptr ? (preload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_preload_graph") : nullptr;
+        if (fn != nullptr) {
+            devs.emplace_back(b, fn);
+        }
+    }
+    if (devs.empty()) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    llama_memory_context_ptr mctx = memory->init_full();
+    if (!mctx) {
+        return;
+    }
+    // the reserve's state for the graphs after it stays as it was
+    const int64_t  save_prefetch    = prefetch_n_tokens;
+    const uint32_t save_plan_small  = sched_plan_small_tokens;
+    const uint32_t save_n_input     = n_input_tensors;
+    constexpr uint32_t n_tail = 4;
+    int n_loaded = 0;
+    int n_graphs = 0;
+    for (const uint32_t n_out : { 1u, n_tail }) {
+        if (n_out > cparams.n_outputs_max) {
+            continue;
+        }
+        ggml_cgraph * gf = graph_reserve(n_tail, 1, n_out, mctx.get(), /*split_only =*/ true);
+        if (gf == nullptr) {
+            continue;
+        }
+        n_graphs++;
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        std::unique_ptr<bool[]> on_dev(new bool[std::max(1, n_nodes)]);
+        for (const auto & d : devs) {
+            for (int i = 0; i < n_nodes; ++i) {
+                on_dev[i] = ggml_backend_sched_get_tensor_backend(sched.get(), ggml_graph_node(gf, i)) == d.first;
+            }
+            n_loaded += d.second(d.first, gf, on_dev.get());
+        }
+    }
+    ggml_backend_sched_reset(sched.get());
+    prefetch_n_tokens       = save_prefetch;
+    sched_plan_small_tokens = save_plan_small;
+    n_input_tensors         = save_n_input;
+    LLAMA_LOG_INFO("%s: CUDA kernels of the %u-token prompt tail loaded at load: %d functions from %d graphs in %.1f ms "
+        "(LLAMA_TAIL_PRELOAD=0: off)\n", __func__, n_tail, n_loaded, n_graphs, (ggml_time_us() - t0)/1e3);
 }
 
 void llama_context::gf_res_epoch_bump(int line) {

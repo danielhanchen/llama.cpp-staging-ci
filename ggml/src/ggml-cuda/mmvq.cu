@@ -1,5 +1,6 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "mmvq.cuh"
+#include "preload.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -2515,7 +2516,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+            ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -2528,7 +2529,7 @@ static void mul_mat_vec_q_switch_fusion(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     if constexpr (mul_mat_vec_q_multi_type(type) && c_nwarps == 0 && !small_k) {
         if (unroll) {
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, 0, 0, 0, 8>, launch_params,
+            ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, 0, 0, 0, 8>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -2536,7 +2537,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
     GGML_UNUSED(unroll);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, c_nwarps>, launch_params,
+    ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, c_nwarps>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -2671,7 +2672,7 @@ static void mul_mat_vec_q_moe_launch(
             const dim3 block_nums_r(nrows_x / rpb_moe, nchannels_dst);
             const ggml_cuda_kernel_launch_params launch_params_r = ggml_cuda_kernel_launch_params(block_nums_r, block_dims, 0, stream);
 #define MMVQ_MOE_LAUNCH_R(RPB, FUS) \
-            ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, RPB, FUS, 1>, launch_params_r, \
+            ggml_cuda_kernel_launch_pl(mul_mat_vec_q_moe<type, RPB, FUS, 1>, launch_params_r, \
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, \
                 stride_row_x, stride_col_y, stride_col_dst, \
                 stride_channel_x, stride_channel_y, stride_channel_dst, \
@@ -2690,7 +2691,7 @@ static void mul_mat_vec_q_moe_launch(
     // the K iterations a lane runs per pass of its loop (mul_mat_vec_q_moe c_unroll, mmvq_moe_unroll)
     const int unroll = mmvq_moe_unroll<type>(ncols_x, warp_size);
 #define MMVQ_MOE_LAUNCH(FUS, UNR) \
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, FUS, UNR>, launch_params, \
+        ggml_cuda_kernel_launch_pl(mul_mat_vec_q_moe<type, rows_per_block, FUS, UNR>, launch_params, \
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, \
             stride_row_x, stride_col_y, stride_col_dst, \
             stride_channel_x, stride_channel_y, stride_channel_dst, \
@@ -2778,12 +2779,12 @@ static void mul_mat_vec_q_moe_group_launch_cfg(
     const int iters = (ncols_x / qk + vdr * 32 / qi - 1) / (vdr * 32 / qi);
     if (has_fusion && unroll_env >= 2 && iters >= 2) {
         if (unroll_env == 2 || iters == 2) {
-            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_group, c_dec, true, 2>, launch_params,
+            ggml_cuda_kernel_launch_pl(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_group, c_dec, true, 2>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
             mmvq_moe_unroll_log("mul_mat_vec_q_moe_group", type, true, 2, ncols_dst);
         } else {
-            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_group, c_dec, true, 3>, launch_params,
+            ggml_cuda_kernel_launch_pl(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_group, c_dec, true, 3>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
             mmvq_moe_unroll_log("mul_mat_vec_q_moe_group", type, true, 3, ncols_dst);
@@ -2791,11 +2792,11 @@ static void mul_mat_vec_q_moe_group_launch_cfg(
         return;
     }
     if (has_fusion) {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_group, c_dec, true>, launch_params,
+        ggml_cuda_kernel_launch_pl(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_group, c_dec, true>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_group, c_dec, false>, launch_params,
+        ggml_cuda_kernel_launch_pl(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_group, c_dec, false>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
     }
@@ -2970,11 +2971,11 @@ static bool mul_mat_vec_q_moe_bw_launch(
         const dim3 block_dims(32, nwarps);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, (size_t) nwarps*nmat*smem_mat, stream);
         if (fused) {
-            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_bw<type, true>, launch_params,
+            ggml_cuda_kernel_launch_pl(mul_mat_vec_q_moe_bw<type, true>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst, ntok, ids_stride, rpw, smem_mat);
         } else {
-            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_bw<type, false>, launch_params,
+            ggml_cuda_kernel_launch_pl(mul_mat_vec_q_moe_bw<type, false>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst, ntok, ids_stride, rpw, smem_mat);
         }
@@ -3081,7 +3082,7 @@ static bool mul_mat_vec_q_moe_vl_launch(
         bool done = false;
 #define MMVQ_MOE_VL(TPR, G) \
         if (!done && cfg.tpr == (TPR) && cfg.g == (G)) { \
-            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_vl<type, TPR, G, nwarps, c_fused>, launch_params, \
+            ggml_cuda_kernel_launch_pl(mul_mat_vec_q_moe_vl<type, TPR, G, nwarps, c_fused>, launch_params, \
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, \
                 stride_channel_x, stride_channel_y, stride_channel_dst, ntok, ids_stride); \
             done = true; \
@@ -3259,7 +3260,7 @@ static void mul_mat_vec_q_launch_nwarps(
             const dim3 bd(warp_size, c_nwarps, 1);
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(bn, bd, 0, stream);
             const ggml_cuda_mm_fusion_args_device nf{};
-#define MMVQ_COLS_NW_LAUNCH(R) ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, false, c_nwarps, 0, R, 1>, lp, \
+#define MMVQ_COLS_NW_LAUNCH(R) ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, c_ncols_dst, false, false, false, c_nwarps, 0, R, 1>, lp, \
                 vx, vy, (const int32_t *) nullptr, nf, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst, \
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, \
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, 0u)
@@ -3437,7 +3438,7 @@ static bool mul_mat_vec_q_verify_wide(
         const dim3 block_nums((nrows_x + rpb_l - 1) / rpb_l, nchannels_dst, nsamples_dst);
         const dim3 block_dims(warp_size, 4, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-#define MMVQ_VW_LAUNCH(NC, RPB, UNR) ggml_cuda_kernel_launch(mul_mat_vec_q<type, NC, false, false, false, 4, 0, RPB, UNR>, launch_params, \
+#define MMVQ_VW_LAUNCH(NC, RPB, UNR) ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, NC, false, false, false, 4, 0, RPB, UNR>, launch_params, \
             vx, vy, (const int32_t *) nullptr, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, \
             (uint32_t) stride_col_y, (uint32_t) stride_col_dst, channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, \
             (uint32_t) stride_channel_dst, sample_ratio_fd, (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, \
@@ -3578,7 +3579,7 @@ static bool mul_mat_vec_q_tab_launch(
         const dim3 block_dims(warp_size, nwarps_l, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
         // c_tab only for the codebook types: the grid types' kernel (grid_n) is the same with either value
-#define MMVQ_TAB_LAUNCH_W(FUS, RPB, NW) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, NW, 0, RPB, 1, false, !grid_type>, launch_params, \
+#define MMVQ_TAB_LAUNCH_W(FUS, RPB, NW) ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, 1, FUS, false, false, NW, 0, RPB, 1, false, !grid_type>, launch_params, \
             vx, vy, ids, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, \
             channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, \
             sample_ratio_fd, (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst, (uint32_t) ids_stride)
@@ -3707,7 +3708,7 @@ static bool mul_mat_vec_q_wpr_launch(
             const dim3 block_nums(nrows_x / env_rows, nchannels_dst, nsamples_dst);
             const dim3 block_dims(warp_size, 2, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-#define MMVQ_W2_LAUNCH(FUS, RPB) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, 2, 0, RPB, 1, false, false, 0>, launch_params, \
+#define MMVQ_W2_LAUNCH(FUS, RPB) ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, 1, FUS, false, false, 2, 0, RPB, 1, false, false, 0>, launch_params, \
             vx, vy, ids, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, \
             channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, \
             sample_ratio_fd, (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst, (uint32_t) ids_stride)
@@ -3732,7 +3733,7 @@ static bool mul_mat_vec_q_wpr_launch(
         const dim3 block_nums(nrows_x / rows_block, nchannels_dst, nsamples_dst);
         const dim3 block_dims(warp_size, env_w, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-#define MMVQ_WPR_LAUNCH(FUS, W, RPW) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, W, 0, RPW, 1, false, false, W>, launch_params, \
+#define MMVQ_WPR_LAUNCH(FUS, W, RPW) ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, 1, FUS, false, false, W, 0, RPW, 1, false, false, W>, launch_params, \
             vx, vy, ids, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, \
             channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, \
             sample_ratio_fd, (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst, (uint32_t) ids_stride)
@@ -4051,7 +4052,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             const dim3 block_nums(nrows_x / rpb, nchannels_dst, nsamples_dst);
             const dim3 block_dims(warp_size, nwarps, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-#define MMVQ_COLS_LAUNCH(RPB) ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, false, 0, 0, RPB, 1>, launch_params, \
+#define MMVQ_COLS_LAUNCH(RPB) ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, c_ncols_dst, false, false, false, 0, 0, RPB, 1>, launch_params, \
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst, \
                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, \
                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride)
@@ -4087,7 +4088,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             const dim3 block_nums((nrows_x + rpb - 1) / rpb, nchannels_dst, nsamples_dst);
             const dim3 block_dims(warp_size, nwarps, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-#define MMVQ_RPB_LAUNCH(RPB, UNR) ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, false, 0, 0, RPB, UNR>, launch_params, \
+#define MMVQ_RPB_LAUNCH(RPB, UNR) ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, c_ncols_dst, false, false, false, 0, 0, RPB, UNR>, launch_params, \
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst, \
                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, \
                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride)
@@ -4163,7 +4164,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     const dim3 block_nums(nrows_x / 2, nchannels_dst, nsamples_dst);
                     const dim3 block_dims(warp_size, calc_nwarps(type, c_ncols_dst, table_id), 1);
                     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-#define MMVQ_2ROWS_LAUNCH(FUS) ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, FUS, false, false, 0, 0, 2, 1>, launch_params, \
+#define MMVQ_2ROWS_LAUNCH(FUS) ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, c_ncols_dst, FUS, false, false, 0, 0, 2, 1>, launch_params, \
                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst, \
                         channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, \
                         sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride)
@@ -4287,7 +4288,7 @@ static void mul_mat_vec_q_multi_launch(
     const uint3 zero = make_uint3(0, 0, 0);
     const uint3 one  = init_fastdiv_values(1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(nblocks, 1, 1), dim3(warp_size, nwarps, 1), 0, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, c_small_k, c_halve_iters, c_nwarps, n_multi, c_rpb, c_unroll>, launch_params,
+    ggml_cuda_kernel_launch_pl(mul_mat_vec_q<type, c_ncols_dst, false, c_small_k, c_halve_iters, c_nwarps, n_multi, c_rpb, c_unroll>, launch_params,
         fusion.multi_x[0], vy, (const int32_t *) nullptr, fusion, fusion.multi_dst[0], (uint32_t) ncols_x, zero, (uint32_t) stride_row_x,
         (uint32_t) stride_col_y, (uint32_t) nrows[0], one, 0u, 0u, 0u, one, 0u, 0u, 0u, 0u);
 }
@@ -4689,8 +4690,11 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
+    // a kernel preload: the kernel this product takes, nothing cleared, allocated or quantized
+    const bool preload = ggml_cuda_preload_on();
+
     // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+    if (!preload && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
         if (size_alloc > size_data) {
@@ -4704,7 +4708,7 @@ void ggml_cuda_mul_mat_vec_q(
     const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1_alloc(ctx.pool());
     char * src1_q8_1 = nullptr;
-    {
+    if (!preload) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -4880,7 +4884,7 @@ void ggml_cuda_mul_mat_vec_q_ew(ggml_backend_cuda_context & ctx, const ggml_tens
     const int rpb = rpb_env == 4 || nrows_x % 16 != 0 ? 4 : 16;
     const ggml_cuda_kernel_launch_params launch_params =
         ggml_cuda_kernel_launch_params(dim3((nrows_x + rpb - 1) / rpb, 1, 1), dim3(32, 4, 1), 0, ctx.stream());
-#define MMVQ_EW_LAUNCH_R(NC, RPB) ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, NC, false, false, false, 4, 0, RPB, 1, true>, \
+#define MMVQ_EW_LAUNCH_R(NC, RPB) ggml_cuda_kernel_launch_pl(mul_mat_vec_q<GGML_TYPE_Q8_0, NC, false, false, false, 4, 0, RPB, 1, true>, \
         launch_params, src0->data, nullptr, nullptr, fusion, (float *) dst->data, ncols_x, zero, stride_row_x, stride_col_y, \
         stride_col_dst, one, 0, 0, 0, one, 0, 0, 0, 0)
 #define MMVQ_EW_LAUNCH(NC) if (rpb == 16) { MMVQ_EW_LAUNCH_R(NC, 16); } else { MMVQ_EW_LAUNCH_R(NC, 4); }
@@ -5073,7 +5077,7 @@ void ggml_cuda_mul_mat_vec_q_inject(ggml_backend_cuda_context & ctx, const ggml_
     const int nblocks_inj = inj.nrows*inj.nsplit;
     const ggml_cuda_kernel_launch_params launch_params =
         ggml_cuda_kernel_launch_params(dim3(nblocks_q + nblocks_inj, 1, 1), dim3(32, MMVQ_HC_NWARPS, 1), 0, ctx.stream());
-#define MMVQ_INJ_LAUNCH(NC) ggml_cuda_kernel_launch(mul_mat_vec_q8_0_inject<NC, rpb, 8>, launch_params, src0->data, (const void *) vy, \
+#define MMVQ_INJ_LAUNCH(NC) ggml_cuda_kernel_launch_pl(mul_mat_vec_q8_0_inject<NC, rpb, 8>, launch_params, src0->data, (const void *) vy, \
         (float *) dst->data, ncols_x, stride_row_x, stride_col_y, stride_col_dst, nblocks_inj, inj)
     switch (ncols_dst) {
         case 1: MMVQ_INJ_LAUNCH(1); break;
@@ -5241,7 +5245,7 @@ void ggml_cuda_mul_mat_vec_q_hc_pre(ggml_backend_cuda_context & ctx, const ggml_
     constexpr int rpb = 4;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
         dim3((unsigned int) (src0->ne[1] / rpb), 1, 1), dim3(32, MMVQ_HC_NWARPS, 1), 0, ctx.stream());
-#define MMVQ_HC_PRE_LAUNCH(NC) ggml_cuda_kernel_launch(mul_mat_vec_q8_0_hc_pre<NC, rpb>, launch_params, src0->data, (const void *) vy, \
+#define MMVQ_HC_PRE_LAUNCH(NC) ggml_cuda_kernel_launch_pl(mul_mat_vec_q8_0_hc_pre<NC, rpb>, launch_params, src0->data, (const void *) vy, \
         (float *) gate->data, x, mixed, q8_1_out, cnt, ncols_x, stride_row_x, stride_col_y, stride_col_gate, (int) n_embd, sx1, sx2, scale)
     switch (ncols_dst) {
         case 1: MMVQ_HC_PRE_LAUNCH(1); break;

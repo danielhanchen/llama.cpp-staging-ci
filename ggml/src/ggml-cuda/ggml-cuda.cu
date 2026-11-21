@@ -9,6 +9,7 @@
 #include "ggml-cuda/dflash2-conv.cuh"
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/preload.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -6596,7 +6597,8 @@ static bool ggml_cuda_qsa_fill_chain(const ggml_cgraph * cgraph, const ggml_tens
 
 #define GGML_CUDA_QSA_MASKLESS_MAX_TOKENS 16
 
-static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+// structural (a kernel preload, ggml_backend_cuda_preload_graph): the nodes are not allocated, the memory checks are left out
+static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const bool structural = false) {
     cuda_ctx->qsa_maskless.clear();
     cuda_ctx->qsa_skip.clear();
     if (ggml_cuda_qsa_maskless_mode() == 0) {
@@ -6627,8 +6629,8 @@ static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, co
             if (i_sm < 0) {
                 continue;
             }
-            const auto hits = [](const char * r0, const char * r1, const ggml_tensor * t) {
-                return r0 < (const char *) t->data + ggml_nbytes(t) && (const char *) t->data < r1;
+            const auto hits = [structural](const char * r0, const char * r1, const ggml_tensor * t) {
+                return !structural && r0 < (const char *) t->data + ggml_nbytes(t) && (const char *) t->data < r1;
             };
             const auto overlaps = [&](const ggml_tensor * a, const ggml_tensor * b) {
                 return hits((const char *) a->data, (const char *) a->data + ggml_nbytes(a), b);
@@ -6710,8 +6712,8 @@ static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, co
         if (i_sr < 0) {
             continue;
         }
-        const auto hits = [](const char * r0, const char * r1, const ggml_tensor * t) {
-            return r0 < (const char *) t->data + ggml_nbytes(t) && (const char *) t->data < r1;
+        const auto hits = [structural](const char * r0, const char * r1, const ggml_tensor * t) {
+            return !structural && r0 < (const char *) t->data + ggml_nbytes(t) && (const char *) t->data < r1;
         };
         const auto overlaps = [&](const ggml_tensor * a, const ggml_tensor * b) {
             return hits((const char *) a->data, (const char *) a->data + ggml_nbytes(a), b);
@@ -8334,12 +8336,149 @@ static void ggml_cuda_qsa_sel_plan(ggml_backend_cuda_context * cuda_ctx, const g
 static void ggml_cuda_qsa_sel_launch(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * c2, const ggml_backend_cuda_context::qsa_sel_args & a) {
     const int n = (a.kpool*a.n_top + a.n_tail)*a.n_tok;
     static const bool grid = getenv("GGML_CUDA_QSA_SEL_GRID") == nullptr || atoi(getenv("GGML_CUDA_QSA_SEL_GRID")) != 0;
+    if (ggml_cuda_preload_on()) {
+        ggml_cuda_preload_func(grid && a.no_alias ? (const void *) k_qsa_sel_chain_grid : (const void *) k_qsa_sel_chain);
+        return;
+    }
     if (grid && a.no_alias) {
         k_qsa_sel_chain_grid<<<(n + 127)/128, 128, 0, cuda_ctx->stream()>>>(a, (int32_t *) c2->data, n);
     } else {
         k_qsa_sel_chain<<<1, 256, n*sizeof(int32_t), cuda_ctx->stream()>>>(a, (int32_t *) c2->data);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// kernel preload (proc "ggml_backend_cuda_preload_graph"). Under lazy module loading (the CUDA 12 default) a kernel is loaded at its
+// first launch, and that load waits for the whole device: the first launch of a kernel in the 4-token tail of a long prompt then waits
+// for the MoE cache's refill on the upload stream and for an MTP drafter's prompt pass (RTX PRO 6000, Qwen3.8-Flash-Next with MTP, 48 GB:
+// 62 ms). A caller with an idle device (llama_context at load, after the fit) passes a graph of that shape: each node runs the dispatch
+// of its launch with the launch sites loading their function (cudaFuncGetAttributes) instead of running it, so the kernels it loads
+// are the ones the same node would launch. Covered: the lightning indexer, top-k (the one-block radix select), the QSA selection chain,
+// flash attention (with its sparse list build) and the mul_mat_vec_f / mul_mat_vec_q products (each also as the fused gate launch
+// where the node may fuse). Nothing is allocated, written or launched; the kernels are kept loaded for the life of the process.
+thread_local bool ggml_cuda_preload_active = false;
+static thread_local std::unordered_set<const void *> * ggml_cuda_preload_seen = nullptr;
+static thread_local int ggml_cuda_preload_n_new = 0;
+
+void ggml_cuda_preload_func(const void * fn) {
+    if (fn == nullptr || (ggml_cuda_preload_seen != nullptr && !ggml_cuda_preload_seen->insert(fn).second)) {
+        return;
+    }
+    cudaFuncAttributes attr;
+    if (cudaFuncGetAttributes(&attr, fn) == cudaSuccess) {
+        ggml_cuda_preload_n_new++;
+    } else {
+        (void) cudaGetLastError();
+    }
+}
+
+static void ggml_cuda_preload_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * node) {
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    // products of a weight only (an activation has no memory in the graph passed here)
+    if (src0 == nullptr || src1 == nullptr || src0->buffer == nullptr || src0->data == nullptr || src1->type != GGML_TYPE_F32 ||
+            node->type != GGML_TYPE_F32 || (node->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+        return;
+    }
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    ggml_cuda_mm_fusion_args_host fused{};
+    fused.gate = src0;
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        // (as ggml_cuda_mul_mat_id)
+        const ggml_tensor * ids = node->src[2];
+        if (node->ne[2] <= MMVQ_MAX_BATCH_SIZE && ggml_is_quantized(src0->type) && node->ne[2] <= ggml_cuda_mmvq_mmid_max_batch(src0->type, cc)) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, node, nullptr);
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+                ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, node, &fused);
+            }
+        }
+        return;
+    }
+    // (as ggml_cuda_mul_mat for a product that is not batch invariant)
+    const int64_t ne11 = src1->ne[1];
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (bad_padding_clear || ggml_cuda_op_mul_mat_use_fwht(node) || (src0->type == GGML_TYPE_F32 && ggml_get_op_params_i32(node, 3) == GGML_PREC_F32)) {
+        return;
+    }
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, node);
+        if (ggml_cuda_should_fuse_mul_mat_vec_f(node)) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, node, &fused);
+        }
+        return;
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false) ||
+            ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
+        return;
+    }
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, node, nullptr);
+        if (ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, node, &fused);
+        }
+    }
+}
+
+// on_device (may be nullptr: every node): the nodes this backend runs. Returns the number of functions loaded by this call
+static int ggml_backend_cuda_preload_graph(ggml_backend_t backend, ggml_cgraph * cgraph, const bool * on_device) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    static std::mutex mutex;
+    static std::unordered_set<const void *> seen[GGML_CUDA_MAX_DEVICES];
+    std::lock_guard<std::mutex> lock(mutex);
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    // the plans of the graph evaluation stay as they were (the walk plans the QSA nodes of this graph by their structure)
+    auto saved_maskless = std::move(cuda_ctx->qsa_maskless);
+    auto saved_skip     = std::move(cuda_ctx->qsa_skip);
+    ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph, /*structural =*/ true);
+    static const bool sel_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_SEL_FUSION");
+
+    ggml_cuda_preload_seen   = &seen[cuda_ctx->device];
+    ggml_cuda_preload_n_new  = 0;
+    ggml_cuda_preload_active = true;
+    std::vector<const ggml_tensor *> chain, inputs;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if ((on_device != nullptr && !on_device[i]) || ggml_is_empty(node)) {
+            continue;
+        }
+        switch (node->op) {
+            case GGML_OP_LIGHTNING_INDEXER:
+                ggml_cuda_lightning_indexer(*cuda_ctx, node);
+                break;
+            case GGML_OP_TOP_K:
+                ggml_cuda_op_top_k(*cuda_ctx, node);
+                break;
+            case GGML_OP_FLASH_ATTN_EXT:
+                ggml_cuda_flash_attn_ext_preload(*cuda_ctx, node);
+                break;
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_MUL_MAT_ID:
+                ggml_cuda_preload_mul_mat(*cuda_ctx, node);
+                break;
+            case GGML_OP_CPY:
+                if (node->type == GGML_TYPE_I32 && !sel_disabled && !ggml_cuda_fusion_disabled()) {
+                    ggml_backend_cuda_context::qsa_sel_args a = {};
+                    chain.clear();
+                    inputs.clear();
+                    if (ggml_cuda_qsa_sel_match(cgraph, node, a, chain, inputs)) {
+                        a.no_alias = true; // (the graph evaluation decides it from the memory of the nodes)
+                        ggml_cuda_qsa_sel_launch(cuda_ctx, node, a);
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    ggml_cuda_preload_active = false;
+    ggml_cuda_preload_seen   = nullptr;
+    cuda_ctx->qsa_maskless = std::move(saved_maskless);
+    cuda_ctx->qsa_skip     = std::move(saved_skip);
+    (void) cudaGetLastError();
+    return ggml_cuda_preload_n_new;
 }
 
 // (GGML_CUDA_DISABLE_SET_ROWS_PAIR=1 off): a SET_ROWS whose next compute node is another SET_ROWS of the same types (the K and
@@ -13589,6 +13728,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_moe_refill_done") == 0) {
         return (void *)ggml_backend_cuda_moe_refill_done;
+    }
+    if (strcmp(name, "ggml_backend_cuda_preload_graph") == 0) {
+        return (void *)ggml_backend_cuda_preload_graph;
     }
     if (strcmp(name, "ggml_backend_copy_regions_async") == 0) {
         return (void *)ggml_backend_cuda_copy_regions_async;
