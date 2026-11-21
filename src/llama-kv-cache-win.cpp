@@ -27,7 +27,7 @@ static ggml_type kv_win_type_from_name(const char * name, ggml_type def) {
             return (ggml_type) t;
         }
     }
-    LLAMA_LOG_WARN("%s: k19-kvwin: unknown type %s, using %s\n", __func__, name, ggml_type_name(def));
+    LLAMA_LOG_WARN("%s: unknown type %s, using %s\n", __func__, name, ggml_type_name(def));
     return def;
 }
 
@@ -105,7 +105,7 @@ bool llama_kv_cache::win_init(const llama_kv_win_params & p) {
         why = "neither K nor V is quantized";
     }
     if (why != nullptr) {
-        LLAMA_LOG_WARN("%s: k19-kvwin: recent-window ring off: %s\n", __func__, why);
+        LLAMA_LOG_WARN("%s: recent-window ring off: %s\n", __func__, why);
         return false;
     }
 
@@ -162,7 +162,7 @@ bool llama_kv_cache::win_init(const llama_kv_win_params & p) {
         } else {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
             if (buf == nullptr) {
-                throw std::runtime_error("failed to allocate the k19-kvwin ring buffer");
+                throw std::runtime_error("failed to allocate the KV window ring buffer");
             }
             ggml_backend_buffer_clear(buf, 0);
             total += ggml_backend_buffer_get_size(buf);
@@ -199,7 +199,7 @@ bool llama_kv_cache::win_init(const llama_kv_win_params & p) {
         rg.reset(win_r, kv_size);
     }
 
-    LLAMA_LOG_INFO("%s: k19-kvwin: ring of %u slots x %u streams (last %d + first %d positions, %u seqs per stream, ubatch %u) "
+    LLAMA_LOG_INFO("%s: ring of %u slots x %u streams (last %d + first %d positions, %u seqs per stream, ubatch %u) "
             "K %s / V %s beside the cache K %s / V %s: %.2f MiB, attention %s\n", __func__, win_r, n_stream, win.n_win, win.n_sinks, n_seq_strm,
             p.n_ubatch, ggml_type_name(tk), ggml_type_name(tv), ggml_type_name(layers[0].k->type), ggml_type_name(tv_cache), total/1048576.0,
             win_fused_ ? "two-source flash attention" : "concat stopgap (no two-source flash attention on the device)");
@@ -306,7 +306,7 @@ void llama_kv_cache::win_assign(const slot_info & sinfo, const llama_ubatch & ub
             const int32_t j = win_take(strm, lo);
             if (j < 0) {
                 if (n_full_log.fetch_add(1) < 4) {
-                    LLAMA_LOG_WARN("%s: k19-kvwin: ring full (%u slots, stream %u): the cell of position %d reads the cache\n",
+                    LLAMA_LOG_WARN("%s: ring full (%u slots, stream %u): the cell of position %d reads the cache\n",
                             __func__, win_r, strm, p);
                 }
                 continue;
@@ -407,7 +407,7 @@ void llama_kv_cache::set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_
             us += ggml_time_us() - t0;
             rows += n;
             if (++calls % 256 == 0 || n >= 512) {
-                LLAMA_LOG_INFO("k19-kvwin prof: %lld mask builds, %lld rows, %.3f ms total, %.2f us per row\n", (long long) calls.load(),
+                LLAMA_LOG_INFO("KV window mask profile: %lld mask builds, %lld rows, %.3f ms total, %.2f us per row\n", (long long) calls.load(),
                         (long long) rows.load(), us.load()/1e3, (double) us.load()/std::max<int64_t>(1, rows.load()));
             }
         }
@@ -515,7 +515,7 @@ void llama_kv_cache::set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_
 
     static std::atomic<int> n_log { 0 };
     if (debug > 0 || n_log.fetch_add(1) < 2) {
-        LLAMA_LOG_INFO("%s: k19-kvwin: %llu (row, cell) pairs read from the ring (%u tokens, %lld cells, %u slots)\n", __func__,
+        LLAMA_LOG_INFO("%s: %llu (row, cell) pairs read from the ring (%u tokens, %lld cells, %u slots)\n", __func__,
                 (unsigned long long) n_moved, n_tokens, (long long) n_kv, win_r);
     }
 }
@@ -742,7 +742,7 @@ bool llama_kv_cache::state_read_win(llama_io_read_i & io, uint32_t strm, uint32_
     uint32_t n_flags = 0;
     io.read(&n_flags, sizeof(n_flags));
     if (n_flags != cell_count) {
-        LLAMA_LOG_ERROR("%s: k19-kvwin: ring flags for %u cells, %u restored\n", __func__, n_flags, cell_count);
+        LLAMA_LOG_ERROR("%s: ring flags for %u cells, %u restored\n", __func__, n_flags, cell_count);
         return false;
     }
     std::vector<uint8_t> flags(n_flags);
@@ -755,7 +755,7 @@ bool llama_kv_cache::state_read_win(llama_io_read_i & io, uint32_t strm, uint32_
     const bool use = win_on() && tk == (int32_t) win.type_k && tv == (int32_t) win.type_v && !sinfo.empty();
     static std::atomic<int> n_log { 0 };
     if (!use && win_on() && n_log.fetch_add(1) < 2) {
-        LLAMA_LOG_WARN("%s: k19-kvwin: the blob's ring is %s / %s, this cache's %s / %s: the restored cells read the cache\n", __func__,
+        LLAMA_LOG_WARN("%s: the blob's ring is %s / %s, this cache's %s / %s: the restored cells read the cache\n", __func__,
                 ggml_type_name((ggml_type) tk), ggml_type_name((ggml_type) tv), ggml_type_name(win.type_k), ggml_type_name(win.type_v));
     }
 
@@ -803,7 +803,7 @@ bool llama_kv_cache::state_read_win(llama_io_read_i & io, uint32_t strm, uint32_
             uint64_t row = 0;
             io.read(&row, sizeof(row));
             if (w != nullptr && row != w->nb[1]) {
-                LLAMA_LOG_ERROR("%s: k19-kvwin: mismatched ring row size (%zu != %zu)\n", __func__, (size_t) row, (size_t) w->nb[1]);
+                LLAMA_LOG_ERROR("%s: mismatched ring row size (%zu != %zu)\n", __func__, (size_t) row, (size_t) w->nb[1]);
                 return false;
             }
             // runs of consecutive target slots in one copy each (see state_write_win)

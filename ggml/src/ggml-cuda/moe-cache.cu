@@ -1061,7 +1061,7 @@ static void moe_pf_report() {
                 continue;
             }
             c[MOE_PF_STAT_SKIPPED] = g.skipped;
-            fprintf(stderr, "ggml_cuda: k19-g4pref: device %d (%lld slots): %llu prefetch layers, %llu predicted cached, %llu prefetch fills "
+            fprintf(stderr, "ggml_cuda: device %d (%lld slots): %llu prefetch layers, %llu predicted cached, %llu prefetch fills "
                 "(%llu capped), %llu useful, %llu wasted (%llu by prefetches, %llu by lookups), %llu misses of prefetch-evicted experts, "
                 "%llu lookups with %llu fills, %llu prefetch ops skipped\n", g.device, (long long) g.n_slots,
                 c[MOE_PF_STAT_LAYERS], c[MOE_PF_STAT_CACHED], c[MOE_PF_STAT_FILLS], c[MOE_PF_STAT_CAPPED], c[MOE_PF_STAT_USEFUL],

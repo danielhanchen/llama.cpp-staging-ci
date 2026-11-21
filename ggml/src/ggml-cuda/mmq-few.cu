@@ -861,12 +861,12 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
         return e != nullptr && atoi(e) != 0;
     }();
     if (log_each) {
-        GGML_LOG_INFO("k19-kqtc: mmq-few %s %lld columns 1 matrices rows %lld K %lld\n", ggml_type_name(src0->type), (long long) ne11,
+        GGML_LOG_INFO("few-row MMQ: mmq-few %s %lld columns 1 matrices rows %lld K %lld\n", ggml_type_name(src0->type), (long long) ne11,
             (long long) ne01, (long long) ne00);
     }
     static std::once_flag once;
     std::call_once(once, [&] {
-        GGML_LOG_INFO("k19-kqtc: few-row MMQ (GGML_CUDA_MMQ_FEW=%d (-1 = AUTO), up to %d columns; =0 off) takes dense products (first: %s, %lld columns, K %lld)\n",
+        GGML_LOG_INFO("few-row MMQ: few-row MMQ (GGML_CUDA_MMQ_FEW=%d (-1 = AUTO), up to %d columns; =0 off) takes dense products (first: %s, %lld columns, K %lld)\n",
             mmq_few_env().mode, mmq_few_env().max_cols, ggml_type_name(src0->type), (long long) ne11, (long long) ne00);
     });
 

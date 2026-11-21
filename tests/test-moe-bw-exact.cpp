@@ -42,7 +42,7 @@ static int n_bw_logs = 0;
 static const char * log_match = nullptr;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-moebw:") != nullptr) {
+    if (strstr(text, "MoE mat-vec:") != nullptr) {
         n_bw_logs += log_match == nullptr || strstr(text, log_match) != nullptr;
         return;
     }

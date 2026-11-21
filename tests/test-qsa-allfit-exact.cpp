@@ -21,9 +21,9 @@ static int n_allfit = 0;
 static int n_scored = 0;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-p2qsa graph: allfit") != nullptr) {
+    if (strstr(text, "QSA graph: allfit") != nullptr) {
         n_allfit++;
-    } else if (strstr(text, "k19-p2qsa graph: scored") != nullptr) {
+    } else if (strstr(text, "QSA graph: scored") != nullptr) {
         n_scored++;
     } else if (level == GGML_LOG_LEVEL_ERROR) {
         fputs(text, stderr);

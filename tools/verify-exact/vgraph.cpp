@@ -78,7 +78,8 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
         g_invalid++;
     }
     if (level >= GGML_LOG_LEVEL_WARN || p || strstr(text, "changed at node") || strstr(text, "n_kv buckets") ||
-            strstr(text, "not reused") || strstr(text, "invalidated") || strstr(text, "k19-vwidth") || g_log_all) {
+            strstr(text, "not reused") || strstr(text, "invalidated") || strstr(text, "incremental KQ mask") || strstr(text, "KQ masks start from") ||
+            strstr(text, "k-pool inputs keep") || strstr(text, "verify graph prewarm") || strstr(text, "warmed up after") || g_log_all) {
         fputs(text, stderr);
     }
 }

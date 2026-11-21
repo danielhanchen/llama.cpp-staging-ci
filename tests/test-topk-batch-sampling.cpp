@@ -27,7 +27,7 @@
 static bool g_engaged = false;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-p3topk:") != nullptr) {
+    if (strstr(text, "batched top-k:") != nullptr) {
         g_engaged = true;
     }
     if (level >= GGML_LOG_LEVEL_ERROR) {

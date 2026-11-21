@@ -1687,7 +1687,7 @@ static std::string g_small_check_line;
 static void small_check_log(enum ggml_log_level level, const char * text, void * user_data) {
     GGML_UNUSED(level);
     GGML_UNUSED(user_data);
-    if (text != nullptr && strstr(text, "k19-mgpu3 small graph backends:") != nullptr) {
+    if (text != nullptr && strstr(text, "multi-GPU small graph backends:") != nullptr) {
         g_small_check_line = text;
     }
 }

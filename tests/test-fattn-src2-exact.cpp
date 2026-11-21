@@ -33,7 +33,7 @@
 static bool g_src2_logged = false;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-fattnq4: two-source flash attention") != nullptr) {
+    if (strstr(text, "quantized-KV flash attention: two-source flash attention") != nullptr) {
         g_src2_logged = true;
         fputs(text, stdout);
     }

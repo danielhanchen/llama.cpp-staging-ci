@@ -241,7 +241,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         return;
     }
     if (cached_ok && llama_moe_cache_active(ctx) && !wide_graphs) {
-        SRV_INF("k19-g4cap: verify graphs prewarmed beside a MoE cache that holds %.1f%% of the host experts (LLAMA_SPEC_PREWARM_CACHED_FRAC "
+        SRV_INF("verify graphs prewarmed beside a MoE cache that holds %.1f%% of the host experts (LLAMA_SPEC_PREWARM_CACHED_FRAC "
                 "%.2f)\n", 100.0*cache_frac, cached_frac_min);
     }
     auto dev_free_mib = []() -> double {
@@ -358,21 +358,21 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
                 n_ok += ok;
                 if (mem_log) {
                     const double fr = dev_free_mib();
-                    SRV_INF("k19-fullcost: prewarm chain %d form %d width %d: device free %.1f MiB (%+.1f)\n", c, form, w, fr, fr - free_prev);
+                    SRV_INF("prewarm chain %d form %d width %d: device free %.1f MiB (%+.1f)\n", c, form, w, fr, fr - free_prev);
                     free_prev = fr;
                 }
             }
         }
     }
     if (floor_hit) {
-        SRV_INF("k19-int3fix: verify graph prewarm left %d of %d chain x form x width graphs to the first request that needs them: device free "
+        SRV_INF("verify graph prewarm left %d of %d chain x form x width graphs to the first request that needs them: device free "
                 "memory under %.0f MiB (LLAMA_SPEC_PREWARM_MIN_FREE_MIB=0: no floor)\n", n_skipped, n_chain*n_forms*(int) widths.size(), min_free);
     }
     if (pw_both && ok) {
-        SRV_INF("k19-int3fix: verify graphs prewarmed in both QSA forms, scored and all-fit, %d widths (LLAMA_SPEC_PREWARM_ALLFIT=0: scored only)\n", (int) widths.size());
+        SRV_INF("verify graphs prewarmed in both QSA forms, scored and all-fit, %d widths (LLAMA_SPEC_PREWARM_ALLFIT=0: scored only)\n", (int) widths.size());
     }
     if (!ok) {
-        SRV_WRN("k19-vwidth: verify graph prewarm stopped at %d rows (a decode or sampler swap failed)\n", n_ok + 1);
+        SRV_WRN("verify graph prewarm stopped at %d rows (a decode or sampler swap failed)\n", n_ok + 1);
     }
     if (!chains.empty()) {
         llama_set_sampler_swap(ctx, 0, restore);
@@ -390,7 +390,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         llama_moe_cache_prewarm_end(ctx);
     }
     llama_moe_cache_fingerprint(ctx, "after the prewarm");
-    SRV_INF("k19-vwidth: the decode / verify graphs of 1..%d rows warmed up after a %d-token prompt, %d decodes each, %d sampler chain(s) (%.1f ms; LLAMA_SPEC_PREWARM=0: off)\n",
+    SRV_INF("the decode / verify graphs of 1..%d rows warmed up after a %d-token prompt, %d decodes each, %d sampler chain(s) (%.1f ms; LLAMA_SPEC_PREWARM=0: off)\n",
             n_ok, n_pre, reps, (int) chains.size(), (ggml_time_us() - t0)/1000.0);
 }
 
@@ -399,7 +399,7 @@ static bool spec_end_full_window() {
     static const bool v = [] {
         const char * e = getenv("LLAMA_SPEC_END_FULL_WINDOW");
         const bool on = e == nullptr || atoi(e) != 0;
-        LOG_INF("k19-l4reg: the last pass before the n_predict limit keeps the full draft window: %s (LLAMA_SPEC_END_FULL_WINDOW=0: off)\n",
+        LOG_INF("the last pass before the n_predict limit keeps the full draft window: %s (LLAMA_SPEC_END_FULL_WINDOW=0: off)\n",
             on ? "on" : "off");
         return on;
     }();
@@ -1233,7 +1233,7 @@ struct server_slot {
                 static std::atomic<int64_t> n_kept{0};
                 const int64_t k = ++n_kept;
                 if (k <= 2 || (k & (k - 1)) == 0) {
-                    SLT_INF(*this, "k19-l4reg: %d token(s) left before the n_predict limit: the draft window is kept (engaged %" PRId64 " times)\n",
+                    SLT_INF(*this, "%d token(s) left before the n_predict limit: the draft window is kept (engaged %" PRId64 " times)\n",
                         n_remaining(), k);
                 }
             }
@@ -1408,7 +1408,7 @@ struct server_slot {
             // k19-hostgap: engagement of the task-queue yield's fast end (LLAMA_SERVER_YIELD_FAST=0: off), counts since start
             int64_t n_fast = 0, n_total = 0;
             server_queue_yield_counts(n_fast, n_total);
-            SLT_INF(*this, "k19-hostgap: %" PRId64 " of %" PRId64 " task-queue yields ended without waiting for the worker (LLAMA_SERVER_YIELD_FAST=0 off)\n",
+            SLT_INF(*this, "%" PRId64 " of %" PRId64 " task-queue yields ended without waiting for the worker (LLAMA_SERVER_YIELD_FAST=0 off)\n",
                     n_fast, n_total);
         }
         if (srv_pass_timer().on) {
@@ -2205,7 +2205,7 @@ private:
                 getenv("LLAMA_SPEC_TPP_NEED_PLE") != nullptr && atoi(getenv("LLAMA_SPEC_TPP_NEED_PLE")) == 0 ? tpp_host_input_bytes(params.model.path) : 0;
             const uint64_t need = mtp_shape ? tgt_bytes - std::min(ple_bytes, tgt_bytes) + tpp_gguf_bytes(sp.draft.mparams.path) + (1536ull << 20) : 0;
             if (ple_bytes > 0) {
-                SRV_INF("k19-bigverify: the per-layer embedding table (%.0f MiB) stays in host memory: not counted in the device need of the "
+                SRV_INF("the per-layer embedding table (%.0f MiB) stays in host memory: not counted in the device need of the "
                     "draft window rule (LLAMA_SPEC_TPP_NEED_PLE=0; unset: counted)\n", ple_bytes/1048576.0);
             }
             // (no GPU: no MoE cache. LLAMA_SPEC_TPP_FORCE_CACHED=1, a test hook: as if the experts did not fit)
@@ -2391,11 +2391,11 @@ private:
                 }
             }
             if (share_low) {
-                SRV_INF("k19-q4cap: MoE cache expected to hold %.1f%% of the routed experts (from %.2f): the 3rd draft in the chat bucket only "
+                SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (from %.2f): the 3rd draft in the chat bucket only "
                     "(below 1536 tokens; LLAMA_SPEC_TPP_CACHED_LOW=0: off)\n", 100.0*share_est, share_lo);
             }
             if (share_try) {
-                SRV_INF("k19-sharegate: MoE cache expected to hold %.1f%% of the routed experts (%.0f MiB short of %.0f MiB, %.0f MiB of RAM): "
+                SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (%.0f MiB short of %.0f MiB, %.0f MiB of RAM): "
                     "priced 3-draft windows %s (LLAMA_SPEC_TPP_CACHED_SHARE=%.2f; LLAMA_SPEC_TPP_SHAREGATE=0: off)\n", 100.0*share_est,
                     share_short/1048576.0, share_exp/1048576.0, share_ram/1048576.0, share_ok ? "on" : "off", share_min);
             }
@@ -2418,7 +2418,7 @@ private:
             // (PLE rows read from the disk and expert misses copied at ~10 GB/s), against 3.4 -> 4.0 tokens per pass
             if (deep_try && !on) {
                 if (g4t_band && !g4t_ctx_ok) {
-                    SRV_INF("k19-g4tail2: n_ctx %d is above LLAMA_FIT_LONGCTX_MIN_CTX (%lld): the g4tail rule stays off (MTP windows and "
+                    SRV_INF("n_ctx %d is above LLAMA_FIT_LONGCTX_MIN_CTX (%lld): the g4tail rule stays off (MTP windows and "
                         "the prefetch as with LLAMA_MOE_G4TAIL=0)\n", params.n_ctx, (long long) g4t_ctx_max);
                 }
                 spec_g4t_raised = g4t;
@@ -2472,11 +2472,11 @@ private:
                         "windows of %d drafts (LLAMA_SPEC_DEPTH_MID_HI=0: %d)\n", 100.0*deep_share, deep_share_min, mid_hi, n_mid, n_def);
                 }
                 if (g4t) {
-                    SRV_INF("k19-g4tail: MoE cache expected to hold %.1f%% of the routed experts (band %.2f .. %.2f, compute capability 12.0, target "
+                    SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (band %.2f .. %.2f, compute capability 12.0, target "
                         "in RAM): MTP windows of %d drafts and the cache's cross-layer prefetch in its band (LLAMA_MOE_G4TAIL=0: off)\n", 100.0*deep_share,
                         g4t_lo, g4t_hi, n_def);
                 }
-                SRV_INF("k19-fnmtp2: MoE cache expected to hold %.1f%% of the routed experts (%.0f MiB short of %.0f MiB); target GGUF %.0f MiB %s "
+                SRV_INF("MoE cache expected to hold %.1f%% of the routed experts (%.0f MiB short of %.0f MiB); target GGUF %.0f MiB %s "
                     "(%.0f MiB of RAM available): %s (LLAMA_SPEC_DEPTH_CACHED_SHARE=%.2f; LLAMA_SPEC_DEPTH_CACHED=0: 2 drafts)\n", 100.0*deep_share,
                     short_b/1048576.0, exp_b/1048576.0, tgt_bytes/1048576.0, in_ram_fs ? "on a memory file system" : resident ? "fits in RAM" :
                     "does not fit in RAM", ram_avail/1048576.0, def_on || g4t || def_mid ? "deeper MTP windows by default" : "MTP windows of 2 drafts", deep_share_min);
@@ -2507,7 +2507,7 @@ private:
             const bool deep_cached = mtp_shape && !on && cache_expected && sp.has_dft() && (e != nullptr ? atoi(e) != 0 : dev_ok) &&
                 depth_cached >= 3 && !exact_mtp && (ram_fits || disk_ok);
             if (mtp_shape && !on && cache_expected && sp.has_dft() && depth_cached >= 3 && !exact_mtp && !(ram_fits || disk_ok)) {
-                SRV_INF("k19-fnmtp: MTP stays at 2 drafts beside the MoE cache: the routed experts (%.0f MiB) do not fit in %.0f MiB of RAM, "
+                SRV_INF("MTP stays at 2 drafts beside the MoE cache: the routed experts (%.0f MiB) do not fit in %.0f MiB of RAM, "
                     "the cache's misses come from the disk (LLAMA_SPEC_DEPTH_CACHED_DISK=1: deeper windows anyway)\n",
                     expert_bytes/1048576.0, ram_avail/1048576.0);
             }
@@ -2527,7 +2527,7 @@ private:
                 if (getenv("LLAMA_SPEC_VERIFY4_CACHED") == nullptr) {
                     common_set_env("LLAMA_SPEC_VERIFY4_CACHED", "1");
                 }
-                SRV_INF("k19-fnmtp: MoE cache expected (need %.0f MiB for model + drafter, %.0f MiB free on the GPUs): MTP drafts %d in every "
+                SRV_INF("MoE cache expected (need %.0f MiB for model + drafter, %.0f MiB free on the GPUs): MTP drafts %d in every "
                     "window below position %s, 2 and a priced 3rd from there; 4-row verify windows tagged (LLAMA_SPEC_DEPTH_CACHED=0: 2 drafts)\n", need/1048576.0,
                     dev_free/1048576.0, sp.draft.n_max, getenv("LLAMA_SPEC_DEPTH_POS") != nullptr ? getenv("LLAMA_SPEC_DEPTH_POS") : "12288");
             } else if (mtp_shape && on) {
@@ -2542,11 +2542,11 @@ private:
                 // (the chat bucket's deeper windows on a MoE target only: a dense one keeps 4)
                 const bool chat_ok = cc_min == 1200 && cc_max == 1200 && de == nullptr && common_moe_expert_bytes(params.model.path) > 0;
                 sp.draft.n_max   = deep ? (chat_ok ? chat_deepen(4) : 4) : 3;
-                SRV_INF("k19-tpp: MTP drafts 2, a 3rd where it pays (need %.0f MiB for model + drafter, %.0f MiB free on %d GPUs%s; "
+                SRV_INF("MTP drafts 2, a 3rd where it pays (need %.0f MiB for model + drafter, %.0f MiB free on %d GPUs%s; "
                     "LLAMA_SPEC_TPP=0: off)\n", need/1048576.0, dev_free/1048576.0, n_gpu, n_gpu == 0 ? ", no GPU: forced" : "");
                 if (deep) {
                     const char * dp = getenv("LLAMA_SPEC_DEPTH_POS");
-                    SRV_INF("k19-depth: MTP drafts 4 in every window below position %s (LLAMA_SPEC_DEPTH_POS; LLAMA_SPEC_DEPTH=0: off)\n",
+                    SRV_INF("MTP drafts 4 in every window below position %s (LLAMA_SPEC_DEPTH_POS; LLAMA_SPEC_DEPTH=0: off)\n",
                         dp != nullptr ? dp : "12288");
                 }
                 // With the deeper chat windows on the whole card (compute capability 12.0, MoE target, an MTP drafter of its own) the
@@ -2579,24 +2579,24 @@ private:
                 if (getenv("LLAMA_SPEC_VERIFY4_CACHED") == nullptr) {
                     common_set_env("LLAMA_SPEC_VERIFY4_CACHED", "1");
                 }
-                SRV_INF("k19-adraft: MoE cache expected (need %.0f MiB, %.0f MiB free on the GPUs): sampled requests draft up to %d, "
+                SRV_INF("MoE cache expected (need %.0f MiB, %.0f MiB free on the GPUs): sampled requests draft up to %d, "
                     "greedy ones %d (LLAMA_SPEC_ADRAFT=0: off)\n", need/1048576.0, dev_free/1048576.0,
                     sp.draft.n_max, sp.draft.adraft);
             } else if (mtp_shape && n_gpu == 0 && e == nullptr) {
-                SRV_INF("%s", "k19-tpp: off: no GPU (LLAMA_SPEC_TPP=1: on)\n");
+                SRV_INF("%s", "off: no GPU (LLAMA_SPEC_TPP=1: on)\n");
             } else if (mtp_shape && (e != nullptr ? atoi(e) != 0 : dev_ok)) {
-                SRV_INF("k19-tpp: off: 3-draft windows are off because the MoE cache is on (need %.0f MiB for model + drafter, %.0f MiB free on the GPUs%s%s); "
+                SRV_INF("off: 3-draft windows are off because the MoE cache is on (need %.0f MiB for model + drafter, %.0f MiB free on the GPUs%s%s); "
                     "MTP windows of 2 drafts, as LLAMA_SPEC_TPP=0 (LLAMA_SPEC_TPP_CACHED=1: on)\n", need/1048576.0, dev_free/1048576.0,
                     host_experts ? ", experts placed on the host" : "", fe != nullptr && atoi(fe) != 0 ? ", LLAMA_SPEC_TPP_FORCE_CACHED" : "");
             } else if (mtp_shape && e == nullptr) {
-                SRV_INF("k19-tpp: MTP stays at 2 drafts here (%d GPUs, lowest compute capability %d: not every GPU is NVIDIA Ampere or newer; "
+                SRV_INF("MTP stays at 2 drafts here (%d GPUs, lowest compute capability %d: not every GPU is NVIDIA Ampere or newer; "
                     "LLAMA_SPEC_TPP=1 forces the wider window)\n", n_gpu, n_gpu > 0 ? cc_min : -1);
             }
             // k19-small1115: the windows above were widened past Studio's 2 drafts on a --parallel N server: cut back to 2 in the
             // rounds where another slot is active (update_slots)
             spec_active_cap = params.n_parallel > 1 && mtp_shape && sp.draft.n_max > 2 ? 2 : 0;
             if (spec_active_cap > 0) {
-                SRV_INF("k19-small1115: --parallel %d: a lone request drafts up to %d as with --parallel 1, %d while another slot is active "
+                SRV_INF("--parallel %d: a lone request drafts up to %d as with --parallel 1, %d while another slot is active "
                     "(LLAMA_SPEC_TPP_ACTIVE=0: %d always)\n", params.n_parallel, sp.draft.n_max, spec_active_cap, spec_active_cap);
             }
         }
@@ -2725,10 +2725,10 @@ private:
             const char * pl = getenv("LLAMA_MOE_G4TAIL_PLACED");
             if ((pg == nullptr || atoi(pg) != 0) && (pl == nullptr || atoi(pl) == 0)) {
                 spec_g4t_cap = 2;
-                SRV_INF("k19-g4tail2: the placed MoE cache is outside the prefetch band (%s): MTP windows of 2 drafts "
+                SRV_INF("the placed MoE cache is outside the prefetch band (%s): MTP windows of 2 drafts "
                     "(LLAMA_MOE_G4TAIL_PLACED_GATE=0: keep the wider windows)\n", pl == nullptr ? "no verdict" : "verdict off");
             } else if (pl != nullptr && atoi(pl) != 0) {
-                SRV_INF("%s", "k19-g4tail2: the placed MoE cache is in the prefetch band: the wider MTP windows stay\n");
+                SRV_INF("%s", "the placed MoE cache is in the prefetch band: the wider MTP windows stay\n");
             }
         }
 

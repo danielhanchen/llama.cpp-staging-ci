@@ -250,10 +250,16 @@ int main(int argc, char ** argv) {
         }
         // the part residency line: the first context of the model (the residency rule runs once per table)
         part_read = base.part;
-        bool pass = ok_rd && rd_calls > 0 && part_read && logits_rd[0].size() == logits_rd[1].size() && !logits_rd[0].empty() &&
+        // the part residency read is Linux only (elsewhere the table stays unread by design)
+#if defined(__linux__)
+        const bool part_need = true;
+#else
+        const bool part_need = false;
+#endif
+        bool pass = ok_rd && rd_calls > 0 && (part_read || !part_need) && logits_rd[0].size() == logits_rd[1].size() && !logits_rd[0].empty() &&
             memcmp(logits_rd[0].data(), logits_rd[1].data(), logits_rd[0].size()*sizeof(float)) == 0;
         printf("%-60s %-9s prompt reads = %" PRIu64 " ubatches, part residency %s, logits %s : %s\n", argv[a], "disktt", rd_calls,
-                part_read ? "read" : "NOT read", ok_rd && logits_rd[0] == logits_rd[1] ? "equal to reads off" : "DIFFER", pass ? "OK" : "FAIL");
+                part_read ? "read" : part_need ? "NOT read" : "not read (Linux only)", ok_rd && logits_rd[0] == logits_rd[1] ? "equal to reads off" : "DIFFER", pass ? "OK" : "FAIL");
         n_fail += !pass;
     }
 

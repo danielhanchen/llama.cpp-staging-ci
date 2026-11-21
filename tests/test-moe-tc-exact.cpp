@@ -6,7 +6,7 @@
 //   - the switch: mode 1 (verify windows) engages on a verify-tagged graph and leaves an untagged one byte-identical to the kill switch,
 //   - a negative control (the kernel's output with one weight row perturbed must fail the reference bound).
 // Each mode runs in a child process (this binary with --child MODE FILE; the switches are read once per process) that dumps every output;
-// GGML_CUDA_MOE_TC_LOG=1 makes the backend log every launch ("k19-ampmoe:"), counted per child. Types: Q4_K / Q5_K / Q6_K / IQ4_XS
+// GGML_CUDA_MOE_TC_LOG=1 makes the backend log every launch ("int8 tensor-core MoE:"), counted per child. Types: Q4_K / Q5_K / Q6_K / IQ4_XS
 // (256-value units), Q8_0 / IQ4_NL / Q5_0 (blocks of 32, K tails), fused gate + up + SWIGLU and down products, 2..8 tokens, shared
 // experts across tokens (P), skipped slots, rows not a multiple of 16. No CUDA device / no Ampere-class device: SKIP, exit 0.
 
@@ -34,7 +34,7 @@
 static int n_tc_logs = 0;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-ampmoe:") != nullptr && strstr(text, " tokens ") != nullptr && strstr(text, " slots ") != nullptr) {
+    if (strstr(text, "int8 tensor-core MoE:") != nullptr && strstr(text, " tokens ") != nullptr && strstr(text, " slots ") != nullptr) {
         n_tc_logs++;
         return;
     }

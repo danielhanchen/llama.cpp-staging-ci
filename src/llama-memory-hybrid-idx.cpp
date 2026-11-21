@@ -51,7 +51,7 @@ static ggml_type idx_cache_type(ggml_type t) {
             LLAMA_LOG_WARN("%s: LLAMA_KV_IDX_TYPE=%s is not a type name, the indexer cache keeps %s\n", __func__, e, ggml_type_name(t));
         }
     }
-    LLAMA_LOG_INFO("%s: k19-kvwin: indexer key cache %s (attention %s; LLAMA_KV_IDX_TYPE=%s)\n", __func__, ggml_type_name(r), ggml_type_name(t), e);
+    LLAMA_LOG_INFO("%s: indexer key cache %s (attention %s; LLAMA_KV_IDX_TYPE=%s)\n", __func__, ggml_type_name(r), ggml_type_name(t), e);
     return r;
 }
 
@@ -1172,7 +1172,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     if (use_inc) {
         static std::atomic<bool> logged { false };
         if (!logged.exchange(true)) {
-            LLAMA_LOG_INFO("%s: k19-vwidth: k-pool inputs keep the unchanged pools of the last fill (LLAMA_KPOOL_INPUT_INC=0: off)\n", __func__);
+            LLAMA_LOG_INFO("%s: k-pool inputs keep the unchanged pools of the last fill (LLAMA_KPOOL_INPUT_INC=0: off)\n", __func__);
         }
     }
 

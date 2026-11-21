@@ -7,7 +7,7 @@
 // shapes of Qwen3.8-27B (K 5120 / 6144 / 17408) and odd ones (rows not a multiple of 4 / 8, K of one super-block), 1..4 tokens,
 // plain and as a batch invariant verify batch, with and without a fused gate. Each mode runs in a child process (the switches are
 // read once per process) that dumps every output; the parent compares the dumps byte for byte. The head child of a lever must log
-// its engagement ("k19-iqsmem:"), the base child none, so a silent fallback fails (only where the lever is enabled:
+// its engagement ("IQ shared-memory mat-vec:"), the base child none, so a silent fallback fails (only where the lever is enabled:
 // gate_t, from the device compute capability; elsewhere neither child may log and the bytes are still compared); a negative control (GGML_CUDA_MMVQ_MOE_ONE=1:
 // another K split of the single token MUL_MAT_ID) must differ. IQS_BASE_EXE=<a copy of this test in another build's bin dir>: that
 // build's defaults vs this build's (cross-build identity). No CUDA device: SKIP, exit 0.
@@ -44,7 +44,7 @@
 static int n_logs = 0;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-iqsmem:") != nullptr) {
+    if (strstr(text, "IQ shared-memory mat-vec:") != nullptr) {
         n_logs++;
         if (getenv("IQS_PRINT_LOGS")) {
             fputs(text, stderr);

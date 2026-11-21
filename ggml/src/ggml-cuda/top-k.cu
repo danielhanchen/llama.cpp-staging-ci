@@ -972,7 +972,7 @@ static void top_k_two_stage_cuda(ggml_cuda_pool & pool, const float * src, int *
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: k19-dtopk top-k of %d in one two-stage launch (%lld rows of %d; GGML_CUDA_TOPK_TWO_STAGE=0: radix select)\n",
+        GGML_LOG_INFO("%s: device top-k: top-k of %d in one two-stage launch (%lld rows of %d; GGML_CUDA_TOPK_TWO_STAGE=0: radix select)\n",
                 __func__, k, (long long) nrows, ncols);
     }
 }

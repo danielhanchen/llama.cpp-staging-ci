@@ -5,7 +5,7 @@
 // single token launch per token), fused gate + up + SWIGLU and the product alone, rows that the rows per block do not divide (the
 // launch then falls back) and shapes it never takes (K 2048, Q6_K / Q8_0: controls). Each mode runs in a child process (the switches
 // are read once per process) that dumps every output; the parent compares the dumps byte for byte. The head child of a lever must
-// log its engagement ("k19-q4xt:"), the base child none, so a silent fallback fails (only where the lever is enabled:
+// log its engagement ("MoE mat-vec launch:"), the base child none, so a silent fallback fails (only where the lever is enabled:
 // gate_t, from the device compute capability; elsewhere neither child may log and the bytes are still compared); a negative control (GGML_CUDA_MMVQ_MOE_ONE=1:
 // another K split of the single token MUL_MAT_ID) must differ. Q4XT_BASE_EXE=<a copy of this test in another build's bin dir>: that
 // build's defaults vs this build's (cross-build identity). No CUDA device: SKIP, exit 0.
@@ -42,7 +42,7 @@
 static int n_logs = 0;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
-    if (strstr(text, "k19-q4xt:") != nullptr) {
+    if (strstr(text, "MoE mat-vec launch:") != nullptr) {
         n_logs++;
         if (getenv("Q4XT_PRINT_LOGS")) {
             fputs(text, stderr);

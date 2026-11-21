@@ -607,7 +607,7 @@ std::string llama_row_cache::describe() const {
         st.n_filtered.load(), n_static_rows, n_slots_total, mem_bytes/1048576.0);
     std::string s = buf;
     if (rec_on) {
-        snprintf(buf, sizeof(buf), ", k19-autoprof recorder: %" PRIu64 " row reads, %zu rows (%.1f MiB), %" PRIu64 " new rows past the cap",
+        snprintf(buf, sizeof(buf), ", routing profile recorder: %" PRIu64 " row reads, %zu rows (%.1f MiB), %" PRIu64 " new rows past the cap",
             st.n_recorded.load(), n_recorded_rows(), rec_bytes.load()/1048576.0, st.n_rec_full.load());
         s += buf;
     }

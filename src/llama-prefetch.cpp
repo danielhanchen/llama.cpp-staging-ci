@@ -118,7 +118,7 @@ static int64_t prefetch_majflt_thread() {
 }
 
 llama_row_prefetcher::llama_row_prefetcher(enum llama_ple_prefetch_mode mode_, int n_threads, const ggml_tensor * tensor, int fd, size_t file_offs)
-    : mode(mode_), tensor(tensor), fd(fd), file_offs(file_offs) {
+    : mode(mode_), fd(fd), file_offs(file_offs) {
     GGML_ASSERT(mode != LLAMA_PLE_PREFETCH_OFF && mode != LLAMA_PLE_PREFETCH_AUTO);
     GGML_ASSERT(ggml_is_matrix(tensor) && tensor->data);
 

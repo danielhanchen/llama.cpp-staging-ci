@@ -268,6 +268,22 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
     )
 
+    # the same with an accelerator device that takes host buffers but no op (as BLAS does): every graph must still run on a
+    # backend that supports its ops (without the realloc abort: a second backend on the CPU buffer type makes the scheduler,
+    # not the graph allocator, re-plan a graph whose recurrent state gather changed size)
+    # (the recurrent cases, which run the replay commit graphs; its own directory for the session files of the cases)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/llama-context-accel")
+    llama_test(
+        test-llama-context
+        NAME test-llama-context-accel
+        LABEL main
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/llama-context-accel"
+        ARGS --models "${MODEL_DIR}" --accel --test "rollback|replay.*|shared|.*_move|.*_fuzz" -t 2
+    )
+    set_tests_properties(test-llama-context-accel PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
     # recurrent single-token decodes (states read in place) equal one prompt of the same tokens on the CPU
     llama_test(
         test-llama-archs
@@ -308,7 +324,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --models "${MODEL_DIR}"
     )
-    set_tests_properties(test-kv-win PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-kv-win PROPERTIES FIXTURES_REQUIRED generate-models RUN_SERIAL TRUE PROCESSORS 4)
 
     # k19-kvwin: the CPU two-source flash attention (ggml_flash_attn_ext_set_src2) against the concatenation and a double reference
     llama_build(test-fa-src2.cpp)
@@ -381,7 +397,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS "${MODEL_DIR}/mtp/qwen35moe-mtp.gguf"
     )
-    set_tests_properties(test-mtp-draft-topk PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-mtp-draft-topk PROPERTIES FIXTURES_REQUIRED generate-models RUN_SERIAL TRUE PROCESSORS 4)
 
     # k19-p2qsa: the QSA selection without indexer scoring while every pool fits the top_k (LLAMA_QSA_ALLFIT) == the scored one, byte for byte
     llama_build(test-qsa-allfit-exact.cpp)
@@ -452,7 +468,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         else()
             llama_test(test-dtopk-grammar NAME ${DG_NAME} LABEL main ARGS "${MODEL_DIR}/qwen3tts-dense.gguf")
         endif()
-        set_tests_properties(${DG_NAME} PROPERTIES FIXTURES_REQUIRED generate-models)
+        # run alone: a thread pool of up to 4 threads per test; beside other tests on a 3-4 vCPU runner they starved for 15-30 min
+        set_tests_properties(${DG_NAME} PROPERTIES FIXTURES_REQUIRED generate-models RUN_SERIAL TRUE PROCESSORS 4)
         if (DG_MODE STREQUAL "kill")
             set_tests_properties(${DG_NAME} PROPERTIES ENVIRONMENT "LLAMA_DEVICE_TOPK_GRAMMAR=0")
         endif()

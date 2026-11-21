@@ -300,7 +300,7 @@ static bool read_dump(const std::string & path, std::vector<std::vector<uint8_t>
     return true;
 }
 
-// the "k19-p1fuse stats:" line of a child's stderr: gdn_fused_new gdn_fused silu sigmoid onebar twobar
+// the "fusion stats:" line of a child's stderr: gdn_fused_new gdn_fused silu sigmoid onebar twobar
 static bool read_stats(const std::string & path, long long st[6]) {
     FILE * f = fopen(path.c_str(), "r");
     if (f == nullptr) {
@@ -309,9 +309,9 @@ static bool read_stats(const std::string & path, long long st[6]) {
     char line[1024];
     bool ok = false;
     while (fgets(line, sizeof(line), f) != nullptr) {
-        const char * p = strstr(line, "k19-p1fuse stats:");
+        const char * p = strstr(line, "fusion stats:");
         if (p != nullptr) {
-            ok = sscanf(p, "k19-p1fuse stats: gdn_fused_new=%lld gdn_fused=%lld gated_norm_silu=%lld gated_norm_sigmoid=%lld mmvf_onebar=%lld "
+            ok = sscanf(p, "fusion stats: gdn_fused_new=%lld gdn_fused=%lld gated_norm_silu=%lld gated_norm_sigmoid=%lld mmvf_onebar=%lld "
                            "mmvf_twobar=%lld", &st[0], &st[1], &st[2], &st[3], &st[4], &st[5]) == 6;
         } else if (strstr(line, "error") != nullptr || strstr(line, "ERROR") != nullptr) {
             fputs(line, stderr);
