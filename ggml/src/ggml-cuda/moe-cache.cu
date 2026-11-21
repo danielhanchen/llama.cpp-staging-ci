@@ -123,14 +123,17 @@ struct moe_pf_args {
 
 // asynchronous refill of lent slots (llama_moe_cache::unlend, ggml_cuda_moe_refill_*). When a prompt gives its lent slots back, the
 // uploads that refill them may run on a second stream while the next graph computes. Per registered group (the state tensor), a row:
-// [0] the epoch of the last refill queued, [1] the last one complete, then per layer the same pair (need, done): need is written on the
-// compute stream before the graphs that may read the slots, done by the upload stream after the layer's uploads. An assign reads [0..1]
-// at its start without waiting; only while a refill is pending it waits for its own layer before it ends (the products after it read
+// a need part, written on the compute stream before the graphs that may read the slots: [0] the epoch of the last refill queued,
+// [1] the first slot it writes, then the epoch per layer; and a done part, written by the upload stream after the uploads: the epoch
+// complete as a whole, then per layer. An assign reads the epochs and the first slot at its start without waiting; only while a refill
+// is pending, and only for slots from the first one it writes, it waits for its own layer before it ends (the products after it read
 // the hits) and for the layer of the expert a victim holds before that slot is given to another expert, so every read and write of a
-// slot comes after the refill as with a synchronous one: the same slots, the same contents, the same results
+// refilled slot comes after its upload as with a synchronous refill: the same slots, the same contents, the same results
 #define MOE_RF_GROUPS 16
 #define MOE_RF_LAYERS 128
-#define MOE_RF_ROW    (2 + 2*MOE_RF_LAYERS)
+#define MOE_RF_NEED   0                          // [0] epoch, [1] first slot, [2 + il] layer epochs
+#define MOE_RF_DONE   (2 + MOE_RF_LAYERS)        // [0] epoch, [1 + il] layer epochs
+#define MOE_RF_ROW    (MOE_RF_DONE + 2 + MOE_RF_LAYERS)
 static __device__ int32_t moe_rf_tab[MOE_RF_GROUPS][MOE_RF_ROW];
 
 static __device__ __forceinline__ void moe_rf_wait(const int rf, const int il) {
@@ -139,8 +142,8 @@ static __device__ __forceinline__ void moe_rf_wait(const int rf, const int il) {
         return;
     }
     volatile const int32_t * row = moe_rf_tab[rf];
-    const int32_t n = row[2 + 2*il];
-    while (row[2 + 2*il + 1] < n) {
+    const int32_t n = row[MOE_RF_NEED + 2 + il];
+    while (row[MOE_RF_DONE + 1 + il] < n) {
 #if __CUDA_ARCH__ >= 700
         __nanosleep(256);
 #endif
@@ -152,14 +155,18 @@ static __device__ __forceinline__ void moe_rf_wait(const int rf, const int il) {
 #endif
 }
 
-// whether a refill of the group is pending (read once, early: its latency overlaps the lookup)
-static __device__ __forceinline__ bool moe_rf_pending(const int rf) {
+// whether a refill of the group is pending, and the first slot it writes (read once, early: the latency overlaps the lookup)
+static __device__ __forceinline__ bool moe_rf_pending(const int rf, int & lo) {
+    lo = INT_MAX;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (rf < 0 || rf >= MOE_RF_GROUPS) {
         return false;
     }
     volatile const int32_t * row = moe_rf_tab[rf];
-    return row[0] > row[1];
+    const int32_t need = row[MOE_RF_NEED];
+    const int32_t done = row[MOE_RF_DONE];
+    lo = row[MOE_RF_NEED + 1];
+    return need > done;
 #else
     GGML_UNUSED(rf);
     return false;
@@ -178,7 +185,9 @@ static __global__ void moe_cache_assign(
         ids_s1 = ne0;
     }
     // a refill of the group still uploading (see moe_rf_wait): waited for below, only while it is pending
-    const bool rf_pend = moe_rf_pending(rf);
+    int rf_lo = INT_MAX;
+    const bool rf_pend = moe_rf_pending(rf, rf_lo);
+    bool rf_hit = false; // this lane read a slot the pending refill writes
     extern __shared__ int32_t smem[];
     int32_t * miss_e = smem;         // [n_ids] missing experts, in the order of their first use
     int32_t * victim = smem + n_ids; // [n_ids] slots given to them
@@ -212,6 +221,7 @@ static __global__ void moe_cache_assign(
             const int32_t e = moe_cache_id(ids, i, n_expert, ne0, ids_s1);
             const int32_t s = row[e];
             const bool skip = moe_cache_tail_skip(ids, i, s, n_ids, ne0, n_expert, tail_rank, ids_s1);
+            rf_hit = rf_hit || (rf_pend && s >= rf_lo);
             slots[i]             = s;
             fill_s[2*n_ids + i]  = s;
             fill_s[n_ids + i]    = s < 0 && !skip ? e : -1;
@@ -224,8 +234,9 @@ static __global__ void moe_cache_assign(
             n_mis += __shfl_xor_sync(full, n_mis, off, MOE_CACHE_LANES);
             n_skp += __shfl_xor_sync(full, n_skp, off, MOE_CACHE_LANES);
         }
+        const bool rf_any_hit = moe_cache_ballot(rf_hit) != 0;
         if (lane == 0) {
-            if (rf_pend) {
+            if (rf_any_hit) {
                 moe_rf_wait(rf, il); // the products after this read the hits
             }
             if (skip_stat != nullptr && n_skp > 0) {
@@ -285,6 +296,7 @@ static __global__ void moe_cache_assign(
             fill_s[2*n_ids + i] = s; // hit slots: the slot of an expert cached before this lookup, else -1
         }
         if (s >= 0) {
+            rf_hit = rf_hit || (rf_pend && s >= rf_lo);
             ref[s] = 1;
             if ((uint32_t) atomicExch(&pin[s], (int32_t) epoch) != epoch) {
                 n_hit++;
@@ -591,7 +603,7 @@ static __global__ void moe_cache_assign(
         const int32_t s   = victim[j];
         const int32_t e   = take_e[j];
         const int32_t old = key_of[s];
-        if (rf_pend && old >= 0) {
+        if (rf_pend && old >= 0 && s >= rf_lo) {
             moe_rf_wait(rf, old / n_expert); // the victim's expert may still be uploading into it
         }
         if (old >= 0) {
@@ -645,8 +657,9 @@ static __global__ void moe_cache_assign(
             n_evmiss += __shfl_xor_sync(full, n_evmiss, off, MOE_CACHE_LANES);
         }
     }
+    const bool rf_any_hit = moe_cache_ballot(rf_hit) != 0;
     if (lane == 0) {
-        if (rf_pend) {
+        if (rf_any_hit) {
             moe_rf_wait(rf, il); // the products after this read the hits
         }
         if (skip_stat != nullptr && n_skp > 0) {
@@ -1200,9 +1213,10 @@ int ggml_cuda_moe_refill_register(ggml_backend_cuda_context & ctx, const void * 
 #endif
 }
 
-// the layers il[0..n) get a refill of this epoch: the row is queued on the compute stream, before the graphs that read the slots.
-// The caller synchronized the compute stream and the upload stream since the last need / done, so the device row equals the mirror
-bool ggml_cuda_moe_refill_need(ggml_backend_cuda_context & ctx, const void * state_data, const int32_t * il, const int n, const int32_t epoch) {
+// the layers il[0..n) get a refill of this epoch writing slots from lo on: queued on the compute stream, before the graphs that read
+// the slots (the caller synchronized the compute stream since the last one, so its pinned source is free again)
+bool ggml_cuda_moe_refill_need(ggml_backend_cuda_context & ctx, const void * state_data, const int32_t * il, const int n, const int32_t epoch,
+        const int32_t lo) {
     std::lock_guard<std::mutex> lock(moe_rf_mutex);
     const auto it = moe_rf_regs.find(state_data);
     if (it == moe_rf_regs.end() || it->second.device != ctx.device) {
@@ -1214,13 +1228,15 @@ bool ggml_cuda_moe_refill_need(ggml_backend_cuda_context & ctx, const void * sta
             return false;
         }
     }
-    r.mirror[0] = epoch;
+    r.mirror[MOE_RF_NEED]     = epoch;
+    r.mirror[MOE_RF_NEED + 1] = lo;
     for (int i = 0; i < n; ++i) {
-        r.mirror[2 + 2*il[i]] = epoch;
+        r.mirror[MOE_RF_NEED + 2 + il[i]] = epoch;
     }
-    memcpy(r.h_need, r.mirror.data(), MOE_RF_ROW*sizeof(int32_t));
+    // the need part only: the done part has one writer, the upload stream
+    memcpy(r.h_need, r.mirror.data(), MOE_RF_DONE*sizeof(int32_t));
     ggml_cuda_set_device(ctx.device);
-    CUDA_CHECK(cudaMemcpyToSymbolAsync(moe_rf_tab, r.h_need, MOE_RF_ROW*sizeof(int32_t), (size_t) r.idx*MOE_RF_ROW*sizeof(int32_t),
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(moe_rf_tab, r.h_need, MOE_RF_DONE*sizeof(int32_t), (size_t) r.idx*MOE_RF_ROW*sizeof(int32_t),
         cudaMemcpyHostToDevice, ctx.stream()));
     return true;
 }
@@ -1233,7 +1249,7 @@ bool ggml_cuda_moe_refill_done(ggml_backend_cuda_context & ctx, const void * sta
         return false;
     }
     moe_rf_reg & r = it->second;
-    const int k = il < 0 ? 1 : 2 + 2*il + 1;
+    const int k = il < 0 ? MOE_RF_DONE : MOE_RF_DONE + 1 + il;
     r.mirror[k] = epoch;
     r.h_done[k] = epoch;
     ggml_cuda_set_device(ctx.device);

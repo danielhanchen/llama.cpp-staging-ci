@@ -13179,11 +13179,11 @@ static int ggml_backend_cuda_moe_refill_register(ggml_backend_t backend, const g
     return ggml_cuda_moe_refill_register(*(ggml_backend_cuda_context *) backend->context, state->data);
 }
 
-static bool ggml_backend_cuda_moe_refill_need(ggml_backend_t backend, const ggml_tensor * state, const int32_t * il, int n, int32_t epoch) {
+static bool ggml_backend_cuda_moe_refill_need(ggml_backend_t backend, const ggml_tensor * state, const int32_t * il, int n, int32_t epoch, int32_t lo) {
     if (backend == nullptr || !ggml_backend_is_cuda(backend) || state == nullptr || state->data == nullptr) {
         return false;
     }
-    return ggml_cuda_moe_refill_need(*(ggml_backend_cuda_context *) backend->context, state->data, il, n, epoch);
+    return ggml_cuda_moe_refill_need(*(ggml_backend_cuda_context *) backend->context, state->data, il, n, epoch, lo);
 }
 
 static bool ggml_backend_cuda_moe_refill_done(ggml_backend_t backend, const ggml_tensor * state, int il, int32_t epoch) {

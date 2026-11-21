@@ -7866,7 +7866,7 @@ struct llama_moe_cache::impl {
         return e == nullptr || atoi(e) != 0;
     }();
     typedef int  (*rf_register_t)(ggml_backend_t, const ggml_tensor *);
-    typedef bool (*rf_need_t)(ggml_backend_t, const ggml_tensor *, const int32_t *, int, int32_t);
+    typedef bool (*rf_need_t)(ggml_backend_t, const ggml_tensor *, const int32_t *, int, int32_t, int32_t);
     typedef bool (*rf_done_t)(ggml_backend_t, const ggml_tensor *, int, int32_t);
     rf_need_t rf_need_fn = nullptr;
     rf_done_t rf_done_fn = nullptr;
@@ -12921,19 +12921,14 @@ struct llama_moe_cache::impl {
             budget = std::min(budget, refill_cap_once / g.expert_bytes);
         }
         const size_t budget0 = budget;
-        // asynchronous refill (see rf_on): every layer of the group is marked pending, and done on the upload stream after its uploads
+        // asynchronous refill (see rf_on): the uploads run on the upload stream after the clear above, a done flag after each layer's;
+        // the layers are marked pending on the compute stream (with the first slot the refill writes) before the next graph
         ggml_backend_t up = refill_enabled && rf_allow && rf_eligible(g) ? rf_backend(g.id) : nullptr;
         const int32_t ep = g.rf_epoch + 1;
+        int32_t rf_lo = g.n_slots;
         if (up != nullptr) {
-            rf_layers.assign(g.layers.begin(), g.layers.end());
-            if (rf_need_fn(backend, g.state, rf_layers.data(), (int) rf_layers.size(), ep)) {
-                g.rf_epoch = ep;
-                // the uploads after the clear above
-                ggml_backend_event_record(g.rf_ev0, backend);
-                ggml_backend_event_wait(up, g.rf_ev0);
-            } else {
-                up = nullptr;
-            }
+            ggml_backend_event_record(g.rf_ev0, backend);
+            ggml_backend_event_wait(up, g.rf_ev0);
         }
         const size_t bytes0 = stats_refill.bytes;
         for (int32_t il : g.layers) {
@@ -12951,6 +12946,9 @@ struct llama_moe_cache::impl {
                     if (host_layer(il)) {
                         host->begin_call();
                     }
+                    for (const auto & f : fills) {
+                        rf_lo = std::min(rf_lo, f.slot);
+                    }
                     stats_refill.bytes += upload_fills(up != nullptr ? up : backend, il, fills, nullptr);
                     stats_refill.misses += fills.size();
                 }
@@ -12963,6 +12961,12 @@ struct llama_moe_cache::impl {
         if (up != nullptr) {
             rf_done_fn(up, g.state, -1, ep); // the whole refill: the assigns stop checking layers
             ggml_backend_event_record(g.rf_ev1, up);
+            rf_layers.assign(g.layers.begin(), g.layers.end());
+            // (never fails: the same checks passed for this group in rf_eligible; a failure would leave nothing pending, as synchronous)
+            if (!rf_need_fn(backend, g.state, rf_layers.data(), (int) rf_layers.size(), ep, rf_lo)) {
+                ggml_backend_event_wait(backend, g.rf_ev1);
+            }
+            g.rf_epoch = ep;
             g.rf_pending = true;
             // a refill started by the lend of a graph (before its prepare) stays pending through that prepare; one started inside a
             // prepare (the device lookup's unlend) through the graph of that ubatch only
