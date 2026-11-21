@@ -780,16 +780,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_grid(const uint32_t
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        int grid_l;
+        int grid_h;
+        iq_apply_ksigns(aux32 >> (7*l0/2), grid_pos.x, grid_pos.y, grid_l, grid_h);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
-
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
@@ -887,11 +883,8 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_tab(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = tab[qs[l0/2] | ((qh << (8-l0)) & 0x300)];
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-
-        const int grid_l = __vsub4((int) grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4((int) grid_pos.y ^ signs1, signs1);
+        const int grid_l = iq_apply_signs4((int) grid_pos.x, signs_packed_8[l0/2]);
+        const int grid_h = iq_apply_signs4((int) grid_pos.y, signs_packed_8[l0/2] >> 4);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);

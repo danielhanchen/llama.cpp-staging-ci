@@ -103,6 +103,40 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 
+// GGML_CUDA_IQ_SIGN_MUL=0 at compile time: the __vcmpne4 / __vsub4 sign code below instead of the multiply form
+#ifndef GGML_CUDA_IQ_SIGN_MUL
+#define GGML_CUDA_IQ_SIGN_MUL 1
+#endif
+
+// the 4 grid bytes g with the signs of the low 4 bits of s4 applied (bit k negates byte k). Every byte of g must be nonzero (the
+// iq2s / iq3xxs grids: 0x08 / 0x19 / 0x2b and 4..62): then bit k -> 0x01 in byte k by one multiply (the partial products do not
+// overlap), and -g = (g ^ 0xFF) + 1 in each such byte carries into no other byte, so the int is that of __vsub4(g ^ m, m) with the
+// __vcmpne4 byte masks m, in fewer instructions
+static __device__ __forceinline__ int iq_apply_signs4(const int g, const uint32_t s4) {
+#if GGML_CUDA_IQ_SIGN_MUL
+    const int sb = (int) (((s4 & 0x0F) * 0x00204081u) & 0x01010101u);
+    return (g ^ (sb * 0xFF)) + sb;
+#else
+    const int m = __vcmpne4(((s4 & 0x03) << 7) | ((s4 & 0x0C) << 21), 0x00000000);
+    return __vsub4(g ^ m, m);
+#endif // GGML_CUDA_IQ_SIGN_MUL
+}
+
+// the 8 signs of a 7-bit ksigns value v (the 8th = the parity of the 7, as unpack_ksigns) applied to the 8 nonzero grid bytes gl / gh
+static __device__ __forceinline__ void iq_apply_ksigns(const uint8_t v, const int gl, const int gh, int & l, int & h) {
+#if GGML_CUDA_IQ_SIGN_MUL
+    const uint32_t s = v ^ (__popc(v) & 1) << 7;
+    l = iq_apply_signs4(gl, s);
+    h = iq_apply_signs4(gh, s >> 4);
+#else
+    const uint32_t signs = unpack_ksigns(v);
+    const int m0 = __vcmpne4(signs & 0x08040201, 0);
+    const int m1 = __vcmpne4(signs & 0x80402010, 0);
+    l = __vsub4(gl ^ m0, m0);
+    h = __vsub4(gh ^ m1, m1);
+#endif // GGML_CUDA_IQ_SIGN_MUL
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -1206,11 +1240,8 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-
-        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+        const int grid_l = iq_apply_signs4(grid_pos[0], signs_packed_8[l0/2]);
+        const int grid_h = iq_apply_signs4(grid_pos[1], signs_packed_8[l0/2] >> 4);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1245,16 +1276,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        int grid_l;
+        int grid_h;
+        iq_apply_ksigns(aux32 >> (7*l0/2), grid_pos.x, grid_pos.y, grid_l, grid_h);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
-
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
