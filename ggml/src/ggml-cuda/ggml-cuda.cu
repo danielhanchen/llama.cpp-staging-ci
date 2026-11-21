@@ -2838,12 +2838,13 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 //  - only cc 1000..1099. Blackwell spans cc 1000/1100/1200 and only 1000 was measured.
 static bool ggml_cuda_mmf_loses_to_cublas(const ggml_tensor * src0, const ggml_tensor * src1,
         const int cc, const int64_t ne11) {
-    // GGML_CUDA_BF16_CUBLAS=0: off, 1: also on every NVIDIA cc >= 1000 (cc 1100 / 1200 included), unset: cc 1000..1099
+    // Off by default: cuBLAS converts the activations to BF16, so the output differs from mmf.
+    // GGML_CUDA_BF16_CUBLAS=1: on for cc 1000..1099, 2: on for every NVIDIA cc >= 1000 (cc 1100 / 1200 included)
     static const int mode = [] {
         const char * e = getenv("GGML_CUDA_BF16_CUBLAS");
-        return e != nullptr ? atoi(e) : -1;
+        return e != nullptr ? atoi(e) : 0;
     }();
-    if (mode == 0 || src0->type != GGML_TYPE_BF16 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < 1000 || (mode < 0 && cc >= 1100)) {
+    if (mode <= 0 || src0->type != GGML_TYPE_BF16 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < 1000 || (mode == 1 && cc >= 1100)) {
         return false;
     }
     // ne11 == 1 belongs to mmvf, which is faster than both mmf and cuBLAS there.
