@@ -6475,7 +6475,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     for (bool more = true; more; ) {
         // the state before the ubatch that starts at the capture index (a layer-major group captures inside its graph)
         for (int s = 0; s < cap_max; ++s) {
-            if (cap[s].idx >= 0 && !cap[s].done && n_tokens_prev == cap[s].idx) {
+            if (cap[s].idx >= 0 && !cap[s].done && n_tokens_prev == cap[s].idx && cap_starts(s, mctx->get_ubatch())) {
                 cap_now(s, mctx->get_ubatch().pos[0] - 1);
             }
         }
@@ -7519,7 +7519,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         cap_k_group[c] = -1;
         if (cap[c].idx >= 0 && !cap[c].done) {
             for (size_t k = 1; k < group.size(); ++k) {
-                if (group[k].n_tokens_before == cap[c].idx) {
+                if (group[k].n_tokens_before == cap[c].idx && cap_starts(c, *group[k].ub)) {
                     cap_k_group[c] = (int) k;
                 }
             }
@@ -13600,6 +13600,16 @@ bool llama_context::cap_prepare(int s) {
     C.cell    = (uint32_t) cell;
     C.regions = std::move(rg);
     return true;
+}
+
+// the ubatch about to run starts at the batch row of capture s, a row of its sequence: with several sequences in a batch the
+// equal split interleaves their rows, and the count of the rows run before it alone does not place the capture (the
+// snapshot would hold another number of the sequence's tokens than its label says)
+bool llama_context::cap_starts(int s, const llama_ubatch & ub) const {
+    if (ub.n_tokens == 0 || ub.data == nullptr || ub.data->batch_idxs.empty()) {
+        return true; // no row map: as before
+    }
+    return ub.data->batch_idxs[0] == cap[s].idx && ub.n_seq_id[0] >= 1 && ub.seq_id[0][0] == cap[s].seq;
 }
 
 void llama_context::cap_now(int s, llama_pos pos) {
