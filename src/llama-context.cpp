@@ -5314,22 +5314,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // a kept small graph built for these parameters goes back into the scheduler: only its allocation is redone (the same
     // graph allocates to the same addresses, so its CUDA graph is replayed as captured)
     auto small_swap_in = [&]() -> bool {
+        const gf_small_modes & km = gf_res_small_modes[i_small];
         if (n_small == 0 || gf == nullptr || !gf_res_small_built[i_small] || gf_res_small_epoch[i_small] != gf_res_epoch ||
-                moe_cache_seed_graph != moe_cache_seed || moe_cache_hybrid_graph != moe_cache_hybrid || moe_cache_devseed_graph != moe_cache_devseed ||
-                moe_inplace_graph != moe_inplace_ok ||
+                km.seed != moe_cache_seed || km.hybrid != moe_cache_hybrid || km.devseed != moe_cache_devseed ||
+                km.inplace != moe_inplace_ok ||
                 !res->can_reuse(gparams)) {
             // debug (LLAMA_GRAPH_SMALL_WHY=N): the first condition that refused the kept graph, for up to N refusals
             static int why_left = getenv("LLAMA_GRAPH_SMALL_WHY") ? atoi(getenv("LLAMA_GRAPH_SMALL_WHY")) : 0;
             if (n_small > 0 && gf != nullptr && why_left > 0) {
                 why_left--;
                 const char * why = !gf_res_small_built[i_small] ? "not built" : gf_res_small_epoch[i_small] != gf_res_epoch ? "epoch" :
-                    moe_cache_seed_graph != moe_cache_seed ? "seed mode" : moe_cache_hybrid_graph != moe_cache_hybrid ? "hybrid mode" :
-                    moe_cache_devseed_graph != moe_cache_devseed ? "devseed mode" : moe_inplace_graph != moe_inplace_ok ? "inplace" : "can_reuse";
+                    km.seed != moe_cache_seed ? "seed mode" : km.hybrid != moe_cache_hybrid ? "hybrid mode" :
+                    km.devseed != moe_cache_devseed ? "devseed mode" : km.inplace != moe_inplace_ok ? "inplace" : "can_reuse";
                 LLAMA_LOG_INFO("%s: kept graph for %u tokens (way %u) not reused: %s (epoch %llu / %llu)\n", __func__, n_small, i_small % GF_SMALL_WAYS,
                     why, (unsigned long long) gf_res_small_epoch[i_small], (unsigned long long) gf_res_epoch);
             }
             return false;
         }
+        // the graph now in the scheduler is this one: the reuse check of the next ubatch compares against its modes
+        moe_cache_seed_graph    = km.seed;
+        moe_cache_hybrid_graph  = km.hybrid;
+        moe_cache_devseed_graph = km.devseed;
+        moe_inplace_graph       = km.inplace;
         gf_res_prev_active = nullptr; // (not an invalidation of the kept small graphs)
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -5550,6 +5556,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         moe_cache_hybrid_graph = moe_cache_hybrid;
         // the seed plans are enabled in the op params of the graph, a reused graph keeps them (and may be replayed as captured)
         moe_cache_devseed_graph = moe_cache_devseed;
+        if (n_small > 0) {
+            gf_res_small_modes[i_small] = { moe_cache_seed, moe_cache_hybrid, moe_cache_devseed, moe_inplace_ok };
+        }
     }
 
     if (t_tr0) {

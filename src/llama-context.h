@@ -947,6 +947,15 @@ private:
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_used{};
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_nuse{}; // uses since the kept graph was built
     std::array<std::map<llama_seq_id, llama_sampler *>, GF_SMALL_N> gf_res_small_smpl{}; // the sampler chains a kept graph was built with
+    // the MoE cache modes a kept graph was built with (seed, hybrid, device seed, in place): the context-wide *_graph values follow
+    // the graph built last, which can be another size's
+    struct gf_small_modes {
+        bool seed    = false;
+        int  hybrid  = 0;
+        bool devseed = false;
+        bool inplace = false;
+    };
+    std::array<gf_small_modes, GF_SMALL_N> gf_res_small_modes{};
     uint64_t gf_res_epoch = 1;
     // set by restore_pp_plan around its graph_reserve: the kept graphs stay valid when the reserve replaced no buffer
     bool reserve_keep_small = false;
