@@ -887,7 +887,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
-    // k19-kvwin: the window mode's default layout is a q4_0 cache beside the 8-bit ring
+    // the window mode's default layout is a q4_0 cache beside the 8-bit ring
     if (params.kv_win >= 0) {
         if (!params.cache_type_k_set) {
             params.cache_type_k = GGML_TYPE_Q4_0;

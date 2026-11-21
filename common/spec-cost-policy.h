@@ -1,6 +1,6 @@
 #pragma once
 
-// k11-decode: cost-priced window choice for n-gram (suffix) drafts drafted alone.
+// cost-priced window choice for n-gram (suffix) drafts drafted alone.
 //
 // The verify window of t tokens (the sampled token + t - 1 drafted ones) is priced by the measured wall time of the rounds of that
 // size (an EMA per size, kept across requests: it is a property of the model, the GPU and the placement, not of the text). A draft
@@ -38,7 +38,7 @@ struct common_spec_cost_policy {
     static constexpr int    SKIP    = 2;      // the first rounds of a size build its graph and capture it: not its cost
 
     double margin = 0.03;
-    bool   gain_gate = false;  // LLAMA_SPEC_POLICY_GAIN=1: on (G4 LFM2.5 32 GB: it stopped the short window of a repeat, rep -5%; no cell gained)
+    bool   gain_gate = false;  // LLAMA_SPEC_POLICY_GAIN=1: on (RTX PRO 6000 LFM2.5 32 GB: it stopped the short window of a repeat, rep -5%; no cell gained)
     int    short_k   = 3;      // the drafts of the short window (the gain gate's window)
 
     std::array<double, MAX_T + 1> cost{}, cost_n{}, last{};
@@ -135,8 +135,8 @@ struct common_spec_cost_policy {
     }
 
     // the drafts to take (0 = a plain round) of the offered k_full (k_short: the short window, taken instead when it prices better)
-    // probe_full (k15-lfm2): a full window not measured PROBES times yet is probed (q >= P_PROBE) even where the measured short window
-    // prices better: a cheap short window measured first otherwise keeps the full one at its guessed (SHAPE) cost for good (G4 LFM2.5
+    // probe_full: a full window not measured PROBES times yet is probed (q >= P_PROBE) even where the measured short window
+    // prices better: a cheap short window measured first otherwise keeps the full one at its guessed (SHAPE) cost for good (RTX PRO 6000 LFM2.5
     // 32 GB with GGML_CUDA_MMVQ_MOE_ONE=1 and a 2-draft short window: the 8-row window never ran, 8k 511 -> 470 tok/s)
     int choose(int k_full, int k_short, double q, bool probe_full = false) const {
         if (k_full <= 0) {
@@ -176,7 +176,7 @@ struct common_spec_cost_policy {
         return 0;
     }
 
-    // k19-lookup8 (LLAMA_SPEC_SUFFIX_SIZES): the window is any allowed size up to the offered drafts, not only the short and the full
+    // LLAMA_SPEC_SUFFIX_SIZES: the window is any allowed size up to the offered drafts, not only the short and the full
     // one. Bit t of `sizes` allows a verify window of t rows (t - 1 drafts); every allowed size is its own target graph, so the set stays
     // small. The size with the most expected tokens per measured ms is taken when it beats a plain round by the margin; a size not
     // measured PROBES times yet (or not for STALE rounds) is probed only where the class is right at least P_PROBE of the time, and
@@ -313,7 +313,7 @@ struct common_spec_round_timer {
     }
 };
 
-// k15-fn: LLAMA_SPEC_COST=1, the cost-aware MTP window.
+// LLAMA_SPEC_COST=1, the cost-aware MTP window.
 // While the MTP drafts, each draft's top-1 probability p is mapped to a measured acceptance a(p) (8 probability
 // buckets, decayed counts; before data a(p) = p), the chain's expected committed tokens E(rows) = 1 + a1 + a1 a2 + ... are
 // priced by the measured round time of a window of that many rows (an EMA per context bucket and size, kept across requests),
@@ -512,10 +512,10 @@ struct common_spec_mtp_cost {
     }
 };
 
-// k19-tpp (LLAMA_SPEC_TPP): the round time of the floor window (n_floor drafts) and of the floor + 1 window, per context bucket, as the
+// LLAMA_SPEC_TPP: the round time of the floor window (n_floor drafts) and of the floor + 1 window, per context bucket, as the
 // median of the last NS rounds of each (robust to the graph captures and host stalls a mean takes in). The floor window keeps being
 // measured: it runs while it has fewer than PROBES samples in the bucket and once every STALE rounds after its last sample, so one slow
-// early round cannot price it out (the first G4 gate: T3 sampled once at 19.4 ms in a warm-up round, real 11 ms, then never again)
+// early round cannot price it out (the first RTX PRO 6000 gate: T3 sampled once at 19.4 ms in a warm-up round, real 11 ms, then never again)
 struct common_spec_tpp_cost {
     static constexpr int CTX    = 5;    // context buckets: < 1536, < 6144, < 12288, < 24576, longer
     static constexpr int NS     = 15;
@@ -537,7 +537,7 @@ struct common_spec_tpp_cost {
     int     stale   = STALE;
 
     // the draft past the floor: how often it held against its predicted rate (draft_rate), per context bucket, decayed. The rate
-    // is calibrated over every context, and a long context can hold far less than it says (G4 fn4 30k: the wider windows added
+    // is calibrated over every context, and a long context can hold far less than it says (RTX PRO 6000 4-bit 30k: the wider windows added
     // ~0.05 tokens per pass), so the wider window's extra tokens are scaled by this ratio. LLAMA_SPEC_TPP_MARG_PRIOR: the prior's
     // weight in drafts (0: off, the rate as calibrated); LLAMA_SPEC_TPP_MARG_CAP: the largest ratio (a kept draft is one whose rate
     // looked high, so held / predicted runs below 1 even where the rate is right; the cap above 1 lets that noise even out)
@@ -549,14 +549,14 @@ struct common_spec_tpp_cost {
     marg_stat mg[CTX];
     double marg_prior  = 4.0;
     double marg_cap    = 1.25;
-    // LLAMA_SPEC_TPP_MAX_POS (default 24576, 0: no limit): from this position on the window stays at the floor. G4 fn4 full card
+    // LLAMA_SPEC_TPP_MAX_POS (default 24576, 0: no limit): from this position on the window stays at the floor. RTX PRO 6000 4-bit full card
     // (ktp_g4d): with the held / predicted pricing 30k was still 0.979 of base (0.961 without it) while 16k gained 4.1%; the
     // floor-only window there is the base's own (the kill switch arm: 0.999)
     int64_t max_pos    = 24576;
     int64_t pos_cur    = 0;
     // the round times are priced from a fixed table by default, not from live timings: live medians move with timing noise, so the
-    // window sequence (and with an MoE cache, which experts are resident and how a CPU miss sums) differed launch to launch (G4 fn4
-    // 16 GB, ktp_g4d: 2-3 md5 per cell, base stable). The table is c(4 rows) / c(3 rows) per context bucket, measured on G4 fn4:
+    // window sequence (and with an MoE cache, which experts are resident and how a CPU miss sums) differed launch to launch (RTX PRO 6000 4-bit
+    // 16 GB: 2-3 md5 per cell, base stable). The table is c(4 rows) / c(3 rows) per context bucket, measured on an RTX PRO 6000 4-bit:
     // all experts on the device 1.14 below 12288 (chat / 8k: 11.96 / 10.52, 12.50 / 10.99 ms) and 1.18 above (16k: 12.88 / 10.93);
     // with an MoE cache streaming experts 1.22 (16 / 32 GB: +5.6 / +3.1 ms per 4-row pass on ~26 / ~17 ms). The drafts' probabilities
     // and the held counts are functions of the text, so the windows are too. LLAMA_SPEC_TPP_LIVE=1: the live medians (as before);
@@ -570,21 +570,21 @@ struct common_spec_tpp_cost {
     bool      switch_skip = false;
     int       last_k      = -1;
     size_stat sw[CTX][2];
-    // k19-tppctx, LLAMA_SPEC_TPP_CTX (default 1, =0 off): the window of some context buckets is fixed instead of priced:
+    // LLAMA_SPEC_TPP_CTX (default 1, =0 off): the window of some context buckets is fixed instead of priced:
     // LLAMA_SPEC_TPP_CTX_EXTRA="e0,e1,e2,e3,e4" drafts past the floor per bucket (0 or 1; -1 = priced as before), default "1,-1,-1,-1,-1":
-    // the chat bucket (below 1536 tokens) takes the 3rd draft in every window. G4 Qwen3.8-Flash-Next fn4 full card (kvr2_c1, x3): chat
+    // the chat bucket (below 1536 tokens) takes the 3rd draft in every window. RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits full card (x3): chat
     // 258.8 -> 278.6 tok/s (3.24 -> 3.46 tokens per pass at 12.52 / 12.42 ms per pass, the same text), 8k / 16k / 30k unchanged (0.995 /
     // 1.004 / 1.007, same text); a 4-row window runs a 3-row one's kernels (LLAMA_SPEC_TPP_VERIFY), so the text does not change.
     // Deterministic: no timing
     int  ctx_extra[CTX] = { -1, -1, -1, -1, -1 };
     bool ctx_on         = true;
-    // k19-depth: below deep_pos (LLAMA_SPEC_DEPTH_POS, default 12288) every window drafts deep_extra more past floor + 1, so its width
+    // below deep_pos (LLAMA_SPEC_DEPTH_POS, default 12288) every window drafts deep_extra more past floor + 1, so its width
     // is fixed at floor + 2 + deep_extra rows there; from deep_pos on the windows are the ones above (floor, floor + 1 where it pays).
     // The drafter sets deep_extra from its n_max (the server raises Studio's 2 drafts to 4 where it is on: LLAMA_SPEC_DEPTH). One width
     // per context band, as each width a request mixes pays its own CUDA graph captures. Deterministic
     int     deep_extra = 0;
     int64_t deep_pos   = 12288;
-    // k19-fnmtp: the deep band also for a window of floor + 1 drafts (deep_extra 0): set beside a MoE cache by the server's rule
+    // the deep band also for a window of floor + 1 drafts (deep_extra 0): set beside a MoE cache by the server's rule
     bool    deep_all   = false;
 
     common_spec_tpp_cost() {
@@ -714,12 +714,12 @@ struct common_spec_tpp_cost {
         m.held = MDECAY*m.held + (held ? 1.0 : 0.0);
     }
 
-    // k19-tppctx: the fixed drafts past the floor of the current bucket, -1 = priced
+    // the fixed drafts past the floor of the current bucket, -1 = priced
     int forced_extra() const {
         return ctx_on ? ctx_extra[bk] : -1;
     }
 
-    // k19-depth: the current position is in the deep band (every window drafts floor + 1 + deep_extra)
+    // the current position is in the deep band (every window drafts floor + 1 + deep_extra)
     bool deep() const {
         return (deep_extra > 0 || deep_all) && pos_cur < deep_pos;
     }

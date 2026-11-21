@@ -1,6 +1,6 @@
 #pragma once
 
-// k9-draft: speculation cost governor (per slot). Speculative decoding only changes speed, so it should never be slower than plain
+// speculation cost governor (per slot). Speculative decoding only changes speed, so it should never be slower than plain
 // decoding; whether it pays depends on the model, the drafter, the device, the context and the text, so it is measured: the time from
 // one emitted step to the next (draft + verify + sampling + server work; a checkpoint replay folds into the step that emits) and the
 // tokens it emitted, on both sides. After TensorSharp's SpeculationCostGovernor (TensorSharp.Runtime/Speculative/
@@ -8,7 +8,7 @@
 // loss parks drafting for 32 steps, doubling up to 256 while it keeps losing; a win holds for 64 steps, doubling up to 1024 while it
 // keeps winning, and a window of the last 8 drafted steps is watched against the round's plain cost; a probe whose first 4 measured
 // steps accepted nothing ends as a loss, and so does a hold whose last 8 drafted steps accepted nothing; a new request caps a park at
-// the first interval and keeps at most one counted loss, and a winning hold carries over (TensorSharp keeps it too; measured on G4,
+// the first interval and keeps at most one counted loss, and a winning hold carries over (TensorSharp keeps it too; measured on an RTX PRO 6000,
 // Qwen3.6 + MTP: re-measuring a plain block at every request cost 2-5% of the decode where drafting wins). The first sample of each side after a change is
 // dropped (it pays the graph rebuild), and so is the worst drafted sample of a round.
 //
@@ -18,7 +18,7 @@
 // are dropped when a request ends.
 //
 // Steps where drafting was allowed but produced no draft (an n-gram drafter without a match) are not samples of either side.
-// OPT-IN, LLAMA_SPEC_GOVERNOR=1 (unset / 0: off, drafting always allowed, the code path of the k9 tip): on G4 (RTX PRO 6000) it cost
+// OPT-IN, LLAMA_SPEC_GOVERNOR=1 (unset / 0: off, drafting always allowed, the code path of the k9 tip): on an RTX PRO 6000 (RTX PRO 6000) it cost
 // 0-5% decode beside a winning MTP head (Qwen3.6-35B-A3B, gemma-4-26B-A4B + its assistant, n_max 2) and did not recover the n-gram
 // losses on LFM2.5. LLAMA_SPEC_GOVERNOR_MARGIN (1.03): drafting stays
 // on while its ms per token is at most margin x the plain one; LLAMA_SPEC_GOVERNOR_LOG=1 logs every verdict.

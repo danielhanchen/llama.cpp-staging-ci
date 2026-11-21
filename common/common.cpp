@@ -974,7 +974,7 @@ void common_set_env(const std::string & name, const std::string & value) {
 #endif
 }
 
-// k15-fn: a draft model (no MoE cache of its own) is measured with the weight copies of one prefetch split counted
+// a draft model (no MoE cache of its own) is measured with the weight copies of one prefetch split counted
 // (LLAMA_FIT_STAGING_SPLIT, see sched_reserve): with its experts on the host (--spec-draft-cpu-moe) the arena does not fit beside a
 // full MoE cache, the copies then land in its graph allocation (Qwen3.8-Flash-Next MTP Q8_0 at 32 GB: measured 199 MiB of compute,
 // 982 MiB once loaded, out of memory at the first draft). LLAMA_FIT_STAGING_SPLIT=0: the old measure
@@ -1285,7 +1285,7 @@ static int64_t common_model_n_layer(const std::string & path, std::vector<uint8_
 // lend_*: the group of layers with the same expert sizes that holds the most expert bytes (the MoE cache splits its budget between such
 // groups by their host bytes and lends a graph allocation from a bank tail of its largest group, see llama_moe_cache lend): its slot,
 // its largest tensor per expert and its share of the expert bytes of the model
-// k19-df2cost: the DFlash2 cached window band's upper cached share (common/speculative.cpp) and the device memory it keeps for its second width
+// the DFlash2 cached window band's upper cached share (common/speculative.cpp) and the device memory it keeps for its second width
 #ifndef K19_DF2COST_FRAC_MAX
 #define K19_DF2COST_FRAC_MAX 0.5
 #endif
@@ -1451,24 +1451,24 @@ static int64_t common_gguf_u32(const std::string & path, const char * key) {
     }
 }
 
-// k15-up: the layer-major batch (tokens per merged group). Default 8192; 16384 (one group for a 16k prompt, one pass over the host
+// the layer-major batch (tokens per merged group). Default 8192; 16384 (one group for a 16k prompt, one pass over the host
 // experts instead of two) where the draft model was left out by --fit (fit_off): no drafter or MTP heads keep n_batch-sized rows
 // beside it (an MTP drafter on the device grew the peak RSS by 570 MiB at 16384, a dropped one by 50-96 MiB). A group whose lent
 // allocation does not fit is refused and split (ggml sched lend guard), so a cache that cannot lend for 8 members runs 4 + 4 as at
-// 8192. G4 Flash-Next UD-IQ4_XS Studio argv, 16k: 24 GB 3.661 -> 3.216 s, 16 GB (own-buffer lend) 3.820 -> 3.184 s, md5 unchanged.
+// 8192. RTX PRO 6000 Flash-Next 4-bit Studio argv, 16k: 24 GB 3.661 -> 3.216 s, 16 GB (own-buffer lend) 3.820 -> 3.184 s, md5 unchanged.
 // LLAMA_MOE_LAYER_MAJOR_BATCH=N sets N; LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO=0 keeps 8192
-// k15-up (2): built-in MTP heads (no -md model) keep one next-n row per batch token (llama_context::output_reserve, embd_nextn unmasked:
+// built-in MTP heads (no -md model) keep one next-n row per batch token (llama_context::output_reserve, embd_nextn unmasked:
 // n_embd floats x n_batch), which is all the drafter's prompt pass needs after the batch. 16384 adds n_embd x 4 B x 8192 to the host
 // output buffer; it is taken where that is at most LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB (100): Qwen3.6-35B-A3B (n_embd 2048) +64 MiB.
-// The rest of the measured peak RSS growth (~170 MiB, G4 q4x 12 GB +237) is the 8-member graph's own host buffers, the same without a
+// The rest of the measured peak RSS growth (~170 MiB, RTX PRO 6000 4-bit 12 GB +237) is the 8-member graph's own host buffers, the same without a
 // draft (Flash-Next 16 GB, draft dropped: +170)
-// k17-small: what a launch without the drafter passes where the fit dropped an MTP drafter (LLAMA_FIT_MTP_DROP, the 2-thread MTP-cache
+// what a launch without the drafter passes where the fit dropped an MTP drafter (LLAMA_FIT_MTP_DROP, the 2-thread MTP-cache
 // rule): no draft types (no next-n rows, one output per sequence, no rollback states), no draft context flag (the layer-major refill
 // and the state capture of a drafting server), the default capture count. Before this the server ran in the "draft left out" mode:
 // a 16384-token layer-major batch, the capture and refill of a drafting context, and its prompts and checkpoints differed from a
 // plain launch (2k / 8k text not equal to it). The trial fit runs with these context parameters, so the placement is that launch's
-// k19-rollback: where --fit leaves the draft model out (no room on the device beside the main model and its MoE cache: G4 capped at 8 GB,
-// Qwen3.8-Flash-Next UD-IQ4_XS + its Q8_0 MTP drafter), the server drafts n-gram suffix windows instead (cost-priced, as the server's own
+// where --fit leaves the draft model out (no room on the device beside the main model and its MoE cache: RTX PRO 6000 capped at 8 GB,
+// Qwen3.8-Flash-Next 4-bit + its Q8_0 MTP drafter), the server drafts n-gram suffix windows instead (cost-priced, as the server's own
 // n-gram drafting). Their rollback keeps no per-token recurrent rows on the device: the dropped draft's context already runs with n_rs_seq 0,
 // so a partly accepted window of a recurrent model restores the server's checkpoint of the state (host memory) and decodes the accepted
 // tokens again. Where nothing repeats nothing is drafted, and the launch is the plain one (no rows, no checkpoint).
@@ -1518,21 +1518,21 @@ static int64_t common_lm_batch_default(const common_params & params, bool * nodr
     if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) {
         return atoll(e);
     }
-    // (was opt-in: G4 k15g4y1 Flash-Next 16 GB VmHWM +170 (fn4) / +188 (fn1) MiB, transient during the group, mostly its host KQ masks)
-    // k15-pp: on by default again (LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO=0: 8192) now that the 16384 group's own host memory is gone:
+    // (was opt-in: RTX PRO 6000 Flash-Next 16 GB VmHWM +170 (the 4-bit Flash-Next) / +188 (the 1-bit Flash-Next) MiB, transient during the group, mostly its host KQ masks)
+    // on by default again (LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO=0: 8192) now that the 16384 group's own host memory is gone:
     // device-built KQ masks (no host mask per member), no CUDA graph records for the merged graph, next-n rows on the device beside
-    // MTP heads. G4 fn4 16 GB (k15g4n1): VmHWM 75300 vs 75347 MiB for the 8192 default with host masks, 16k TTFT 3.24 vs 4.07 s
+    // MTP heads. RTX PRO 6000, the 4-bit Flash-Next 16 GB: VmHWM 75300 vs 75347 MiB for the 8192 default with host masks, 16k TTFT 3.24 vs 4.07 s
     static const bool auto_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO")) != 0;
     if (!auto_env) {
         return 8192;
     }
-    if (params.speculative.draft.fit_off && params.speculative.has_dft()) {   // a dropped MTP drafter: as a plain launch (k17-small)
+    if (params.speculative.draft.fit_off && params.speculative.has_dft()) {   // a dropped MTP drafter: as a plain launch
         return 16384;
     }
     const bool mtp_heads = !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
         [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
-    // k17: no draft model and no MTP heads (no speculation, or n-gram drafts only) keep no next-n rows either, as a dropped draft does:
-    // 16384 there too (one pass over the host experts for a 16k prompt and no group boundary). G4 k17fn24 Flash-Next UD-IQ4_XS 24 GB no
+    // no draft model and no MTP heads (no speculation, or n-gram drafts only) keep no next-n rows either, as a dropped draft does:
+    // 16384 there too (one pass over the host experts for a 16k prompt and no group boundary). RTX PRO 6000 Flash-Next 4-bit 24 GB no
     // draft 16k / 30k TTFT 3.34 / 6.41 -> 3.03 / 5.81 s at the previous depth. LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT=0 keeps 8192
     static const bool nodraft_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT")) != 0;
     if (nodraft_env && !params.speculative.has_dft() && !mtp_heads) {
@@ -1541,9 +1541,9 @@ static int64_t common_lm_batch_default(const common_params & params, bool * nodr
         }
         return 16384;
     }
-    // k19-np12c, opt-in (LLAMA_MOE_LAYER_MAJOR_BATCH_LEND=1): beside a separate MTP drafter (-md, draft-mtp) whose device weights the
+    // opt-in (LLAMA_MOE_LAYER_MAJOR_BATCH_LEND=1): beside a separate MTP drafter (-md, draft-mtp) whose device weights the
     // target's prompt groups borrow (kdp, LLAMA_MTP_DRAFT_LEND) 16384. Off by default: the server's drafter pass covers the whole last
-    // batch, so a 30k prompt passed 14332 drafter rows instead of 6140 (G4 Flash-Next UD-IQ4_XS 12 GB, Studio's -np 4 with the q3_k drafter:
+    // batch, so a 30k prompt passed 14332 drafter rows instead of 6140 (RTX PRO 6000 Flash-Next 4-bit 12 GB, Studio's -np 4 with the q3_k drafter:
     // TTFT 6.89 vs 6.66 s, e2e 9.837 vs 9.572 s), and the choice is made before --fit knows whether anything is lent (16 GB, nothing lent:
     // MoE cache 4488 vs 4576 MiB, 30k e2e 8.616 vs 8.486 s)
     static const bool lend_batch_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_LEND") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_LEND")) != 0;
@@ -1554,8 +1554,8 @@ static int64_t common_lm_batch_default(const common_params & params, bool * nodr
     if (lend_batch_env && lend_on && dft_mtp) {
         return 16384;
     }
-    // beside built-in MTP heads 16384 (LLAMA_MOE_LAYER_MAJOR_BATCH_MTP=0: 8192). It was opt-in: G4 k15g4q1 q4x 12 GB 16k TTFT -13% but
-    // decode 8k / 16k -11 / -10%, RssAnon +95 MiB. k17 (on the scheduler trim, the input arena fit and the MTP state release): G4 k17lmm3 q4x
+    // beside built-in MTP heads 16384 (LLAMA_MOE_LAYER_MAJOR_BATCH_MTP=0: 8192). It was opt-in: RTX PRO 6000 4-bit 12 GB 16k TTFT -13% but
+    // decode 8k / 16k -11 / -10%, RssAnon +95 MiB. An earlier build (on the scheduler trim, the input arena fit and the MTP state release): RTX PRO 6000 4-bit
     // + MTP 12 GB, 3 launches: 16k / 30k TTFT 1.46 -> 1.34 / 2.74 -> 2.36 s, decode equal, md5 sets equal, end RssAnon 2446-2459 against
     // 2497-2509 MiB for the previous 8192 default; KLD inside the model's own band. Only beside built-in heads: a -md draft keeps 8192
     static const bool mtp_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_MTP") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_MTP")) != 0;
@@ -1573,16 +1573,16 @@ static int64_t common_lm_batch_default(const common_params & params, bool * nodr
 // default (no compute buffer growth taken from the cache) and the batch holds up to LLAMA_MOE_LAYER_MAJOR_BATCH (8192) tokens, at most the
 // context and lm_ub_max ubatches. LLAMA_MOE_LAYER_MAJOR=1 forces it for spilled experts, =0 turns it off; unset (auto): on for spilled
 // experts with speculative decoding by a model (the built-in MTP heads, a -md draft), where the rules below keep the default n_ubatch
-// (no lending beside a draft: G4, Qwen3.6-35B-A3B UD-Q3_K_M + MTP at 8 GB, 2k / 8k prompt 2288 -> 3709 / 2430 -> 6609 tok/s, same text);
+// (no lending beside a draft: RTX PRO 6000, Qwen3.6-35B-A3B 3-bit + MTP at 8 GB, 2k / 8k prompt 2288 -> 3709 / 2430 -> 6609 tok/s, same text);
 // where they grow n_ubatch (a lent graph) the prompt stays ubatch by ubatch
 // the share of the host experts below which a prompt's layer-major groups run beside the hybrid gate (llama_context lm_hybrid_frac_ok,
-// LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC, default 0.25). k18 (LLAMA_MOE_LM_GATE_BATCH, default on; =0 the k16 line, 0.05): the batch of an
+// LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC, default 0.25). An earlier build (LLAMA_MOE_LM_GATE_BATCH, default on; =0 the earlier line, 0.05): the batch of an
 // explicit -ub grows to hold groups wherever the context runs them; with 0.05 a cache of 5-10% kept one ubatch per batch under the gate,
-// so no group formed (G4, Qwen3.8-Flash-Next UD-IQ4_XS 12 GB, 6.3% cached, Studio -ub 2048: 8k prompt 1945 tok/s against 4463 at
+// so no group formed (RTX PRO 6000, Qwen3.8-Flash-Next 4-bit 12 GB, 6.3% cached, Studio -ub 2048: 8k prompt 1945 tok/s against 4463 at
 // 16 GB with groups; 16 GB beside a Q8_0 MTP drafter, 8.0%: 1845 tok/s, TTFT 1.84 -> 4.44 s)
-// k17-fnbatch: the 16384 batch without a draft (common_lm_batch_default) only where the cache has room for its merged graphs: the member
+// the 16384 batch without a draft (common_lm_batch_default) only where the cache has room for its merged graphs: the member
 // estimate n_ubatch x 4 B x (4 n_embd + 4 n_expert_used n_ff_exp), (k - 1) of them, at most 1/LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM (2)
-// of the cache; else 8192. G4 / T4 k17nbg / k17nbo: Flash-Next UD-IQ4_XS 12 GB (2321 MiB cache) 16k / 30k text changed beside the
+// of the cache; else 8192. RTX PRO 6000 / T4 / Flash-Next 4-bit 12 GB (2321 MiB cache) 16k / 30k text changed beside the
 // hybrid gate for -0.7 / -1.1% TTFT; gpt-oss-20b 8 GB on T4 (3026 MiB cache) still split 4 + 4, its input arena 91 -> 182 MiB and 16k
 // TTFT +1.0%; 24 GB (15068 MiB) one group, 30k TTFT -2.3%, text unchanged
 static bool common_lm_nodraft_room(const common_params & params, int64_t n_ubatch, int64_t want, int64_t * est_out = nullptr) {
@@ -1615,12 +1615,12 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     }
     const char * env_lm = getenv("LLAMA_MOE_LAYER_MAJOR");
     const int    lm     = env_lm == nullptr || strcmp(env_lm, "auto") == 0 ? -1 : (atoi(env_lm) != 0 ? 1 : 0);
-    // k15-small4: layer-major prompts without a draft (LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 keeps the prompt ubatch by ubatch)
+    // layer-major prompts without a draft (LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 keeps the prompt ubatch by ubatch)
     static const bool nd_on = getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT")) != 0;
     if (params.n_ubatch_set) {
-        // k9-prompt-pass: an explicit -ub without -b (Unsloth Studio passes --ubatch-size 2048 for a vision projector) kept n_batch at its
+        // an explicit -ub without -b (Unsloth Studio passes --ubatch-size 2048 for a vision projector) kept n_batch at its
         // default 2048, so a batch held one ubatch, layer-major never engaged and a long prompt copied every spilled expert once per
-        // ubatch (G4, Flash-Next UD-IQ4_XS 32 GB, 8k prompt: 4 passes, 147.7 GB). The ubatch stays as given (none of the rules below runs),
+        // ubatch (RTX PRO 6000, Flash-Next 4-bit 32 GB, 8k prompt: 4 passes, 147.7 GB). The ubatch stays as given (none of the rules below runs),
         // only the batch grows to hold several ubatches, under the same conditions as layer-major auto (or LLAMA_MOE_LAYER_MAJOR=1).
         // LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB=0 keeps n_batch. Not on unified memory under Windows (params.moe_uma_keep_batch) unless
         // LLAMA_MOE_LAYER_MAJOR=1: groups of large ubatches were slower there than one ubatch per graph (see common_init_result)
@@ -1629,12 +1629,12 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                 !common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
             return;
         }
-        // k10: not where the MoE cache's default hybrid gate will run (it holds at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts):
-        // that path refuses every layer-major group, so the raise only changed the batches (local B200, Qwen3.6 UD-Q4_K_XL + MTP, 1500 MiB
-        // cache, -ub 2048: 8k text differs from k9 with no group run)
-        // k16: except below LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC (0.05) of the host experts, where llama_context runs the groups beside the
-        // gate (k13-small, lm_hybrid_frac_ok) but this early return kept n_batch at one ubatch, so no group formed: G4, Qwen3.8-Flash-Next
-        // UD-IQ4_XS 12 GB with Studio's -ub 2048 (cache 2642 of 56762 MiB, 4.7%), 8k / 16k / 30k prompt 1917 / 1934 / 1896 tok/s against
+        // not where the MoE cache's default hybrid gate will run (it holds at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts):
+        // that path refuses every layer-major group, so the raise only changed the batches (local B200, Qwen3.6 4-bit + MTP, 1500 MiB
+        // cache, -ub 2048: 8k text differs from an earlier build with no group run)
+        // except below LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC (0.05) of the host experts, where llama_context runs the groups beside the
+        // gate (an earlier build, lm_hybrid_frac_ok) but this early return kept n_batch at one ubatch, so no group formed: RTX PRO 6000, Qwen3.8-Flash-Next
+        // 4-bit 12 GB with Studio's -ub 2048 (cache 2642 of 56762 MiB, 4.7%), 8k / 16k / 30k prompt 1917 / 1934 / 1896 tok/s against
         // 4396 / 4460 at 16 GB (groups). LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID=0 restores the early return
         static const bool xh_on = getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID")) != 0;
         static const double lm_hyb_frac = common_lm_hybrid_frac();
@@ -1652,7 +1652,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         if (params.n_ctx > 0) {
             want = std::min<int64_t>(want, params.n_ctx);
         }
-        // the cache given up for the merged graphs of k ubatches (k17-fnbatch: a function of k, to compare the 16384 and 8192 batches)
+        // the cache given up for the merged graphs of k ubatches (a function of k, to compare the 16384 and 8192 batches)
         auto reserve_for = [&](const int64_t k) -> int64_t {
             int64_t reserve = -1;
             if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB")) {
@@ -1660,12 +1660,12 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             } else {
                 const bool ckpt_batch = getenv("LLAMA_MOE_LAYER_MAJOR_CKPT") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_CKPT")) != 0;
                 double frac = ckpt_batch ? 0.025 : 0.0;
-                // k18 (LLAMA_MOE_LM_GATE_RESERVE_FRAC, default 0.10; 0 = as before): beside the hybrid gate the fit leaves ~550 MiB
+                // (LLAMA_MOE_LM_GATE_RESERVE_FRAC, default 0.10; 0 = as before): beside the hybrid gate the fit leaves ~550 MiB
                 // free while a 4-member group at -ub 2048 grows the compute buffers ~850 MiB, and the cache cannot lend the whole merged
-                // allocation, so every 8k prompt ran as 2 + 2 and read the host experts twice (G4 Flash-Next UD-IQ4_XS: 12 GB no draft
+                // allocation, so every 8k prompt ran as 2 + 2 and read the host experts twice (RTX PRO 6000 Flash-Next 4-bit: 12 GB no draft
                 // and 16 GB beside the Q8_0 MTP drafter, "split at 2", 8k TTFT 2.62 / 2.88 s against 1.83 at 16 GB with one graph)
                 // Only the shortfall: (k - 1) member estimates (+10%) less LLAMA_MOE_LM_GATE_RESERVE_FREE_MIB (default 512, the free memory
-                // found beside the gate at group time: 545 / 576 MiB on G4), at most that share of the cache; a group that fits takes nothing
+                // found beside the gate at group time: 545 / 576 MiB on RTX PRO 6000), at most that share of the cache; a group that fits takes nothing
                 double gate_frac = 0.0;
                 if (lm_beside_gate && lm != 1 && common_moe_hybrid_gate_on(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
                     gate_frac = 0.10;
@@ -1694,8 +1694,8 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             }
             return reserve;
         };
-        // k17-fnbatch: the 16384 batch without a draft only where it gives up no more of the cache than 8192 and the cache has room
-        // for its graphs (common_lm_nodraft_room); else 8192. G4 k17nbg Flash-Next UD-IQ4_XS 16 GB beside the hybrid gate: 540.51 instead
+        // the 16384 batch without a draft only where it gives up no more of the cache than 8192 and the cache has room
+        // for its graphs (common_lm_nodraft_room); else 8192. RTX PRO 6000 Flash-Next 4-bit 16 GB beside the hybrid gate: 540.51 instead
         // of 412.00 MiB kept free (cache 4859 vs 4992 MiB), 8k / 30k TTFT +2.0 / +1.0%. LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM=0: always
         const int64_t ub_n = (int64_t) cparams.n_ubatch;
         static const bool nd_room_on = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM") == nullptr || atof(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM")) > 0.0;
@@ -1718,26 +1718,26 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             params.n_batch_ckpt = (int32_t) cparams.n_batch;
             params.n_batch  = (int32_t) want;
             cparams.n_batch = (uint32_t) want;
-            // k15-small4: without a draft the context turns layer-major on only with this mark (as the n_ubatch-default branch below sets it;
+            // without a draft the context turns layer-major on only with this mark (as the n_ubatch-default branch below sets it;
             // an explicit -ub, e.g. Studio's --ubatch-size 2048, never reached that branch)
             if (lm != 1 && !common_spec_draft_model(params)) {
                 common_set_env("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT", "1");
             }
             // a merged graph of k ubatches keeps what crosses its cuts for every member; at a large ubatch that is more than the fit leaves
-            // free (G4, Flash-Next UD-IQ4_XS 32 GB + Q8_0 MTP drafter, -ub 2048: 4 ubatches needed 755 MiB, 744 MiB were free, so the group
+            // free (RTX PRO 6000, Flash-Next 4-bit 32 GB + Q8_0 MTP drafter, -ub 2048: 4 ubatches needed 755 MiB, 744 MiB were free, so the group
             // ran as 2 + 2 and read the experts twice). With LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC (default 0.025 when the server checkpoint is
             // one batch back, LLAMA_MOE_LAYER_MAJOR_CKPT=1, else 0) the cache gives up min(frac of itself, (k - 1) x the estimate of one
             // member: n_ubatch x 4 B x (4 n_embd + 4 n_expert_used n_ff_exp)); LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB=N takes N MiB.
             // Not by default: with the checkpoint one ubatch back an 8k prompt is a group of 3 (fits) + the checkpoint ubatch, and the 481 MiB
-            // the cache gave up there cost the decode after it 1.9% (hit rate 86.84 -> 86.62%) for no prompt gain (same G4 VM, 8k cell)
+            // the cache gave up there cost the decode after it 1.9% (hit rate 86.84 -> 86.62%) for no prompt gain (same RTX PRO 6000 VM, 8k cell)
             int64_t reserve = reserve_for((int64_t) cparams.n_batch/(int64_t) cparams.n_ubatch);
             if (reserve > 0 && (int64_t) params.moe_cache_size > 2*reserve) {
                 params.moe_cache_size  -= (size_t) reserve;
                 cparams.moe_cache_size  = params.moe_cache_size;
-                // k11: the memory given up here is for the merged graphs only. The check whether a prompt's host seed fits
+                // the memory given up here is for the merged graphs only. The check whether a prompt's host seed fits
                 // (llama_context::sched_reserve_seed) must not count it as free: with it counted, a 128 MiB reserve made the host seed fit
-                // and replaced the device seed of Flash-Next UD-IQ4_XS 32 GB (Studio argv), whose 2k prompt then waited on the routing of
-                // each layer (G4 k11pgAA: 2k -8.5%, 20004 instead of 5731 uploads per ubatch)
+                // and replaced the device seed of Flash-Next 4-bit 32 GB (Studio argv), whose 2k prompt then waited on the routing of
+                // each layer (RTX PRO 6000 2k -8.5%, 20004 instead of 5731 uploads per ubatch)
                 common_set_env("LLAMA_MOE_LAYER_MAJOR_RESERVED_BYTES", std::to_string(reserve));
             } else {
                 reserve = 0;
@@ -1758,7 +1758,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             if (params.n_ctx > 0) {
                 want = std::min<int64_t>(want, params.n_ctx);
             }
-            // k17-fnbatch: as for an explicit -ub, 16384 without a draft only where the cache has room for its graphs
+            // as for an explicit -ub, 16384 without a draft only where the cache has room for its graphs
             static const bool nd_room_on = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM") == nullptr || atof(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM")) > 0.0;
             if (nd16 && nd_room_on && want > 8192 && !common_lm_nodraft_room(params, (int64_t) cparams.n_ubatch, want)) {
                 want = 8192;
@@ -1781,9 +1781,9 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         COM_INF("MoE cache: layer-major prompts beside speculative decoding: n_ubatch stays %u, n_batch %u (LLAMA_MOE_LAYER_MAJOR=0 disables)\n",
             cparams.n_ubatch, cparams.n_batch);
     } else if (lm == -1 && spill && !common_spec_draft_model(params) && cparams.n_ubatch == ub0) {
-        // k15-small4: without a draft too, wherever the rules above keep the default n_ubatch with spilled experts (the small-device
+        // without a draft too, wherever the rules above keep the default n_ubatch with spilled experts (the small-device
         // placement keeps it for good): every ubatch otherwise uploads the experts the cache misses again. T4 4 GB, Qwen3.6-35B-A3B
-        // UD-Q4_K_XL, no MTP: 2k / 8k prompt 163 / 167 tok/s ubatch by ubatch against 590 / 911 in layer-major groups (the same ubatches,
+        // 4-bit, no MTP: 2k / 8k prompt 163 / 167 tok/s ubatch by ubatch against 590 / 911 in layer-major groups (the same ubatches,
         // layer by layer). LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 keeps the prompt ubatch by ubatch
         if (nd_on) {
             set_batch();
@@ -1800,8 +1800,8 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     if (force == 0) {
         return;
     }
-    // k15-pp: LLAMA_MTP_EXACT=1 promises the drafted text byte equal to the text without a draft, but these rules raise n_ubatch
-    // without a model drafter and keep the default beside one, and the prompt's numerics follow n_ubatch (Qwen3.6-35B-A3B UD-Q4_K_XL +
+    // LLAMA_MTP_EXACT=1 promises the drafted text byte equal to the text without a draft, but these rules raise n_ubatch
+    // without a model drafter and keep the default beside one, and the prompt's numerics follow n_ubatch (Qwen3.6-35B-A3B 4-bit +
     // MTP heads, --cpu-moe --moe-cache-mib 4000, strict: no draft at n_ubatch 4096 differed from the drafter at 512 from the second
     // token on; the no-draft arm at 512 matched it and the all-device runs). In the exact mode n_ubatch stays the default with and
     // without a draft (the layer-major groups below then read the prompt, as beside a draft). LLAMA_MOE_PREFILL_UB=N still forces N,
@@ -1818,11 +1818,11 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
             return;
         }
     }
-    // k13-small: no larger n_ubatch beside the small-device placement (common_fit_small_device): its 256 MiB margin has no room for the
-    // run-time buffers of a larger ubatch. G4 4 GB q3m without a draft: "every expert cached" took n_ubatch 2048 (compute 804 MiB) and the
+    // no larger n_ubatch beside the small-device placement (common_fit_small_device): its 256 MiB margin has no room for the
+    // run-time buffers of a larger ubatch. RTX PRO 6000 4 GB q3m without a draft: "every expert cached" took n_ubatch 2048 (compute 804 MiB) and the
     // first 2k prompt ran out of device memory (CUDA error). LLAMA_MOE_PREFILL_UB=N still forces N
-    // k19-l4poly: not on a host-bound small device (common_fit_hostbound): its larger ubatches run with the cache banks released (the
-    // tiny-cache rule below, k19-tiny-ub, or the k19-place8 context), so they are sized within the cache, which keeps its size
+    // not on a host-bound small device (common_fit_hostbound): its larger ubatches run with the cache banks released (the
+    // tiny-cache rule below, an earlier build, or the decode-sized placement context), so they are sized within the cache, which keeps its size
     if (force < 0 && common_fit_small_device() && !common_fit_hostbound()) {
         COM_INF("MoE cache: small device: n_ubatch stays %u (LLAMA_MOE_PREFILL_UB=N forces N)\n", cparams.n_ubatch);
         return;
@@ -1878,8 +1878,8 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     const bool has_draft = params.speculative.has_dft() && !params.speculative.draft.fit_off;
     const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-    // k9-draft: n-gram drafts (no draft context, verify batches of a few tokens) leave the prompt rules as without speculative decoding:
-    // the k6 spec gate was measured with model drafters (the decode after a lent prompt with an MTP head lost 5.5-6%), and with it
+    // n-gram drafts (no draft context, verify batches of a few tokens) leave the prompt rules as without speculative decoding:
+    // the earlier spec gate was measured with model drafters (the decode after a lent prompt with an MTP head lost 5.5-6%), and with it
     // ngram-mod's prompts lost 68-82% (LFM2.5 at 8 GB); LLAMA_MOE_SPILL_LEND_NGRAM=0 restores the gate
     const bool lend_ngram = getenv("LLAMA_MOE_SPILL_LEND_NGRAM") == nullptr || atoi(getenv("LLAMA_MOE_SPILL_LEND_NGRAM")) != 0;
     const bool has_spec  = has_draft || std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
@@ -2008,12 +2008,12 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     // tiny cache: the cache holds the experts of fewer than LLAMA_MOE_PREFILL_UB_TINY_TOKENS (4, the minimum of the RAM tier,
     // LLAMA_MOE_HOST_MIN_TOKENS) tokens of a model whose experts spill. A prompt ubatch then uploads every expert of every layer from the
     // host (none from the cache) and decode misses most experts anyway, so the cache buys little, while every ubatch reads all the experts
-    // again: from disk when they do not fit in RAM. Qwen3.8-Flash-Next UD-IQ1_S on a T4 at 8 GB (31 GB RAM, the experts of 1.6 tokens on
+    // again: from disk when they do not fit in RAM. Qwen3.8-Flash-Next 1-bit on a T4 at 8 GB (31 GB RAM, the experts of 1.6 tokens on
     // the device): an 8k prompt at n_ubatch 512 read 594 GB in 16 ubatches and ran 21% slower than the base, which keeps 6 whole layers
     // on the device. Here n_ubatch grows (1024 ... LLAMA_MOE_PREFILL_UB_MAX) while the cache keeps at least
     // LLAMA_MOE_PREFILL_UB_TINY_KEEP (0.25) of itself and the KV cache does not grow. LLAMA_MOE_PREFILL_UB_TINY=0 off, =N forces N here
     {
-        common_set_env("LLAMA_MOE_TINY_RELEASE", ""); // set below for the context this rule sizes (k19-tiny-ub)
+        common_set_env("LLAMA_MOE_TINY_RELEASE", ""); // set below for the context this rule sizes
         common_moe_slot_bytes sbt;
         const char * env_t   = getenv("LLAMA_MOE_PREFILL_UB_TINY");
         const int    force_t = env_t != nullptr ? atoi(env_t) : -1;
@@ -2025,8 +2025,8 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
         if (const char * e = getenv("LLAMA_MOE_PREFILL_UB_TINY_KEEP")) {
             keep = std::min(1.0, std::max(0.0, atof(e)));
         }
-        // k13-small: not beside the small-device placement (common_fit_small_device), whose 256 MiB margin has no room for the larger
-        // ubatch's run-time buffers: G4 4 GB q3m without a draft grew to n_ubatch 2048 (compute 804 MiB) and ran out of device memory
+        // not beside the small-device placement (common_fit_small_device), whose 256 MiB margin has no room for the larger
+        // ubatch's run-time buffers: RTX PRO 6000 4 GB q3m without a draft grew to n_ubatch 2048 (compute 804 MiB) and ran out of device memory
         // in a request (CUDA error); LLAMA_MOE_PREFILL_UB_TINY=N still forces N
         const bool small_dev = common_fit_small_device() && !common_fit_hostbound() && force_t <= 0;
         if (force_t != 0 && !small_dev && force <= 0 && !rule_frac && common_moe_slot_bytes_of(params.model.path, sbt) && sbt.n_used > 0 && sbt.n_layer > 0) {
@@ -2052,19 +2052,19 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
                 }
                 if (pick_t != ub_def) {
                     const int64_t taken_t = std::max<int64_t>(0, m_t.total - m_def.total);
-                    // k19-tiny-ub (LLAMA_MOE_PREFILL_UB_TINY_RELEASE=0: the growth is taken from the cache for good, as before): the larger
+                    // (LLAMA_MOE_PREFILL_UB_TINY_RELEASE=0: the growth is taken from the cache for good, as before): the larger
                     // n_ubatch is for prompts only, so the cache keeps its size (less any KV growth, none by the rule above) and frees its
                     // banks while ubatches of more than the default n_ubatch run; the next ubatch of at most that many tokens frees the
                     // compute buffers (also an MTP drafter's) and allocates and refills the banks again with the experts they held
                     // (llama_context::tiny_rel_enter / tiny_rel_leave). Decode then reads the cache of the default n_ubatch with the prompt
-                    // of the larger one. T4 6 GB, Qwen3.6-35B-A3B + MTP: the rule took 576 / 974 MiB of 1141 / 1398 MiB (q4x / q3m) and kept
+                    // of the larger one. T4 6 GB, Qwen3.6-35B-A3B + MTP: the rule took 576 / 974 MiB of 1141 / 1398 MiB (4-bit / q3m) and kept
                     // them through decode (chat decode 33.5 / 38.6 tok/s, released: 38.6 / 50.2). Single device, no separate draft model
                     // (its compute buffers are not freed)
                     // Only where the whole cache holds the experts of at least LLAMA_MOE_PREFILL_UB_TINY_RELEASE_MIN_TOKENS (1.5) tokens: below
                     // that the decode misses most experts of a token with or without the growth, so it gains little, while every prompt
                     // refills the whole cache after it and stages from the host the experts the smaller cache would have copied on the
                     // device (L4 LFM2.5-24B-A2B 4 GB, 1.2 tokens: e2e chat / 2k / 8k 1.04 / 1.03 / 0.96 of the rule before; T4 Qwen3.6-35B-A3B
-                    // + MTP 6 GB, 1.6 / 2.3 tokens (q4x / q3m): 1.14 / 1.15 / 1.08 and 1.27 / 1.20 / 1.11)
+                    // + MTP 6 GB, 1.6 / 2.3 tokens (4-bit / q3m): 1.14 / 1.15 / 1.08 and 1.27 / 1.20 / 1.11)
                     static const bool tiny_rel_env = getenv("LLAMA_MOE_PREFILL_UB_TINY_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_PREFILL_UB_TINY_RELEASE")) != 0;
                     double tiny_rel_min_tokens = 1.5;
                     if (const char * e = getenv("LLAMA_MOE_PREFILL_UB_TINY_RELEASE_MIN_TOKENS")) {
@@ -2089,10 +2089,10 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
                             }
                             fclose(fm);
                             tiny_rel_ram = total_kb <= 0 || std::max(0.0, (double) sbt.total - (double) cache) <= ram_frac*(double) total_kb*1024.0;
-                            // k19-smallm (LLAMA_MOE_TINY_RELEASE_RAM_FIT=0: the RAM share alone, as before): also where the whole model
+                            // (LLAMA_MOE_TINY_RELEASE_RAM_FIT=0: the RAM share alone, as before): also where the whole model
                             // file fits in the available memory with LLAMA_MOE_TINY_RELEASE_RAM_RESERVE (0.10) of the RAM to spare. The
-                            // refill reads only the cache's experts, from a page cache that then keeps the whole file. Kaggle T4 (4 vCPU,
-                            // 31.3 GB RAM, 29.8 GB available), Qwen3.6-35B-A3B UD-Q4_K_XL + MTP at 6 GB: 19.2 GB of host experts are 61%
+                            // refill reads only the cache's experts, from a page cache that then keeps the whole file. T4 (4 vCPU,
+                            // 31.3 GB RAM, 29.8 GB available), Qwen3.6-35B-A3B 4-bit + MTP at 6 GB: 19.2 GB of host experts are 61%
                             // of the RAM, so the share kept the old rule (cache 1139 -> 549 MiB, decode hit rate 25.7%) though the 21.8 GB
                             // file stayed resident (0 MB read from the disk during the requests)
                             static const bool ram_fit_env = getenv("LLAMA_MOE_TINY_RELEASE_RAM_FIT") == nullptr ||
@@ -2118,8 +2118,8 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
                     }
 #endif
                     const int64_t kv_grow  = std::max<int64_t>(0, kv_t(m_t) - kv_t(m_def));
-                    // k19-l4poly: a host-bound small device always releases (its 384 MiB margin has no room for the growth beside the
-                    // cache; with k19-place8 the context releases the banks for every larger ubatch anyway)
+                    // a host-bound small device always releases (its 384 MiB margin has no room for the growth beside the
+                    // cache; with the decode-sized placement the context releases the banks for every larger ubatch anyway)
                     const bool    tiny_rel = (common_fit_hostbound() && m_t.n_dev == 1 && m_def.n_dev == 1 && !has_draft) ||
                         (tiny_rel_env && m_t.n_dev == 1 && m_def.n_dev == 1 && !has_draft && tokens >= tiny_rel_min_tokens && tiny_rel_ram);
                     const int64_t cache_t  = cache - (tiny_rel ? kv_grow : taken_t);
@@ -2168,23 +2168,23 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     const int64_t all_experts = have_sb ? (int64_t) (1.02*(double) sb.total) + sb.n_layer*sb.sum : INT64_MAX;
     // spilled experts, LLAMA_MOE_CACHE_LEND unset: the graph allocation is lent as with LLAMA_MOE_CACHE_LEND=2 (LLAMA_MOE_SPILL_LEND=0
     // disables). A larger n_ubatch then costs the decode no cache (its compute buffers are taken from the cache only while a prompt
-    // ubatch runs), unlike LLAMA_MOE_PREFILL_UB_SPILL=1, which shrinks the cache for good. G4 (RTX PRO 6000) at 32 GB, Qwen3.8-Flash-Next
-    // UD-IQ4_XS, 2 reps: 8k / 16k prompt 1933 / 1931 -> 3583 / 4247 tok/s (3927 / 4252 with 3 splits of prefetch), decode 81.7 / 81.1 -> 84.2 / 82.3
+    // ubatch runs), unlike LLAMA_MOE_PREFILL_UB_SPILL=1, which shrinks the cache for good. RTX PRO 6000 (RTX PRO 6000) at 32 GB, Qwen3.8-Flash-Next
+    // 4-bit, 2 reps: 8k / 16k prompt 1933 / 1931 -> 3583 / 4247 tok/s (3927 / 4252 with 3 splits of prefetch), decode 81.7 / 81.1 -> 84.2 / 82.3
     // (not with the opt-in LLAMA_MOE_PREFILL_UB_SPILL=1 rule). Only while the cache holds at most LLAMA_MOE_SPILL_LEND_MAX_FRAC (0.5) of
     // the experts: a cache holding most of them already makes a small share of each prompt pass, and its decode hit rate is sensitive
-    // to the cache state a prompt leaves; there lending cost the decode after a single-ubatch prompt (Qwen3.6-35B-A3B UD-Q4_K_XL at 16 GB,
-    // 66% cached, G4: decode after a 2k prompt 214.3 -> 202.3 tok/s, hit rate 96.9 -> 96.1%), while at 12 GB (44%) it was within 0.3%
+    // to the cache state a prompt leaves; there lending cost the decode after a single-ubatch prompt (Qwen3.6-35B-A3B 4-bit at 16 GB,
+    // 66% cached, RTX PRO 6000: decode after a 2k prompt 214.3 -> 202.3 tok/s, hit rate 96.9 -> 96.1%), while at 12 GB (44%) it was within 0.3%
     double spill_lend_max_frac = 0.5;
     if (const char * e = getenv("LLAMA_MOE_SPILL_LEND_MAX_FRAC")) {
         spill_lend_max_frac = std::max(0.0, atof(e));
     }
-    // Not with speculative decoding unless LLAMA_MOE_SPILL_LEND=2: with an MTP draft (Flash-Next + MTP Q8_0 at 32 GB, G4) the prompt
+    // Not with speculative decoding unless LLAMA_MOE_SPILL_LEND=2: with an MTP draft (Flash-Next + MTP Q8_0 at 32 GB, RTX PRO 6000) the prompt
     // gained +13% / +94% / +107% (2k / 8k / 16k) but the decode after it lost 4.5% / 9.3% / 0% (the cache is 18% smaller there and the
     // graph lends 29% of it during a prompt)
     const int  spill_lend_mode = getenv("LLAMA_MOE_SPILL_LEND") != nullptr ? atoi(getenv("LLAMA_MOE_SPILL_LEND")) : 1;
     // and only while the experts left on the host are at most LLAMA_MOE_SPILL_LEND_MAX_RAM_FRAC (0.5) of the RAM (Linux): the slots lent to a
     // prompt graph are refilled from the host experts after it, which on a host whose page cache cannot keep them reads them from the
-    // disk again (L4 24 GB, 52 GB RAM, Flash-Next UD-IQ4_XS from the VM disk: decode after an 8k prompt 12.5 -> 7.6 tok/s)
+    // disk again (L4 24 GB, 52 GB RAM, Flash-Next 4-bit from the VM disk: decode after an 8k prompt 12.5 -> 7.6 tok/s)
     bool spill_lend_ram = true;
 #ifdef __linux__
     {
@@ -2206,13 +2206,13 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
         }
     }
 #endif
-    // with speculative decoding too (LLAMA_MOE_SPILL_LEND_SPEC=0 restores the k6 gate). B200 ballasted to 32 GB, Flash-Next
-    // UD-IQ4_XS + Q4_K_M MTP drafter: the spec gate left the prompt at n_ubatch 2048, four expert passes per 8k prompt (169 GB H2D,
+    // with speculative decoding too (LLAMA_MOE_SPILL_LEND_SPEC=0 restores the earlier gate). B200 ballasted to 32 GB, Flash-Next
+    // 4-bit + Q4_K_M MTP drafter: the spec gate left the prompt at n_ubatch 2048, four expert passes per 8k prompt (169 GB H2D,
     // 8k prompt 1630 tok/s)
-    // LLAMA_MOE_SPILL_LEND_SPEC unset: with a separate drafter (-md) only; 0: never (the k6 gate); 1: with any draft. A built-in MTP head
-    // (Qwen3.6-35B-A3B UD-Q4_K_XL on G4 at 12 / 16 GB, where k6 keeps n_ubatch 512) lost 5.5-6% of the decode after a lent 2k prompt (on a
+    // LLAMA_MOE_SPILL_LEND_SPEC unset: with a separate drafter (-md) only; 0: never (the earlier gate); 1: with any draft. A built-in MTP head
+    // (Qwen3.6-35B-A3B 4-bit on RTX PRO 6000 at 12 / 16 GB, where an earlier build keeps n_ubatch 512) lost 5.5-6% of the decode after a lent 2k prompt (on a
     // different text: n_ubatch rounding; no seeding variant recovered it) for a 2.8-2.9x 2k prompt, so it stays off there by default;
-    // Flash-Next + its Q4_K_M drafter at 32 GB (k6 at 2048): 2k decode 84.7 -> 87.0 tok/s with the auto pinned experts, same text
+    // Flash-Next + its Q4_K_M drafter at 32 GB (an earlier build at 2048): 2k decode 84.7 -> 87.0 tok/s with the auto pinned experts, same text
     static const int spill_lend_spec_mode = getenv("LLAMA_MOE_SPILL_LEND_SPEC") != nullptr ? atoi(getenv("LLAMA_MOE_SPILL_LEND_SPEC")) : -1;
     const bool spill_lend_spec = spill_lend_spec_mode > 0 || (spill_lend_spec_mode < 0 && has_draft);
     const bool spill_lend = env_l == nullptr && !rule_frac && have_sb && cache_ref < all_experts &&
@@ -2227,7 +2227,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     const auto lend_fits = [&](const mem & m) {
         const int64_t c       = cache - std::max<int64_t>(0, kv(m) - kv(m_def) + (m.dft - m_def.dft)); // the cache without the KV (and draft context) growth
         // in the bank tail of the largest group of layers with the same expert sizes, from its share of the cache (a model with
-        // mixed expert types, e.g. Qwen3.8-Flash-Next UD-IQ4_XS, lends from a group with smaller slots than its largest layer: an
+        // mixed expert types, e.g. Qwen3.8-Flash-Next 4-bit, lends from a group with smaller slots than its largest layer: an
         // estimate from the largest layer took an n_ubatch 8192 graph of all-token outputs (llama-perplexity, 8770 MiB) that the
         // cache could not lend, and the context failed to allocate it; LLAMA_MOE_LEND_FIT_LARGEST=1 restores that estimate)
         static const bool largest = getenv("LLAMA_MOE_LEND_FIT_LARGEST") != nullptr && atoi(getenv("LLAMA_MOE_LEND_FIT_LARGEST")) != 0;
@@ -2248,13 +2248,13 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     // where the rule below (fix 2) would keep the default n_ubatch, because the growth of the reference n_ubatch is more than
     // LLAMA_MOE_PREFILL_UB_SHRINK_MAX_FRAC of a spilling cache that holds the experts of at least LLAMA_MOE_PREFILL_UB_TINY_TOKENS tokens,
     // the compute buffers of the larger n_ubatch are lent from the cache instead (the LLAMA_MOE_CACHE_LEND=2 behaviour): the cache gives
-    // up only the KV growth, so decode keeps the cache fix 2 kept, and prompts keep the larger ubatch the k5 rule gave them. Measured with
-    // LLAMA_MOE_CACHE_LEND=2 forced (decode / 2k prompt, k6 -> lent): gpt-oss-20B Q2_K at 8 GB, G4 183.3 / 5262 -> 172.8 / 11846, L4
-    // 58.3 / 1197 -> 55.1 / 2856, T4 38.0 / 891 -> 35.9 / 1211; Qwen3.6-35B-A3B UD-Q4_K_XL at 8 GB, T4 33.8 / 361 -> 33.5 / 753.
+    // up only the KV growth, so decode keeps the cache fix 2 kept, and prompts keep the larger ubatch the earlier rule gave them. Measured with
+    // LLAMA_MOE_CACHE_LEND=2 forced (decode / 2k prompt, an earlier build -> lent): gpt-oss-20B Q2_K at 8 GB, RTX PRO 6000 183.3 / 5262 -> 172.8 / 11846, L4
+    // 58.3 / 1197 -> 55.1 / 2856, T4 38.0 / 891 -> 35.9 / 1211; Qwen3.6-35B-A3B 4-bit at 8 GB, T4 33.8 / 361 -> 33.5 / 753.
     // Only with the conditions of the spill lending (single device, the graph fits a bank tail, no speculative decoding, the host experts
-    // at most LLAMA_MOE_SPILL_LEND_MAX_RAM_FRAC of the RAM); a host whose RAM fails that gate takes the growth from the cache as the k5 rule
+    // at most LLAMA_MOE_SPILL_LEND_MAX_RAM_FRAC of the RAM); a host whose RAM fails that gate takes the growth from the cache as the earlier rule
     // does (the slots lent to a prompt would be refilled from the disk). LLAMA_MOE_PREFILL_UB_SHRINK_LEND=0: fix 2 as before (n_ubatch
-    // stays the default); =2: lend also past the RAM gate and with speculative decoding. LLAMA_MOE_PREFILL_UB_SHRINK=1: the k5 rule.
+    // stays the default); =2: lend also past the RAM gate and with speculative decoding. LLAMA_MOE_PREFILL_UB_SHRINK=1: the earlier rule.
     bool fix2_lend = false, fix2_take = false, fix2_cond = false;
     const int f2_mode = getenv("LLAMA_MOE_PREFILL_UB_SHRINK_LEND") != nullptr ? atoi(getenv("LLAMA_MOE_PREFILL_UB_SHRINK_LEND")) : 1;
     {
@@ -2275,7 +2275,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
             fix2_cond = (double) growth > shrink_max*(double) cache && cache - growth < all_experts && tokens >= tiny_tokens;
             // with the spill lending on, the pick below decides (it keeps lending at the reference n_ubatch, see there)
             if (fix2_cond && !lend_graph) {
-                const bool gate_ok = f2_mode >= 2 || ((!has_spec || spill_lend_spec) && spill_lend_ram); // with a draft too (LLAMA_MOE_SPILL_LEND_SPEC=0: as k6)
+                const bool gate_ok = f2_mode >= 2 || ((!has_spec || spill_lend_spec) && spill_lend_ram); // with a draft too (LLAMA_MOE_SPILL_LEND_SPEC=0: as before)
                 if (gate_ok && m_def.n_dev == 1 && lend_fits(m_ref)) {
                     fix2_lend  = true;
                     lend_graph = true;
@@ -2296,8 +2296,8 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     // per n_ubatch tokens (an 8k prompt at 8192 instead of 4 times at 2048), so n_ubatch grows up to LLAMA_MOE_PREFILL_UB_MAX while the memory
     // it takes from the cache is at most LLAMA_MOE_PREFILL_UB_SPILL_FRAC (0.15) of the cache and the KV cache does not grow (decode then reads a
     // smaller cache). A n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO (4096) also skips the own-ids seed of each prompt (see llama_context).
-    // OPT-IN, LLAMA_MOE_PREFILL_UB_SPILL=1 (G4 RTX PRO 6000, 3 reps + A/A): Qwen3.8-Flash-Next UD-IQ4_XS at 32 GB 8k prompt +78% over pinned
-    // experts alone (2610 -> 4641 tok/s), decode -2%; but Qwen3.6-35B-A3B UD-Q4_K_XL at 12 / 16 GB decode -5..-7% after a 2k prompt (the
+    // OPT-IN, LLAMA_MOE_PREFILL_UB_SPILL=1 (RTX PRO 6000 RTX PRO 6000, 3 reps + A/A): Qwen3.8-Flash-Next 4-bit at 32 GB 8k prompt +78% over pinned
+    // experts alone (2610 -> 4641 tok/s), decode -2%; but Qwen3.6-35B-A3B 4-bit at 12 / 16 GB decode -5..-7% after a 2k prompt (the
     // smaller cache and the skipped seed), so it is not the default. Unset or 0: the rule before (n_ubatch grows only while every expert
     // stays cached)
     bool rule_spill = !rule_frac && !lend_graph && force <= 0 && have_sb && cache_ref < all_experts;
@@ -2346,8 +2346,8 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
         rule = "every expert cached, no KV growth";
     }
     // the fix 2 case: lending pays only with a larger n_ubatch than the reference one. At the reference n_ubatch the growth is taken from
-    // the cache as the k5 rule does (T4 at 8 GB, Qwen3.6-35B-A3B UD-Q4_K_XL, n_ubatch 2048, decode / 2k prompt: lent 32.55 / 722 and
-    // 33.5 / 753, taken 32.5 / 815 and k5 32.85 / 786; fix 2 itself 32.5 / 358)
+    // the cache as the earlier rule does (T4 at 8 GB, Qwen3.6-35B-A3B 4-bit, n_ubatch 2048, decode / 2k prompt: lent 32.55 / 722 and
+    // 33.5 / 753, taken 32.5 / 815 and an earlier build 32.85 / 786; fix 2 itself 32.5 / 358)
     if (fix2_cond && pick == cands[0] && (fix2_lend || (spill_lend && !lend_graph))) {
         fix2_lend  = false;
         lend_graph = false;
@@ -2357,8 +2357,8 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
             "n_ubatch %u)\n", cands[0], ub_def);
     }
     // the reference n_ubatch takes its compute (and KV) growth from the cache for good. Where the cache then no longer holds every
-    // expert, every decode step reads the smaller cache: gpt-oss-20B Q2_K at an 8 GB cap (G4), 5347 -> 4984 MiB (6.8%): device hit rate
-    // 87.8% and decode 142 tok/s (k5, n_ubatch 2048) vs 90.3% and 189 tok/s (512), for 2k prompts at 5258 instead of 9900 tok/s. So n_ubatch
+    // expert, every decode step reads the smaller cache: gpt-oss-20B Q2_K at an 8 GB cap (RTX PRO 6000), 5347 -> 4984 MiB (6.8%): device hit rate
+    // 87.8% and decode 142 tok/s (an earlier build, n_ubatch 2048) vs 90.3% and 189 tok/s (512), for 2k prompts at 5258 instead of 9900 tok/s. So n_ubatch
     // stays the default when the growth is more than LLAMA_MOE_PREFILL_UB_SHRINK_MAX_FRAC (0.05) of the cache, unless the cache is tiny (the
     // experts of fewer than LLAMA_MOE_PREFILL_UB_TINY_TOKENS = 4 tokens): there the prompt ubatches of 512 tokens admit more experts into the
     // cache than the decode keeps, and both lose (gpt-oss-20B at 6 GB, the experts of 2.7 tokens: decode 84.5 -> 66.2 tok/s, hit rate
@@ -2384,7 +2384,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
         }
     }
     // a lent prompt graph with a draft keeps the draft context at the n_ubatch of the default (its compute buffer is not lent:
-    // the growth would come out of the cache). G4, Qwen3.6-35B-A3B UD-Q4_K_XL + its MTP at 12 / 16 GB: the main context lent at n_ubatch 8192
+    // the growth would come out of the cache). RTX PRO 6000, Qwen3.6-35B-A3B 4-bit + its MTP at 12 / 16 GB: the main context lent at n_ubatch 8192
     // grew the MTP context to 2048 (+293 MiB of compute), the cache shrank 7812 -> 7525 MiB, hit rate 87.5 -> 86.6% and chat decode -2.3% /
     // -1.7% (same tokens and acceptance). LLAMA_MOE_LEND_DRAFT_UB_KEEP=0: the draft grows with the main n_ubatch as before
     static const bool dft_keep_env = getenv("LLAMA_MOE_LEND_DRAFT_UB_KEEP") == nullptr || atoi(getenv("LLAMA_MOE_LEND_DRAFT_UB_KEEP")) != 0;
@@ -2396,7 +2396,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
         // the cache and the scheduler read the lending mode from the environment
         common_set_env("LLAMA_MOE_CACHE_LEND", "2");
         // with a draft the lent prompt does not seed the cache (n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO) and the verify batches lost
-        // 9.8% decode after a 2k prompt (G4, Flash-Next + Q4_K_M drafter: miss fetch 2.8 -> 6.1 ms/token): the slots that come back after the
+        // 9.8% decode after a 2k prompt (RTX PRO 6000, Flash-Next + Q4_K_M drafter: miss fetch 2.8 -> 6.1 ms/token): the slots that come back after the
         // prompt are refilled with the experts its last ubatch routed most (LLAMA_MOE_CACHE_REFILL_ROUTED, set here unless given)
         if (dft_keep) {
             params.speculative.draft.n_ubatch = (int32_t) common_draft_n_ubatch(params, ub_def);
@@ -2441,7 +2441,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
 // the device memory of a DFlash / DSpark draft that cannot be created without its target: returns its K/V cache bytes and sets compute to
 // the larger of its feature graph and its noise-block graph (see llama_context::sched_reserve), plus the growth of the target's compute
 // buffer once the draft asks it for the inputs of its n_extract layers (path_tgt, n_ubatch_tgt): each is an output of the target's graph,
-// n_embd floats per token, held twice (qwen4exp builds a stream mean; G4 Flash-Next at -ub 2048: 989.5 -> 1189.5 MiB, 2 x 100 MiB);
+// n_embd floats per token, held twice (qwen4exp builds a stream mean; RTX PRO 6000 Flash-Next at -ub 2048: 989.5 -> 1189.5 MiB, 2 x 100 MiB);
 // 0 and compute unchanged for other drafts
 static size_t common_fit_dflash_estimate(const std::string & path_dft, const llama_context_params & cp, size_t & compute,
         const std::string & path_tgt = std::string(), uint32_t n_ubatch_tgt = 0) {
@@ -2519,7 +2519,7 @@ static size_t common_fit_dflash_estimate(const std::string & path_dft, const lla
         }
         compute += (size_t) (2.0*(double) n_extract*(double) n_embd_tgt*(double) std::min<uint32_t>(n_ubatch_tgt, cp.n_ctx)*sizeof(float));
     }
-    // k19-draftcost: a DFlash2 draft's restricted head (llama_model::draft_head_from_target), rows of the target's lm head in its type:
+    // a DFlash2 draft's restricted head (llama_model::draft_head_from_target), rows of the target's lm head in its type:
     // the LLAMA_DFLASH_DRAFT_VOCAB tokens + the LLAMA_MTP_DRAFT_VOCAB_CTX request rows (4096) + the control tokens (at most 1024
     // counted). Only when set: by default the head is made only for a target without a MoE cache, which this estimate does not size
     const char * env_dv = getenv("LLAMA_DFLASH_DRAFT_VOCAB");
@@ -2578,18 +2578,18 @@ bool common_fit_dflash_draft_bytes(const char * path_dft, const llama_context_pa
 // --fit with a separate draft model and a MoE cache: true if the draft model should run on the CPU (see common_init_result)
 // the main model is fitted alone with an unbounded cache (on copies of the parameters), which gives the memory left after its layers;
 // the draft model's device memory at that context size must fit in what the requested cache leaves, plus at most max_frac of the cache
-// k19-mtpkeep: an MTP draft model refused at its device size is weighed again with its expert matrices in host memory (computed on the
+// an MTP draft model refused at its device size is weighed again with its expert matrices in host memory (computed on the
 // CPU for the drafter's few rows per step), n_ubatch 16 (LLAMA_FIT_DRAFT_HOST_EXPS_UB; its prompt rows only write K / V, see
 // LLAMA_MTP_PROMPT_KV_ONLY) and the target's K / V types. At 16 rows a q8_0 K / V is read in place by flash attention
 // (GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS); at 64 the reserve held an f16 copy of the whole K / V (256 / 512 MiB of its 308 / 601 MiB
-// compute buffer at ctx 131072 / 262144). G4 10 / 12 GB, Qwen3.8-Flash-Next UD-IQ4_XS ctx 131072 / 262144 + its Q8_0 MTP GGUF: 3519 / 4100 MiB of
+// compute buffer at ctx 131072 / 262144). RTX PRO 6000 10 / 12 GB, Qwen3.8-Flash-Next 4-bit ctx 131072 / 262144 + its Q8_0 MTP GGUF: 3519 / 4100 MiB of
 // device memory at its file's placement (2550 MiB of it the experts of its MoE layer, 2495 MiB of compute at n_ubatch 2048 on the
 // whole card), 2019 / 2600 MiB requantized, against a cache of 2524 / 2272 MiB: refused, so Studio's MTP never drafted there.
 // The caller applies the placement (the draft's tensor overrides, n_ubatch, cache types) to the draft params
-// k19-mtpkeep (LLAMA_FIT_DRAFT_HOST_EXPS_KV=q4_0 | q8_0 | f16, opt-in): the K / V type of that placement instead of the target's; q4_0
+// (LLAMA_FIT_DRAFT_HOST_EXPS_KV=q4_0 | q8_0 | f16, opt-in): the K / V type of that placement instead of the target's; q4_0
 // halves the drafter's K / V of q8_0 and is read in place up to 16 rows too (GGML_CUDA_FATTN_Q4_INPLACE_MAX_ROWS); it changes the drafts
 // only, never the target's output
-// k19-mtpkeep: the tokens per layer whose experts a MoE cache of `cache` bytes holds (n_expert_used slots per token, the expert layers
+// the tokens per layer whose experts a MoE cache of `cache` bytes holds (n_expert_used slots per token, the expert layers
 // on the host counted at the largest slot as the fit does); -1 = unknown
 static double common_fit_cache_tokens(const std::string & path, const llama_model_tensor_buft_override * ov, int32_t ngl, double cache) {
     const double host = common_moe_host_expert_bytes(path, ov, ngl);
@@ -2601,9 +2601,9 @@ static double common_fit_cache_tokens(const std::string & path, const llama_mode
     return cache/((double) sbt.sum*(double) sbt.n_used*std::max(host_layers, 1.0));
 }
 
-// k19-mtpkeep: a host-expert MTP drafter is kept only where the MoE cache left beside it holds the experts of a whole verify window per
+// a host-expert MTP drafter is kept only where the MoE cache left beside it holds the experts of a whole verify window per
 // layer (the draft's n_max + 1 tokens): narrower, the verified rows leave the device slots and run the host path, and the drafter costs
-// more than it drafts. G4 Qwen3.8-Flash-Next UD-IQ4_XS + its Q8_0 MTP (n_max 2): 10 GB / 131K kept at 1.8 tokens (cache 2302 -> 1788 MiB)
+// more than it drafts. RTX PRO 6000 Qwen3.8-Flash-Next 4-bit + its Q8_0 MTP (n_max 2): 10 GB / 131K kept at 1.8 tokens (cache 2302 -> 1788 MiB)
 // decode chat 72.5 -> 73.1, 2k 71.1 -> 50.1, 8k 68.2 -> 65.3 tok/s, 8k prompt 2980 -> 2135 tok/s: dropped by this; 16 GB / 262K
 // (cache 5747 -> 4182 MiB, about 3.8 tokens) kept. LLAMA_FIT_DRAFT_HOST_EXPS_KEEP_TOKENS=N sets the tokens, 0 keeps without this check
 static double common_fit_draft_hx_keep_tokens(const common_params & params) {
@@ -2644,23 +2644,23 @@ static bool common_fit_draft_on_cpu(
         const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level,
         bool * needs_target = nullptr, common_fit_draft_hx * hx = nullptr) {
     constexpr double MiB = 1024.0*1024.0;
-    // default 0.25 (k15-pp: 0.60 admits more drafts, +13..55% decode, but the drafter's own prompt pass, about 29 us per prompt token
-    // plus about 50 ms per request, then sits on every prompt: G4 TTFT +8..18%, +42% at Flash-Next UD-IQ1_S 16 GB 16k, where the smaller
-    // cache also lends too few slots for a full layer-major group (k15g4d2). LLAMA_FIT_DRAFT_MAX_CACHE_FRAC=0.60
+    // default 0.25 (0.60 admits more drafts, +13..55% decode, but the drafter's own prompt pass, about 29 us per prompt token
+    // plus about 50 ms per request, then sits on every prompt: RTX PRO 6000 TTFT +8..18%, +42% at Flash-Next 1-bit 16 GB 16k, where the smaller
+    // cache also lends too few slots for a full layer-major group. LLAMA_FIT_DRAFT_MAX_CACHE_FRAC=0.60
     // opts in until the drafter's prompt pass is off the time to first token
     double max_frac = 0.25;
     if (const char * env = getenv("LLAMA_FIT_DRAFT_MAX_CACHE_FRAC")) {
         max_frac = std::max(0.0, atof(env));
     }
-    // k15-pp: the cache the draft leaves must still hold more than this share of the host experts (LLAMA_FIT_DRAFT_MIN_CACHE_FRAC,
-    // default LLAMA_MOE_CACHE_HYBRID_MAX_FRAC = 0.10; 0 off), so a draft never shrinks the cache into the hybrid gate's range. G4 16 GB:
+    // the cache the draft leaves must still hold more than this share of the host experts (LLAMA_FIT_DRAFT_MIN_CACHE_FRAC,
+    // default LLAMA_MOE_CACHE_HYBRID_MAX_FRAC = 0.10; 0 off), so a draft never shrinks the cache into the hybrid gate's range. RTX PRO 6000 16 GB:
     // Flash-Next IQ1_S + Q4_K_M leaves 11.9% (admitted, the win above); + Q8_0 (1 GiB more) would leave about 9%, refused
     double min_frac = common_moe_hybrid_max_frac();
     if (const char * env = getenv("LLAMA_FIT_DRAFT_MIN_CACHE_FRAC")) {
         min_frac = std::max(0.0, atof(env));
     } else if (g_fit_dflash_kv_host) {
         // the refit of a DFlash / DSpark launch on the small-device placement (see the caller): a cache of 2% of the host experts
-        // beside the drafter. G4 10 GB / 131K, Qwen3.8-Flash-Next UD-IQ4_XS + DFlash2 Q8_0 (932 MiB): the cache 4072 -> 3140 MiB (5.5%),
+        // beside the drafter. RTX PRO 6000 10 GB / 131K, Qwen3.8-Flash-Next 4-bit + DFlash2 Q8_0 (932 MiB): the cache 4072 -> 3140 MiB (5.5%),
         // chat 82.7 -> 129.1 tok/s (no drafting before), 8k 78.7 -> 106.7, all layers on the device
         min_frac = 0.02;
     }
@@ -2687,14 +2687,14 @@ static bool common_fit_draft_on_cpu(
         LOG_INF("%s: the main model alone does not fit, the draft model is placed on the CPU\n", __func__);
         return true;
     }
-    // k19-place8: a small device whose cache was sized for decode keeps no device drafter (as the placement before it, where none fit):
-    // its verify windows are multi-token hybrid batches, open on k19-nanfix
-    // k19-kvlong (LLAMA_FIT_PLACE8_DRAFT=1, opt-in, measurement): the draft model is weighed against that cache by the rules below
-    // as on a mid-size device (what a small drafter buys against the cache it takes, G4 10 / 12 GB at long contexts)
+    // a small device whose cache was sized for decode keeps no device drafter (as the placement before it, where none fit):
+    // its verify windows are multi-token hybrid batches, open on an earlier build
+    // (LLAMA_FIT_PLACE8_DRAFT=1, opt-in, measurement): the draft model is weighed against that cache by the rules below
+    // as on a mid-size device (what a small drafter buys against the cache it takes, RTX PRO 6000 10 / 12 GB at long contexts)
     static const bool place8_draft_env = getenv("LLAMA_FIT_PLACE8_DRAFT") != nullptr && atoi(getenv("LLAMA_FIT_PLACE8_DRAFT")) != 0;
     // and always in the refit of a DFlash / DSpark launch with its K/V cells in host chunks (g_fit_dflash_kv_host, see the caller)
     const bool place8_draft = place8_draft_env || g_fit_dflash_kv_host;
-    // k19-mtpkeep (LLAMA_FIT_DRAFT_HOST_EXPS, default on; 0 = off): only where the draft would be left out otherwise, for an MTP draft
+    // (LLAMA_FIT_DRAFT_HOST_EXPS, default on; 0 = off): only where the draft would be left out otherwise, for an MTP draft
     // model whose experts are not already placed by the user (-cmoed / -otd)
     static const bool hx_env = getenv("LLAMA_FIT_DRAFT_HOST_EXPS") == nullptr || atoi(getenv("LLAMA_FIT_DRAFT_HOST_EXPS")) != 0;
     bool hx_user = false;
@@ -2714,7 +2714,7 @@ static bool common_fit_draft_on_cpu(
     const size_t cache = std::min(requested, pot);     // what it would hold without the draft model
     const size_t free_ = pot - cache;                  // memory the cache leaves unused
 
-    // k19-mtpkeep: the host-expert placement, measured and weighed: it may take at most LLAMA_FIT_DRAFT_HOST_EXPS_MAX_CACHE_FRAC (0.5)
+    // the host-expert placement, measured and weighed: it may take at most LLAMA_FIT_DRAFT_HOST_EXPS_MAX_CACHE_FRAC (0.5)
     // of the cache and must leave the experts of at least LLAMA_FIT_DRAFT_HOST_EXPS_MIN_TOKENS (1.0) tokens per layer cached; the
     // layers-first rule of the caller then still drops it where it would cost target layers
     auto try_hx = [&]() -> bool {
@@ -2795,9 +2795,9 @@ static bool common_fit_draft_on_cpu(
             dft += dmds[i].model + dmds[i].context + dmds[i].compute;
         }
     } catch (const std::exception & e) {
-        // k15-small4: a draft that needs the target's context to be created (a gemma-4 assistant shares the target's KV cache and token
+        // a draft that needs the target's context to be created (a gemma-4 assistant shares the target's KV cache and token
         // embeddings, "requires ctx_other") cannot be measured on its own. Keeping the old placement put it on the GPU unmeasured:
-        // T4 4 GB, gemma-4-26B-A4B UD-Q3_K_M + its Q8_0 assistant, the fit left 258 MiB free and the draft's 425 MiB of weights failed
+        // T4 4 GB, gemma-4-26B-A4B 3-bit + its Q8_0 assistant, the fit left 258 MiB free and the draft's 425 MiB of weights failed
         // to allocate, so the server exited. Its weights are the tensor data of its GGUF, its context the target's (shared); its compute
         // buffer is LLAMA_FIT_DRAFT_EST_COMPUTE_MIB (default 128; the gemma-4 assistant measured 76.5 MiB at n_ubatch 512 once created).
         // LLAMA_FIT_DRAFT_ESTIMATE=0: the old placement
@@ -2822,7 +2822,7 @@ static bool common_fit_draft_on_cpu(
         // larger of its two graphs (llama_context::sched_reserve), the feature batch of n_ubatch rows (the encoder input of n_extract
         // target layers, its output and the K/V of a layer) and the noise block of block_size rows per sequence on the target's lm head
         // (logits and the selector's copy). The 128 MiB default held neither the 2000 MiB compute buffer of the token graph at n_ubatch
-        // 2048 (G4 32 GB, Qwen3.8-Flash-Next + DFlash2: cudaMalloc failed, drafting off) nor a full-context K/V cache
+        // 2048 (RTX PRO 6000 32 GB, Qwen3.8-Flash-Next + DFlash2: cudaMalloc failed, drafting off) nor a full-context K/V cache
         const size_t kv_dflash = env_c == nullptr ? common_fit_dflash_estimate(path_dft, cparams_dft, compute, params.model.path, cparams.n_ubatch) : 0;
         if (kv_dflash > 0 || compute == 0) {
             LOG_INF("%s: DFlash draft estimate: K/V %.2f MiB, compute %.2f MiB\n", __func__, kv_dflash/MiB, compute/MiB);
@@ -2841,11 +2841,11 @@ static bool common_fit_draft_on_cpu(
     const double left   = std::max(0.0, (double) cache - take);
     const bool   floor_ok = min_frac <= 0.0 || host <= 0.0 || left > min_frac*host;
     bool         gpu    = cap_ok && floor_ok;
-    // k18 (LLAMA_FIT_DRAFT_MIN_TOKENS, default 4; 0 = the cap and floor alone, as before): a draft the cap or the floor refuses still gets
+    // (LLAMA_FIT_DRAFT_MIN_TOKENS, default 4; 0 = the cap and floor alone, as before): a draft the cap or the floor refuses still gets
     // the GPU when the cache it leaves holds the experts of at least that many tokens per layer (n_expert_used slots per token: a verify
     // window of the draft plus the tail the cache serves on the device). The floor existed because prompts lost their layer-major groups
-    // under the hybrid gate; those now run beside the gate (common_moe_cache_auto_ubatch, k18), and the decode gain of drafting comes from
-    // reading the resident weights once per verified window. G4, Qwen3.8-Flash-Next UD-IQ4_XS + its Q8_0 MTP head forced on: 16 GB
+    // under the hybrid gate; those now run beside the gate (common_moe_cache_auto_ubatch, an earlier build), and the decode gain of drafting comes from
+    // reading the resident weights once per verified window. RTX PRO 6000, Qwen3.8-Flash-Next 4-bit + its Q8_0 MTP head forced on: 16 GB
     // (cache 8271 -> 4576 MiB, 4.1 tokens per layer) decode chat / 2k / 8k 89.9 / 89.3 / 85.6 -> 139.1 / 103.8 / 118.5 tok/s; 12 GB
     // (3549 -> 479 MiB, 0.4 tokens) +29 / -9 / +6%: refused here
     int64_t min_tok = 4;
@@ -2866,13 +2866,13 @@ static bool common_fit_draft_on_cpu(
             gpu      = tok_ok;
         }
     }
-    // k18 (LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT, default 1; LLAMA_DRAFT_REQUANT=off disables, an explicit type forces it in every fit):
+    // (LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT, default 1; LLAMA_DRAFT_REQUANT=off disables, an explicit type forces it in every fit):
     // a draft refused at its file's types is measured again with its FFN / expert matrices at q3_k and its output matrix at q4_k
     // (requantized at load, see llama_model_loader general.requant_type) and gets the GPU when the cache it then leaves holds the experts
     // of at least that many tokens per layer; the load then uses those types (LLAMA_DRAFT_REQUANT / _OUTPUT are set for it). Drafts are
-    // verified: the output is the target's, only the acceptance moves. G4, Qwen3.8-Flash-Next UD-IQ4_XS 12 GB + its Q8_0 MTP drafter:
+    // verified: the output is the target's, only the acceptance moves. RTX PRO 6000, Qwen3.8-Flash-Next 4-bit 12 GB + its Q8_0 MTP drafter:
     // refused (0.4 tokens) -> q3_k / q4_k admitted (1.x tokens), request time chat / 2k / 8k 3.30 / 4.03 / 4.82 -> 2.39 / 4.01 / 4.46 s
-    // k19: matrices whose rows q3_k's blocks do not divide go to LLAMA_DRAFT_REQUANT_FALLBACK (q4_0, llama_model_loader::create_tensor),
+    // matrices whose rows q3_k's blocks do not divide go to LLAMA_DRAFT_REQUANT_FALLBACK (q4_0, llama_model_loader::create_tensor),
     // so the measure here sees them too. Same head at ctx 32768: 2009 MiB (0.9 tokens, refused) with its ffn_down_exps kept at Q8_0
     const char * env_rq = getenv("LLAMA_DRAFT_REQUANT");
     const bool rq_off = env_rq != nullptr && (strcmp(env_rq, "off") == 0 || strcmp(env_rq, "0") == 0 || strcmp(env_rq, "none") == 0);
@@ -2881,16 +2881,16 @@ static bool common_fit_draft_on_cpu(
     // probe cannot measure that: a cost model gives it instead, the expected distinct experts a verify window of n_max + 1 tokens reads
     // per layer over those of one token, with independent routing (n_expert / n_used * (1 - (1 - n_used / n_expert)^(n_max + 1))). At most
     // LLAMA_FIT_DRAFT_REQUANT_MAX_VERIFY_RATIO (3.5) keeps the 1-token line, above it LLAMA_FIT_DRAFT_MIN_TOKENS applies at the smaller
-    // size too. Calibrated on two G4 cells (the model ranks them, its scale is a heuristic: real routing is correlated):
-    //  - Qwen3.8-Flash-Next UD-IQ4_XS 12 GB (512 experts, 10 used) + its Q8_0 MTP drafter, n_max 2: model 2.94, measured verify step
-    //    1.9x a single token at 1.4 tokens per layer, request time chat 3.32 -> 2.44 s: admitted at 1 token
-    //  - Qwen3.6-35B-A3B UD-Q4_K_XL 7 GB (256 experts, 8 used) + Qwen3.5-0.8B Q8_0, draft-simple n_max 4: model 4.70, measured 38.8 ms per
-    //    verify step against 5.7 ms per token without the drafter, chat 175 -> 60.5 tok/s at 2.8 tokens: refused
+    // size too. Calibrated on two RTX PRO 6000 cells (the model ranks them, its scale is a heuristic: real routing is correlated):
+    // - Qwen3.8-Flash-Next 4-bit 12 GB (512 experts, 10 used) + its Q8_0 MTP drafter, n_max 2: model 2.94, measured verify step
+    // 1.9x a single token at 1.4 tokens per layer, request time chat 3.32 -> 2.44 s: admitted at 1 token
+    // - Qwen3.6-35B-A3B 4-bit 7 GB (256 experts, 8 used) + Qwen3.5-0.8B Q8_0, draft-simple n_max 4: model 4.70, measured 38.8 ms per
+    // verify step against 5.7 ms per token without the drafter, chat 175 -> 60.5 tok/s at 2.8 tokens: refused
     common_moe_slot_bytes sbt_v;
     double v_ratio = -1.0;
     if (common_moe_slot_bytes_of(params.model.path, sbt_v) && sbt_v.n_used > 0 && sbt_v.n_expert > sbt_v.n_used) {
         const double q = 1.0 - (double) sbt_v.n_used/(double) sbt_v.n_expert;
-        // (k19-g4tail2: the server's g4tail rule widens the windows only where its placed cache takes the prefetch band, else they
+        // (the server's tail rule widens the windows only where its placed cache takes the prefetch band, else they
         // stay at the drafts the drafter was admitted for, fit_n_max; a floor from the wider windows left the drafter out instead)
         const int    n_fit = params.speculative.draft.fit_n_max > 0 ? params.speculative.draft.fit_n_max : common_speculative_n_max(&params.speculative);
         const int    n = std::max(1, n_fit) + 1;
@@ -2900,10 +2900,10 @@ static bool common_fit_draft_on_cpu(
     if (const char * e = getenv("LLAMA_FIT_DRAFT_REQUANT_MAX_VERIFY_RATIO")) {
         v_max = std::max(0.0, atof(e));
     }
-    // k19-np12b (LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT_MULTI, default 0.75; 1 = as before): with several slots (llama-server -np > 1, Studio's
-    // -np 4 --kv-unified) the floor is lower. Their replay rows and compute take 545 MiB of the 12 GB fit of Qwen3.8-Flash-Next UD-IQ4_XS:
+    // (LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT_MULTI, default 0.75; 1 = as before): with several slots (llama-server -np > 1, Studio's
+    // -np 4 --kv-unified) the floor is lower. Their replay rows and compute take 545 MiB of the 12 GB fit of Qwen3.8-Flash-Next 4-bit:
     // its q3_k MTP drafter leaves the experts of 0.8 tokens per layer there (1.3 at -np 1) and was refused, chat 3.375 s vs 2.700 s
-    // admitted (G4 k19sr). LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT (fractional) sets the floor for every slot count
+    // admitted (RTX PRO 6000 . LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT (fractional) sets the floor for every slot count
     double rq_min_tok = v_ratio >= 0.0 && v_ratio <= v_max ? 1.0 : (double) min_tok;
     if (rq_min_tok == 1.0 && params.n_parallel > 1) {
         const char * em = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT_MULTI");
@@ -2912,9 +2912,9 @@ static bool common_fit_draft_on_cpu(
     if (const char * e = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT")) {
         rq_min_tok = std::max(0.0, atof(e));
     }
-    // k19-draftcost (LLAMA_FIT_DRAFT_REQUANT_SHARE, default 0.10; 0 = only the rescue above): a draft admitted at its file's types that
+    // (LLAMA_FIT_DRAFT_REQUANT_SHARE, default 0.10; 0 = only the rescue above): a draft admitted at its file's types that
     // takes more than this share of the cache it would get is requantized the same way, which leaves a larger cache.
-    // G4 Qwen3.8-Flash-Next UD-IQ4_XS 32 GB ctx 32768 + its Q8_0 MTP drafter (3109 MiB, 12.5% of the
+    // RTX PRO 6000 Qwen3.8-Flash-Next 4-bit 32 GB ctx 32768 + its Q8_0 MTP drafter (3109 MiB, 12.5% of the
     // 24800 MiB cache): 1608 MiB requantized, cache 21687 -> 23187 MiB, decode chat / 8k / 30k +4.5 / +18 / +20%. Its Q4_K_M drafter at
     // 16 GB (2229 MiB, 31%) was admitted as is with a smaller cache than the rescued Q8_0 one. Drafts are verified: only the acceptance
     // and the cache size move (same text, full card: the requantized drafter accepts 4.20 / 3.88 tokens per pass against Q8_0's 4.13 / 3.88)
@@ -2995,7 +2995,7 @@ static bool common_fit_draft_on_cpu(
 
 // speculative decoding: the draft model and its context are created after the main context (common_speculative_init_result), which
 // until then sees the device memory that --fit gave them as free. What the main context places in free memory while it is created
-// (the automatic MoE cache lending decision, the seed graph, a staging arena without a lender) took it: Qwen3.8-Flash-Next UD-IQ4_XS
+// (the automatic MoE cache lending decision, the seed graph, a staging arena without a lender) took it: Qwen3.8-Flash-Next 4-bit
 // with an MTP draft on 32 GB, --fit on --moe-cache-mib 200000: the cache did not lend its 1275 MiB of staging copies because 5 GiB
 // looked free, and the draft context then failed to allocate its 778 MiB compute buffer. The draft is measured at the params it is
 // created with (as in common_moe_cache_auto_ubatch) and that memory is kept free in the main context while it is created
@@ -3036,7 +3036,7 @@ static void common_draft_mem_reserve(const common_params & params, const llama_m
         bytes.clear();
         // a DFlash / DSpark draft cannot be created without its target: its estimate (common_fit_dflash_estimate, the weights from its
         // GGUF) is kept free on the first GPU it would use. Without it the main context of Qwen3.8-Flash-Next + DFlash2 at 32 / 16 GB
-        // (G4) placed its staging arena in the draft's memory, and its pp graph then failed to allocate once the draft was loaded
+        // (RTX PRO 6000) placed its staging arena in the draft's memory, and its pp graph then failed to allocate once the draft was loaded
         size_t compute = 0;
         const size_t kv = has_draft && mparams_dft.n_gpu_layers != 0 ? common_fit_dflash_estimate(params_dft.model.path, cparams_dft, compute, params.model.path, cparams.n_ubatch) : 0;
         ggml_backend_dev_t dev = nullptr;
@@ -3106,8 +3106,8 @@ static std::string common_gguf_arch(const std::string & path) {
 static bool common_moe_resident_ubatch_try(common_params & params, llama_model_params & mparams, llama_context_params & cparams,
         const common_fit_extra_model * extra, ggml_log_level log_level, uint32_t u, bool quiet);
 
-// k9-prompt-pass: the prompt ubatch of a MoE model whose experts are all on the device (see the call in common_init_result)
-// k15-lfm2: where 2048 does not keep every expert on the device, 1024 is tried next (LFM2.5 on a 16 GB G4 tier: 512 -> 1024; a ubatch
+// the prompt ubatch of a MoE model whose experts are all on the device (see the call in common_init_result)
+// where 2048 does not keep every expert on the device, 1024 is tried next (LFM2.5 on a 16 GB RTX PRO 6000 tier: 512 -> 1024; a ubatch
 // size only regroups the same products, as -ub does: the equivalence rule). LLAMA_MOE_RESIDENT_UB_LADDER=0: 2048 only;
 // =2: for every model (default: LFM2 / LFM2-MoE)
 static void common_moe_resident_ubatch(common_params & params, llama_model_params & mparams, llama_context_params & cparams,
@@ -3198,7 +3198,7 @@ static bool common_moe_resident_ubatch_try(common_params & params, llama_model_p
 // (the fit caps the cache at the bytes of the host experts and at the free device memory)
 static constexpr size_t COMMON_MOE_CACHE_AUTO_BYTES = (size_t) 1 << 40;
 
-// k9-prompt-pass: unified memory: every offload device an integrated GPU (e.g. AMD Strix Halo gfx1151, GGML_BACKEND_DEVICE_TYPE_IGPU
+// unified memory: every offload device an integrated GPU (e.g. AMD Strix Halo gfx1151, GGML_BACKEND_DEVICE_TYPE_IGPU
 // from the device's integrated attribute); LLAMA_MOE_UMA=1 / 0 forces the decision
 static bool common_moe_uma(const common_params & params) {
     if (const char * e = getenv("LLAMA_MOE_UMA")) {
@@ -3240,17 +3240,17 @@ bool common_moe_cache_auto_resolve(common_params & params, bool fit) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    // k19-int3fix2: the verify graphs a server prewarms beside a drafter (counted by the fits that carry a draft model or MTP heads): up
+    // the verify graphs a server prewarms beside a drafter (counted by the fits that carry a draft model or MTP heads): up
     // to 3 sampler chains (greedy, masked greedy, top-k) x the verify widths 1 .. n_max + 1 (see common_fit_set_prewarm_graphs)
     common_fit_set_prewarm_graphs(params.warmup ? 3*(std::max(1, common_speculative_n_max(&params.speculative)) + 1) : 0);
-    // k19-l4gap2: the verify window's rows for the disk-tier k19-placemid ubatch (common/fit.cpp)
+    // the verify window's rows for the disk-tier mid ubatch (common/fit.cpp)
     common_fit_set_verify_rows(common_speculative_n_max(&params.speculative) + 1);
-    // k19-uma: the parameters as given, for the launch again without a MoE cache (see below)
+    // the parameters as given, for the launch again without a MoE cache (see below)
     const common_params params_given = params;
     bool uma_no_cache = false;
-    bool kv_sel_mtp_restart = false; // k19-g4ten: the launch is fitted again with K/V host chunks beside its MTP drafter (see below)
+    bool kv_sel_mtp_restart = false; // the launch is fitted again with K/V host chunks beside its MTP drafter (see below)
 uma_restart:
-    // k15-up2: built-in MTP heads (no -md model) for the context's prefetch depth rule (llama_context::sched_new), before any fit probe
+    // built-in MTP heads (no -md model) for the context's prefetch depth rule (llama_context::sched_new), before any fit probe
     common_set_env("LLAMA_SPEC_MTP_HEADS", !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
         [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; }) ? "1" : "0");
     // --moe-cache-mib auto: the fit sizes the cache (the fitted size is kept in params, so that a reload from params, e.g. the server
@@ -3261,9 +3261,9 @@ uma_restart:
     // --weight-stream on means what LLAMA_WEIGHT_STREAM=1 does for the automatic expert pinning of the model loader (which reads the
     // environment, it has no weight stream parameter): the experts stay mapped, so the weight stream and its RAM tier serve them instead
     // of a pinned copy taking that RAM. An explicit LLAMA_MOE_PIN_EXPERTS still wins
-    // k18 (LLAMA_MOE_LOWRAM_LEND=1 keeps lending): where D1 streams the experts through the RAM tier, the device cache does not lend slots
+    // (LLAMA_MOE_LOWRAM_LEND=1 keeps lending): where D1 streams the experts through the RAM tier, the device cache does not lend slots
     // to prompt staging. A lent slot's expert must move to RAM, which in this tier has no room for it (RAM + device slots hold every
-    // expert with ~1 GiB to spare), so each prompt dropped ~2000 experts that the decode then read back from the drive (G4 fndl 48 GiB,
+    // expert with ~1 GiB to spare), so each prompt dropped ~2000 experts that the decode then read back from the drive (RTX PRO 6000 fndl 48 GiB,
     // 8k prompt: 7.5 GB read, decode 28-32 tok/s). Without the lend the fit gives the prompt graphs their own buffer (device cache 21.4 ->
     // 20.1 GiB), RAM hits 99.9% of the misses, and both prompt and decode are faster (8k e2e 83-89 -> 63 s, 16k 130-138 -> 87 s, decode
     // after 8k 28-32 -> 52 tok/s). Set before the fit, which reads it; an explicit LLAMA_MOE_CACHE_LEND wins
@@ -3282,9 +3282,9 @@ uma_restart:
     }
 
     // with --fit the MoE cache load mode is decided after the fit has placed the experts
-    // k9-prompt-pass: unified memory (every offload device an integrated GPU, e.g. AMD Strix Halo gfx1151): spilled experts are not copied
+    // unified memory (every offload device an integrated GPU, e.g. AMD Strix Halo gfx1151): spilled experts are not copied
     // over a PCIe link, so the discrete-GPU rule that keeps n_ubatch at 512 while the cache does not hold every expert does not apply there.
-    // Measured on gfx1151 (Qwen3.6-35B-A3B UD-Q3_K_M + MTP, 8 GB budget): -ub 2048 vs the default 2k prompt
+    // Measured on gfx1151 (Qwen3.6-35B-A3B 3-bit + MTP, 8 GB budget): -ub 2048 vs the default 2k prompt
     // 1252 -> 1373 (Linux) / 1125 -> 1185 (Windows), decode after it 65.0 -> 72.3 / 57.7 -> 66.8, chat decode equal. Without -ub and with
     // a MoE cache asked for, n_ubatch = LLAMA_MOE_UMA_UB (2048) there, set before the fit and handled as a given -ub (the fit, the draft
     // context see it as such). LLAMA_MOE_UMA_UB=0 off; LLAMA_MOE_UMA=1 / 0 forces the unified-memory decision.
@@ -3313,7 +3313,7 @@ uma_restart:
         }
     }
 
-    // k19-mgpu: a reload from params (the server waking from sleep) fits again from -sm layer and decides the split mode again
+    // a reload from params (the server waking from sleep) fits again from -sm layer and decides the split mode again
     if (params.split_mode_auto) {
         params.split_mode      = LLAMA_SPLIT_MODE_LAYER;
         params.split_mode_auto = false;
@@ -3324,7 +3324,7 @@ uma_restart:
 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
-        common_fit_set_ubatch_user(params.n_ubatch_set); // k19-fitfaoff
+        common_fit_set_ubatch_user(params.n_ubatch_set); // fit without flash attention
         common_fit_faoff_ubatch_reset();
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
@@ -3332,7 +3332,7 @@ uma_restart:
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-        // k19-kvsel auto: no fit of a launch that asks for a drafter places K/V in host chunks, so its fits (the drafter's placement, the
+        // auto: no fit of a launch that asks for a drafter places K/V in host chunks, so its fits (the drafter's placement, the
         // drop rules, the K/V type) are those of LLAMA_KV_SEL_HOST=0
         common_fit_kv_sel_allow(!has_draft && !spec_mtp);
         common_fit_kv_sel_granted(true);
@@ -3363,7 +3363,7 @@ uma_restart:
         // the old order (the draft model first, the main model around it) with LLAMA_FIT_DRAFT_LAST=0, or when -ngld or -devd is set
 
         // the fit of the main model on copies of the params at a K/V type, K/V placement (kvo: on the device) and n_ubatch (0: as given),
-        // with the MTP drop rule below applied (the KV auto rules: k16-parity, k19-kvlong)
+        // with the MTP drop rule below applied (the KV auto rules)
         std::vector<uint8_t> exps;
         const int64_t n_layer = params.fit_params && !model_only ? common_model_n_layer(params.model.path, exps) : 0;
         struct kv_probe {
@@ -3377,9 +3377,9 @@ uma_restart:
             uint32_t ub      = 0;     // n_ubatch after the fit
             uint32_t ub_req  = 0;     // n_ubatch asked for (0: as given)
             ggml_type type   = GGML_TYPE_COUNT; // K/V type
-            int32_t  win     = -1;    // k19-kvwin4: KV window ring positions (-1: none)
+            int32_t  win     = -1;    // KV window ring positions (-1: none)
         };
-        // k19-kvwin4: the KV window ring (n_win, n_sinks) a probe fits with (-1: as given)
+        // the KV window ring (n_win, n_sinks) a probe fits with (-1: as given)
         int32_t probe_win = -1, probe_win_sinks = 0;
         const auto probe = [&](ggml_type t, bool kvo, uint32_t ub) {
             kv_probe r;
@@ -3449,7 +3449,7 @@ uma_restart:
             return r;
         };
 
-        // k16-parity: q8_0 K/V above 8K context where it buys device residency (q8_0: 8-bit codes
+        // q8_0 K/V above 8K context where it buys device residency (q8_0: 8-bit codes
         // + an fp16 scale per 32 values). Only without -ctk / -ctv (or their
         // LLAMA_ARG_ variables), with flash attention not off, and only when the f16 placement spills (layers on the CPU, the MTP drafter
         // dropped, or experts in system memory). Both K/V types are fitted on copies, each with the MTP drop rule below applied, and
@@ -3463,12 +3463,12 @@ uma_restart:
             const char * env_ar = getenv("LLAMA_KV_AUTO_Q8_ARCHS");
             const int     aq_mode = env_aq != nullptr ? atoi(env_aq) : 1;
             const int64_t min_ctx = env_mc != nullptr ? atoll(env_mc) : 8192;
-            // k16-parity G4 (k16p_g4c, q3m 4 GB + MTP): the two trades below win decode but lose the prompt with q8_0 K/V (20k: decode
+            // KV parity, RTX PRO 6000 (a 3-bit model, 4 GB + MTP): the two trades below win decode but lose the prompt with q8_0 K/V (20k: decode
             // +12..19% over f16, 2k / 8k prompt -9% / -34%; 32k: +5..15%, -40% / -60%; 16k "a larger MoE cache": decode -4..-9%), so by
             // default q8_0 is kept only for more context, more layers or every expert on the device. LLAMA_KV_AUTO_Q8_TRADE=1: also for the
             // MTP drafter that f16 drops and for a MoE cache larger by max(64 MiB, 1/8)
             const bool aq_trade = getenv("LLAMA_KV_AUTO_Q8_TRADE") != nullptr && atoi(getenv("LLAMA_KV_AUTO_Q8_TRADE")) != 0;
-            // (k19-kvwin: not beside the KV window ring, whose cache types are given)
+            // (not beside the KV window ring, whose cache types are given)
             bool aq_on = aq_mode != 0 && !model_only && !params.cache_type_k_set && !params.cache_type_v_set && params.kv_win < 0 &&
                 params.cache_type_k == GGML_TYPE_F16 && params.cache_type_v == GGML_TYPE_F16 &&
                 params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && !params.embedding &&
@@ -3517,28 +3517,28 @@ uma_restart:
             }
         }
 
-        // k19-kvlong: a long context on a small card. The K/V and the compute buffers grow with n_ctx (the flash attention mask and the QSA
+        // a long context on a small card. The K/V and the compute buffers grow with n_ctx (the flash attention mask and the QSA
         // selection masks with n_ctx x n_ubatch), and the fit moves whole layers to the host to make room for them: Qwen3.8-Flash-Next at
         // ctx 262144 on 10 GB (q8_0 K/V) kept 17 of 49 layers on the device, with dense weights 5597 MiB, the compute buffer 4127 MiB at
         // n_ubatch 2048 and the K/V 4192 MiB. When the placement spills layers, two other trades are fitted first:
         // - a smaller n_ubatch (halved down to LLAMA_FIT_LONGCTX_UB_MIN, 512): the prompt runs in more, smaller steps.
-        //   LLAMA_FIT_LONGCTX_UB: 2 (default since k19-defaults1116) also a given -ub (Studio passes -ub 2048: G4 Flash-Next 12 GB ctx
-        //   262144 kept 30 of 49 layers at 29 tok/s, 10 GB 17 of 49 at 23), 1 only without -ub, 0 never;
+        // LLAMA_FIT_LONGCTX_UB: 2 (default since an earlier build) also a given -ub (Studio passes -ub 2048: RTX PRO 6000 Flash-Next 12 GB ctx
+        // 262144 kept 30 of 49 layers at 29 tok/s, 10 GB 17 of 49 at 23), 1 only without -ub, 0 never;
         // - opt-in (LLAMA_FIT_LONGCTX_KV_HOST=1): the K/V in pinned host memory (-nkvo; the recurrent states stay on the device). The
-        //   attention still runs on the GPU from a copy of the cells in use, so each decode step copies the whole used K/V of every
-        //   attention layer: G4 10 GB, Flash-Next ctx 262144, n_ubatch 1024: every layer on the device and a 3 GB MoE cache, chat
-        //   21.4 -> 31.4 tok/s and the 8k prompt 523 -> 918 tok/s, but decode after it 19.9 -> 18.8, and lower still as the context
-        //   grows (a QSA layer reads only its selected cells: a gather of those would remove that cost).
+        // attention still runs on the GPU from a copy of the cells in use, so each decode step copies the whole used K/V of every
+        // attention layer: RTX PRO 6000 10 GB, Flash-Next ctx 262144, n_ubatch 1024: every layer on the device and a 3 GB MoE cache, chat
+        // 21.4 -> 31.4 tok/s and the 8k prompt 523 -> 918 tok/s, but decode after it 19.9 -> 18.8, and lower still as the context
+        // grows (a QSA layer reads only its selected cells: a gather of those would remove that cost).
         // - opt-in (LLAMA_FIT_LONGCTX_KV4=1) when that still spills layers, or leaves no MoE cache beside host experts: a 4-bit
-        //   K/V (q4_0, LLAMA_FIT_LONGCTX_KV4_TYPE) with the same n_ubatch ladder, only without -ctk / -ctv / --kv-window (or LLAMA_KV_WIN)
-        //   and for LLAMA_FIT_LONGCTX_KV4_ARCHS (qwen35moe,qwen4exp). k19-kvwin4: in KV window mode by default, the last
-        //   LLAMA_FIT_LONGCTX_KV4_WIN (16384) positions and the first LLAMA_FIT_LONGCTX_KV4_SINKS (4) also in a q8_0 ring beside the q4_0
-        //   cache (LLAMA_FIT_LONGCTX_KV4_WIN=0: the plain 4-bit cache). G4 10 GB, Flash-Next ctx 262144: q4_0 at n_ubatch 512 keeps every
-        //   layer and a 2 GB MoE cache on the device (compute buffer 583 MiB against 1841 MiB with q8_0): chat 21.4 -> 83.8 tok/s, decode
-        //   after an 8k prompt 19.9 -> 78.5. The window size is the smallest that kept every paired KLD CI against q8_0 at 0 (Flash-Next,
-        //   ctx 262144, whole card, long48 = 48 prompts of 2.1k / 8.2k and long20k = 16 of 20k tokens; first-token KLD and top-1, decode
-        //   KLD): 1024 failed the long48 first token (+.0174 [+.0053, +.0334]), 8192 the long20k decode (+.0026 [+.0003, +.0047]); 16384
-        //   passed all (ring 210 MiB at n_ubatch 512). Past the window the cache is 4-bit: longer prompts than these are not gated.
+        // K/V (q4_0, LLAMA_FIT_LONGCTX_KV4_TYPE) with the same n_ubatch ladder, only without -ctk / -ctv / --kv-window (or LLAMA_KV_WIN)
+        // and for LLAMA_FIT_LONGCTX_KV4_ARCHS (qwen35moe,qwen4exp). in KV window mode by default, the last
+        // LLAMA_FIT_LONGCTX_KV4_WIN (16384) positions and the first LLAMA_FIT_LONGCTX_KV4_SINKS (4) also in a q8_0 ring beside the q4_0
+        // cache (LLAMA_FIT_LONGCTX_KV4_WIN=0: the plain 4-bit cache). RTX PRO 6000 10 GB, Flash-Next ctx 262144: q4_0 at n_ubatch 512 keeps every
+        // layer and a 2 GB MoE cache on the device (compute buffer 583 MiB against 1841 MiB with q8_0): chat 21.4 -> 83.8 tok/s, decode
+        // after an 8k prompt 19.9 -> 78.5. The window size is the smallest that kept every paired KLD CI against q8_0 at 0 (Flash-Next,
+        // ctx 262144, whole card, long48 = 48 prompts of 2.1k / 8.2k and long20k = 16 of 20k tokens; first-token KLD and top-1, decode
+        // KLD): 1024 failed the long48 first token (+.0174 [+.0053, +.0334]), 8192 the long20k decode (+.0026 [+.0003, +.0047]); 16384
+        // passed all (ring 210 MiB at n_ubatch 512). Past the window the cache is 4-bit: longer prompts than these are not gated.
         // A trade is kept only when it puts more layers on the device (then the larger MoE cache, then the MTP drafter); the K/V in host
         // memory is preferred over the smaller n_ubatch when both give the same layers (LLAMA_FIT_LONGCTX_PREFER=ub: the other way).
         // Only with flash attention not off, the K/V placement and -ngl not given, a MoE model and n_ctx above LLAMA_FIT_LONGCTX_MIN_CTX
@@ -3560,7 +3560,7 @@ uma_restart:
                 has_exps = has_exps || e != 0;
             }
             // not on the disk tier (the host experts do not fit in the available RAM and the model is not on a memory file system): there a
-            // prompt ubatch reads the experts it misses from the disk, so a smaller n_ubatch reads them more often. Colab L4 10 GB,
+            // prompt ubatch reads the experts it misses from the disk, so a smaller n_ubatch reads them more often. L4 10 GB,
             // Flash-Next from the VM disk (57.6 GB of experts, 51 GB of RAM), ctx 262144, n_ubatch 2048 -> 512: decode after an 8k prompt
             // 1.3 -> 1.8 tok/s but the prompt 18 -> 8 tok/s. LLAMA_FIT_LONGCTX_DISK=1 lowers it there too
             const bool disk_tier = [&] {
@@ -3589,7 +3589,7 @@ uma_restart:
                 const ggml_type t = cparams.type_k == cparams.type_v ? cparams.type_k : GGML_TYPE_COUNT;
                 const kv_probe a = t != GGML_TYPE_COUNT ? probe(t, true, 0) : kv_probe{};
                 // also where every layer fits but experts stay in host memory, with LLAMA_FIT_LONGCTX_UB=2 (or LLAMA_FIT_LONGCTX_CACHE=1):
-                // at a long context the compute buffer takes what the MoE cache and a drafter would get. G4 16 GB, Flash-Next ctx 262144,
+                // at a long context the compute buffer takes what the MoE cache and a drafter would get. RTX PRO 6000 16 GB, Flash-Next ctx 262144,
                 // -ub 2048: 4924 MiB of compute buffer, no MoE cache, no drafter, chat 37 tok/s (12 GB with n_ubatch 512: 83)
                 const bool lc_cache = a.ok && a.layers >= n_layer + 1 && a.n_host > 0 && ub_may &&
                     (lc_ub == 2 || env_i("LLAMA_FIT_LONGCTX_CACHE", 0) != 0);
@@ -3657,7 +3657,7 @@ uma_restart:
                             best = *c;
                         }
                     }
-                    // the 4-bit K/V step (opt-in): the same ladder with the K/V on the device (k19-kvwin4: in KV window mode)
+                    // the 4-bit K/V step (opt-in): the same ladder with the K/V on the device (in KV window mode)
                     const bool kv4_on = env_i("LLAMA_FIT_LONGCTX_KV4", 0) != 0 && !params.cache_type_k_set && !params.cache_type_v_set &&
                         params.kv_win < 0 && getenv("LLAMA_KV_WIN") == nullptr && getenv("LLAMA_KV_WIN_SINKS") == nullptr &&
                         (t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0);
@@ -3756,7 +3756,7 @@ uma_restart:
                 draft_cpu = common_fit_draft_on_cpu(params, mparams, cparams, mparams_dft, cparams_dft, params_dft.model.path, fit_log_level,
                     &draft_needs_target, &hx);
                 if (!draft_cpu && hx.on) {
-                    // k19-mtpkeep: the draft runs with its experts in host memory: the draft params (the context the server creates) and the
+                    // the draft runs with its experts in host memory: the draft params (the context the server creates) and the
                     // copies the rest of the fit measures it with (the extra model of the layers-first rule)
                     for (auto * v : { &params.speculative.draft.tensor_buft_overrides, &params_dft.tensor_buft_overrides }) {
                         if (!v->empty() && v->back().pattern == nullptr) {
@@ -3778,7 +3778,7 @@ uma_restart:
                     }
                 }
                 if (!draft_cpu && !rq_before && getenv("LLAMA_DRAFT_REQUANT") != nullptr) {
-                    // k18: the draft was admitted requantized: the rest of the fit (the extra model) measures it at those types, as it loads
+                    // the draft was admitted requantized: the rest of the fit (the extra model) measures it at those types, as it loads
                     // (the overrides are added in place: the extra model holds params_dft's path and &mparams_dft)
                     if (!params_dft.kv_overrides.empty() && params_dft.kv_overrides.back().key[0] == 0) {
                         params_dft.kv_overrides.pop_back();
@@ -3802,21 +3802,21 @@ uma_restart:
             }
         }
         // a DFlash / DSpark draft borrows the target's token embeddings and lm head (device tensors) whatever path the fit took above
-        // (the small-device placement returns before the draft is priced): G4 10 GB Qwen3.8-Flash-Next + DFlash2 with
+        // (the small-device placement returns before the draft is priced): RTX PRO 6000 10 GB Qwen3.8-Flash-Next + DFlash2 with
         // LLAMA_FIT_DRAFT_CPU=1 aborted in the draft's first graph reservation (output.weight on CUDA0, the draft context on the CPU)
         if (draft_cpu && std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type t) {
                 return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; })) {
             draft_needs_target = true;
         }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
-        // k15-small4: a draft that runs on the target's context (a gemma-4 assistant reads the target's KV cache) cannot run on the CPU
+        // a draft that runs on the target's context (a gemma-4 assistant reads the target's KV cache) cannot run on the CPU
         // while that cache is on the device: T4 4 GB with LLAMA_FIT_DRAFT_CPU=1 aborted in its first graph reservation (a CPU context
         // with a pre-allocated CUDA tensor). It is left out instead
         if (draft_cpu && draft_needs_target && env_dcpu != nullptr && atoi(env_dcpu) != 0) {
             COM_WRN("%s: LLAMA_FIT_DRAFT_CPU=1: the draft model runs on the target's KV cache and cannot run on the CPU beside it, it is left out\n", __func__);
         }
         const bool   draft_off = draft_cpu && params.speculative.draft.fit_can_drop && (env_dcpu == nullptr || atoi(env_dcpu) == 0 || draft_needs_target);
-        // k15-ov: the context's prefetch depth rule treats a target whose draft --fit dropped as running without one (no device draft
+        // the context's prefetch depth rule treats a target whose draft --fit dropped as running without one (no device draft
         // competes with the deeper staging); cparams.spec_draft stays set, as it also turns on layer-major prompts (llama_context::sched_new)
         common_set_env("LLAMA_FIT_DRAFT_DROPPED", draft_off ? "1" : "0");
         if (draft_cpu) {
@@ -3832,14 +3832,14 @@ uma_restart:
                 // fitted and run as without a draft model, the caller turns drafting off
                 cparams.n_rs_seq = 0;
                 mparams.load_mtp = params.load_mtp;
-                // k19-rollback: or drafts n-gram windows instead (LLAMA_SPEC_DROP_NGRAM)
+                // or drafts n-gram windows instead (LLAMA_SPEC_DROP_NGRAM)
                 common_fit_drop_ngram(params, cparams);
             }
         }
 
-        // k15-pp4: the state capture snapshots (layer-major prompts beside a draft, llama_context::cap_planned_bytes) are counted by the
+        // the state capture snapshots (layer-major prompts beside a draft, llama_context::cap_planned_bytes) are counted by the
         // fit; where counting them costs device layers, the capture is dropped (llama_context_params::n_state_capture = 0) before any
-        // layer: G4 q3m 4 GB + MTP, ctx 16384: two snapshots (126 MiB) took the small-device placement's whole 114 MiB cache, and 14 of
+        // layer: RTX PRO 6000 q3m 4 GB + MTP, ctx 16384: two snapshots (126 MiB) took the small-device placement's whole 114 MiB cache, and 14 of
         // 42 layers went to the CPU. LLAMA_FIT_CAPTURE_SHRINK=0 keeps the count. Placement only: the server then checkpoints as without
         // capture (LLAMA_LM_CKPT_CAPTURE=0), whose output it equals
         const llama_model_params   mparams_in  = mparams;
@@ -3869,9 +3869,9 @@ uma_restart:
         };
         common_params_fit_status fit_status = run_fit(cparams.n_state_capture);
         {
-            // LLAMA_FIT_CAPTURE_SHRINK: 2 (default) no capture; 1 one snapshot first, then none; 0 keeps the count. G4 q3m 4 GB + MTP,
-            // ctx 16384 (k15g4s1): one counted snapshot keeps the 42 layers but its 61 MiB leave the first layer-major group 98 MiB free
-            // (split at 2), 2k / 8k prompt 3395 / 3266 tok/s; no capture gives k14's groups and md5, 5264 / 4812 (k14 5229 / 5429)
+            // LLAMA_FIT_CAPTURE_SHRINK: 2 (default) no capture; 1 one snapshot first, then none; 0 keeps the count. RTX PRO 6000 q3m 4 GB + MTP,
+            // ctx 16384: one counted snapshot keeps the 42 layers but its 61 MiB leave the first layer-major group 98 MiB free
+            // (split at 2), 2k / 8k prompt 3395 / 3266 tok/s; no capture gives the earlier build's groups and md5, 5264 / 4812 (an earlier build 5229 / 5429)
             static const int shrink = getenv("LLAMA_FIT_CAPTURE_SHRINK") == nullptr ? 2 : atoi(getenv("LLAMA_FIT_CAPTURE_SHRINK"));
             std::vector<uint8_t> exps;
             const int64_t n_layer = common_model_n_layer(params.model.path, exps);
@@ -3903,15 +3903,15 @@ uma_restart:
                     best_n < 0 ? "kept, fewer snapshots do not keep more layers" : best_n == 0 ? "no capture" : "one snapshot",
                     layers(), n_layer + 1);
             }
-            // k15-pp5: with the snapshots not counted (LLAMA_FIT_CAPTURE unset, the default) they are allocated at the first capture from
+            // with the snapshots not counted (LLAMA_FIT_CAPTURE unset, the default) they are allocated at the first capture from
             // what the fit left free. On a small-margin placement (common_fit_small_device: the margin dropped below the default beside a
-            // cache of at most 256 MiB) or one that did not keep every layer in device memory there is no room for them: G4 q3m 4 GB + MTP,
-            // ctx 16384 ran out of device memory at the first prompt save in 2 of 2 launches (k15g4c8), with LLAMA_STATE_CAPTURE_MAX=1 too.
-            // The capture is dropped there as above (the server checkpoints as with LLAMA_LM_CKPT_CAPTURE=0; md5 = k14); the placement
+            // cache of at most 256 MiB) or one that did not keep every layer in device memory there is no room for them: RTX PRO 6000 q3m 4 GB + MTP,
+            // ctx 16384 ran out of device memory at the first prompt save in 2 of 2 launches, with LLAMA_STATE_CAPTURE_MAX=1 too.
+            // The capture is dropped there as above (the server checkpoints as with LLAMA_LM_CKPT_CAPTURE=0; md5 = an earlier build); the placement
             // is the fit's, unchanged. LLAMA_FIT_CAPTURE_GUARD=0 keeps the capture
-            // k19-tierfix-fit: also where --fit dropped the draft model: cparams.spec_draft stays set (layer-major prompts), so the
-            // server still captures and the snapshots are allocated from the margin all the same. G4 capped at 8 GB, Qwen3.8-Flash-Next
-            // UD-IQ4_XS + the dropped Q8_0 MTP drafter: the 8k prompt asked for 112.57 MiB snapshots with 110.56 MiB free (3 times in
+            // also where --fit dropped the draft model: cparams.spec_draft stays set (layer-major prompts), so the
+            // server still captures and the snapshots are allocated from the margin all the same. RTX PRO 6000 capped at 8 GB, Qwen3.8-Flash-Next
+            // 4-bit + the dropped Q8_0 MTP drafter: the 8k prompt asked for 112.57 MiB snapshots with 110.56 MiB free (3 times in
             // a prompt). LLAMA_FIT_CAPTURE_GUARD_DROPPED=0 keeps the capture beside a dropped draft
             static const bool guard      = getenv("LLAMA_FIT_CAPTURE_GUARD") == nullptr || atoi(getenv("LLAMA_FIT_CAPTURE_GUARD")) != 0;
             static const bool guard_drop = getenv("LLAMA_FIT_CAPTURE_GUARD_DROPPED") == nullptr || atoi(getenv("LLAMA_FIT_CAPTURE_GUARD_DROPPED")) != 0;
@@ -3922,10 +3922,10 @@ uma_restart:
                     __func__, common_fit_small_device() ? "small device" : "layers in system memory", draft_off ? ", draft model dropped" : "");
             }
         }
-        // k15-small4 (after the k15-c capture shrink, from the same inputs): an MTP drafter (the target's own NextN layers, no -md) that costs whole layers on a small device is dropped, as a
+        // (after the earlier capture shrink, from the same inputs): an MTP drafter (the target's own NextN layers, no -md) that costs whole layers on a small device is dropped, as a
         // draft model that does not fit is (fit_can_drop). Its context (KV, compute buffer at the draft ubatch), the NextN weights and the
         // recurrent rollback state (n_rs_seq) are fitted with the target; where they push layers to the CPU, every token runs those layers
-        // (attention, recurrent state) on the CPU: T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP kept 22 of 42 layers on the device (decode
+        // (attention, recurrent state) on the CPU: T4 4 GB, Qwen3.6-35B-A3B 4-bit + MTP kept 22 of 42 layers on the device (decode
         // 4-5 tok/s), without the drafter every layer and a 476 MiB MoE cache. Only when the fit with the drafter moved layers off the
         // device is the fit run again without it; the drafter goes if that one keeps every layer on the device.
         // LLAMA_FIT_MTP_DROP=0: keep the drafter and the layer placement
@@ -3945,7 +3945,7 @@ uma_restart:
                 mp.tensor_buft_overrides = tbo.data();
             }
             mp.load_mtp = params.load_mtp;
-            // k17-small: the trial is the fit of a launch without the drafter (common_fit_plain_launch); LLAMA_FIT_DROP_PLAIN=0: the
+            // the trial is the fit of a launch without the drafter (common_fit_plain_launch); LLAMA_FIT_DROP_PLAIN=0: the
             // drafting context's parameters minus its rollback states, as before
             static const bool drop_plain = getenv("LLAMA_FIT_DROP_PLAIN") == nullptr || atoi(getenv("LLAMA_FIT_DROP_PLAIN")) != 0;
             common_params params_plain = params;
@@ -3954,7 +3954,7 @@ uma_restart:
                 common_set_env("LLAMA_SPEC_MTP_HEADS", "0");
             } else {
                 cp.n_rs_seq = 0;
-                cp.n_state_capture = cparams.n_state_capture;   // k15-c: the capture count the shrink above chose
+                cp.n_state_capture = cparams.n_state_capture;   // the capture count the shrink above chose
             }
             common_fit_set_moe_margin_auto(!params.fit_params_target_set);
             const common_params_fit_status st2 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
@@ -3987,13 +3987,13 @@ uma_restart:
                 moe_gain_mtp_trial = true;
             }
         }
-        // k19-q38t: before the rule below drops a separate MTP drafter that pushes layers of a dense target to a host with few threads,
+        // before the rule below drops a separate MTP drafter that pushes layers of a dense target to a host with few threads,
         // the drafter is fitted again squeezed: its context reads the prompt in ubatches of LLAMA_FIT_DRAFT_SQUEEZE_UB (256) tokens (its
         // compute buffer scales with its ubatch: one block, 569 MiB at -ub 2048 for Qwen3.8-27B's MTP GGUF; it only fills its KV from
         // the target's rows, a few percent of the prompt time) and, where that alone does not keep every layer, beside a margin of
         // LLAMA_FIT_DRAFT_SQUEEZE_MARGIN_MIB (512, the floor Studio keeps on every card) instead of the default 1024 (not below a
         // --fit-target given). The first that keeps every target layer on the device is taken; otherwise the rule below decides as
-        // before. Kaggle T4, Qwen3.8-27B UD-Q3_K_XL + its MTP GGUF, ctx 16384: the drafter stays with every layer on the device
+        // before. T4, Qwen3.8-27B 3-bit + its MTP GGUF, ctx 16384: the drafter stays with every layer on the device
         // instead of being dropped. Drafting changes the text as on any GPU where the drafter fits (the exact contract,
         // LLAMA_MTP_EXACT=1 GGML_CUDA_VERIFY_REASSOC=0, keeps the no-draft text). LLAMA_FIT_DRAFT_SQUEEZE=0: off
         bool draft_squeezed = false;
@@ -4007,9 +4007,9 @@ uma_restart:
             const int32_t n_threads   = params.cpuparams.n_threads;
             const uint32_t sq_ub      = e_ub != nullptr ? (uint32_t) std::max(1, atoi(e_ub)) : 256u;
             const size_t   sq_margin  = (size_t) (e_mm != nullptr ? std::max(0, atoi(e_mm)) : 512) * 1024 * 1024;
-            // k19-q38r2: a third step beside a margin of LLAMA_FIT_DRAFT_SQUEEZE_MARGIN2_MIB (448). With block 0 no longer left on the
-            // host by the NextN slot (llama-model.cpp), Qwen3.8-27B UD-Q3_K_XL + its MTP GGUF at ctx 16384 needs 14313 of 14806 MiB on a
-            // Kaggle T4 for every layer (493 MiB free): 19 MiB short of 512. Where no step keeps every layer, the 512 MiB step's fit is
+            // a third step beside a margin of LLAMA_FIT_DRAFT_SQUEEZE_MARGIN2_MIB (448). With block 0 no longer left on the
+            // host by the NextN slot (llama-model.cpp), Qwen3.8-27B 3-bit + its MTP GGUF at ctx 16384 needs 14313 of 14806 MiB on a
+            // T4 for every layer (493 MiB free): 19 MiB short of 512. Where no step keeps every layer, the 512 MiB step's fit is
             // still taken when it leaves only one block on the host (what the drafter ran beside before: the old slot left block 0 there)
             const char * e_m2 = getenv("LLAMA_FIT_DRAFT_SQUEEZE_MARGIN2_MIB");
             const size_t   sq_margin2 = (size_t) (e_m2 != nullptr ? std::max(0, atoi(e_m2)) : 448) * 1024 * 1024;
@@ -4119,12 +4119,12 @@ uma_restart:
                 }
             }
         }
-        // k19-q38d: the k15-small4 rule above for a separate draft model (-md: an MTP head GGUF, a DFlash / EAGLE drafter, a small model)
+        // the small-device drafter rule above for a separate draft model (-md: an MTP head GGUF, a DFlash / EAGLE drafter, a small model)
         // fitted beside a target without a MoE cache, on a host with few threads. Where the drafter's weights, context and verify buffers
-        // push whole target layers to the CPU, every token and every verify row runs those layers on the host's few threads: Kaggle T4
-        // (2 threads), dense Qwen3.8-27B UD-Q3_K_XL + its MTP head GGUF, ctx 16384: 60 of 66 layers on the device with the drafter, MTP
+        // push whole target layers to the CPU, every token and every verify row runs those layers on the host's few threads: T4
+        // (2 threads), dense Qwen3.8-27B 3-bit + its MTP head GGUF, ctx 16384: 60 of 66 layers on the device with the drafter, MTP
         // decode 3.9 tok/s (717 ms per pass) against 11.5 without it (every layer on the device). With many host threads the drafts still
-        // pay beside spilled layers (G4 48 threads, Qwen3.8-27B UD-Q4_K_XL capped at 16 GB: MTP 43.5 tok/s against 24.7 without), so the
+        // pay beside spilled layers (RTX PRO 6000 48 threads, Qwen3.8-27B 4-bit capped at 16 GB: MTP 43.5 tok/s against 24.7 without), so the
         // rule needs fewer than LLAMA_FIT_DRAFT_SPILL_MIN_THREADS (8) host threads; the fit then runs again without the drafter and drafting
         // is off if that keeps every layer on the device. Exact: the text is the no-draft text. LLAMA_FIT_DRAFT_SPILL_DROP=0: keep the drafter
         {
@@ -4162,7 +4162,7 @@ uma_restart:
                 common_fit_set_moe_margin_auto(!params.fit_params_target_set);
                 common_params_fit_status st4 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
                     mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
-                // k19-spilldrop: at a long context the launch without the drafter can spill too (Kaggle T4, Qwen3.8-27B UD-Q3_K_XL + its
+                // at a long context the launch without the drafter can spill too (T4, Qwen3.8-27B 3-bit + its
                 // MTP GGUF, ctx 32768: 57 of 65 blocks with the drafter, 60 without at the 1024 MiB margin), and the rule above kept the
                 // drafter beside 8 host blocks: 3.49 / 2.89 / 2.22 tok/s (chat / 8k / 16k), against 4.41 / 4.09 / 3.60 without it at 60
                 // blocks and 8.70 / 9.86 / 9.51 without it with every block on the device beside a 256 MiB margin (205 MiB free at the
@@ -4282,10 +4282,10 @@ uma_restart:
                 }
             }
         }
-        // k19-kvlong (the order on a capped card: target layers, then the compute buffer at a sane n_ubatch, then K/V, then the drafter,
+        // (the order on a capped card: target layers, then the compute buffer at a sane n_ubatch, then K/V, then the drafter,
         // then the MoE cache): a separate draft model beside a MoE target is admitted against the memory of the cache
-        // (common_fit_draft_on_cpu), but the fit that then measures it with its context can move target layers to the host. G4 capped at
-        // 16 GB, Qwen3.8-Flash-Next UD-IQ4_XS ctx 262144 + its requantized Q8_0 MTP GGUF: 41 of 49 layers with it (every layer without it),
+        // (common_fit_draft_on_cpu), but the fit that then measures it with its context can move target layers to the host. RTX PRO 6000 capped at
+        // 16 GB, Qwen3.8-Flash-Next 4-bit ctx 262144 + its requantized Q8_0 MTP GGUF: 41 of 49 layers with it (every layer without it),
         // decode 37 tok/s, against 83 at 12 GB with every layer and no drafter. Where the fit with the drafter keeps fewer layers on the
         // device than the fit without it, the drafter is left out (drafting off, the plain fit): 37.2 / 35.3 -> 89.7 / 81.8 tok/s chat / 8k
         // there, prompt 1170 -> 5760. LLAMA_FIT_DRAFT_LAYERS_FIRST_UB=N (opt-in) first fits an MTP drafter again with its context
@@ -4301,7 +4301,7 @@ uma_restart:
                     params.speculative.draft.fit_can_drop && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && params.moe_cache_size > 0 &&
                     n_layer > 0 && std::any_of(exps.begin(), exps.end(), [](uint8_t x) { return x != 0; }) &&
                     mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers && lay(mparams) < n_layer + 1) {
-                // the plain fit (no drafter), as k19-spilldrop runs it
+                // the plain fit (no drafter), as the spill-drop step runs it
                 llama_model_params   mp = mparams_in;
                 llama_context_params cp = cparams_in;
                 std::vector<float>   ts = ts_in;
@@ -4327,10 +4327,10 @@ uma_restart:
                     const char * e_lfm = getenv("LLAMA_FIT_DRAFT_LAYERS_FIRST_TUB_MIN");
                     const uint32_t lft_min = e_lfm != nullptr ? (uint32_t) std::max(32, atoi(e_lfm)) : 256u;
                     bool hx_ran = false; // a fit after the plain one ran: the drop below fits the plain way again (the fit's global state)
-                    // k19-mtpkeep (LLAMA_FIT_DRAFT_HOST_EXPS_LF, default on; LLAMA_FIT_DRAFT_HOST_EXPS=0 turns it off with the rest): before
+                    // (LLAMA_FIT_DRAFT_HOST_EXPS_LF, default on; LLAMA_FIT_DRAFT_HOST_EXPS=0 turns it off with the rest): before
                     // the drafter goes, an MTP draft model is fitted again with its experts in host memory, n_ubatch 16 and the target's
                     // K / V types (see common_fit_draft_hx), at the target's own n_ubatch; it stays if that keeps as many layers as the plain
-                    // fit. G4 16 GB / 262K, Qwen3.8-Flash-Next UD-IQ4_XS + its Q8_0 MTP GGUF: 41 of 49 layers at its file's placement, so
+                    // fit. RTX PRO 6000 16 GB / 262K, Qwen3.8-Flash-Next 4-bit + its Q8_0 MTP GGUF: 41 of 49 layers at its file's placement, so
                     // Studio's MTP never drafted there
                     {
                         const char * e_hx  = getenv("LLAMA_FIT_DRAFT_HOST_EXPS");
@@ -4342,10 +4342,10 @@ uma_restart:
                         // the host-expert placement the drafter already has (common_fit_draft_on_cpu set it, the fit with it gave l_with):
                         // the same fit again only with the lend below, which is what can change its outcome
                         const bool hx_have = common_fit_draft_host_exps_get();
-                        // k19-mtpkeep (LLAMA_FIT_DRAFT_HOST_EXPS_LEND=0 off): the drafter's device weights and compute buffers are lent to
+                        // (LLAMA_FIT_DRAFT_HOST_EXPS_LEND=0 off): the drafter's device weights and compute buffers are lent to
                         // the target's prompt ubatches that run with the cache banks released (layer-major groups: LLAMA_MTP_DRAFT_LEND;
                         // single released ubatches: LLAMA_MOE_PLACE8_LEND, which this sets), so this fit counts only its K / V beside
-                        // the prompt compute buffers and everything in the decode-sized placement of k19-place8; kept only with that placement
+                        // the prompt compute buffers and everything in the decode-sized placement of the fit; kept only with that placement
                         const char * e_hxd = getenv("LLAMA_FIT_DRAFT_HOST_EXPS_LEND");
                         const char * e_dl  = getenv("LLAMA_MTP_DRAFT_LEND");
                         const bool hx_lend = (e_hxd == nullptr || atoi(e_hxd) != 0) && (e_dl == nullptr || atoi(e_dl) != 0) &&
@@ -4481,10 +4481,10 @@ uma_restart:
                             kept = true;
                         }
                     }
-                    // k19-kvlong (LLAMA_FIT_DRAFT_LAYERS_FIRST_TUB=1, opt-in): before the drafter goes, the target's n_ubatch is halved (down to
+                    // (LLAMA_FIT_DRAFT_LAYERS_FIRST_TUB=1, opt-in): before the drafter goes, the target's n_ubatch is halved (down to
                     // LLAMA_FIT_DRAFT_LAYERS_FIRST_TUB_MIN, 256) and the fit with the drafter runs again; it stays if that keeps as many layers
                     // as the plain fit. On a small device the decode-sized cache must be positive beside the prompt compute buffers before the
-                    // k19-place8 step lends it their memory: G4 10 GB Qwen3.8-Flash-Next ctx 262144 + DFlash2 Q4_0 (495 MiB) went 335 -> -160 MiB
+                    // step lends it their memory: RTX PRO 6000 10 GB Qwen3.8-Flash-Next ctx 262144 + DFlash2 Q4_0 (495 MiB) went 335 -> -160 MiB
                     // at ub 512, so the small-device placement was skipped and 8 layers spilled, while a smaller target ubatch frees that room
                     if (!kept && (e_lft == nullptr ? false : atoi(e_lft) != 0)) {
                         for (uint32_t ub_t = cparams_in.n_ubatch/2; !kept && ub_t >= lft_min; ub_t /= 2) {
@@ -4523,7 +4523,7 @@ uma_restart:
                         }
                     }
                     if (!kept && hx_ran) {
-                        // the plain fit again: the fit's global state (the k19-place8 placement and the environment it sets for the
+                        // the plain fit again: the fit's global state (the decode-sized placement and the environment it sets for the
                         // context) is that of the last fit, here the host-expert one
                         mp = mparams_in;
                         cp = cparams_in;
@@ -4566,7 +4566,7 @@ uma_restart:
                         common_fit_plain_launch(params, cp_plain);
                         // the context runs as a launch without a drafter (cparams.spec_draft is off): its prompts keep their layer-major
                         // groups only with this mark, which the MoE cache rules set for a launch without -md (they still see the drafter
-                        // here). Without it the G4 16 GB ctx 262144 8k prompt ran ubatch by ubatch, 1860 tok/s against 5743 without -md
+                        // here). Without it the RTX PRO 6000 16 GB ctx 262144 8k prompt ran ubatch by ubatch, 1860 tok/s against 5743 without -md
                         // (same placement, same text). LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 keeps it off
                         if (const char * e_nd = getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT"); e_nd == nullptr || atoi(e_nd) != 0) {
                             common_set_env("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT", "1");
@@ -4575,19 +4575,19 @@ uma_restart:
                 }
             }
         }
-        // k17-small: on a small device with few host threads an MTP drafter that keeps every layer on the device can still take most of
-        // the MoE cache (Qwen3.6-35B-A3B 4 GB, ctx 16384: UD-Q3_K_M cache 31 MiB with it, 699 MiB without; UD-Q4_K_XL 99 vs 535). There
-        // the host computes nearly every expert of every drafted verify window on its few threads (Kaggle T4 half, 2 threads, ctx 32768:
-        // no drafter + 297 MiB cache decoded 16.0-20.8 tok/s, the drafter beside a 33 MiB cache 14.6-16.6, k15smPC),
-        // while hosts with many threads gain from the drafts (G4 48 threads, 16k: the drafter kept is k14's 153 tok/s). So below
+        // on a small device with few host threads an MTP drafter that keeps every layer on the device can still take most of
+        // the MoE cache (Qwen3.6-35B-A3B 4 GB, ctx 16384: 3-bit cache 31 MiB with it, 699 MiB without; 4-bit 99 vs 535). There
+        // the host computes nearly every expert of every drafted verify window on its few threads (T4 half, 2 threads, ctx 32768:
+        // no drafter + 297 MiB cache decoded 16.0-20.8 tok/s, the drafter beside a 33 MiB cache 14.6-16.6, ,
+        // while hosts with many threads gain from the drafts (RTX PRO 6000 48 threads, 16k: the drafter kept is the earlier build's 153 tok/s). So below
         // LLAMA_FIT_MTP_CACHE_MIN_THREADS (4, the spill guard's threshold) host threads, on a small-device placement with the drafter, the
         // fit runs again without it; the drafter goes if that keeps every layer on the device and gives the cache at least
         // LLAMA_FIT_MTP_CACHE_GAIN_MIB (256) and twice its size. The drafter's own text equals the target's where the verify is exact.
-        // On by default (LLAMA_FIT_MTP_CACHE_DROP=0 keeps the drafter). G4 KLD against a full-card reference, judged against today's MTP
-        // 4 GB default under the same route tail skip setting (k17s_g4d, tail skip off): decode mean / p99 0.00149 / 0.0287 short and
+        // On by default (LLAMA_FIT_MTP_CACHE_DROP=0 keeps the drafter). RTX PRO 6000 KLD against a full-card reference, judged against today's MTP
+        // 4 GB default under the same route tail skip setting , tail skip off): decode mean / p99 0.00149 / 0.0287 short and
         // 0.00187 / 0.0299 long for this placement, 0.00136 / 0.0244 and 0.00208 / 0.0322 for today's default; with the default tail
-        // skip both are further out (0.0061 / 0.0034 short), the skip being the accepted default. Kaggle T4 2 threads: decode
-        // +29..+49% (q3m 16k), +25% (q4x 16k)
+        // skip both are further out (0.0061 / 0.0034 short), the skip being the accepted default. T4 2 threads: decode
+        // +29..+49% (q3m 16k), +25% (4-bit 16k)
         {
             const char * e_cd = getenv("LLAMA_FIT_MTP_CACHE_DROP");
             const char * e_ct = getenv("LLAMA_FIT_MTP_CACHE_MIN_THREADS");
@@ -4627,7 +4627,7 @@ uma_restart:
                 const common_params_fit_status st3 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
                     mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
                 const int64_t gain_wo = common_fit_moe_margin_gain();
-                // (k19-vramlend: without the unbacked KV a lazy grant added to the cache of the trial, so the keep / drop decision is the
+                // (without the unbacked KV a lazy grant added to the cache of the trial, so the keep / drop decision is the
                 // one of LLAMA_KV_LAZY=0)
                 const int64_t c_wo    = st3 == COMMON_PARAMS_FIT_STATUS_SUCCESS && cp.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES ?
                     (int64_t) (cp.moe_cache_size - std::min(cp.moe_cache_size, common_fit_kv_lazy_grant(cp.moe_cache_size))) + gain_wo : -1;
@@ -4665,16 +4665,16 @@ uma_restart:
                 }
             }
         }
-        // k19-fitplain: the k19-spilldrop step-down for a plain launch (no draft model, no MTP heads asked) of a dense model. Where the
-        // fit at the default 1024 MiB margin moves whole layers to the CPU, every token runs those layers on the host: Kaggle T4,
-        // Qwen3.8-27B UD-Q3_K_XL, ctx 32768: 5 of 65 blocks on the CPU, 4.41 / 4.09 / 3.60 tok/s (chat / 8k / 16k), against 8.70 / 9.86
+        // the spill-drop step-down for a plain launch (no draft model, no MTP heads asked) of a dense model. Where the
+        // fit at the default 1024 MiB margin moves whole layers to the CPU, every token runs those layers on the host: T4,
+        // Qwen3.8-27B 3-bit, ctx 32768: 5 of 65 blocks on the CPU, 4.41 / 4.09 / 3.60 tok/s (chat / 8k / 16k), against 8.70 / 9.86
         // / 9.51 with every block on the device beside a 256 MiB margin (157-159 MiB free at the lowest with 192 MiB). So the fit runs
         // again beside the margins of LLAMA_FIT_PLAIN_SPILL_MARGINS_MIB (512,448,256,192), and the first that keeps every layer on the
         // device is taken; where none does, the default placement stays. Only on devices that drive no display (the CUDA backend's
         // ggml_backend_dev_headless: no kernel run time limit and NVML reports no display active or connected): a desktop's compositor
         // and other apps take and give back device memory while the server runs, which the smaller margin does not cover. An unknown
         // signal (no NVML, another backend, Windows WDDM) keeps 1024 MiB. Not with a --fit-target or -ngl given (the user's),
-        // nor for a model with experts (their own small-device margin, k13-small). Placement only: the text is the one of the same
+        // nor for a model with experts (their own small-device margin, an earlier build). Placement only: the text is the one of the same
         // launch with -fitt at that margin. LLAMA_FIT_PLAIN_SPILL=0: off; LLAMA_FIT_PLAIN_HEADLESS=1 / 0: take / refuse the step-down
         // whatever the signal (a desktop user who knows the headroom, or a test)
         {
@@ -4770,7 +4770,7 @@ uma_restart:
 
         // --moe-cache-mib auto that the fit did not size (a failed or skipped fit, no host experts on a device) is no cache, as with
         // the release: the unbounded request must never reach the context
-        // k19-kvsel auto, a launch that asked for a drafter which the fit dropped (Studio's MTP heads on G4 10 / 12 GB, k19-mtpkeep refusing
+        // auto, a launch that asked for a drafter which the fit dropped (Studio's MTP heads on RTX PRO 6000 10 / 12 GB, an earlier build refusing
         // the host-expert drafter): every fit so far, the drop decision included, ran without host chunks (common_fit_kv_sel_allow), and
         // the placement taken is the one of the launch without the drafter. That plain fit runs once more from the same inputs with
         // host chunks allowed and replaces it where it granted them and keeps every layer it had; the drafter stays dropped either way.
@@ -4839,10 +4839,10 @@ uma_restart:
         } else if (moe_cache_auto) {
             COM_INF("%s: --moe-cache-mib auto: MoE cache %zu MiB\n", __func__, cparams.moe_cache_size/(1024*1024));
         }
-        // k19-mtpprice: a separate MTP drafter reads the prompt in ubatches of at most common_draft_ubatch_max() only beside a MoE cache
+        // a separate MTP drafter reads the prompt in ubatches of at most common_draft_ubatch_max() only beside a MoE cache
         // (common_base_params_to_speculative), and the fit prices it that way while it plans one. Where the fit then ends without a cache
         // but with experts in host memory (layers moved to the CPU), the drafter's context would be created at the target's n_ubatch, a
-        // compute buffer the fit never priced: G4 12 GB, Qwen3.8-Flash-Next ctx 131072 -ub 2048 + its requantized MTP GGUF, priced 2021
+        // compute buffer the fit never priced: RTX PRO 6000 12 GB, Qwen3.8-Flash-Next ctx 131072 -ub 2048 + its requantized MTP GGUF, priced 2021
         // MiB at n_ubatch 512, the context's 1443 MiB compute buffer at 2048 failed ("failed to create MTP context", drafting off). The
         // drafter keeps the n_ubatch it was priced at. LLAMA_FIT_DRAFT_UB_PIN=0 off
         {
@@ -4863,14 +4863,14 @@ uma_restart:
                     "memory; LLAMA_FIT_DRAFT_UB_PIN=0 off)\n", __func__, cap);
             }
         }
-        // k17-small (lazy KV): where the fit keeps a drafter (a draft model or the MTP heads) the KV cache is backed whole at load and the
-        // MoE cache keeps its floor (common_fit does not give it the unbacked KV beside a drafter): G4 q4x 4 GB 16k + MTP ran out of memory
+        // (lazy KV): where the fit keeps a drafter (a draft model or the MTP heads) the KV cache is backed whole at load and the
+        // MoE cache keeps its floor (common_fit does not give it the unbacked KV beside a drafter): RTX PRO 6000 4-bit 4 GB 16k + MTP ran out of memory
         // at the first request 3/3 with the bigger cache, q3m 16k + MTP was 5-17% slower. Without a drafter (none asked, or dropped by the
         // fit) lazy KV stays on. LLAMA_KV_LAZY_FIT_DRAFT=1 keeps it on beside a drafter
         {
             const char * e_kv = getenv("LLAMA_KV_LAZY");
             const char * e_fd = getenv("LLAMA_KV_LAZY_FIT_DRAFT");
-            // k19-vramlend: unset = auto (on where the fit gave the MoE cache the unbacked KV), LLAMA_KV_LAZY=0 off (the kill switch)
+            // unset = auto (on where the fit gave the MoE cache the unbacked KV), LLAMA_KV_LAZY=0 off (the kill switch)
             const bool lazy_auto = e_kv != nullptr && strcmp(e_kv, "auto") == 0;   // (opt-in variant: LLAMA_KV_LAZY=auto)
             const bool lazy_on   = lazy_auto || (e_kv != nullptr && atoi(e_kv) != 0);
             const bool draft_on = !params.speculative.draft.fit_off && !params.speculative.draft.fit_on_cpu && (params.speculative.has_dft() ||
@@ -4886,7 +4886,7 @@ uma_restart:
                 COM_INF("%s: lazy KV: a drafter is kept, the KV cache is backed whole at load, MoE cache %zu MiB (%zu MiB of unbacked KV "
                     "given back; LLAMA_KV_LAZY_FIT_DRAFT=1 keeps lazy KV)\n", __func__, cparams.moe_cache_size/(1024*1024), grant/(1024*1024));
             }
-            // k19-vramlend: the automatic mode backs the KV lazily only where this fit gave the MoE cache the KV it leaves unbacked (the
+            // the automatic mode backs the KV lazily only where this fit gave the MoE cache the KV it leaves unbacked (the
             // cache gives it back as the context grows); elsewhere (no MoE cache, several devices, a fit that granted nothing) the KV cache
             // is backed whole at load as with LLAMA_KV_LAZY=0
             const size_t grant_now = suspend || !lazy_on ? 0 : common_fit_kv_lazy_grant(cparams.moe_cache_size);
@@ -4898,7 +4898,7 @@ uma_restart:
             }
         }
 
-        // k19-kvsel auto (LLAMA_KV_SEL_HOST unset or =auto): the K/V of an armed QSA cache goes to host chunks only where a fit placed it
+        // auto (LLAMA_KV_SEL_HOST unset or =auto): the K/V of an armed QSA cache goes to host chunks only where a fit placed it
         // there (a small device without a drafter, see common_fit_impl) and no drafter is kept; everywhere else the K/V cache is the one of
         // LLAMA_KV_SEL_HOST=0 (the kill switch). =1: always, as before
         if (llama_kv_sel_mode() == 2) {
@@ -4908,7 +4908,7 @@ uma_restart:
             common_set_env("LLAMA_KV_SEL_GRANTED", granted ? "1" : "0");
             // the refill after a released prompt ubatch (llama_context::tiny_rel_leave) is capped at LLAMA_KV_SEL_SHORT_REFILL MiB: unset
             // = 0 (the slots come back empty, misses fill them), N = N MiB, "pre" = the cache of the placement without host chunks (the first
-            // fit beside a dropped drafter, else this cache less the host-chunk bytes), "off" = every slot refilled. G4 Flash-Next Studio
+            // fit beside a dropped drafter, else this cache less the host-chunk bytes), "off" = every slot refilled. RTX PRO 6000 Flash-Next Studio
             // MTP argv (drafter dropped), 42-token chat prompt, 3 launches: HOST=0 112 / 112 / 111 tok/s at 10 / 12 / 16 GB; auto with
             // the cap 0: 110 / 109 / 106, "pre" 110 / 97 / 91, "off" 110 / 86 / 75; decode with 0 vs "off": chat 81.0 / 84.4 / 91.4 vs
             // 81.1 / 85.3 / 93.4, 8k 78.1 / 80.3 / 88.0 vs 77.0 / 83.7 / 90.3 (HOST=0 75.1 / 74.0 / 78.5)
@@ -4936,10 +4936,10 @@ uma_restart:
         // the fit may have reduced the MoE cache (it gets the memory left after the layers), the load mode below follows the fitted size
         params.moe_cache_size = cparams.moe_cache_size;
 
-        // k19-uma: unified memory (common_moe_uma: every offload device an integrated GPU), --moe-cache-mib auto: a fitted cache of at
+        // unified memory (common_moe_uma: every offload device an integrated GPU), --moe-cache-mib auto: a fitted cache of at
         // most the hybrid gate's share (LLAMA_MOE_CACHE_HYBRID_MAX_FRAC, 0.10) of the host experts is not used. There the device and the
         // host read the same DRAM: the host experts that ggml-cpu computes in place (upstream's --cpu-moe path) are not slower to reach
-        // than the cache's copies, and the cache's fit costs the rest of the placement: gfx1151 Qwen3.6-35B-A3B UD-Q4_K_XL + MTP at an
+        // than the cache's copies, and the cache's fit costs the rest of the placement: gfx1151 Qwen3.6-35B-A3B 4-bit + MTP at an
         // emulated 4 GiB device (3.1% cached), the fit dropped the MTP drafter to keep the cache and the layers on the device, decode 43.1
         // tok/s vs 52.7 with --moe-cache-mib 0 (MTP kept, 35 of 42 layers on the device) and upstream's 50.7. The launch is fitted again
         // from the given parameters as with --moe-cache-mib 0. Discrete GPUs are unchanged; LLAMA_MOE_UMA_MIN_FRAC=0 keeps the cache
@@ -4960,11 +4960,11 @@ uma_restart:
             }
         }
 
-        // k19-g4ten (LLAMA_KV_SEL_MTP=0 off): a launch with an MTP drafter that took the small-device placement (k19-place8) on one GPU and
+        // (LLAMA_KV_SEL_MTP=0 off): a launch with an MTP drafter that took the small-device placement on one GPU and
         // lost its drafter there, with the routed experts in RAM and more than LLAMA_KV_SEL_DEV_CELLS (32768) context cells: the whole fit
         // runs again from the given parameters with the K/V cells past the device cells in host chunks (LLAMA_KV_SEL_HOST=1 for this
-        // process), so the memory they free goes to the MoE cache and the drafter is weighed beside that cache (the auto rule of k19-kvsel
-        // grants host chunks only without a drafter). G4 RTX PRO 6000, Qwen3.8-Flash-Next UD-IQ4_XS + its Q8_0 MTP drafter (n_max 2), 3
+        // process), so the memory they free goes to the MoE cache and the drafter is weighed beside that cache (the auto rule of an earlier build
+        // grants host chunks only without a drafter). RTX PRO 6000 RTX PRO 6000, Qwen3.8-Flash-Next 4-bit + its Q8_0 MTP drafter (n_max 2), 3
         // launches per VM against the same launch without this rule (auto host chunks, no drafter): 10 GB / 131K cache 4004 -> 3269 MiB
         // beside the drafter (3.2 tokens of experts per layer, kept), chat 82.1 -> 105.6, 8k 77.5 -> 93.4, 2k 79.3 -> 78.0 tok/s (another
         // VM: 81.2 -> 106.3, 76.5 -> 90.6, 78.3 -> 79.1; a third, whose host computed an expert row 15% slower, 2k 78.1 -> 66.1); 12 GB /
@@ -4972,7 +4972,7 @@ uma_restart:
         // LLAMA_KV_SEL_HOST=1
         // The same refit for a DFlash / DSpark drafter (LLAMA_KV_SEL_DFLASH=0 off), which the small-device placement drops as well:
         // in the refit it is weighed against the cache (as LLAMA_FIT_PLACE8_DRAFT=1) with a cache floor of 2% of the host experts.
-        // G4 10 GB / 131K, Qwen3.8-Flash-Next UD-IQ4_XS + DFlash2 Q8_0 n6, 3 launches: chat 82.7 -> 129.1 tok/s, 8k 78.7 -> 106.7
+        // RTX PRO 6000 10 GB / 131K, Qwen3.8-Flash-Next 4-bit + DFlash2 Q8_0 n6, 3 launches: chat 82.7 -> 129.1 tok/s, 8k 78.7 -> 106.7
         const bool spec_dflash_ks = !spec_mtp && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
             [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; }) &&
             (getenv("LLAMA_KV_SEL_DFLASH") == nullptr || atoi(getenv("LLAMA_KV_SEL_DFLASH")) != 0);
@@ -5000,9 +5000,9 @@ uma_restart:
             }
         }
 
-        // k19-fitfaoff (LLAMA_FIT_FAOFF_UB=0 off): without flash attention and without -ub the fit chose n_ubatch for the F16 copies of
+        // (LLAMA_FIT_FAOFF_UB=0 off): without flash attention and without -ub the fit chose n_ubatch for the F16 copies of
         // the KQ matrix it reserves (common_fit_faoff_ubatch_plan); it stays as if given with -ub, so the n_ubatch growth rules below
-        // (resident ubatch, the MoE cache's auto ubatch, up to 2048 and more), which do not price those copies, keep it. Kaggle 2x T4
+        // (resident ubatch, the MoE cache's auto ubatch, up to 2048 and more), which do not price those copies, keep it. 2x T4
         // dsf8 -fa off ctx 16384: -ub 2048 with its 4096 MiB reserve 4.5 / 2.5 tok/s chat / 8k, -ub 512 52.7 / 17.1, both without an abort
         if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && !params.n_ubatch_set && common_fit_faoff_ubatch() > 0) {
             const uint32_t ub = std::min<uint32_t>(cparams.n_ubatch, common_fit_faoff_ubatch());
@@ -5013,11 +5013,11 @@ uma_restart:
             params.n_ubatch_set   = true;
         }
 
-        // k9-prompt-pass: every expert on the device (the MoE cache was asked for and has nothing to hold): the prompt runs at
+        // every expert on the device (the MoE cache was asked for and has nothing to hold): the prompt runs at
         // LLAMA_MOE_RESIDENT_UB (2048) instead of the default n_ubatch when the fit still places every expert on the device at that
         // ubatch, the KV cache does not grow with it (no sliding-window layers: their cache holds the window plus one ubatch, which every
         // later decode step reads) and the draft context keeps its ubatch. The MoE kernels of a 512-token ubatch run far below their
-        // peak (G4, Qwen3.6-35B-A3B UD-Q4_K_XL 32 GB, -ub 2048: 2k / 8k prompt +49 / +52%). LLAMA_MOE_RESIDENT_UB=0 off, =N that ubatch;
+        // peak (RTX PRO 6000, Qwen3.6-35B-A3B 4-bit 32 GB, -ub 2048: 2k / 8k prompt +49 / +52%). LLAMA_MOE_RESIDENT_UB=0 off, =N that ubatch;
         // LLAMA_MOE_RESIDENT_UB_SWA=1 also with sliding-window layers
         if (!model_only && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (moe_cache_auto || params.moe_cache_size > 0) &&
                 !params.n_ubatch_set && !params.embedding && !cparams.embeddings &&
@@ -5029,7 +5029,7 @@ uma_restart:
         // the fitted overrides live in params.tensor_buft_overrides, which mparams points to
         mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, mparams.n_gpu_layers);
 
-        // k16-fit: the memory the fit leaves free (its target) is also the headroom of the context's optional load-time allocations (the
+        // the memory the fit leaves free (its target) is also the headroom of the context's optional load-time allocations (the
         // MoE cache seed graph, an unlent staging arena): they only take memory beyond it (llama_context::sched_reserve_seed,
         // llama_moe_cache lend_decide). LLAMA_FIT_TARGET_HEADROOM=0: their fixed 512 MiB as before
         if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (getenv("LLAMA_FIT_TARGET_HEADROOM") == nullptr || atoi(getenv("LLAMA_FIT_TARGET_HEADROOM")) != 0)) {
@@ -5040,19 +5040,19 @@ uma_restart:
             common_set_env("LLAMA_FIT_TARGET_MIB", std::to_string(target/(1024*1024)));
         }
 
-        // k19-mgpu (LLAMA_SPLIT_AUTO_TENSOR=0 off): on two or more GPUs, without -sm / -ts / -ngl / -ot given, where the fit kept the whole
+        // (LLAMA_SPLIT_AUTO_TENSOR=0 off): on two or more GPUs, without -sm / -ts / -ngl / -ot given, where the fit kept the whole
         // model on the devices (no host experts, no MoE cache, the draft not on the CPU) and the architecture splits by tensor, the model
         // loads with -sm tensor when a measure of that placement (every layer, an even split) leaves each GPU its fit margin. Decode on
-        // -sm layer runs the GPUs one after the other; -sm tensor runs both on half of every layer. Kaggle 2x T4, Qwen3.8-27B UD-Q3_K_XL
-        // ctx 16384: no draft chat 13.2 -> 18.6 tok/s, MTP n2 chat 23.8 -> 31.4, 8k 22.0 -> 30.2; Qwen3.6-35B-A3B UD-Q4_K_XL + MTP
+        // -sm layer runs the GPUs one after the other; -sm tensor runs both on half of every layer. 2x T4, Qwen3.8-27B 3-bit
+        // ctx 16384: no draft chat 13.2 -> 18.6 tok/s, MTP n2 chat 23.8 -> 31.4, 8k 22.0 -> 30.2; Qwen3.6-35B-A3B 4-bit + MTP
         // chat 101.7 -> 108.7, 8k 93.0 -> 105.8. A draft model follows the target's split mode (common_base_params_to_speculative)
-        // MoE models too by default (k19-moetp; LLAMA_SPLIT_AUTO_TENSOR=3 = dense models only, the k19-mgpu default). The Qwen3.6-35B-A3B
-        // UD-Q4_K_XL "out of band" verdict (srv_kld long48 first-token KLD mean 0.00184 vs the -fa off arm's 0.00145) was the gate, not the
+        // MoE models too by default (an earlier build; LLAMA_SPLIT_AUTO_TENSOR=3 = dense models only, the earlier multi-GPU default). The Qwen3.6-35B-A3B
+        // 4-bit "out of band" verdict (srv_kld long48 first-token KLD mean 0.00184 vs the -fa off arm's 0.00145) was the gate, not the
         // split: the AllReduce adds the two F32 halves exactly (P2P) at quant-block-aligned splits, and a rounding-only change on the layer
         // path (GGML_CUDA_DISABLE_FUSION=1) lands at 0.00101 on the same prompts; the three arms' means overlap (bootstrap 95% CIs), tensor
         // vs -fa off paired p = 0.43, 24 / 48 prompts worse, median / geometric mean lower (0.00048 / 0.00047 vs 0.00065 / 0.00049): one
         // MoE routing flip anywhere in a 2100-8200 token prompt moves the first token by ~1e-3 whatever the size of the rounding change.
-        // Kaggle 2x T4 q4x: MTP 101.9 -> 106.9 chat, 94.3 -> 106.0 8k; no draft 66.1 -> 81.4, 63.5 -> 79.9
+        // 2x T4 4-bit: MTP 101.9 -> 106.9 chat, 94.3 -> 106.0 8k; no draft 66.1 -> 81.4, 63.5 -> 79.9
         {
             static const char * e_auto = getenv("LLAMA_SPLIT_AUTO_TENSOR");
             const int  mode = e_auto == nullptr ? 1 : atoi(e_auto);
@@ -5082,14 +5082,14 @@ uma_restart:
             const bool ngl_user = mparams_in.n_gpu_layers != llama_model_default_params().n_gpu_layers;
             const bool tbo_none = std::none_of(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
                 [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
-            // k19-2xt4 (LLAMA_SPLIT_AUTO_TENSOR_HOST=0 off): a MoE model whose -sm layer fit put routed experts on the host (its
+            // (LLAMA_SPLIT_AUTO_TENSOR_HOST=0 off): a MoE model whose -sm layer fit put routed experts on the host (its
             // -ot overrides and a MoE cache, none given by the user) is measured for -sm tensor too: where the tensor split holds the
             // whole model, the fit's host experts and cache are dropped and it loads split by tensor. Layer split places whole layers
             // per GPU, so a model of few large layers (DeepSeek-V4.1 8-layer fake: 2.64 GiB of experts per layer, 24.1 GiB) leaves
-            // slack on both cards that the even tensor split uses. Kaggle 2x T4 dsf8: -sm layer + 2 x 8.9 GB
+            // slack on both cards that the even tensor split uses. 2x T4 dsf8: -sm layer + 2 x 8.9 GB
             // MoE cache 65.6 / 63.1 tok/s (chat / 8k), 8k TTFT 11.5 s; -sm tensor 75.1 / 69.3, 5.05 s
             // srv_kld long48 on dsf8 (vs the layer + cache default): first-token KLD mean 0.0091 / p99 0.134 / top1 0.917, per position
-            // 0.0027 / 0.133 / 0.9725, inside the -fa off band of the same launch (k19-fitfaoff, -fa off vs on: 0.0095 / 0.143 / 0.917 and
+            // 0.0027 / 0.133 / 0.9725, inside the -fa off band of the same launch (an earlier build, -fa off vs on: 0.0095 / 0.143 / 0.917 and
             // 0.0025 / 0.133 / 0.9736), so on by default; LLAMA_SPLIT_AUTO_TENSOR_HOST=0 = the layer fit's host experts and cache as before
             static const bool host_on = [] {
                 const char * e = getenv("LLAMA_SPLIT_AUTO_TENSOR_HOST");
@@ -5104,7 +5104,7 @@ uma_restart:
                     !draft_cpu) {
                 llama_model_params   mp = mparams;
                 llama_context_params cp = cparams;
-                cp.moe_cache_size       = 0;   // k19-2xt4: a fit_host launch is measured without the fit's cache (no-op otherwise)
+                cp.moe_cache_size       = 0;   // a fit_host launch is measured without the fit's cache (no-op otherwise)
                 mp.split_mode           = LLAMA_SPLIT_MODE_TENSOR;
                 mp.n_gpu_layers         = llama_model_default_params().n_gpu_layers;
                 mp.tensor_split         = nullptr;
@@ -5152,7 +5152,7 @@ uma_restart:
                         " MiB, margin %zu MiB; LLAMA_SPLIT_AUTO_TENSOR=0 keeps -sm layer)\n", __func__, gpus.size(), fits ? "-sm tensor" : "-sm layer",
                         need/(1024*1024), dft/(1024*1024), free_min/(1024*1024), params.fit_params_target[0]/(1024*1024));
                     if (fits && fit_host) {
-                        // k19-2xt4: the tensor split replaces the fit's host experts and MoE cache
+                        // the tensor split replaces the fit's host experts and MoE cache
                         const size_t n_fit_tbo = (size_t) std::count_if(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
                             [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
                         COM_INF("%s: --fit: -sm tensor holds the whole model: the layer fit's host experts (%zu overrides) and %zu MiB MoE "
@@ -5169,7 +5169,7 @@ uma_restart:
                         mparams.n_gpu_layers   = mp.n_gpu_layers;
                         params.split_mode      = LLAMA_SPLIT_MODE_TENSOR;
                         params.split_mode_auto = true;
-                        // F32 on the AllReduce wire on every host: off the P2P path (no peer access, e.g. some Kaggle 2x T4 VMs) the
+                        // F32 on the AllReduce wire on every host: off the P2P path (no peer access, e.g. some 2x T4 VMs) the
                         // AllReduce defaults to a BF16 wire, a second text class besides the P2P path's exact F32 sum (q38s chat md5
                         // 75d741 vs f813a2); with F32 both paths add the same two halves, so the text does not depend on the host.
                         // An explicit GGML_CUDA_AR_BF16_THRESHOLD wins
@@ -5189,7 +5189,7 @@ uma_restart:
         common_moe_cache_auto_ubatch(params, mparams, cparams);
     }
 
-    // k11 (LLAMA_MOE_FIT_MARGIN): once n_ubatch, lending and the load mode follow the cache the fit sized with the full margin, the
+    // (LLAMA_MOE_FIT_MARGIN): once n_ubatch, lending and the load mode follow the cache the fit sized with the full margin, the
     // cache takes the part of the default margin a spilled context does not need (see common_fit_moe_margin_gain)
     if (!model_only && moe_margin_gain > 0 && cparams.moe_cache_size > 0 && cparams.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES) {
         cparams.moe_cache_size += (size_t) moe_margin_gain;
@@ -5200,16 +5200,16 @@ uma_restart:
         moe_margin_gain = 0;
     }
 
-    // k19-df2reg: a target beside a DFlash2 drafter with a MoE cache seeds the cache from a prompt's own ids only for ubatches of 1024+
+    // a target beside a DFlash2 drafter with a MoE cache seeds the cache from a prompt's own ids only for ubatches of 1024+
     // tokens (see llama_context::seed_own_min); an explicit LLAMA_MOE_CACHE_SEED_OWN_DFLASH keeps its value
     if (!model_only && cparams.moe_cache_size > 0 && getenv("LLAMA_MOE_CACHE_SEED_OWN_DFLASH") == nullptr &&
             std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end()) {
         common_set_env("LLAMA_MOE_CACHE_SEED_OWN_DFLASH", "1");
     }
 
-    // k19-df2cost: where the DFlash2 cached window band engages (a DFlash drafter, the cache holding LLAMA_DFLASH_CACHED_FRAC_MIN ..
+    // where the DFlash2 cached window band engages (a DFlash drafter, the cache holding LLAMA_DFLASH_CACHED_FRAC_MIN ..
     // LLAMA_DFLASH_CACHED_FRAC_MAX of the host experts, see common/speculative.cpp) the target keeps the verify graphs of two widths
-    // (3 rows and the whole draft) and their CUDA graphs, which the fit did not price: G4 Qwen3.8-Flash-Next UD-IQ4_XS 32 GB, srv_kld long48
+    // (3 rows and the whole draft) and their CUDA graphs, which the fit did not price: RTX PRO 6000 Qwen3.8-Flash-Next 4-bit 32 GB, srv_kld long48
     // aborted with CUDA out of memory after a 2096-token prompt. The cache leaves LLAMA_DFLASH_CACHED_RESERVE_MIB (K19_DF2COST_RESERVE_MIB)
     // of device memory for them (0: none)
     if (!model_only && cparams.moe_cache_size > 0 && cparams.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES &&
@@ -5335,9 +5335,9 @@ uma_restart:
         cparams.n_mem_reserve    = reserve_bytes.size();
     }
 
-    // k19-rollback: the n-gram suffix drafter alone asked for the recurrent rollback rows (need_n_rs_seq) of a model whose rollback
+    // the n-gram suffix drafter alone asked for the recurrent rollback rows (need_n_rs_seq) of a model whose rollback
     // keeps a large state per drafted token (GDN / Mamba hybrids), and the layer weights spill to host memory: the rows (7 x 8.4 MiB conv
-    // rows + replay stores on G4 Qwen3.8-Flash-Next, 59 MiB at 8 GB, where the small-device placement has ~50 MiB left) go, and a
+    // rows + replay stores on RTX PRO 6000 Qwen3.8-Flash-Next, 59 MiB at 8 GB, where the small-device placement has ~50 MiB left) go, and a
     // window that is not fully accepted is rolled back from the host copy of the state (llama_rs_snap_save, one sequence). Nothing stays
     // on the device for the drafter; where nothing repeats the launch runs as one without it. The fit priced the rows, so their memory
     // stays free. LLAMA_SPEC_SUFFIX_RS=1 keeps the rows (=0 never takes them, as before)
@@ -5356,7 +5356,7 @@ uma_restart:
         }
     }
 
-    // -t given: the threads that compute missing experts on the host are the user's too (k11 LLAMA_MOE_HOST_THREADS)
+    // -t given: the threads that compute missing experts on the host are the user's too (LLAMA_MOE_HOST_THREADS)
     if (params.n_threads_set && getenv("LLAMA_MOE_HOST_THREADS") == nullptr) {
         common_set_env("LLAMA_MOE_HOST_THREADS", "0");
     }
@@ -5420,7 +5420,7 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    // k19-g4pref: the MoE cache's default cross-layer prefetch stays off beside an MTP drafter (G4 Flash-Next Studio MTP n2 at depth 4,
+    // the MoE cache's default cross-layer prefetch stays off beside an MTP drafter (RTX PRO 6000 Flash-Next Studio MTP n2 at depth 4,
     // 48 GB: 8k tok/s geomean 0.90 over 6 prompts with it on); an explicit LLAMA_MOE_PREFETCH or LLAMA_MOE_PREFETCH_AUTO is kept
     if (getenv("LLAMA_MOE_PREFETCH") == nullptr && getenv("LLAMA_MOE_PREFETCH_AUTO") == nullptr &&
             std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) !=
@@ -5584,7 +5584,7 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
-    // k13: with frozen MoE-cache small batches (LLAMA_MOE_CPU_MISS_FROZEN=1 / LLAMA_SPEC_EXACT_FROZEN=1) the probe decode below runs for
+    // with frozen MoE-cache small batches (LLAMA_MOE_CPU_MISS_FROZEN=1 / LLAMA_SPEC_EXACT_FROZEN=1) the probe decode below runs for
     // recurrent rollback contexts too: its two tokens fill free cache slots before the freeze, so a context with drafts (rollback
     // snapshots, no probe before) started from another cache than the same context without them, and the texts differed
     const bool rs = llama_n_rs_seq(ctx) > 0;
@@ -5946,7 +5946,7 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
     return common_overrides_put_experts_on_host(overrides, std::max<int64_t>(n_layer + 1 - n_gpu, 0), n_layer, experts);
 }
 
-// k10: whether the MoE cache will take its default hybrid gate (llama_moe_cache: LLAMA_MOE_CACHE_HYBRID unset and the slots hold at most
+// whether the MoE cache will take its default hybrid gate (llama_moe_cache: LLAMA_MOE_CACHE_HYBRID unset and the slots hold at most
 // LLAMA_MOE_CACHE_HYBRID_MAX_FRAC (0.10) of the host experts' bytes). Estimated from the fitted cache size and the expert bytes of the layers
 // whose experts the overrides (or n_gpu_layers) leave on the host, all expert layers of the same size
 static bool common_moe_hybrid_gate_on(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers) {
@@ -5959,7 +5959,7 @@ static bool common_moe_hybrid_gate_on(const common_params & params, const llama_
     if ((env_cm != nullptr && atoi(env_cm) == 2) || ((env_cm == nullptr || atoi(env_cm) != 0) && env_cg != nullptr && atoi(env_cg) == 0)) {
         return false;
     }
-    // k19-exactmtp: LLAMA_MTP_EXACT=1 turns the cache's host path off (no hybrid gate) unless LLAMA_MOE_CPU_MISS=1 / LLAMA_MOE_EXACT_HOST=1
+    // LLAMA_MTP_EXACT=1 turns the cache's host path off (no hybrid gate) unless LLAMA_MOE_CPU_MISS=1 / LLAMA_MOE_EXACT_HOST=1
     {
         const char * x = getenv("LLAMA_MTP_EXACT");
         const char * k = getenv("LLAMA_MOE_EXACT_HOST");
@@ -6050,9 +6050,9 @@ static bool common_moe_lowram_maps(const common_params & params, int32_t n_gpu_l
 }
 
 static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers) {
-    // k15-fn (LLAMA_MOE_LOWRAM_MAP=0 off): an explicit --load-mode none copies every host expert into pinned memory, which is not
-    // reclaimable; where the host experts and 8 GiB do not fit in the available memory that load is killed for memory (G4 fndl at
-    // 48 GiB: Flash-Next UD-IQ4_XS, 57.4 GB of host experts, rc -9). Load with mmap there instead: the weight store streams the experts
+    // (LLAMA_MOE_LOWRAM_MAP=0 off): an explicit --load-mode none copies every host expert into pinned memory, which is not
+    // reclaimable; where the host experts and 8 GiB do not fit in the available memory that load is killed for memory (RTX PRO 6000 fndl at
+    // 48 GiB: Flash-Next 4-bit, 57.4 GB of host experts, rc -9). Load with mmap there instead: the weight store streams the experts
     // and the MoE cache RAM tier serves them. Never where they fit, so every such host loads as before
     uint64_t expert_bytes = 0, avail = 0;
     if (load_mode == LLAMA_LOAD_MODE_NONE && common_moe_lowram_maps(params, n_gpu_layers, &expert_bytes, &avail)) {
@@ -6096,10 +6096,10 @@ static enum llama_load_mode common_moe_cache_load_mode(const common_params & par
         if (model_bytes > 0 && model_bytes <= 0.8*mem_avail) {
             // with host experts the load without mmap copies them into pinned memory, which is not reclaimable, while the page cache
             // still holds the file it reads them from: where both do not fit, the copy evicts the file it reads and the load reads it
-            // from the disk again (L4, 53 GB RAM, Qwen3.6-35B-A3B UD-Q4_K_XL 21 GB at a 12 GB cap: 56 s vs 10.6 s with mmap). With mmap the
+            // from the disk again (L4, 53 GB RAM, Qwen3.6-35B-A3B 4-bit 21 GB at a 12 GB cap: 56 s vs 10.6 s with mmap). With mmap the
             // device lookup registers the mapped pages in place (no second copy). So without mmap only if the host experts and the file fit
             // in LLAMA_MOE_LOAD_NONE_RAM_FRAC (0.5) of the available memory; with every expert on a device nothing is pinned, the rule above.
-            // G4 with a host RAM ballast, the same model at 12 GB (41 GB of host experts and file): MemAvailable 49 GB (84%) loaded without mmap
+            // RTX PRO 6000 with a host RAM ballast, the same model at 12 GB (41 GB of host experts and file): MemAvailable 49 GB (84%) loaded without mmap
             // in 48.8 s vs 5.9 s with mmap, 59 GB (69%) still in 19-54 s, 177 GB (23%) in 8.2 s; the registered mapping reads slower once
             // loaded: decode 164.8 vs 179.2 tok/s, 2k prompt 5212 vs 7326 tok/s (--load-mode none keeps that steady state at the cost of the load)
             double none_frac = 0.5;
@@ -6114,7 +6114,7 @@ static enum llama_load_mode common_moe_cache_load_mode(const common_params & par
                 expert_bytes = common_moe_slot_bytes_of(params.model.path, sb) && sb.total > 0 ? (uint64_t) sb.total : model_bytes;
             }
             // a model file in tmpfs / ramfs is memory already, outside the available memory, and the copy cannot evict it: only the pinned
-            // copy of the host experts counts there (G4, Flash-Next UD-IQ1_S in /dev/shm at 8 GB: 38000 + 69186 MiB against 50% of 108171 MiB
+            // copy of the host experts counts there (RTX PRO 6000, Flash-Next 1-bit in /dev/shm at 8 GB: 38000 + 69186 MiB against 50% of 108171 MiB
             // took the mmap load, 2k decode 60.4 vs 64.4 tok/s and prompt 1946 vs 2270 tok/s without mmap). LLAMA_MOE_LOAD_NONE_TMPFS=0 counts the file
             const char * env_tmpfs = getenv("LLAMA_MOE_LOAD_NONE_TMPFS");
             const bool file_in_ram = (env_tmpfs == nullptr || atoi(env_tmpfs) != 0) && common_model_file_in_ram(params.model.path);
@@ -6176,9 +6176,9 @@ static struct llama_model_params common_model_params_to_llama_impl(common_params
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-    // k19-q38t: with a separate MTP drafter (-md + draft-mtp) the draft context runs on the drafter's own NextN block and draft head
+    // with a separate MTP drafter (-md + draft-mtp) the draft context runs on the drafter's own NextN block and draft head
     // (common_speculative_init_result), so the target's NextN layers and the restricted draft head built from them were loaded for
-    // nothing: Qwen3.8-27B UD-Q3_K_XL on a T4, 569 MiB of device memory (12240 vs 11671 MiB of weights), enough to push 6 of 66 layers
+    // nothing: Qwen3.8-27B 3-bit on a T4, 569 MiB of device memory (12240 vs 11671 MiB of weights), enough to push 6 of 66 layers
     // to the host and drop the drafter there. The target is loaded without them (the drafter's file loads its own: its path is the
     // model path of the draft params). The target graph never reads them, so its text is unchanged.
     // LLAMA_MTP_MD_TARGET_NEXTN=1: load them as before
@@ -6762,9 +6762,9 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
 
     llama_batch_ext * res = batch.get();
     llama_batch_ext_clear(res);
-    // k19-host (LLAMA_BATCH_STATE_REF=0: copied as before): a batch of 64 entries or more (an MTP drafter's prompt pass) hands its state
+    // (LLAMA_BATCH_STATE_REF=0: copied as before): a batch of 64 entries or more (an MTP drafter's prompt pass) hands its state
     // rows to the context by reference: the views given to set_embd_state() stay valid until the decode that takes this batch returns
-    // (the caller decodes it at once), so the rows are read in place instead of copied into the batch first (G4 Flash-Next + Q8_0 MTP
+    // (the caller decodes it at once), so the rows are read in place instead of copied into the batch first (RTX PRO 6000 Flash-Next + Q8_0 MTP
     // drafter: 240 MiB, ~13 ms on the server thread for the 6144-row segment of an 8k prompt)
     static const bool state_ref_env = getenv("LLAMA_BATCH_STATE_REF") == nullptr || atoi(getenv("LLAMA_BATCH_STATE_REF")) != 0;
     const bool state_ref = state_ref_env && n >= 64;
@@ -6930,18 +6930,18 @@ static bool ckpt_pool_on() {
 
 static std::mutex                    g_ckpt_pool_mutex;
 static std::vector<common_state_buf> g_ckpt_pool;
-// k17: capacities of the buffers a background copy returns to the pool once it is done (common_state_buf_pending_add)
+// capacities of the buffers a background copy returns to the pool once it is done (common_state_buf_pending_add)
 static std::vector<size_t>           g_ckpt_pool_pending;
 
-// k11: the pool keeps at most this many bytes (LLAMA_STATE_POOL_MIB, default 1024) and 8 buffers
+// the pool keeps at most this many bytes (LLAMA_STATE_POOL_MIB, default 1024) and 8 buffers
 // largest buffer asked of the pool so far (the lock is held by the callers that write it)
 static size_t g_ckpt_pool_req_max = 0;
 
 // ... and at most twice the largest request (one state being saved, one ready for the next save): a pool kept at its byte cap held up to
-// 1 GiB idle at the end of a run, 6-7x the state of LFM2.5. k17: default on (LLAMA_STATE_POOL_REL=0: the byte cap alone), with the
+// 1 GiB idle at the end of a run, 6-7x the state of LFM2.5. default on (LLAMA_STATE_POOL_REL=0: the byte cap alone), with the
 // request save's checkpoint copies on a thread (LLAMA_PCS_CKPT_COPY_ASYNC) the T4 multi-turn run ends below the copies made in place:
 // LFM2.5 2553 vs 2740 MiB, Qwen3.6 MTP 23379 vs 23975 MiB (with LLAMA_STATE_POOL_PENDING and _SMALL_FRESH), same text, same VmHWM,
-// G4 q4x 12 GB chat TTFT 101 vs 125 ms
+// RTX PRO 6000 4-bit 12 GB chat TTFT 101 vs 125 ms
 static size_t ckpt_pool_limit() {
     static const size_t lim = (size_t) (getenv("LLAMA_STATE_POOL_MIB") ? std::max(0, atoi(getenv("LLAMA_STATE_POOL_MIB"))) : 1024) << 20;
     static const bool rel = getenv("LLAMA_STATE_POOL_REL") == nullptr || atoi(getenv("LLAMA_STATE_POOL_REL")) != 0;
@@ -6974,7 +6974,7 @@ void common_state_buf_recycle(common_state_buf && buf) {
     ckpt_pool_trim();
 }
 
-// k17 (LLAMA_STATE_POOL_PENDING=0: off): a buffer on its way back to the pool (the originals of the checkpoint copies a request save runs
+// (LLAMA_STATE_POOL_PENDING=0: off): a buffer on its way back to the pool (the originals of the checkpoint copies a request save runs
 // on a thread, LLAMA_PCS_CKPT_COPY_ASYNC) counts as pooled for the prefault worker. Without it the worker saw a pool short of the
 // buffers the copy still held, faulted in fresh ones, and the originals then landed on top: the pool ended fuller than with the copies
 // made in place, where the slot's erase returns the originals before the worker runs (T4 LFM2.5 multi-turn end RSS +577 MiB)
@@ -7046,7 +7046,7 @@ void common_state_thp_free(void * p) {
 #endif
 }
 
-// k11 (LLAMA_STATE_PREFAULT, default on with the pool, =0 off): a background thread keeps buffers whose pages are already resident
+// (LLAMA_STATE_PREFAULT, default on with the pool, =0 off): a background thread keeps buffers whose pages are already resident
 // in the pool, so the prompt-cache save and the checkpoints of the next request do not fault in fresh memory on the TTFT path
 static bool state_prefault_on() {
     static const bool on = ckpt_pool_on() && (getenv("LLAMA_STATE_PREFAULT") == nullptr || atoi(getenv("LLAMA_STATE_PREFAULT")) != 0);
@@ -7105,7 +7105,7 @@ struct state_prefault_worker {
                     have  += b.capacity() >= n && (fit > 0 ? b.capacity() / fit <= n : (!ckpt_pool_fit() || b.capacity() / ckpt_pool_fit() <= n));
                     total += b.capacity();
                 }
-                for (const size_t cap : g_ckpt_pool_pending) { // k17: the buffers a background copy returns shortly
+                for (const size_t cap : g_ckpt_pool_pending) { // the buffers a background copy returns shortly
                     have  += cap >= n && (fit > 0 ? cap / fit <= n : (!ckpt_pool_fit() || cap / ckpt_pool_fit() <= n));
                     total += cap;
                 }
@@ -7186,7 +7186,7 @@ size_t common_state_buf_pool_bytes() {
     return t;
 }
 
-// k17 (LLAMA_STATE_POOL_SMALL_FRESH=0: off, any request takes the smallest pooled buffer that fits): a request below the pool's minimum
+// (LLAMA_STATE_POOL_SMALL_FRESH=0: off, any request takes the smallest pooled buffer that fits): a request below the pool's minimum
 // (1 MiB, the size it keeps) gets fresh memory, not a pooled buffer. Every pooled buffer is a state or a large checkpoint, so a small
 // checkpoint took one whole and kept it resident for as long as it lived: T4 LFM2.5 multi-turn, 6 checkpoints of 2.8 MiB held 308 MiB
 // in the slot and 1.4 MiB held 389 MiB in the cache entry. Faulting in a fresh buffer this small costs microseconds
@@ -7213,7 +7213,7 @@ bool common_state_buf_take(common_state_buf & buf, size_t n) {
     }
     // a buffer more than twice the request is left in the pool: a small checkpoint that took a state buffer kept all of it resident for as
     // long as the checkpoint lived (its capacity is not in the prompt cache's size), e.g. 2.8 MiB of checkpoints held 149 MiB on LFM2.5
-    // (opt-in LLAMA_STATE_POOL_FIT=1: G4 q4x reuse turns +1.4-2.5 ms with it and REL; default: any buffer that fits)
+    // (opt-in LLAMA_STATE_POOL_FIT=1: RTX PRO 6000 4-bit reuse turns +1.4-2.5 ms with it and REL; default: any buffer that fits)
     if (best == g_ckpt_pool.end() || (ckpt_pool_fit() && best->capacity() / ckpt_pool_fit() > n)) {
         return false;
     }
@@ -7260,14 +7260,14 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    // k17 (LLAMA_STATE_CKPT_FIT=0: any pooled buffer that fits): a new checkpoint takes a pooled buffer of at most twice its size, and the
+    // (LLAMA_STATE_CKPT_FIT=0: any pooled buffer that fits): a new checkpoint takes a pooled buffer of at most twice its size, and the
     // prefault worker keeps two of those ready. Every pooled buffer is a state or a checkpoint, and a checkpoint that took a state buffer kept
-    // it whole for its life, in the slot and in the cache entry it was lent or moved to: G4 resident Qwen3.6 MTP multi-turn, 8 checkpoints
+    // it whole for its life, in the slot and in the cache entry it was lent or moved to: RTX PRO 6000 resident Qwen3.6 MTP multi-turn, 8 checkpoints
     // of 502 MiB held 860-980 MiB, the entry's 691 MiB held 1387 MiB with the idle lend (1173 MiB without). Copies (clones) keep the
-    // pool's rule: they come several at once on a reuse turn, where a fitted pool faulted fresh pages on the request path (round 26)
+    // pool's rule: they come several at once on a reuse turn, where a fitted pool faulted fresh pages on the request path
     // default auto: only once the server lends checkpoints at idle (common_state_ckpt_fit_enable, resident placements): T4 Qwen3.6 MTP
     // (spilled, no lend) ended +152 MiB with the fit always on (fresh fitted buffers beside the pooled state buffers) and reuse turns
-    // 2-5% slower; G4 resident -339 MiB with it (3649 vs 3988), where the lent checkpoints otherwise kept the state buffers whole
+    // 2-5% slower; RTX PRO 6000 resident -339 MiB with it (3649 vs 3988), where the lent checkpoints otherwise kept the state buffers whole
     if (common_state_ckpt_fit()) {
         common_state_buf_take_fit(data_tgt, ckpt_size, 2);
         common_state_buf_prefault_fit(ckpt_size, 2, 2);

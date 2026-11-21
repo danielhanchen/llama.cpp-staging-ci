@@ -37,7 +37,7 @@ enum common_layer_fraction_t {
 // --fit-kv-resident auto: use the KV-resident placement for a dense model only if the whole-layer placement would put less than this much
 // KV cache (incl. recurrent state) in system memory per byte of weights it puts there. Making room in device memory for that KV cache moves
 // as many bytes of FFN weights to system memory, which every token reads, while the whole-layer placement reads only the used cells.
-// Calibrated on k6 (Colab G4 RTX PRO 6000, EPYC 9B45 48 vCPU at -t 24 and pinned to 8 / 6 physical cores; Qwen3.8-27B, gemma-4-12B,
+// Calibrated on (RTX PRO 6000, EPYC 9B45 48 vCPU at -t 24 and pinned to 8 / 6 physical cores; Qwen3.8-27B, gemma-4-12B,
 // gemma-4-31B, Llama-3.1-8B; VRAM 4-16 GB, -c 8192 / 32768; llama-server, 2048-token prompt, medians of 3): below 0.13 (ratios
 // 0.045-0.120, 8 cells x 3 thread counts) FFN first decoded +0.0..+8.8% faster and processed prompts +0.8..+21% faster; from 0.141 up
 // (0.141-1.012, 8 cells) it decoded up to 34% slower: slower in every cell at 6 threads (-0.6..-33%), faster only in the two
@@ -51,17 +51,17 @@ class common_params_fit_exception : public std::runtime_error {
 
 static bool    g_moe_margin_auto = true;
 static int64_t g_moe_margin_gain = 0;
-// k19-kvsel: measurements count the K/V bytes of host chunks (mb.kv_sel) on their device, as without LLAMA_KV_SEL_HOST (see common_fit_impl)
+// measurements count the K/V bytes of host chunks (mb.kv_sel) on their device, as without LLAMA_KV_SEL_HOST (see common_fit_impl)
 static bool    g_fit_sel_as_dev  = false;
-// k19-kvsel auto: this fit placed the K/V of host chunks (common_fit_impl), and whether any fit of the process did (common_fit_kv_sel_granted)
+// this fit placed the K/V of host chunks (common_fit_impl), and whether any fit of the process did (common_fit_kv_sel_granted)
 static bool    g_fit_sel_granted = false;
 static bool    g_fit_sel_any     = false;
 static bool    g_fit_sel_allow   = true;  // common: false for a launch that asks for a drafter (common_fit_kv_sel_allow)
 static size_t  g_fit_sel_bytes   = 0;     // the K/V bytes in host chunks of the last grant (common_fit_kv_sel_host_bytes)
 
-// k19-fitfaoff: the last measured context ran attention without flash attention (-fa off, or auto resolved off)
+// the last measured context ran attention without flash attention (-fa off, or auto resolved off)
 static bool    g_fit_fa_off      = false;
-// k19-fitfaoff: bytes of one F16 copy of the largest KQ matrix of the last measured context without flash attention (0 with it)
+// bytes of one F16 copy of the largest KQ matrix of the last measured context without flash attention (0 with it)
 static int64_t g_fit_faoff_kq    = 0;
 
 bool common_fit_last_flash_attn() {
@@ -76,9 +76,9 @@ int64_t common_fit_faoff_kq_bytes(int64_t n_head, int64_t n_ubatch, int64_t n_ct
     return std::max<int64_t>(0, n_head)*std::max<int64_t>(0, n_ubatch)*std::max<int64_t>(0, n_ctx)*2;
 }
 
-// k19-fitfaoff: -ub / LLAMA_ARG_UBATCH given (common_fit_set_ubatch_user): the fit keeps that n_ubatch without flash attention
+// -ub / LLAMA_ARG_UBATCH given (common_fit_set_ubatch_user): the fit keeps that n_ubatch without flash attention
 static bool     g_fit_ub_user    = false;
-// k19-fitfaoff: the smallest n_ubatch a fit without flash attention chose since the last reset (0: none chosen)
+// the smallest n_ubatch a fit without flash attention chose since the last reset (0: none chosen)
 static uint32_t g_fit_faoff_ub   = 0;
 
 void common_fit_set_ubatch_user(bool ub_user) {
@@ -136,7 +136,7 @@ void common_fit_set_prewarm_graphs(int n_graphs) {
     g_prewarm_graphs = std::max(0, n_graphs);
 }
 
-// k19-l4gap2: the rows of a speculative verify window (draft n_max + 1; 1 without a drafter), set before the fit
+// the rows of a speculative verify window (draft n_max + 1; 1 without a drafter), set before the fit
 static int g_verify_rows = 1;
 
 void common_fit_set_verify_rows(int n_rows) {
@@ -149,7 +149,7 @@ bool common_fit_small_device() {
     return g_small_device;
 }
 
-// k19-place8: see the small-device branch of common_params_fit_impl. Skipped where the user set LLAMA_MOE_TINY_RELEASE_FORCE (the test
+// see the small-device branch of common_params_fit_impl. Skipped where the user set LLAMA_MOE_TINY_RELEASE_FORCE (the test
 // knob of the same release) before the first fit; LLAMA_FIT_PLACE8=0 off; LLAMA_FIT_PLACE8_UB (31): the largest ubatch the decode-sized
 // context runs beside the whole cache
 static bool g_place8 = false;
@@ -179,7 +179,7 @@ static bool common_fit_place8_on() {
 }
 
 // the default is one token below the batch from which the CUDA backend copies host weights to compute an op on the device
-// (GGML_OP_OFFLOAD_MIN_BATCH, 32): a reserve at 32 tokens holds the expert copies of a split (G4 8 GB fn4: 1709 MiB of compute, the
+// (GGML_OP_OFFLOAD_MIN_BATCH, 32): a reserve at 32 tokens holds the expert copies of a split (RTX PRO 6000 8 GB a 4-bit MoE: 1709 MiB of compute, the
 // cache grew 65 -> 669 MiB only), one at 31 computes the experts its slots do not hold on the host
 static uint32_t common_fit_place8_ub() {
     static const uint32_t ub = [] {
@@ -193,7 +193,7 @@ static uint32_t common_fit_place8_ub() {
 }
 
 // read by the context (llama_context, see tiny_rel_ub) when it is created: set for the loaded context, never for a measurement
-// mid: k19-placemid (a device of the regular fit, not the small-device branch): the context keeps its layer-major prompt groups, the
+// mid: the mid-size placement (a device of the regular fit, not the small-device branch): the context keeps its layer-major prompt groups, the
 // cache keeps multi-token hybrid batches (LLAMA_MOE_PLACE8_MID) and the draft model is fitted as usual
 static bool g_place8_mid = false;
 
@@ -202,10 +202,10 @@ bool common_fit_place8_mid() {
 }
 
 // grow_mib (mid only): the compute buffer memory the cache took, which a released layer-major group may grow back into
-// k19-g4cbuf (LLAMA_FIT_PLACE8_FA_INPLACE=0 off): with the graphs of a device reserved at ub tokens, flash attention reads a q8_0 K / V
+// (LLAMA_FIT_PLACE8_FA_INPLACE=0 off): with the graphs of a device reserved at ub tokens, flash attention reads a q8_0 K / V
 // in place up to that many rows on that device (the CUDA backend's "ggml_backend_cuda_set_fa_q8_inplace_rows"; every other device and
 // context keeps 16), so the decode-sized reserve holds no f16 copy of the whole K / V. Set before the fit's decode-sized measurements,
-// so the cache gets that memory, and reset with the placement. G4 Qwen3.8-Flash-Next UD-IQ4_XS: 12 GB / 262K compute 561 -> 193 MiB,
+// so the cache gets that memory, and reset with the placement. RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits: 12 GB / 262K compute 561 -> 193 MiB,
 // decode chat 73.0 -> 74.5, 8k 67.7 -> 72.3 tok/s; 10 GB / 131K 285 -> 101 MiB, level; first-token KLD identical (paired), decode
 // KLD in the -fa off band
 static ggml_backend_dev_t g_place8_fa_dev = nullptr;
@@ -231,8 +231,8 @@ static void common_fit_place8_fa_rows(ggml_backend_dev_t dev, uint32_t ub) {
     }
 }
 
-// groups: the k19-pgroups small device (LLAMA_MOE_PLACE8_GROUPS, read by the context), which keeps the layer-major groups of a mid-size
-// device but not its short-prompt split or its routed refills (see llama_context, k19-pgroups2)
+// groups: the the small-device prompt groups small device (LLAMA_MOE_PLACE8_GROUPS, read by the context), which keeps the layer-major groups of a mid-size
+// device but not its short-prompt split or its routed refills (see llama_context, its prompt groups)
 static void common_fit_place8_env(uint32_t ub, bool mid = false, int64_t grow_mib = 0, bool groups = false, ggml_backend_dev_t dev = nullptr) {
     common_fit_place8_fa_rows(ub > 0 ? dev : nullptr, ub);
     common_set_env("LLAMA_MOE_PLACE8_UB", ub > 0 ? std::to_string(ub) : "");
@@ -242,13 +242,13 @@ static void common_fit_place8_env(uint32_t ub, bool mid = false, int64_t grow_mi
     g_place8_mid = ub > 0 && mid;
 }
 
-// k19-l4poly: a host-bound small device. A device with less than LLAMA_FIT_PLACE8_MIN_FREE_MIB (6144) free whose every layer fits
+// a host-bound small device. A device with less than LLAMA_FIT_PLACE8_MIN_FREE_MIB (6144) free whose every layer fits
 // within the default margin, but beside a MoE cache of at most LLAMA_FIT_HOSTBOUND_MAX_FRAC (0.10, the share of the hybrid gate,
 // LLAMA_MOE_CACHE_HYBRID_MAX_FRAC) of the host experts: the host computes most misses of every decode step and a larger cache is what
-// shortens it. Colab L4 capped at 4 GB, LFM2.5-24B-A2B UD-Q4_K_XL ctx 16384 (3696 MiB free, 13371 MiB of host experts): a 1157 MiB
+// shortens it. L4 capped at 4 GB, LFM2.5-24B-A2B at 4 bits ctx 16384 (3696 MiB free, 13371 MiB of host experts): a 1157 MiB
 // cache at the 1024 MiB margin, 663 MiB of it after the tiny-cache n_ubatch rule (117 slots, 4.8%).
 // Such a device takes the small-device placement (the 256 MiB margin + the run-time reserve) and its
-// k19-place8 decode-sized cache. LLAMA_FIT_HOSTBOUND=0 off
+// the small-device placement decode-sized cache. LLAMA_FIT_HOSTBOUND=0 off
 static bool g_hostbound = false;
 
 bool common_fit_hostbound() {
@@ -260,7 +260,7 @@ double common_fit_hostbound_max_frac() {
     return f;
 }
 
-// the k19-place8 multi-token guard (LLAMA_MOE_PLACE8_SINGLE) is off on a host-bound device: k19-nanfix (the cause) is merged, and its
+// the small-device multi-token guard (LLAMA_MOE_PLACE8_SINGLE) is off on a host-bound device: the NaN fix (the cause) is merged, and its
 // verify windows otherwise run every expert on the host. Only set while the user has not set it, and taken back by the next fit
 static void common_fit_hostbound_env(bool on) {
     static bool set_by_fit = false;
@@ -301,7 +301,7 @@ int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, in
     return std::min(reserve_mib, cache_mib - floor_mib);
 }
 
-// k17-small (lazy KV): the MoE cache sizes a fit raised by the unbacked KV, and by how much (every fit of the process)
+// (lazy KV): the MoE cache sizes a fit raised by the unbacked KV, and by how much (every fit of the process)
 static std::vector<std::pair<size_t, size_t>> g_kv_lazy_grants;
 
 size_t common_fit_kv_sel_host_bytes() {
@@ -332,21 +332,21 @@ size_t common_fit_kv_lazy_grant(size_t moe_cache_size) {
 // the margin of a device beside a MoE cache for the default margin m (see common_fit_set_moe_margin_auto)
 static int64_t common_fit_moe_margin_impl(int64_t m, int64_t free_dev, int64_t cache_want, bool has_drafter);
 
-// k19-fitfaoff (LLAMA_FIT_FAOFF_MARGIN=0 off): without flash attention the reduced margin beside a MoE cache is not taken. The
+// (LLAMA_FIT_FAOFF_MARGIN=0 off): without flash attention the reduced margin beside a MoE cache is not taken. The
 // attention then runs as KQ / KQV mat-muls whose F16 copies of the KQ matrix (n_kv x n_tokens x n_head) come from the CUDA pool at
 // run time, outside the measured compute buffer; the reduced margin (256 MiB, gated with flash attention on) does not hold them.
-// Kaggle 2x T4, DeepSeek-V4.1 fake dsf8, -fa off, --moe-cache-mib auto, ctx 16384: fit projected 1297 MiB free on CUDA1 at the 1024 MiB
+// 2x T4, a fake DeepSeek-V4.1, -fa off, --moe-cache-mib auto, ctx 16384: fit projected 1297 MiB free on CUDA1 at the 1024 MiB
 // margin, the cache then took +768 MiB per device (+1536 total), and the first 2100-token prompt aborted with CUDA out of memory in
 // the pool (cuMemCreate). The measured compute buffer itself matched the run (CUDA1 10768 MiB both)
-// k19-q4cap (LLAMA_FIT_MOE_HEADLESS=0 off, =1 also on a card with a display): on a headless card (the CUDA backend's NVML display signal,
-// as k19-fitplain) with a device budget of at least LLAMA_FIT_MOE_HEADLESS_MIN_GIB (10), the default 1024 MiB margin beside a MoE cache
+// (LLAMA_FIT_MOE_HEADLESS=0 off, =1 also on a card with a display): on a headless card (the CUDA backend's NVML display signal,
+// as the plain-launch step-down) with a device budget of at least LLAMA_FIT_MOE_HEADLESS_MIN_GIB (10), the default 1024 MiB margin beside a MoE cache
 // steps down to LLAMA_FIT_MOE_HEADLESS_MIB (512) where the rule above keeps it (beside a drafter or MTP heads, or a cache share over
 // its ratio). Nothing else allocates on such a card, and from 10 GiB the host weight prefetch staging of the main context lives in lent
 // cache memory (L4 12 GB: 354 MiB lent) instead of the margin; below that the staging (T4 8 GB: 386 MiB, depth 2) and the prompt
-// graphs of the released banks need the margin: Colab T4 8 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, margin 512: the main context's
+// graphs of the released banks need the margin: T4 8 GB, Qwen3.6-35B-A3B at 4 bits + MTP, margin 512: the main context's
 // staging was not allocated (chat -5.7..-8%) and a 30k prompt aborted (3445 MiB compute buffer, cudaMalloc out of memory). Gains with
-// it (Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, 3 launches, chat / 8k decode): G4 @16 +4.7 / +2.3%, L4 12 GB +1.3 / +6.0% (30k +10.7%), L4 16 GB 0 / +0.8%, T4 12 GB
-// +1.2 / +3.3%; KLD short192 / long48 inside the -fa off band (L4 12 GB, T4 8 GB). Cards with a display keep 1024 (other processes)
+// it (Qwen3.6-35B-A3B at 4 bits + MTP, 3 launches, chat / 8k decode): RTX PRO 6000 @16 +4.7 / +2.3%, L4 12 GB +1.3 / +6.0% (30k +10.7%), L4 16 GB 0 / +0.8%, T4 12 GB
+// +1.2 / +3.3%; KLD short / long prompts inside the -fa off band (L4 12 GB, T4 8 GB). Cards with a display keep 1024 (other processes)
 static int64_t common_fit_moe_margin_headless(int64_t m, int64_t r, int64_t free_dev, int headless) {
     constexpr int64_t MiB_ = 1024*1024;
     constexpr int64_t m_default = 1024*MiB_;
@@ -398,17 +398,17 @@ static int64_t common_fit_moe_margin_impl(int64_t m, int64_t free_dev, int64_t c
     if (!g_moe_margin_auto || m < m_default) {
         return m;
     }
-    // k17-models: on by default (256 MiB stay free beside the cache) where the device budget is at least LLAMA_MOE_FIT_MARGIN_MIN_GIB (10)
-    // and the host experts the cache would hold are at most LLAMA_MOE_FIT_MARGIN_MAX_RATIO (1.3; k18: 1.8 cost Flint 16 GB (1.37) +71 / +181 ms
-    // G4 / L4 chat TTFT) times that budget: a cache that holds a
+    // on by default (256 MiB stay free beside the cache) where the device budget is at least LLAMA_MOE_FIT_MARGIN_MIN_GIB (10)
+    // and the host experts the cache would hold are at most LLAMA_MOE_FIT_MARGIN_MAX_RATIO (1.3; 1.8 cost Flint 16 GB (1.37) +71 / +181 ms
+    // RTX PRO 6000 / L4 chat TTFT) times that budget: a cache that holds a
     // small share of a large expert set stages many misses per prompt ubatch at run time and needs the margin.
-    // Gate (k17m_l4mm / g4mm / g4mg / g4mh, chat to 30k prompts, log grep for allocation failures and fallbacks), experts / budget:
-    //   pass with 256: LFM2.5 Q4_K_XL 12 GB (1.12), q4x + MTP 12 / 16 GB (1.58 / 1.17), Flint Q4_K_XL 16 GB (1.37),
-    //     Flash-Next IQ1_S + MTP 16 / 24 GB (2.38 / 1.58), IQ4_XS + MTP 24 GB (2.37), q4x 8 GB (2.40)
-    //   fail with 256: Flint 12 GB (1.85: no allocation failure, but its pinned text follows the cache size and short192 KLD is x1.03 over
-    //     a one-point G4 band), Flint 8 GB (2.82, prefetch staging allocation failed), Flash-Next IQ4_XS 12 GB (4.78, CUDA out of memory abort)
+    // Gate (L4 and RTX PRO 6000 runs, chat to 30k prompts, log grep for allocation failures and fallbacks), experts / budget:
+    //   pass with 256: LFM2.5 at 4 bits 12 GB (1.12), a 4-bit MoE + MTP 12 / 16 GB (1.58 / 1.17), Flint at 4 bits 16 GB (1.37),
+    //     Flash-Next at 1 bit + MTP 16 / 24 GB (2.38 / 1.58), at 4 bits + MTP 24 GB (2.37), a 4-bit MoE 8 GB (2.40)
+    //   fail with 256: Flint 12 GB (1.85: no allocation failure, but its pinned text follows the cache size and short-prompt KLD is x1.03 over
+    //     a one-point RTX PRO 6000 band), Flint 8 GB (2.82, prefetch staging allocation failed), Flash-Next at 4 bits 12 GB (4.78, CUDA out of memory abort)
     //     and 16 GB (3.55, 1275 MiB staging allocation failed)
-    // Gain: LFM2.5 12 GB cache 9236 -> 10000 MiB, long48 +6..+9% (L4 76.4 -> 83.6, G4 257.4 -> 273.1), chat +6..+10%; q4x 12 GB 0..+12%.
+    // Gain: LFM2.5 12 GB cache 9236 -> 10000 MiB, long-prompt +6..+9% (L4 76.4 -> 83.6, RTX PRO 6000 257.4 -> 273.1), chat +6..+10%; a 4-bit MoE 12 GB 0..+12%.
     // LLAMA_MOE_FIT_MARGIN=0: the full margin everywhere; LLAMA_MOE_FIT_MARGIN_MIB keeps its meaning (below)
     if (getenv("LLAMA_MOE_FIT_MARGIN_MIB") == nullptr) {
         const char * en  = getenv("LLAMA_MOE_FIT_MARGIN");
@@ -416,10 +416,10 @@ static int64_t common_fit_moe_margin_impl(int64_t m, int64_t free_dev, int64_t c
         const char * er  = getenv("LLAMA_MOE_FIT_MARGIN_MAX_RATIO");
         const int64_t mn = (eg != nullptr ? std::max<int64_t>(0, atoll(eg)) : 10)*1024*MiB_;
         const double  mr = er != nullptr ? std::max(0.0, atof(er)) : 1.3;
-        // k18-margin: never beside a draft model or MTP heads (LLAMA_MOE_FIT_MARGIN_DRAFT=1 allows it). The drafter's runtime pools
-        // (mul_mat_q, CUDA graphs) live in that slack once the MTP draft is priced exactly: k15 head b741bad76b7 + the rule aborted with
-        // CUDA out of memory in every G4 q4x + MTP 12 / 16 GB launch (about 130 MiB free after the cache took +768 MiB), fn1 + MTP 24 GB
-        // at 8k / 16k and 1 of 2 L4 q4x + MTP 12 GB launches; the kill switch and base had 0 aborts
+        // never beside a draft model or MTP heads (LLAMA_MOE_FIT_MARGIN_DRAFT=1 allows it). The drafter's runtime pools
+        // (mul_mat_q, CUDA graphs) live in that slack once the MTP draft is priced exactly: an earlier build + the rule aborted with
+        // CUDA out of memory in every RTX PRO 6000 a 4-bit MoE + MTP 12 / 16 GB launch (about 130 MiB free after the cache took +768 MiB), a 1-bit MoE + MTP 24 GB
+        // at 8k / 16k and 1 of 2 L4 a 4-bit MoE + MTP 12 GB launches; the kill switch and base had 0 aborts
         const char * ed = getenv("LLAMA_MOE_FIT_MARGIN_DRAFT");
         const bool draft_ok = ed != nullptr && atoi(ed) != 0;
         if ((en != nullptr && atoi(en) == 0) || free_dev < mn || (double) cache_want > mr*(double) free_dev || (has_drafter && !draft_ok)) {
@@ -427,9 +427,9 @@ static int64_t common_fit_moe_margin_impl(int64_t m, int64_t free_dev, int64_t c
         }
         return m - m_default + 256*MiB_;
     }
-    // opt-in (k11 G4 timing): the 8 GB tiers use the default margin at run time (layer-major groups, prefetch depth, the MTP context's
-    // staging, the CUDA pools: 70 MiB free at the low point of Qwen3.6 UD-Q4_K_XL + MTP); 384 MiB ran out of device memory there and on
-    // Flash-Next UD-IQ1_S, and halved the 8k prompt of Qwen3.6 Q3_K_M
+    // opt-in (RTX PRO 6000 timing): the 8 GB tiers use the default margin at run time (layer-major groups, prefetch depth, the MTP context's
+    // staging, the CUDA pools: 70 MiB free at the low point of Qwen3.6 at 4 bits + MTP); 384 MiB ran out of device memory there and on
+    // Flash-Next at 1 bit, and halved the 8k prompt of Qwen3.6 Q3_K_M
     const char * env = getenv("LLAMA_MOE_FIT_MARGIN");
     const char * e   = getenv("LLAMA_MOE_FIT_MARGIN_MIB");
     if ((env != nullptr && atoi(env) == 0) || e == nullptr) {
@@ -440,14 +440,14 @@ static int64_t common_fit_moe_margin_impl(int64_t m, int64_t free_dev, int64_t c
     return m - m_default + std::min(keep, m_default);
 }
 
-// k17-small (LLAMA_FIT_MTP_PRICE, default 1): the fit prices an MTP drafter as it runs. Once the draft attaches, the target's graphs
+// (LLAMA_FIT_MTP_PRICE, default 1): the fit prices an MTP drafter as it runs. Once the draft attaches, the target's graphs
 // also return the hidden state before the output norm (llama_set_embeddings_nextn), and the drafter's graphs return it for their
-// output rows. Both re-reserve larger compute buffers that the measures did not have: Kaggle T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP
-// at ctx 16384, the main context grew 474 -> 506 MiB and q3m 428 -> 466 MiB. g_fit_nextn = 1 while a fit for an MTP target measures
+// output rows. Both re-reserve larger compute buffers that the measures did not have: another T4 4 GB, Qwen3.6-35B-A3B at 4 bits + MTP
+// at ctx 16384, the main context grew 474 -> 506 MiB and a 3-bit MoE 428 -> 466 MiB. g_fit_nextn = 1 while a fit for an MTP target measures
 // the main model; an MTP context's own measure always has it (see below). The drafter without a MoE cache of its own (its share too
-// small) also keeps one prefetch split in its compute, see sched_reserve. =0: the measures before k17-small, =1: on every device.
+// small) also keeps one prefetch split in its compute, see sched_reserve. =0: the measures before the drafter pricing, =1: on every device.
 // Default: on where the server's post-draft floor is (an NVIDIA GPU below compute capability 8.0, see LLAMA_DRAFT_MIN_FREE_MIB), so
-// that the fit rather than that floor decides the drafter there; off elsewhere. G4 (cc 12.0) runs q4x 4 GB 16k + MTP with 18.6 MiB
+// that the fit rather than that floor decides the drafter there; off elsewhere. RTX PRO 6000 (cc 12.0) runs a 4-bit MoE 4 GB 16k + MTP with 18.6 MiB
 // free after the draft (decode 170 tok/s); the exact price would drop the drafter there for the 256 MiB margin (116 tok/s without it).
 // The default is decided once and exported as LLAMA_FIT_MTP_PRICE, which the measure in sched_reserve reads
 // an NVIDIA GPU below compute capability 8.0 among the devices
@@ -478,9 +478,9 @@ static bool common_fit_mtp_price_on() {
             return atoi(e) != 0;
         }
         const bool pre_ampere = common_fit_pre_ampere();
-        // k17-small round 9: on every GPU by default. G4 4 GB, Qwen3.6-35B-A3B UD-Q3_K_M + MTP at ctx 32768 aborted in its first prompt
+        // on every GPU by default. RTX PRO 6000 4 GB, Qwen3.6-35B-A3B at 3 bits + MTP at ctx 32768 aborted in its first prompt
         // with the old price (2 of 2 launches, as base) and runs with the exact one (the fit drops the drafter: 143 tok/s); where the old
-        // price kept the drafter and it ran (q4x 16k / 20k), the main context had lost its host weight prefetch to a failed allocation
+        // price kept the drafter and it ran (a 4-bit MoE 16k / 20k), the main context had lost its host weight prefetch to a failed allocation
         // after the draft attached (8k prompt 1662-1888 tok/s against 9200-9502 without the drafter, decode 11-19% higher with it).
         // LLAMA_FIT_MTP_PRICE_PRE_AMPERE_ONLY=1: only below compute capability 8.0 (054ee0034e5)
         const char * e_pa = getenv("LLAMA_FIT_MTP_PRICE_PRE_AMPERE_ONLY");
@@ -539,10 +539,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
     }
-    g_fit_fa_off = !llama_get_flash_attn(ctx); // k19-fitfaoff: as resolved by the context (auto included)
+    g_fit_fa_off = !llama_get_flash_attn(ctx); // as resolved by the context (auto included)
     g_fit_faoff_kq = g_fit_fa_off ? common_fit_faoff_kq_bytes(llama_model_n_head(model), llama_n_ubatch(ctx), llama_n_ctx(ctx)) : 0;
 
-    // k17-small: measure the graphs the context runs once an MTP draft is attached (unmasked for the target, masked for the drafter,
+    // measure the graphs the context runs once an MTP draft is attached (unmasked for the target, masked for the drafter,
     // as common_speculative sets them)
     if (mtp_price) {
         const bool is_mtp = cparams->ctx_type == LLAMA_CONTEXT_TYPE_MTP;
@@ -587,7 +587,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
-    // k15-fn: the staging arena a lending MoE cache takes over (mb.lend_freed) is memory the measure counted nowhere and the loaded
+    // the staging arena a lending MoE cache takes over (mb.lend_freed) is memory the measure counted nowhere and the loaded
     // context does not take: count it off the device (compute first, then context), as the fit counts the arena of a context that
     // does not lend (not at all). fit_moe_cache_size gives it to the cache. Only with LLAMA_MOE_CACHE_LEND_SAVE=1 (nothing reported otherwise)
     for (size_t i = 0; i < nd; i++) {
@@ -753,18 +753,18 @@ static void common_params_fit_impl(
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
-    common_fit_hostbound_env(false); // k19-l4poly: decided again by every fit
-    // k19-place8: every fit measures without the release a previous fit set up (the small-device branch decides it again)
+    common_fit_hostbound_env(false); // decided again by every fit
+    // every fit measures without the release a previous fit set up (the small-device branch decides it again)
     if (g_place8) {
         common_fit_place8_env(0);
     }
-    // k17-small (lazy KV): a fit beside a drafter measures the KV cache as backed whole, as without LLAMA_KV_LAZY (the KV cache is then
-    // allocated so, see common_init_result): measured lazily, G4 q3m 4 GB 16k + MTP got a 151 MiB cache against 152 without lazy KV;
+    // (lazy KV): a fit beside a drafter measures the KV cache as backed whole, as without LLAMA_KV_LAZY (the KV cache is then
+    // allocated so, see common_init_result): measured lazily, RTX PRO 6000 a 3-bit MoE 4 GB 16k + MTP got a 151 MiB cache against 152 without lazy KV;
     // a fit without one (none asked, or the trial that drops it) measures it lazily. LLAMA_KV_LAZY_FIT_DRAFT=1: lazily beside a drafter too
     {
         const char * e_kv = getenv("LLAMA_KV_LAZY");
         const char * e_fd = getenv("LLAMA_KV_LAZY_FIT_DRAFT");
-        if (e_kv != nullptr && (strcmp(e_kv, "auto") == 0 || atoi(e_kv) != 0)) {   // k19-vramlend: LLAMA_KV_LAZY=auto or 1
+        if (e_kv != nullptr && (strcmp(e_kv, "auto") == 0 || atoi(e_kv) != 0)) {   // LLAMA_KV_LAZY=auto or 1
             const char * v = extra != nullptr && !(e_fd != nullptr && atoi(e_fd) != 0) ? "1" : "0";
 #if defined(_WIN32)
             _putenv_s("LLAMA_KV_LAZY_SUSPEND", v);
@@ -787,20 +787,20 @@ static void common_params_fit_impl(
     const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
-    // k17-small: the main model of a fit with an MTP context on its weights is measured as an MTP target (see g_fit_nextn)
+    // the main model of a fit with an MTP context on its weights is measured as an MTP target (see g_fit_nextn)
     struct nextn_scope {
         int prev;
         explicit nextn_scope(bool on) : prev(g_fit_nextn) { if (on) { g_fit_nextn = 1; } }
         ~nextn_scope() { g_fit_nextn = prev; }
     } nextn_guard(extra != nullptr && extra->shares_model && common_fit_mtp_price_on());
-    const bool has_drafter = extra != nullptr || mparams->load_mtp; // a draft model or MTP heads beside the target (k18-margin)
+    const bool has_drafter = extra != nullptr || mparams->load_mtp; // a draft model or MTP heads beside the target (the drafter margin rule)
 
     dmds_t      dmds_extra;    // memory of the extra model, laid out on the devices of the main model
     std::string key_extra;     // context (and placement, see below) that memory was measured at
 
-    // k16-fit: an extra model that shares the weights of the main model (an MTP context) runs them in the placement the fit gives the
+    // an extra model that shares the weights of the main model (an MTP context) runs them in the placement the fit gives the
     // main model, and takes its share of the main model's MoE cache budget (llama_moe_cache::budget, layer_set::nextn). Measured with
-    // its own parameters (every weight on the device, no cache) it priced the MTP context of Qwen3.6-35B-A3B UD-Q4_K_XL at 323 MiB of
+    // its own parameters (every weight on the device, no cache) it priced the MTP context of Qwen3.6-35B-A3B at 4 bits at 323 MiB of
     // compute; with the experts in system memory it takes 714 MiB of compute (the staging of its host experts) and a 250 MiB cache share,
     // so the loaded drafter left 474 MiB free against the 1024 MiB target (40 MiB at the end of a run). It is measured in the placement
     // and at the cache size of the probe it is added to (one extra measure per distinct placement). LLAMA_FIT_EXTRA_FOLLOW=0: its own
@@ -935,7 +935,7 @@ static void common_params_fit_impl(
     try {
         dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
     } catch (const std::runtime_error &) {
-        // k18-fit-small: an explicit MoE cache too small for the experts of one token fails the probe context; the real context runs
+        // an explicit MoE cache too small for the experts of one token fails the probe context; the real context runs
         // without the cache (llama_context, LLAMA_MOE_CACHE_TOO_SMALL_FAIL=1 fails it), so fit what it runs: one warning instead of an
         // error line (T4 Granite 4.0-H tiny Q4_K_M --moe-cache-mib 4). Only when the same measure without the cache succeeds
         const char * e_fail = getenv("LLAMA_MOE_CACHE_TOO_SMALL_FAIL");
@@ -985,9 +985,9 @@ static void common_params_fit_impl(
         }
     }
 
-    // k19-fitfaoff (LLAMA_FIT_FAOFF_UB=0 off, LLAMA_FIT_FAOFF_MARGIN=0 both off): without flash attention and without -ub, the KQ copy
+    // (LLAMA_FIT_FAOFF_UB=0 off, LLAMA_FIT_FAOFF_MARGIN=0 both off): without flash attention and without -ub, the KQ copy
     // reserve below scales with n_ubatch, so the fit first halves n_ubatch (down to 512) while the whole model at that ubatch misses a
-    // GPU's margin plus the reserve, and only then moves layers / experts to the host. Kaggle 2x T4 dsf8 -fa off ctx 16384: at -ub 2048
+    // GPU's margin plus the reserve, and only then moves layers / experts to the host. 2x T4 fake DeepSeek-V4.1 -fa off ctx 16384: at -ub 2048
     // the 4096 MiB reserve put 8 of 9 layers on the host (4.5 / 2.5 tok/s chat / 8k), at -ub 512 (1024 MiB) 52.7 / 17.1 without an abort
     bool has_gpu = false;
     for (size_t id = 0; id < nd; id++) {
@@ -1032,9 +1032,9 @@ static void common_params_fit_impl(
         g_fit_faoff_ub = g_fit_faoff_ub == 0 ? cparams->n_ubatch : std::min(g_fit_faoff_ub, cparams->n_ubatch);
     }
 
-    // k19-fitfaoff (LLAMA_FIT_FAOFF_MARGIN=0 off): without flash attention the KQ / KQV mat-muls take F16 copies of the KQ matrix
+    // (LLAMA_FIT_FAOFF_MARGIN=0 off): without flash attention the KQ / KQV mat-muls take F16 copies of the KQ matrix
     // (n_head x n_ubatch x n_kv) from the CUDA pool at run time; the measured compute buffer holds the F32 KQ but not those copies.
-    // Each GPU's margin gets one copy at the full context. Kaggle 2x T4, DeepSeek-V4.1 fake dsf8, -fa off, ctx 16384, -ub 2048: with
+    // Each GPU's margin gets one copy at the full context. 2x T4, a fake DeepSeek-V4.1, -fa off, ctx 16384, -ub 2048: with
     // the 1024 MiB margin (1297 MiB projected free on CUDA1) the 7986-token prompt still aborted in a pool allocation (cuMemCreate)
     if (g_fit_fa_off && g_fit_faoff_kq > 0 && common_fit_faoff_keep() && nd > 0) {
         for (size_t id = 0; id < nd; id++) {
@@ -1088,7 +1088,7 @@ static void common_params_fit_impl(
     //           User tensor overrides make auto behave as off.
     // LLAMA_FIT_DENSE_FFN overrides kv_resident (kill switch): 0 = off, 1 = on, 2 = on but whole layers if the layers do not fit without
     // their FFN tensors. With on, user tensor overrides are kept as constraints.
-    // G4 (RTX PRO 6000), gemma-4 E2B UD-IQ2_M at a 2 GB cap, -c 16384, medians of 3: FFN first (34/36 layers) decoded 121.0 tok/s vs 131.6
+    // RTX PRO 6000, gemma-4 E2B at 2 bits at a 2 GB cap, -c 16384, medians of 3: FFN first (34/36 layers) decoded 121.0 tok/s vs 131.6
     // with whole layers (11/36) for 2k prompts at 13641 vs 11048 tok/s, so on is not the default; auto keeps whole layers there.
     enum { DENSE_FFN_OFF = 0, DENSE_FFN_ON = 1, DENSE_FFN_STRICT = 2, DENSE_FFN_AUTO = 3 };
     int fit_dense_ffn_mode = kv_resident == COMMON_FIT_KV_RESIDENT_ON   ? DENSE_FFN_ON   :
@@ -1117,7 +1117,7 @@ static void common_params_fit_impl(
     // memory needs the total shrunk by its deficit scaled by its share of the cache (a total surplus can hide a device that misses its target)
     auto fit_moe_cache_size = [&](dmds_t & dmds, const llama_model_params * mp, const bool use_margins) -> int64_t {
         g_moe_margin_gain = 0; // the last sizing of the cache decides
-        int64_t pw_reserve = 0; // k19-int3fix2: prewarmed verify graphs beside a wide-graphs cache (common_fit_set_prewarm_graphs)
+        int64_t pw_reserve = 0; // prewarmed verify graphs beside a wide-graphs cache (common_fit_set_prewarm_graphs)
         int64_t dh_reserve = 0; // the restricted DFlash2 draft head beside a wide-graphs cache (see below)
         auto margin_of = [&](size_t id) -> int64_t {
             return use_margins ? int64_t(margins[id]) + pw_reserve + dh_reserve : 0;
@@ -1158,20 +1158,20 @@ static void common_params_fit_impl(
         if (cache_bytes <= 0) {
             return surplus; // no layer of this placement uses the cache
         }
-        // k11: the part of the margin beside the cache it may take once every other decision is made (common_fit_moe_margin_gain)
+        // the part of the margin beside the cache it may take once every other decision is made (common_fit_moe_margin_gain)
         int64_t margin_gain = 0;
-        const std::vector<int> dev_headless = common_fit_devices_headless(devs); // k19-q4cap
-        // k19-q4cap2 (LLAMA_FIT_MOE_HEADLESS_MIN_SHARE, default 0.25): the headless step-down only where the device memory left for the
+        const std::vector<int> dev_headless = common_fit_devices_headless(devs); // headless-card step-down
+        // (LLAMA_FIT_MOE_HEADLESS_MIN_SHARE, default 0.25): the headless step-down only where the device memory left for the
         // cache (free minus everything else of this placement) holds at least that share of the host experts. A cache holding a small
-        // share runs the deep MTP windows and the host-miss paths whose run-time buffers live in that margin: Colab G4 capped at 16 GB,
-        // Qwen3.8 Flash-Next UD-IQ4_XS + MTP drafter, ctx 32768 (14% share), 3 launches: 8k decode 159.7 -> 91.6 tok/s with the 512 MiB
-        // margin (cache 8265 -> 8777 MiB, 715 -> 203 MiB free after the prompt's bank refill). Qwen3.6-35B-A3B UD-Q4_K_XL + MTP holds
-        // 36-58% at L4 12 / 16 GB, T4 12 GB and G4 @16 and keeps the step-down
+        // share runs the deep MTP windows and the host-miss paths whose run-time buffers live in that margin: RTX PRO 6000 capped at 16 GB,
+        // Qwen3.8 Flash-Next at 4 bits + MTP drafter, ctx 32768 (14% share), 3 launches: 8k decode 159.7 -> 91.6 tok/s with the 512 MiB
+        // margin (cache 8265 -> 8777 MiB, 715 -> 203 MiB free after the prompt's bank refill). Qwen3.6-35B-A3B at 4 bits + MTP holds
+        // 36-58% at L4 12 / 16 GB, T4 12 GB and RTX PRO 6000 @16 and keeps the step-down
         static const double hl_min_share = getenv("LLAMA_FIT_MOE_HEADLESS_MIN_SHARE") != nullptr ?
             std::max(0.0, atof(getenv("LLAMA_FIT_MOE_HEADLESS_MIN_SHARE"))) : 0.25;
         const double hl_experts = hl_min_share > 0.0 ? (double) common_moe_expert_bytes(path_model) : 0.0;
         // No headless step-down beside a separate draft model (LLAMA_FIT_MOE_HEADLESS_DRAFT=1: the step-down beside every draft model).
-        // Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS + its MTP drafter (n2), ctx 32768, 3 interleaved launches, chat / 8k decode with and without
+        // RTX PRO 6000, Qwen3.8-Flash-Next at 4 bits + its MTP drafter (n2), ctx 32768, 3 interleaved launches, chat / 8k decode with and without
         // the step-down: 32 GB budget 240.2 / 206.5 -> 244.3 / 216.6 tok/s, 48 GB 234.2 / 209.2 -> 229.7 / 221.3.
         // Beside a DFlash draft model the step-down stays off only where the memory left for the cache (free minus everything else of
         // this placement) holds at least the wide-graph share of the host experts (LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC 0.6, host experts of
@@ -1192,8 +1192,8 @@ static void common_params_fit_impl(
         // (LLAMA_SPEC_PREWARM_CACHED_FRAC, 0.3) but common_init keeps no device memory back for the DFlash2 cached window's graphs (that
         // band is LLAMA_DFLASH_CACHED_FRAC_MIN 0.2 .. LLAMA_DFLASH_CACHED_FRAC_MAX 0.5, LLAMA_DFLASH_CACHED_RESERVE_MIB 512, see
         // common.cpp). Inside that band its 512 MiB give the prewarm back the memory the step-down takes (32 GB, 42% cached: no width left
-        // out), so the step-down and its larger cache stay. From 0.5 nothing does: Colab A100 40 GB full card, Qwen3.8-Flash-Next
-        // UD-IQ4_XS + DFlash2 n6, ctx 32768, the step-down took the cache 31893 -> 32409 MiB (55.4 -> 56.3%) and the prewarm's floor
+        // out), so the step-down and its larger cache stay. From 0.5 nothing does: an A100 40 GB host, full card, Qwen3.8-Flash-Next
+        // at 4 bits + DFlash2 n6, ctx 32768, the step-down took the cache 31893 -> 32409 MiB (55.4 -> 56.3%) and the prewarm's floor
         // left 20 of 21 graphs (7 without it) to the first request, whose captures then ran in the measured decode: chat 94.7 -> 71.1 tok/s
         // (3 interleaved launches, same text)
         static const bool   hl_df2band   = getenv("LLAMA_FIT_MOE_HEADLESS_DF2BAND") == nullptr || atoi(getenv("LLAMA_FIT_MOE_HEADLESS_DF2BAND")) != 0;
@@ -1273,7 +1273,7 @@ static void common_params_fit_impl(
             return need;
         };
 
-        // k19-int3fix2: the server's verify graph prewarm (server_spec_prewarm) runs beside a cache that holds at least the wide-graphs
+        // the server's verify graph prewarm (server_spec_prewarm) runs beside a cache that holds at least the wide-graphs
         // share of the host experts (llama_moe_cache_wide_graphs) and keeps its graphs' device memory, which no measure here sees: A100
         // 80 GB with 48 GB free, Qwen3.8-Flash-Next + DFlash2 (n_max 6), 3 chains x 7 widths took 828 -> 64 MiB of the 1024 MiB margin
         // (22-66 MiB per graph), and the few-row MMQ graphs the rest (2 MiB, CUDA out of memory at the first request). That memory is
@@ -1281,7 +1281,7 @@ static void common_params_fit_impl(
         // floor (LLAMA_SPEC_PREWARM_MIN_FREE_MIB, default 512) is the default guard
         if (use_margins && has_drafter && g_prewarm_graphs > 0) {
             // opt-in (default 0): measured at 48 GB the reserve lets the server prewarm all 21 graphs, and those windows replay slower
-            // than the ones the 512 MiB floor leaves eager: G4 Flash-Next DFlash2 chat 254.5 tok/s with 40 vs 274.6 without (base
+            // than the ones the 512 MiB floor leaves eager: RTX PRO 6000 Flash-Next DFlash2 chat 254.5 tok/s with 40 vs 274.6 without (base
             // 262.2), A100 80 GB 110.7 vs 120.4 (base 115.6); both run (the reserve alone also kept the A100 alive with the floor off)
             static const double graph_mib = getenv("LLAMA_FIT_PREWARM_GRAPH_MIB") != nullptr ?
                 std::max(0.0, atof(getenv("LLAMA_FIT_PREWARM_GRAPH_MIB"))) : 0.0;
@@ -1311,13 +1311,13 @@ static void common_params_fit_impl(
             }
             const int64_t need = shortfall(dmds_test);
             if (need <= 0) {
-                // k15-fn: the first size that fits can leave memory above the targets (the cache does not take exactly the bytes the
-                // linear estimate gave it: G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at 32 GB left 856 MiB above the 1024 MiB margin);
-                // grow it by the measured surplus while it still fits. Opt-in (LLAMA_MOE_FIT_FILL=1): G4 k15f_g4, Qwen3.6 UD-Q4_K_XL + MTP,
+                // the first size that fits can leave memory above the targets (the cache does not take exactly the bytes the
+                // linear estimate gave it: RTX PRO 6000 Qwen3.8-Flash-Next at 4 bits + MTP at 32 GB left 856 MiB above the 1024 MiB margin);
+                // grow it by the measured surplus while it still fits. Opt-in (LLAMA_MOE_FIT_FILL=1): RTX PRO 6000 Qwen3.6 at 4 bits + MTP,
                 // +338 / +532 MiB of cache at 12 / 16 GB gave +7..+10% decode at 2k-16k (12 GB) and +-2% (16 GB), but a 42-token prompt's
-                // TTFT went 165 -> 178 ms and 125 -> 139 ms; Flash-Next UD-IQ4_XS at 16 / 32 GB and LFM2.5 16 GB had no surplus to fill
+                // TTFT went 165 -> 178 ms and 125 -> 139 ms; Flash-Next at 4 bits at 16 / 32 GB and LFM2.5 16 GB had no surplus to fill
                 static const bool fill = getenv("LLAMA_MOE_FIT_FILL") != nullptr && atoi(getenv("LLAMA_MOE_FIT_FILL")) != 0;
-                // k15-fn: where the cache lends because that frees memory (llama_moe_cache lend_saves), the measure counts the device
+                // where the cache lends because that frees memory (llama_moe_cache lend_saves), the measure counts the device
                 // that much lower (mb.lend_freed). That is a fixed amount, not one that grows with the cache, so the first size, which
                 // takes the whole difference to the measure without the cache as the cache's, misses it: grow by it (at most), as the
                 // fill does by any surplus. Only with LLAMA_MOE_CACHE_LEND_SAVE=1 (opt-in, see llama_moe_cache lend_save)
@@ -1373,7 +1373,7 @@ static void common_params_fit_impl(
     // if the user also fixed the layers the fit aborts below, so only the free memory itself is the target there
     if (fit_moe_cache && !tbo_user.empty()) {
         fit_moe_cache_size(dmds_full, mparams, mparams->n_gpu_layers == default_mparams.n_gpu_layers);
-        // k16-fit: --moe-cache-mib auto (an unbounded request) beside user host experts (--cpu-moe, -ot) where the whole cache fits:
+        // --moe-cache-mib auto (an unbounded request) beside user host experts (--cpu-moe, -ot) where the whole cache fits:
         // every host expert gets a slot, so the request becomes the bytes the cache measures plus the surplus (the slots stop at all
         // experts anyway). Without this the request stayed unbounded, the fit returned "no changes needed" and
         // common_init_result dropped the cache (T4 gpt-oss-20b --cpu-moe auto on a free card: CPU experts at 14 tok/s against 41 with a
@@ -1394,7 +1394,7 @@ static void common_params_fit_impl(
                 surplus     += int64_t(dmds_full[id].free) - int64_t(dmds_full[id].mb.total()) - int64_t(margins[id]);
             }
             // the request also carries the surplus beyond the targets: common_moe_cache_auto_ubatch funds a larger n_ubatch from the
-            // request, and with the bare cache bytes it took them from the slots (T4 gpt-oss-20b k16fit_t4a: 9783 -> 9421 MiB, 9417 of
+            // request, and with the bare cache bytes it took them from the slots (T4 gpt-oss-20b: 9783 -> 9421 MiB, 9417 of
             // 9720 MiB cached). The cache stops at every expert, so the device use stays the projection's plus what n_ubatch takes
             if (cache_bytes > 0) {
                 cparams->moe_cache_size = size_t(cache_bytes + std::max<int64_t>(surplus, 16*MiB));
@@ -1850,21 +1850,21 @@ static void common_params_fit_impl(
         if (fit_moe_cache) {
             // order: the dense weights of all layers, then the cache (up to the requested size), then experts in device memory
             const size_t size_before = cparams->moe_cache_size;
-            dmds_t dmds_cpu_moe_req = dmds_cpu_moe; // k13-small: the measurement at the requested cache size, for the retry below
+            dmds_t dmds_cpu_moe_req = dmds_cpu_moe; // the measurement at the requested cache size, for the retry below
             fit_moe_cache_size(dmds_cpu_moe, mparams, true);
             bool fits_per_device = cparams->moe_cache_size > 0;
             for (size_t id = 0; id < nd; id++) {
                 fits_per_device = fits_per_device && int64_t(dmds_cpu_moe[id].free) - int64_t(dmds_cpu_moe[id].mb.total()) >= margins[id];
             }
-            // k19-kvsel auto (LLAMA_KV_SEL_HOST unset or =auto; =0 off, =1 always): every measurement so far was the one without host
+            // host K/V chunks auto (LLAMA_KV_SEL_HOST unset or =auto; =0 off, =1 always): every measurement so far was the one without host
             // chunks, so this fit is the LLAMA_KV_SEL_HOST=0 fit up to here. Where that fit takes the small-device placement (no cache
             // beside every layer at the default margin) on one device, without a draft model or MTP heads, the K/V of an armed QSA cache
             // past its device cells goes to host chunks (LLAMA_KV_SEL_GRANTED, set by common from common_fit_kv_sel_granted): the cache
             // is measured again with them and the small-device placement below runs on that measurement. Anywhere else nothing changes:
             // the measurements, the placement and the K/V stay those of LLAMA_KV_SEL_HOST=0
             // Not on a disk tier (the host experts take more than 0.8 of the available RAM and the file is not on a memory file system,
-            // the rule of k19-l4gap): there the larger cache only adds bank refills from the disk to every released prompt ubatch while
-            // the decode stays disk-bound (Colab L4 12 GB, Flash-Next ctx 262144 from the VM disk: cache 4075 -> 5275 MiB, decode 4.4 ->
+            // the rule of the disk-tier rule): there the larger cache only adds bank refills from the disk to every released prompt ubatch while
+            // the decode stays disk-bound (L4 12 GB, Flash-Next ctx 262144 from the VM disk: cache 4075 -> 5275 MiB, decode 4.4 ->
             // 4.4 tok/s, 8k prompt 88 -> 80 tok/s; T4 / L4 whole card with =1: prompt -10% / -30%)
             bool sel_granted = false;
             const auto sel_disk_tier = [&]() {
@@ -1904,14 +1904,14 @@ static void common_params_fit_impl(
                     g_moe_margin_gain       = gain_off;
                 }
             }
-            // k19-l4poly: a host-bound small device (see common_fit_hostbound_place): every layer fits within the default margin, but
+            // a host-bound small device (see common_fit_hostbound_place): every layer fits within the default margin, but
             // beside a cache of at most a tenth of the host experts, so the host computes most misses of every token. It takes the
-            // small-device placement below (smaller margin, the k19-place8 decode-sized cache) although it fits
+            // small-device placement below (smaller margin, the small-device decode-sized cache) although it fits
             const size_t  size_fit_hb = cparams->moe_cache_size;
             const int64_t gain_fit_hb = g_moe_margin_gain;
-            // k19-kvsel: K/V cells in host chunks (LLAMA_KV_SEL_HOST=1) leave device memory free that the cache should get, but a device
-            // that fits only because of them would take the regular path at the default margin (G4 10 GB, Qwen3.8-Flash-Next ctx 131K
-            // q8_0: of 1200 MiB freed, k19-placemid gave the cache 560). The path is chosen as without host chunks: the cache is sized
+            // K/V cells in host chunks (LLAMA_KV_SEL_HOST=1) leave device memory free that the cache should get, but a device
+            // that fits only because of them would take the regular path at the default margin (RTX PRO 6000 10 GB, Qwen3.8-Flash-Next ctx 131K
+            // q8_0: of 1200 MiB freed, the mid-size placement gave the cache 560). The path is chosen as without host chunks: the cache is sized
             // once more with their bytes counted on the device, and where that leaves no cache the small-device placement below runs on
             // the real measurement, so the cache gets what the host chunks free. LLAMA_KV_SEL_FIT=0: the path of the real measurement
             bool sel_small = sel_granted && fits_per_device; // (auto: the small-device placement is the one granted for)
@@ -1938,44 +1938,44 @@ static void common_params_fit_impl(
                     g_moe_margin_gain       = gain_fit_hb;
                 }
             }
-            // not beside a draft model or MTP heads (as the k18 margin rule): their run-time pools were never measured at this margin
+            // not beside a draft model or MTP heads (as the drafter margin rule): their run-time pools were never measured at this margin
             const bool    hostbound   = fits_per_device && nd == 1 && size_before > 0 && !has_drafter && !sel_granted &&
                 common_fit_hostbound_place(int64_t(dmds_cpu_moe[0].free), int64_t(size_fit_hb),
                     int64_t(dmds_cpu_moe.back().mb.model) - int64_t(dmds_full.back().mb.model));
-            // k13-small: a small device (G4 ballasted to 4 GB, Qwen3.6-35B-A3B Q3_K_M + MTP: the dense weights of every layer, the context and
+            // a small device (RTX PRO 6000 ballasted to 4 GB, Qwen3.6-35B-A3B Q3_K_M + MTP: the dense weights of every layer, the context and
             // a cache fit only inside the 1024 MiB margin). Without this the fit moves 13 of 41 whole layers (attention, KV, recurrent state)
-            // to the CPU and drops the cache, so every token pays a graph split per CPU layer and per MoE layer (k12: 91 tok/s).
+            // to the CPU and drops the cache, so every token pays a graph split per CPU layer and per MoE layer (91 tok/s before).
             // Here the margin of the one device drops to
             // LLAMA_FIT_SMALL_MARGIN_MIB (256) instead: every layer stays on the device beside a small cache, whose host misses the
             // single-graph path computes (no graph split). The placement is the one of -fitt 256; one GPU only, default margin only (an
-            // explicit smaller -fitt is the user's), LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps the k12 placement.
+            // explicit smaller -fitt is the user's), LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps the earlier placement.
             if ((!fits_per_device || hostbound || sel_small) && nd == 1 && size_before > 0) {
                 const char * e_sm = getenv("LLAMA_FIT_SMALL_MARGIN_MIB");
                 const int64_t small_mib = e_sm != nullptr ? std::max<int64_t>(0, atoll(e_sm)) : 256;
                 constexpr int64_t m_default = 1024*MiB;
                 // opt-in: the cache of a small device that holds only a few experts anyway is capped (LLAMA_FIT_SMALL_CACHE_MIB=48)
                 // where the uncapped fit gives it at most LLAMA_FIT_SMALL_CACHE_CAP_BELOW_MIB (256): what it does not take stays free for
-                // the layer-major prompt groups, which read each host expert once per group instead of once per ubatch. G4 4 GB q3m + MTP
+                // the layer-major prompt groups, which read each host expert once per group instead of once per ubatch. RTX PRO 6000 4 GB a 3-bit MoE + MTP
                 // (111 MiB uncapped, 76 MiB free, every group of 2+ ubatches split): prompt 2k 1885 -> 4712, 8k 1937 -> 4103 tok/s,
                 // decode -9 / -2 / -5% (chat / 2k / 8k, the smaller cache); gpt-oss-20b 4 GB (476 MiB) lost 4-10% decode capped: not capped.
-                // Off by default: the server KLD run (k13kld3, 8k prompts) ran out of device memory in a merged prompt group at the cap
+                // Off by default: the server KLD run (8k prompts) ran out of device memory in a merged prompt group at the cap
                 const char * e_sc = getenv("LLAMA_FIT_SMALL_CACHE_MIB");
                 const int64_t cap_mib = e_sc != nullptr ? std::max<int64_t>(0, atoll(e_sc)) : 0; // opt-in (LLAMA_FIT_SMALL_CACHE_MIB=48): see below
                 const char * e_cb = getenv("LLAMA_FIT_SMALL_CACHE_CAP_BELOW_MIB");
                 const int64_t cap_below_mib = e_cb != nullptr ? std::max<int64_t>(0, atoll(e_cb)) : 256;
-                // opt-in second, smaller margin when the first one leaves no cache (LLAMA_FIT_SMALL_MARGIN_MIN_MIB=N): G4 4 GB Qwen3.6
-                // UD-Q4_K_XL + MTP placed every layer at 128 MiB but ran out of device memory in its first request (CUDA error, run k13r2)
-                // k17-small: with the MTP drafter priced as it runs (common_fit_mtp_price_on) the second margin is 160 MiB by default
+                // opt-in second, smaller margin when the first one leaves no cache (LLAMA_FIT_SMALL_MARGIN_MIN_MIB=N): RTX PRO 6000 4 GB Qwen3.6
+                // at 4 bits + MTP placed every layer at 128 MiB but ran out of device memory in its first request (CUDA error)
+                // with the MTP drafter priced as it runs (common_fit_mtp_price_on) the second margin is 160 MiB by default
                 // (LLAMA_FIT_MTP_SMALL_MARGIN_MIB). The 256 MiB margin was tuned with a drafter priced 129 + 32 MiB short, so at the exact price
-                // it leaves no cache beside the drafter and the fit drops it where it runs: Colab T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP at
+                // it leaves no cache beside the drafter and the fit drops it where it runs: T4 4 GB, Qwen3.6-35B-A3B at 4 bits + MTP at
                 // ctx 16384 drafted with 126.9 MiB free after load at the old price (95 MiB once the target grew for the drafter), while a
-                // Kaggle T4 at 74.8 MiB (about 43 at the first prompt; its driver keeps ~53 MiB more) ran out of memory. 160 MiB priced
-                // exactly leaves ~160 on the Colab host and ~107 on the Kaggle one at the first prompt, the cache taking the rest
+                // another T4 at 74.8 MiB (about 43 at the first prompt; its driver keeps ~53 MiB more) ran out of memory. 160 MiB priced
+                // exactly leaves ~160 on one T4 host and ~107 on the other at the first prompt, the cache taking the rest
                 const bool mtp_priced = extra != nullptr && extra->shares_model && common_fit_mtp_price_on();
                 const char * e_sm3 = getenv("LLAMA_FIT_MTP_SMALL_MARGIN_MIB");
-                // only below compute capability 8.0 (the T4 hosts it was measured on): G4 (cc 12.0) 4 GB q4x 16k at 160 MiB kept the
+                // only below compute capability 8.0 (the T4 hosts it was measured on): RTX PRO 6000 (cc 12.0) 4 GB a 4-bit MoE 16k at 160 MiB kept the
                 // drafter with 130.6 MiB free after it, the target grew 474 -> 506 MiB, and the first prompt ran out of memory creating a
-                // cuBLAS handle (rs_replay_commit, 2 of 2 launches); at 256 the fit drops the drafter there and every cell runs (k17s_g4i)
+                // cuBLAS handle (rs_replay_commit, 2 of 2 launches); at 256 the fit drops the drafter there and every cell runs 
                 const int64_t mtp_min_mib = e_sm3 != nullptr ? std::max<int64_t>(0, atoll(e_sm3)) : (common_fit_pre_ampere() ? 160 : 0);
                 const char * e_sm2 = getenv("LLAMA_FIT_SMALL_MARGIN_MIN_MIB");
                 const int64_t small_min_mib = std::min<int64_t>(small_mib, e_sm2 != nullptr ? std::max<int64_t>(0, atoll(e_sm2)) :
@@ -2000,11 +2000,11 @@ static void common_params_fit_impl(
                             m_ok = m_mib;
                         }
                     }
-                    // k19-kvwin6: beside a KV window ring (whose prompt ubatches need more compute than its decode), no cache may fit at
-                    // the full n_ubatch while every layer does with none: k19-place8 below is then tried from a zero cache. Its safety is
+                    // beside a KV window ring (whose prompt ubatches need more compute than its decode), no cache may fit at
+                    // the full n_ubatch while every layer does with none: the small-device placement below is then tried from a zero cache. Its safety is
                     // that of the placement it starts from: every layer and the full-n_ubatch compute buffers fit within the small margin,
                     // so a released prompt ubatch has the memory it was measured with; the cache only takes the difference to the graphs
-                    // reserved at its small ubatches. Without the k19-place8 cache the placement of before stays.
+                    // reserved at its small ubatches. Without the small-device cache the placement of before stays.
                     // LLAMA_FIT_PLACE8_WIN=0 off
                     bool p8_zero = false;
                     const char * e_kw = getenv("LLAMA_KV_WIN");
@@ -2054,7 +2054,7 @@ static void common_params_fit_impl(
                             g_moe_margin_gain = gain_unc;
                         }
                     }
-                    // k19-tierfix-fit: the run-time reserve (common_fit_small_reserve_mib) is added to the reduced margin, taken from the
+                    // the run-time reserve (common_fit_small_reserve_mib) is added to the reduced margin, taken from the
                     // cache down to its floor; the placement of before is kept where that one does not fit. Only at the first reduced
                     // margin: a placement that needed the second one (LLAMA_FIT_SMALL_MARGIN_MIN_MIB, the MTP margin) has no room for it
                     if (ok && m_ok == small_mib && !p8_zero) {
@@ -2077,16 +2077,16 @@ static void common_params_fit_impl(
                             }
                         }
                     }
-                    // k19-place8: the compute buffer is sized for the largest prompt ubatch (G4 at 8 GB, Qwen3.8-Flash-Next UD-IQ4_XS with -ub
+                    // the compute buffer is sized for the largest prompt ubatch (RTX PRO 6000 at 8 GB, Qwen3.8-Flash-Next at 4 bits with -ub
                     // 2048: 2312 MiB, 1275 of them the staging arena of the prefetched expert copies) beside a cache of a few dozen slots
                     // (65 MiB, ~1% decode hits), and it sits idle during decode. Here the cache takes that memory instead: the context
                     // reserves its graphs at LLAMA_FIT_PLACE8_UB (31) tokens, small batches whose missing experts run on the host, and a larger ubatch runs with the
                     // cache banks released while its compute buffers grow into their memory; the next small ubatch frees the compute buffers
-                    // and refills the banks with the experts they held (the k19-tiny-ub release, llama_context::tiny_rel_enter / leave,
+                    // and refills the banks with the experts they held (the tiny-ubatch release, llama_context::tiny_rel_enter / leave,
                     // byte-exact at a fixed placement). The cache grows by the measured difference between the two placements, so a released
                     // prompt uses what the fit measured for it. Kept only if the larger cache meets the margin; otherwise the placement above
                     // stays. One device only (the small-device rule). LLAMA_FIT_PLACE8=0 off
-                    // measured on G4 8 GB only: devices with less free memory than LLAMA_FIT_PLACE8_MIN_FREE_MIB (6144) keep the old placement
+                    // measured on RTX PRO 6000 8 GB only: devices with less free memory than LLAMA_FIT_PLACE8_MIN_FREE_MIB (6144) keep the old placement
                     static const int64_t place8_min_free = int64_t(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB") != nullptr ?
                         std::max(0, atoi(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB"))) : 6144)*MiB;
                     bool p8_got = false;
@@ -2111,14 +2111,14 @@ static void common_params_fit_impl(
                             return true;
                         };
                         dmds_t d_s;
-                        // k19-kvwin6: context that grows with n_ubatch (the KV window ring holds n_ubatch slots beside its window) keeps the
+                        // context that grows with n_ubatch (the KV window ring holds n_ubatch slots beside its window) keeps the
                         // size of the full n_ubatch at run time (only the graphs are reserved at ub_rel): not part of the growth, added back below
                         int64_t ctx_ub = 0;
                         if (measure8(size_ok, d_s)) {
                             ctx_ub = kv_win_on ? std::max<int64_t>(0, int64_t(dmds_ok[0].mb.context) - int64_t(d_s[0].mb.context)) : 0;
                             grow   = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total()) - ctx_ub;
                         }
-                        // k19-l4poly: a host-bound device takes even a smaller difference (LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB, 256 as elsewhere)
+                        // a host-bound device takes even a smaller difference (LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB, 256 as elsewhere)
                         static const int64_t hb_min = int64_t(getenv("LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB") != nullptr ?
                             std::max(1, atoi(getenv("LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB"))) : 256)*MiB;
                         if (grow >= (hostbound ? hb_min : 256*MiB)) {
@@ -2146,13 +2146,13 @@ static void common_params_fit_impl(
                             LOG_INF("%s: small device: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> "
                                 "%zu MiB; ubatches of more than %u tokens run with the cache banks released (LLAMA_FIT_PLACE8=0 off)\n",
                                 __func__, grow/MiB, (size_t) (size_ok/MiB), (size_t) (cparams->moe_cache_size/MiB), ub_rel);
-                            // k19-pgroups: prompts keep their layer-major groups beside the decode-sized cache, as k19-placemid does on a
+                            // prompts keep their layer-major groups beside the decode-sized cache, as the mid-size placement does on a
                             // mid-size device: a group releases the banks for its merged graph (one pass over each layer's experts for up to
-                            // LLAMA_MOE_LAYER_MAJOR_UB_MAX ubatches) instead of every prompt ubatch running alone with the banks released (G4 10 /
-                            // 12 GB, Flash-Next UD-IQ4_XS ctx 131K / 262K: 493 tok/s prompts vs 3669 with LLAMA_FIT_PLACE8=0, which loses 20-25%
-                            // decode with its 160 MiB cache). The cache, its size and the reserved graphs stay those of k19-place8; the draft rule of
+                            // LLAMA_MOE_LAYER_MAJOR_UB_MAX ubatches) instead of every prompt ubatch running alone with the banks released (RTX PRO 6000 10 /
+                            // 12 GB, Flash-Next at 4 bits ctx 131K / 262K: 493 tok/s prompts vs 3669 with LLAMA_FIT_PLACE8=0, which loses 20-25%
+                            // decode with its 160 MiB cache). The cache, its size and the reserved graphs stay those of the small-device placement; the draft rule of
                             // the small device stays (no device drafter). Devices with at least LLAMA_FIT_PLACE8_GROUPS_MIN_FREE_MIB (9216) free
-                            // (8 GB cards keep k19-place8 as it was), not host-bound. LLAMA_FIT_PLACE8_GROUPS=0 off
+                            // (8 GB cards keep the small-device placement as it was), not host-bound. LLAMA_FIT_PLACE8_GROUPS=0 off
                             static const bool groups_on = getenv("LLAMA_FIT_PLACE8_GROUPS") == nullptr || atoi(getenv("LLAMA_FIT_PLACE8_GROUPS")) != 0;
                             static const int64_t groups_min_free = int64_t(getenv("LLAMA_FIT_PLACE8_GROUPS_MIN_FREE_MIB") != nullptr ?
                                 std::max(0, atoi(getenv("LLAMA_FIT_PLACE8_GROUPS_MIN_FREE_MIB"))) : 9216)*MiB;
@@ -2171,7 +2171,7 @@ static void common_params_fit_impl(
                         }
                     }
                     if (p8_zero && !p8_got) {
-                        ok = false; // the zero-cache start only stands with the k19-place8 cache: the placement of before (below)
+                        ok = false; // the zero-cache start only stands with the small-device cache: the placement of before (below)
                     } else if (p8_zero) {
                         LOG_INF("%s: small device beside the KV window ring: every layer fits at the full n_ubatch without a cache, the small-device "
                             "cache takes the prompt compute memory (LLAMA_FIT_PLACE8_WIN=0 off)\n", __func__);
@@ -2190,7 +2190,7 @@ static void common_params_fit_impl(
                         fits_per_device = true;
                         g_small_device  = true;
                     } else {
-                        // k19-l4poly: a host-bound device that fitted keeps that placement (k19-kvsel: as does one with host chunks)
+                        // a host-bound device that fitted keeps that placement (host K/V chunks: as does one with host chunks)
                         common_fit_place8_env(0);
                         margins[0] = margin_saved;
                         dmds_cpu_moe = dmds_nc_saved;
@@ -2231,7 +2231,7 @@ static void common_params_fit_impl(
                 mparams->tensor_buft_overrides = tensor_buft_overrides;
             }
             if (keep) {
-                // k13-small: the same placement reached under an explicit --fit-target (Studio sends one, at least 512 MiB) is a small
+                // the same placement reached under an explicit --fit-target (Studio sends one, at least 512 MiB) is a small
                 // device too when it leaves less than the default 1024 MiB free beside a cache of at most 256 MiB: the run-time rules keyed
                 // on common_fit_small_device (no n_ubatch growth, the checkpoint merge) then apply there as well. The margin itself is the
                 // caller's and is not touched.
@@ -2241,7 +2241,7 @@ static void common_params_fit_impl(
                     LOG_INF("%s: small device: every layer stays in device memory beside a MoE cache of %zu MiB within the margin of %" PRId64 " MiB\n",
                         __func__, (size_t) (cparams->moe_cache_size/MiB), margins[0]/MiB);
                 }
-                // k19-placemid: the k19-place8 placement on a mid-size device (G4 12 / 16 GB, Qwen3.8-Flash-Next UD-IQ4_XS ctx 32768 -ub 2048:
+                // the small-device placement on a mid-size device (RTX PRO 6000 12 / 16 GB, Qwen3.8-Flash-Next at 4 bits ctx 32768 -ub 2048:
                 // a 2264 MiB compute buffer, 1275 MiB of it the staging arena of the prefetched expert copies, beside a cache of 3068 MiB,
                 // idle during decode). The graphs are reserved at LLAMA_FIT_PLACE8_UB (31) tokens and the cache takes the difference; prompts
                 // keep their layer-major groups, which release the banks for the merged graph (as they already do where it does not fit),
@@ -2251,20 +2251,20 @@ static void common_params_fit_impl(
                 static const bool placemid_on = getenv("LLAMA_FIT_PLACEMID") == nullptr || atoi(getenv("LLAMA_FIT_PLACEMID")) != 0;
                 static const double placemid_min_frac = getenv("LLAMA_FIT_PLACEMID_MIN_FRAC") != nullptr ?
                     std::max(0.0, atof(getenv("LLAMA_FIT_PLACEMID_MIN_FRAC"))) : 0.10;
-                // k19-l4gap (opt-in, LLAMA_FIT_PLACEMID_DISK_SKIP=1): no k19-placemid on a disk tier whose cache holds the experts of fewer
+                // (opt-in, LLAMA_FIT_PLACEMID_DISK_SKIP=1): no the mid-size placement on a disk tier whose cache holds the experts of fewer
                 // than LLAMA_FIT_PLACEMID_DISK_MIN_TOKENS (4, the RAM tier's device minimum, LLAMA_MOE_HOST_MIN_TOKENS) tokens before the
                 // growth: the host experts do not fit in RAM (more than 0.8 of the available memory, the rule of
-                // llama_context::disk_prefetch_init, the file not on a memory file system), and the short prompts that k19-placemid runs as
+                // llama_context::disk_prefetch_init, the file not on a memory file system), and the short prompts that the mid-size placement runs as
                 // ubatches of up to 31 tokens exceed the few tokens the device lookups serve (4 there), so their expert products run on the
                 // CPU from the mapping, whose pages the disk serves at its read rate. With the compute buffers kept a prompt ubatch copies its
-                // routed experts from the RAM tier instead. Colab L4 12 GB, Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk (57.6 GB of
+                // routed experts from the RAM tier instead. L4 12 GB, Qwen3.8-Flash-Next at 4 bits from the VM disk (57.6 GB of
                 // experts, 51 GB of RAM) + MTP n2, 3 interleaved launches: 42-token chat TTFT 28.1 -> 17.1 s, 8k TTFT
                 // 90.7 -> 85.4 s, but chat decode 5.94 -> 5.59 tok/s (the cache keeps 2256 instead of 4173 MiB): answers longer than ~1000
-                // tokens get slower, so it stays opt-in. Unset: k19-placemid as before (no extra work, no log line)
-                // k19-l4gap2 (default; LLAMA_FIT_PLACEMID_DISK_UB=0 off): on the same disk tier k19-placemid keeps its cache but reserves the
+                // tokens get slower, so it stays opt-in. Unset: the mid-size placement as before (no extra work, no log line)
+                // (default; LLAMA_FIT_PLACEMID_DISK_UB=0 off): on the same disk tier the mid-size placement keeps its cache but reserves the
                 // graphs at, and splits short prompts into, ubatches of LLAMA_FIT_PLACEMID_DISK_UB (4) tokens: the tokens the device lookups
                 // serve there, so a short prompt's experts come from the device slots and the RAM tier instead of the CPU products of the
-                // mapping, and the decode keeps the larger cache. Colab L4 12 GB, same model, held-out texts, 3 interleaved launches:
+                // mapping, and the decode keeps the larger cache. L4 12 GB, same model, held-out texts, 3 interleaved launches:
                 // chat TTFT -25%, chat decode +15%, a second chat TTFT -60%, a 1536-token thinking answer
                 // decode +2%; the skip above lost 9% on that answer. Only where a speculative verify window has at most that many rows (MTP
                 // n2: 3), set by common_fit_set_verify_rows: a wider one would release and refill the banks in every pass
@@ -2357,7 +2357,7 @@ static void common_params_fit_impl(
                             100.0*placemid_min_frac);
                     }
                 }
-                // k17-small (lazy KV step 2): LLAMA_KV_LAZY=1 backs only the first LLAMA_KV_LAZY_INIT (4096) cells of
+                // (lazy KV step 2): LLAMA_KV_LAZY=1 backs only the first LLAMA_KV_LAZY_INIT (4096) cells of
                 // the KV cache at load (mb.kv_lazy: the rest, reported only where the MoE cache can shrink). The cache was fitted above
                 // beside the full-context KV, so that size is its floor; it gets the unbacked KV bytes on top (up to the size requested)
                 // and gives them back as the cells grow (llama_moe_cache::shrink), so every cell of the context still fits.
@@ -2365,16 +2365,16 @@ static void common_params_fit_impl(
                 // (LLAMA_KV_LAZY_FIT=0: the cache keeps the floor while still shrinking for the KV cache, a debug knob)
                 static const bool kv_lazy_fit = getenv("LLAMA_KV_LAZY_FIT") == nullptr || atoi(getenv("LLAMA_KV_LAZY_FIT")) != 0;
                 // beside a fitted drafter the cache keeps the floor (LLAMA_KV_LAZY_FIT_DRAFT=1 gives it the unbacked KV there too): the bigger
-                // cache lent the drafter's staging, its compute took 506 MiB and left 14 MiB (G4 q4x 4 GB 16k + MTP: out of memory at the
-                // first request 3/3; q3m 16k + MTP 5-17% slower end to end)
+                // cache lent the drafter's staging, its compute took 506 MiB and left 14 MiB (RTX PRO 6000 a 4-bit MoE 4 GB 16k + MTP: out of memory at the
+                // first request 3/3; a 3-bit MoE 16k + MTP 5-17% slower end to end)
                 static const bool kv_lazy_fit_draft = getenv("LLAMA_KV_LAZY_FIT_DRAFT") != nullptr && atoi(getenv("LLAMA_KV_LAZY_FIT_DRAFT")) != 0;
                 const bool kv_lazy_draft_ok = extra == nullptr || kv_lazy_fit_draft;
                 if (kv_lazy_fit && !kv_lazy_draft_ok && nd == 1 && dmds_cpu_moe[0].mb.kv_lazy > 0) {
                     LOG_INF("%s: lazy KV: a drafter is fitted, the MoE cache keeps %zu MiB, not the %zu MiB of KV cells not backed at load on top "
                         "(LLAMA_KV_LAZY_FIT_DRAFT=1 to give them)\n", __func__, (size_t) (cparams->moe_cache_size/MiB), (size_t) (dmds_cpu_moe[0].mb.kv_lazy/MiB));
                 }
-                // k19-vramlend: in the automatic mode (LLAMA_KV_LAZY unset) only where the unbacked KV is at least LLAMA_KV_LAZY_AUTO_MIN_FRAC
-                // (0.10) of the fitted cache: Colab T4 q4x ctx 32768 no draft, 4 GB (grant 4x the cache) decode +9..+17%, 8 GB (+14%) +2..+5%;
+                // in the automatic mode (LLAMA_KV_LAZY unset) only where the unbacked KV is at least LLAMA_KV_LAZY_AUTO_MIN_FRAC
+                // (0.10) of the fitted cache: T4 a 4-bit MoE ctx 32768 no draft, 4 GB (grant 4x the cache) decode +9..+17%, 8 GB (+14%) +2..+5%;
                 // L4 12 GB (+7%) -2..-6% (the larger cache tipped the CPU-miss rule off for 1-token batches; exact env +2..+3%)
                 static const double kv_lazy_auto_min = getenv("LLAMA_KV_LAZY_AUTO_MIN_FRAC") != nullptr ?
                     std::max(0.0, atof(getenv("LLAMA_KV_LAZY_AUTO_MIN_FRAC"))) : 0.10;
@@ -2996,7 +2996,7 @@ void common_fit_print(
     printf("\n");
 }
 
-// k19-fitplain: see fit.h
+// see fit.h
 std::vector<size_t> common_fit_margin_steps_mib(const char * spec) {
     std::vector<size_t> steps;
     const std::string str = spec != nullptr ? spec : "";

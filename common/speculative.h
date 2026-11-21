@@ -32,7 +32,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 
-// k19-q4xaccept diagnostic: LLAMA_SPEC_ACC_LOG=path appends one line per draft token (D), verify (V) and request (R / P), in order;
+// LLAMA_SPEC_ACC_LOG=path appends one line per draft token (D), verify (V) and request (R / P), in order;
 // null when unset
 FILE * common_spec_acc_log();
 
@@ -47,8 +47,8 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 
 common_params common_base_params_to_speculative(const common_params & params);
 
-// k19-mtpkeep: LLAMA_FIT_DRAFT_HOST_EXPS_NO_OFFLOAD (default on): a draft with fit-placed host experts runs without op offload
-// k19-mtpkeep: the fit placed the MTP draft model's experts in host memory (common_fit_draft_hx); its context then runs without op
+// LLAMA_FIT_DRAFT_HOST_EXPS_NO_OFFLOAD (default on): a draft with fit-placed host experts runs without op offload
+// the fit placed the MTP draft model's experts in host memory (common_fit_draft_hx); its context then runs without op
 // offload (see common_base_params_to_speculative). Process-wide, not a field of common_params: that struct keeps its layout, so a
 // binary built against the previous headers still runs with this library
 void common_fit_draft_host_exps_set(bool on);
@@ -110,12 +110,12 @@ struct common_speculative_draft_params {
     float   top_p = 1.0f;
     float   min_p = 0.0f;
 
-    // k19-sharednoise: set (on) when the target draws with shared noise (LLAMA_SHARED_NOISE=1): the drafter proposes
+    // set (on) when the target draws with shared noise (LLAMA_SHARED_NOISE=1): the drafter proposes
     // argmax(its logit / T + the target's noise) at each drafted position (common_shared_noise_draft_pick) and fills no result_q
     struct common_shared_noise_draft * sn = nullptr;
 
-    // k19-small1115: another slot of the server is active this round (the server caps n_max at the k19-tpp floor then); its round
-    // time is not a lone request's and is kept out of the k19-tpp window cost table
+    // another slot of the server is active this round (the server caps n_max at the tokens-per-ms floor then); its round
+    // time is not a lone request's and is kept out of the tokens-per-ms window cost table
     bool shared = false;
 };
 
@@ -127,20 +127,20 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
-// kdp (LLAMA_MTP_DRAFT_LEND): a prompt batch before the prompt's last rows, which the MTP drafter does not compute (see skip_prompt)
+// LLAMA_MTP_DRAFT_LEND: a prompt batch before the prompt's last rows, which the MTP drafter does not compute (see skip_prompt)
 bool common_speculative_process_skip(common_speculative * spec, const common_batch & batch);
 
-// k11 (LLAMA_LM_CKPT_MERGE): process() of a segment of the target batch whose first entry is target batch row row_offset (the target's nextn
+// LLAMA_LM_CKPT_MERGE: process() of a segment of the target batch whose first entry is target batch row row_offset (the target's nextn
 // rows are read from there); rows_ok: every impl of spec supports it (eagle3 / dflash do not)
 bool common_speculative_process_rows(common_speculative * spec, const common_batch & batch, int32_t row_offset);
 bool common_speculative_rows_ok(const common_speculative * spec);
 
-// k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP): process_rows on target rows the caller waited for with llama_nextn_rows_wait, while the target's
+// LLAMA_MTP_PROMPT_OVERLAP: process_rows on target rows the caller waited for with llama_nextn_rows_wait, while the target's
 // decode may still compute later ubatches; rows_early_ok says whether every impl reads only those rows of the target
 bool common_speculative_rows_early_ok(const common_speculative * spec);
 bool common_speculative_process_rows_early(common_speculative * spec, const common_batch & batch, int32_t row_offset);
 
-// k19-host (LLAMA_MTP_PROMPT_BG): process_rows() reads the target's rows through h (row i at h + i * floats), rows [0, n_lo) from a copy made
+// LLAMA_MTP_PROMPT_BG: process_rows() reads the target's rows through h (row i at h + i * floats), rows [0, n_lo) from a copy made
 // here, and calls nothing of the target context, so it can run on a worker beside the target's next decode (which may overwrite rows
 // [0, n_lo)). rows_ext_floats: floats per row where every impl supports it, else 0. Set and clear on the thread that owns the target
 int64_t common_speculative_rows_ext_floats(const common_speculative * spec);
@@ -153,7 +153,7 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
-// k19-handoff diagnostics of the DFlash2 drafter: LLAMA_DFLASH_TRACE=1 (selector probabilities per draft, logged at accept),
+// Diagnostics of the DFlash2 drafter: LLAMA_DFLASH_TRACE=1 (selector probabilities per draft, logged at accept),
 // LLAMA_DFLASH_CYCLE=1 (drafts cut to 0..n_max tokens in turn), LLAMA_PASS_TIMING=1 (host time of the draft call's parts)
 struct common_dflash_diag_t {
     bool trace  = false;

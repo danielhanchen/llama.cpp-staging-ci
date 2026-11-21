@@ -134,14 +134,14 @@ struct common_sampler {
     std::vector<std::pair<llama_token, float>> bias_sparse; // the tokens with a bias (summed), ascending ids
     std::vector<float> bias_saved;                          // scratch: their raw logits during the scan
     std::vector<float> row;                                 // scratch: a copy of the logits row (mode 3)
-    bool pen_fast = false;                                  // k15: the fast path applies the repetition penalties (common_sampler_penalty_fast)
+    bool pen_fast = false;                                  // the fast path applies the repetition penalties (common_sampler_penalty_fast)
     std::vector<std::pair<llama_token, int>> pen_cnt;       // scratch: the window's tokens and their counts
     std::vector<std::pair<llama_token, float>> sp;          // scratch: biased and penalized tokens with their bias, ascending ids
-    bool dev_token = false;                                 // k15-fn: take the token of a device greedy sampler (common_sampler_set_device_token)
-    bool dev_topk = false;                                  // k15-fn: the row's logits are the device top-k candidates (common_sampler_set_device_topk)
-    int32_t dev_n_bias = 0;                                 // k15-fn: tokens with a bias (logit_bias + suppress tokens), for common_sampler_device_topk
+    bool dev_token = false;                                 // take the token of a device greedy sampler (common_sampler_set_device_token)
+    bool dev_topk = false;                                  // the row's logits are the device top-k candidates (common_sampler_set_device_topk)
+    int32_t dev_n_bias = 0;                                 // tokens with a bias (logit_bias + suppress tokens), for common_sampler_device_topk
     bool dev_bias_pos  = false;                             //         one of those biases can raise a logit
-    // k19-gramdev: the device top-k serves a request with a grammar or a reasoning budget (common_sampler_device_topk); the raw rows are
+    // the device top-k serves a request with a grammar or a reasoning budget (common_sampler_device_topk); the raw rows are
     // on the host too (llama_set_sampler_keep_logits) for the positions the candidates cannot decide
     bool    dev_gram  = false;
     int32_t dev_kneed = 0;                                  //         k + m of common_sampler_device_topk
@@ -151,7 +151,7 @@ struct common_sampler {
     // the same logits (0: off)
     int32_t topk_pre = 0;
 
-    // k19-gramdev: the full raw row of idx (the candidates of a device top-k are in cur otherwise)
+    // the full raw row of idx (the candidates of a device top-k are in cur otherwise)
     void set_logits_full(struct llama_context * ctx, int idx) {
         const float * logits = llama_get_raw_logits_ith(ctx, idx);
         GGML_ASSERT(logits != nullptr && "device top-k with a grammar / reasoning budget needs the raw rows (llama_set_sampler_keep_logits)");
@@ -197,7 +197,7 @@ struct common_sampler {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
             if (dev_topk) {
-                // k15-fn: in id order, as the full row, for the samplers that depend on the order (greedy, dist before any sort)
+                // in id order, as the full row, for the samplers that depend on the order (greedy, dist before any sort)
                 std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
             }
         } else if (topk_pre > 0) {
@@ -283,10 +283,10 @@ static bool common_sampler_penalty_active(const common_params_sampling & params)
     return params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f);
 }
 
-// k15: repetition penalties keep greedy sampling an argmax: the penalties sampler changes only the logits of the tokens of its window
+// repetition penalties keep greedy sampling an argmax: the penalties sampler changes only the logits of the tokens of its window
 // (the last penalty_last_n accepted tokens, the same ones common_sampler::prev holds when the window fits its ring), and the samplers
 // after it keep the highest logit; that needs the penalties before every truncating sampler (top-k / top-p / min-p / top-n-sigma would
-// otherwise pick among the unpenalized top). G4 LFM2.5 (its GGUF sets repeat penalty 1.05): the full chain built and sorted 128k
+// otherwise pick among the unpenalized top). RTX PRO 6000 LFM2.5 (its GGUF sets repeat penalty 1.05): the full chain built and sorted 128k
 // candidates per sampled row. LLAMA_SAMPLE_GREEDY_PENALTY=0: the full chain, as before
 static bool common_sampler_penalty_fast(const common_params_sampling & params) {
     static const bool on = [] {
@@ -394,7 +394,7 @@ static int32_t common_sampler_topk_prefilter(const common_params_sampling & para
     return params.top_k;
 }
 
-// k19-sharednoise (see sampling.h): the shared-noise final stage
+// the shared-noise final stage (see sampling.h)
 bool common_shared_noise_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_SHARED_NOISE");
@@ -762,7 +762,7 @@ struct common_sampler * common_sampler_init(
             const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
                 ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
                  (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
-            // k19-sharednoise: LLAMA_SHARED_NOISE=1: the sampled draw is the counter-based Gumbel-max stage (the same distribution as
+            // LLAMA_SHARED_NOISE=1: the sampled draw is the counter-based Gumbel-max stage (the same distribution as
             // dist). Not with backend sampling (the chain runs on the device there)
             const bool shared_noise = !greedy && common_shared_noise_enabled() && !params.backend_sampling;
             if (shared_noise) {
@@ -833,7 +833,7 @@ struct common_sampler * common_sampler_init(
         }
         std::sort(bt.begin(), bt.end());
         result->dev_n_bias = (int32_t) (std::unique(bt.begin(), bt.end()) - bt.begin());
-        // k19-gramdev: a token listed twice (e.g. a user bias on an EOG token + ignore_eos) gets every bias on the full row (where position =
+        // a token listed twice (e.g. a user bias on an EOG token + ignore_eos) gets every bias on the full row (where position =
         // id) but only its first one on the candidates (the logit-bias sampler's search loop stops at the first match): no device top-k
         result->dev_bias_pos = result->dev_bias_pos || (size_t) result->dev_n_bias < merged_bias.size();
     }
@@ -1088,7 +1088,7 @@ common_sampler_dev_stats common_sampler_get_dev_stats(const struct common_sample
     return gsmpl != nullptr ? gsmpl->dev_stats : common_sampler_dev_stats {};
 }
 
-// k19-gramdev: LLAMA_DEVICE_TOPK_GRAMMAR=0: requests with a grammar or a reasoning budget copy the full rows and sample on the host, as before
+// LLAMA_DEVICE_TOPK_GRAMMAR=0: requests with a grammar or a reasoning budget copy the full rows and sample on the host, as before
 bool common_sampler_device_topk_grammar_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_DEVICE_TOPK_GRAMMAR");
@@ -1104,14 +1104,14 @@ void common_sampler_set_device_token(struct common_sampler * gsmpl, bool on) {
 }
 
 bool common_sampler_device_greedy(const struct common_sampler * gsmpl) {
-    // k15-fn: the sampled token is the argmax of the raw logits (no bias, no active penalties): a device argmax that returns the lowest id
+    // the sampled token is the argmax of the raw logits (no bias, no active penalties): a device argmax that returns the lowest id
     // on a tie gives the same token without copying the logits
     const bool ok = gsmpl != nullptr && gsmpl->greedy_fast && !gsmpl->pen_fast && gsmpl->bias_dense.empty() && gsmpl->bias_sparse.empty();
     return ok;
 }
 
 bool common_sampler_device_greedy_masked(const struct common_sampler * gsmpl, std::vector<llama_token> & mask) {
-    // k15-fn: the argmax of the logits with some tokens excluded (every bias is -inf, e.g. ignore_eos): the device greedy_masked chain
+    // the argmax of the logits with some tokens excluded (every bias is -inf, e.g. ignore_eos): the device greedy_masked chain
     // gives the same token
     mask.clear();
     if (gsmpl == nullptr || !gsmpl->greedy_fast || gsmpl->pen_fast || gsmpl->bias_sparse.empty()) {
@@ -1129,7 +1129,7 @@ bool common_sampler_device_greedy_masked(const struct common_sampler * gsmpl, st
 
 // k + m of common_sampler_device_topk (the candidates the chain needs), or 0 when the chain cannot finish from a device top-k
 static int64_t common_sampler_device_topk_need(const struct common_sampler * gsmpl) {
-    // k15-fn: the chain runs on the k_dev highest raw logits of the row (a device top-k) and still gives the token, the
+    // the chain runs on the k_dev highest raw logits of the row (a device top-k) and still gives the token, the
     // candidates and the probabilities of the full row, when
     //   - everything before the chain's top_k (or before its final greedy) only lowers logits or does nothing: penalties with
     //     repeat >= 1, frequency >= 0, presence >= 0; biases <= 0 (logit_bias, suppress tokens, ignore_eos); inactive dry,
@@ -1138,7 +1138,7 @@ static int64_t common_sampler_device_topk_need(const struct common_sampler * gsm
     //     biased tokens): the k highest lowered logits are then among the k + m highest raw ones;
     //   - no mirostat, adaptive-p, infill, dynamic temperature or probabilities output.
     // The host top_k breaks ties by the lower id, so the full row and its device top-k give the same sorted candidates.
-    // k19-gramdev: a grammar or a reasoning budget qualifies too (LLAMA_DEVICE_TOPK_GRAMMAR=0: not), with the raw rows also copied to
+    // a grammar or a reasoning budget qualifies too (LLAMA_DEVICE_TOPK_GRAMMAR=0: not), with the raw rows also copied to
     // the host: common_sampler_sample_dev_gram decides each position from the candidates when that is provably the full row's result
     // and samples the full row otherwise.
     // Returns k_dev when the request qualifies, 0 otherwise (the raw logits are copied as before)
@@ -1203,7 +1203,7 @@ int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t 
     return need > 0 && need <= (int64_t) k_dev ? k_dev : 0;
 }
 
-// k19-gramdev: one row of a device top-k request with a grammar or a reasoning budget (the candidates C, the k_dev highest raw logits,
+// one row of a device top-k request with a grammar or a reasoning budget (the candidates C, the k_dev highest raw logits,
 // are in cur, in id order; the full raw row is on the host). Today's host path, step by step, with the reason each step on C gives the
 // result of the same step on the full row:
 //   - the reasoning budget passes the logits through unless it is forcing; forcing (a few tokens per request): the full row
@@ -1218,7 +1218,7 @@ int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t 
 //     order (same values, ties by the lower id), and the chain after them sees the same candidates. Otherwise the full row is sampled
 //     (same RNG state: one chain draw happened on each side)
 //   - grammar_first = true: the same count on the masked C before the chain, else the full row
-// not inlined: inlined, it changed the code of common_sampler_sample's full-row path (A100 q4x tools with LLAMA_DEVICE_TOPK_GRAMMAR=0:
+// not inlined: inlined, it changed the code of common_sampler_sample's full-row path (A100 tools run of a 4-bit MoE with LLAMA_DEVICE_TOPK_GRAMMAR=0:
 // +0.5 ms of host sampling per pass against the base bin)
 #if defined(__GNUC__)
 __attribute__((noinline))
@@ -1357,7 +1357,7 @@ static llama_token common_sampler_sample_dev_gram(struct common_sampler * gsmpl,
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    // k19-graph: only while work is queued (the second and later rows of a verify window found the stream idle: 2-4 syncs per pass)
+    // only while work is queued (the second and later rows of a verify window found the stream idle: 2-4 syncs per pass)
     llama_synchronize_pending(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
@@ -1370,7 +1370,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    // k15-fn: a device greedy sampler (common_sampler_device_greedy, set by the server) picked the token and no logits were copied
+    // a device greedy sampler (common_sampler_device_greedy, set by the server) picked the token and no logits were copied
     if (gsmpl->dev_token && gsmpl->greedy_fast && llama_get_sampled_probs_ith(ctx, idx) == nullptr && llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
         const llama_token tok = gsmpl->sampled_token(ctx, idx);
         if (tok != LLAMA_TOKEN_NULL) {
@@ -1541,7 +1541,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    // k19-gramdev: device top-k candidates of a request with a grammar or a reasoning budget
+    // device top-k candidates of a request with a grammar or a reasoning budget
     if (gsmpl->dev_topk && gsmpl->dev_gram && llama_get_sampled_logits_ith(ctx, idx) != nullptr && llama_get_sampled_probs_ith(ctx, idx) == nullptr) {
         return common_sampler_sample_dev_gram(gsmpl, ctx, idx, grammar_first);
     }
@@ -1914,7 +1914,7 @@ llama_token common_shared_noise_draft_pick(common_shared_noise_draft & sn, int32
         }
     }
     if (sn.mode == 2) {
-        // k19-q4xaccept: the mirrored chain keeps c in descending order (penalties re-sort it, truncations keep the head). The window
+        // the mirrored chain keeps c in descending order (penalties re-sort it, truncations keep the head). The window
         // policies get the draft's own probability of the token, as for a raw argmax draft (only the token changes)
         if (p_pick != nullptr) {
             for (size_t k = 0; k < n; ++k) {
