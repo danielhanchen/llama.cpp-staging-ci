@@ -412,7 +412,7 @@ extern "C" {
     // starting depth of the host weight prefetch (copies of that many splits in flight), unless GGML_SCHED_PREFETCH_DEPTH is set; the
     // adaptive depth continues from it and a staging arena that does not fit goes back to the default depth
     GGML_API void                       ggml_backend_sched_set_prefetch_depth_init(ggml_backend_sched_t sched, int depth);
-    // k19-fn16: graphs allocated under an allocation limit (ggml_backend_sched_set_alloc_limit) until the scope ends get the deepest
+    // graphs allocated under an allocation limit (ggml_backend_sched_set_alloc_limit) until the scope ends get the deepest
     // prefetch depth up to `depth` whose staging arena fits next to their measured compute buffer growth (else the usual depth); the arena
     // returns to its earlier size when the scope ends (depth 0; call it after the scheduler was reset or its buffers freed). Not with
     // GGML_SCHED_PREFETCH_DEPTH set. The adaptive depth does not count the scoped graphs
@@ -427,7 +427,7 @@ extern "C" {
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
-    // k15-fn: the scheduler's split and allocation of the graph it allocated last, saved so that the same graph (same tensors, same
+    // the scheduler's split and allocation of the graph it allocated last, saved so that the same graph (same tensors, same
     // topology) can be made current again without splitting and allocating it: plan_save after a successful alloc_graph (NULL if the
     // graph uses prefetch, lent memory, overlap or pipeline copies), plan_restore after a reset (false if the plan is no longer valid:
     // a buffer of the graph allocator or the split context was replaced, then the caller allocates as usual)
@@ -436,7 +436,7 @@ extern "C" {
     GGML_API bool                      ggml_backend_sched_plan_restore(ggml_backend_sched_t sched, ggml_backend_sched_plan_t plan);
     GGML_API void                      ggml_backend_sched_plan_free   (ggml_backend_sched_plan_t plan);
     GGML_API size_t                    ggml_backend_sched_plan_bytes  (ggml_backend_sched_plan_t plan); // host memory of the plan
-    // k19-fullcost: the graph allocator's generation (ggml_gallocr_get_generation): it changes whenever a buffer of the allocator is
+    // the graph allocator's generation (ggml_gallocr_get_generation): it changes whenever a buffer of the allocator is
     // replaced or lent memory changes, i.e. when the addresses of a graph allocated before may no longer be valid
     GGML_API uint64_t                  ggml_backend_sched_get_alloc_generation(ggml_backend_sched_t sched);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
@@ -484,22 +484,22 @@ extern "C" {
     // returns the growth the graph needed (0 after an allocation that was not refused)
     GGML_API void                 ggml_backend_sched_set_alloc_limit(ggml_backend_sched_t sched, bool enable, size_t max_grow);
     GGML_API size_t               ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched);
-    // k19-synclend: the operations on host weights that a device would run (the weights copied to it) stay on the host while op_offload is
+    // the operations on host weights that a device would run (the weights copied to it) stay on the host while op_offload is
     // false (the value ggml_backend_sched_new was given is the default); the fallback of a graph refused by its SYNC copies, see
     // ggml_backend_sched_alloc_graph (GGML_SCHED_HOST_OPS_FALLBACK=0: neither the refusal nor the fallback, ggml_backend_sched_host_fallback_on)
     GGML_API bool                 ggml_backend_sched_get_op_offload(ggml_backend_sched_t sched);
     GGML_API void                 ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, bool op_offload);
     GGML_API bool                 ggml_backend_sched_host_fallback_on(void);
-    // k15-fn: t is a prefetched weight copy of the bound graph in staging memory (the arena or memory the user lent for the copies), which
+    // t is a prefetched weight copy of the bound graph in staging memory (the arena or memory the user lent for the copies), which
     // stays as written until the copy queue reuses its slot; false for a copy the graph allocator placed (its memory is reused by the graph)
     GGML_API bool                 ggml_backend_sched_tensor_is_staged(ggml_backend_sched_t sched, const struct ggml_tensor * t);
-    // k11: with the allocation limit on, a device compute buffer that would grow past the free memory may instead be placed in memory the
+    // with the allocation limit on, a device compute buffer that would grow past the free memory may instead be placed in memory the
     // lender lends (the graph allocation entries of ggml_backend_sched_lend_copy); the graph is refused (as by the limit) only if the
     // lender does not take it
     GGML_API void                 ggml_backend_sched_set_alloc_lend_graph(ggml_backend_sched_t sched, bool enable);
-    // k13-small: frees the compute buffers of the devices (not the host ones): the next graph allocates them at the size it needs
+    // frees the compute buffers of the devices (not the host ones): the next graph allocates them at the size it needs
     GGML_API void                 ggml_backend_sched_free_device_buffers(ggml_backend_sched_t sched);
-    // k19-place8: frees the host weight prefetch staging arenas of the device backends (allocated again by the next prefetched graph)
+    // frees the host weight prefetch staging arenas of the device backends (allocated again by the next prefetched graph)
     GGML_API void                 ggml_backend_sched_free_prefetch_arenas(ggml_backend_sched_t sched);
 
     // Set a callback that places prefetched copies in memory lent by the user instead of the staging arena

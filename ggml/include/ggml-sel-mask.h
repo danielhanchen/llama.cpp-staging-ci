@@ -1,6 +1,6 @@
 #pragma once
 
-// k19-kvlong: the dense selection mask of a sparse (top-k selected cells) attention as one node, GGML_OP_KQ_MASK of kind GGML_KQ_MASK_KIND_SEL (ggml-impl.h: the kind sits in op_params[8], as
+// the dense selection mask of a sparse (top-k selected cells) attention as one node, GGML_OP_KQ_MASK of kind GGML_KQ_MASK_KIND_SEL (ggml-impl.h: the kind sits in op_params[8], as
 // ggml_kq_mask_win's window kinds 1 / 2; op_params[0..5] stay free for the host inputs llama keeps there)
 
 #include "ggml.h"

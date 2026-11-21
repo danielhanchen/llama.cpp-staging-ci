@@ -1532,12 +1532,12 @@ extern "C" {
     // host:  device-accessible pointers to the experts of layer il in host memory, with the layout of the banks
     // the missing experts get a slot (the least recently used one, approximated with a CLOCK) and are copied from host memory
     // result: I32 [n_expert_used, n_tokens] slots of the selected experts, then the copied experts; ggml_view_2d(ctx, res, n_expert_used, n_tokens, res->nb[1], 0) gives the ids for ggml_mul_mat_id with a bank
-    // k15-pp: the KQ mask of a KV-cached attention built by the backend from the cells and the tokens (the values of
+    // the KQ mask of a KV-cached attention built by the backend from the cells and the tokens (the values of
     // llama_kv_cache::set_input_kq_mask: 0 = attend, -INFINITY = masked)
     // cells: I32 [5, n_kv, n_stream]: position (INT32_MIN = empty cell), sequence bits 0-31, sequence bits 32-63, 2D x, 2D y
     // toks:  I32 [8, n_tps, n_stream]: position, sequence id (< 64), causal, SWA type (enum llama_swa_type), n_swa, 2D (M-RoPE), x, y
     // result: type (F16 or F32) [n_kv, n_tps, 1, n_stream]
-    // k19-handoff: the DFlash2 drafter's dynamic grouped convolution over each block of block_size = T / n_blocks rows, in one op.
+    // the DFlash2 drafter's dynamic grouped convolution over each block of block_size = T / n_blocks rows, in one op.
     // x: F32 [H, T] contiguous; dyn: F32 [n_groups * K * 2, T] contiguous (coefficients [n_groups, K, 2 sides]); base: F32 [H * K]
     // contiguous (the side's base weights [group_size, n_groups, K]); H = group_size * n_groups.
     // w_k[h, t] = dyn[(h / group_size) + n_groups * (k + K * side), t] + base[h + H * k]; v_k[h, t] = x[h, t - k] within the block, 0.0f
@@ -1601,7 +1601,7 @@ extern "C" {
             int                   n_banks,
             bool                  overlap);
 
-    // k19-l4c deferred admission: assign (ggml_moe_cache_assign) also writes the experts it admits to its host ids (the host computes every
+    // deferred admission: assign (ggml_moe_cache_assign) also writes the experts it admits to its host ids (the host computes every
     // expert that was not cached before the lookup), and fetch (an overlapped ggml_moe_cache_fetch of that assign) copies the admitted
     // experts to their slots beside the rest of the graph without a join: nothing in the graph reads them (the result of fetch is unused),
     // the backend waits for the copies at the end of the graph, so the next graph finds them cached
@@ -1612,7 +1612,7 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
-    // single-graph host misses (k11, LLAMA_MOE_SINGLE): instead of a graph split per layer, the device publishes the host ids and the
+    // single-graph host misses (LLAMA_MOE_SINGLE): instead of a graph split per layer, the device publishes the host ids and the
     // activations of a small batch to a mailbox in host memory mapped into the device, a host thread computes those experts, and the
     // merge waits for it on the device. mbox: device pointer of the mapped mailbox (layout: ggml_moe_mailbox_hdr, see ggml-moe-mailbox.h),
     // ctl: device memory of the mailbox (sequence, pending), timeout_ms: the merge gives up after it (NaN output, error flag)
@@ -2866,7 +2866,7 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
-    // a verify window of a replay rollback (llama_memory_recurrent replay, k16-draft): before the window, the first wp[0, s] tokens
+    // a verify window of a replay rollback (llama_memory_recurrent replay): before the window, the first wp[0, s] tokens
     // of the stored previous window of sequence s (wk / wv / wgb at token slots wp[1, s] * n_win + t, n_win = wk->ne[2] / 2) are
     // applied to state; the result is the output's state (K == 1: the committed state, not the window's final one), and the window's
     // own k / v / g / beta are written into the other half (token slots (1 - wp[1, s]) * n_win + t) of the stores. Scalar gate only.

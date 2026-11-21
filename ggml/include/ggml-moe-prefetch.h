@@ -1,6 +1,6 @@
 // Ported from ikawrakow/ik_llama.cpp ggml/src/ggml-moe-prefetch.h at e34d163a (author dmaivel), MIT.
 // Copyright (c) 2024-2025 The ik_llama.cpp authors. See LICENSE.
-// k16-disk changes: public header (GGML_API), the registry holds expert tensor ranges with a reference count (not whole mappings),
+// Changes: public header (GGML_API), the registry holds expert tensor ranges with a reference count (not whole mappings),
 // a lookahead byte budget, MADV_RANDOM on the registered ranges, counters (ggml_moe_prefetch_stats).
 #pragma once
 
@@ -16,7 +16,7 @@ extern "C" {
 
 // mapping registry; a registered range marks tensors as mmap-backed and
 // eligible for prefetch. Nothing is opened or retained beyond (base, size).
-// k16-disk: ranges are reference counted (several contexts register the same model); with rand_read the range gets MADV_RANDOM
+// ranges are reference counted (several contexts register the same model); with rand_read the range gets MADV_RANDOM
 // while it is registered (no read-around on a demand fault: the engine reads the exact ranges), MADV_NORMAL when the last
 // reference goes
 GGML_API void ggml_moe_prefetch_register_mapping  (const void * base, size_t size, bool rand_read);
@@ -26,10 +26,10 @@ GGML_API void ggml_moe_prefetch_unregister_mapping(const void * base);
 GGML_API void ggml_moe_prefetch_set_n_threads(int n_threads);
 GGML_API bool ggml_moe_prefetch_enabled(void);
 
-// k16-disk: lookahead (ggml_moe_prefetch_tensor) budget in bytes queued or being read; beyond it lookahead is dropped (0 = no limit)
+// lookahead (ggml_moe_prefetch_tensor) budget in bytes queued or being read; beyond it lookahead is dropped (0 = no limit)
 GGML_API void ggml_moe_prefetch_set_budget(size_t bytes);
 
-// k16-disk: scheduler lookahead depth in MoE splits (ggml-backend.cpp; default GGML_MOE_PREFETCH_AHEAD or 3, 0 = kernel hook only)
+// scheduler lookahead depth in MoE splits (ggml-backend.cpp; default GGML_MOE_PREFETCH_AHEAD or 3, 0 = kernel hook only)
 GGML_API void ggml_moe_prefetch_set_ahead(int n);
 
 // the epoch is bumped once per scheduler pass so per-tensor enqueues are
@@ -58,10 +58,10 @@ GGML_API void ggml_moe_prefetch_wait(const struct ggml_tensor * w);
 GGML_API void ggml_moe_prefetch_cold(const struct ggml_tensor * w);
 
 // kernel-entry hook, called at the start of the CPU MUL_MAT_ID. Thread 0 fire-and-forget enqueues the routed experts of src0
-// (urgent). k16-disk: a no-op while the engine is off (ik falls back to madvise(MADV_WILLNEED) there; here off = k15 behaviour)
+// (urgent). a no-op while the engine is off (ik falls back to madvise(MADV_WILLNEED) there; here off = the earlier behaviour)
 GGML_API void ggml_moe_prefetch_kernel_hook(const struct ggml_tensor * node, int ith);
 
-// k16-disk: cumulative counters (engagement checks, logs)
+// cumulative counters (engagement checks, logs)
 struct ggml_moe_prefetch_counters {
     uint64_t n_jobs;            // chunks taken by the workers
     uint64_t n_skipped;         // chunks found resident (mincore)
