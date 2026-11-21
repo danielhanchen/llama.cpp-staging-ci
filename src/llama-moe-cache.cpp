@@ -377,7 +377,10 @@ struct moe_cache_lru {
     // give a slot to each expert selected by ids in layer il, the misses evict the least recently used experts
     // returns false if the ids select more distinct experts than there are slots
     // evicted: the slots whose expert the misses replace and that expert's key (il*n_expert + e), if not nullptr
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, std::vector<std::pair<int32_t, int32_t>> * evicted = nullptr) {
+    // keep_after (a prompt's seed, see llama_moe_cache seed): the misses evict the slots of layers after keep_after only once the slots of
+    // the layers up to it are used (see plan_keep)
+    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, std::vector<std::pair<int32_t, int32_t>> * evicted = nullptr,
+            int32_t keep_after = INT32_MAX) {
         fills.clear();
         if (evicted != nullptr) {
             evicted->clear();
@@ -441,6 +444,9 @@ struct moe_cache_lru {
                 n_hit++;
             }
         }
+        if (keep_after != INT32_MAX) {
+            return plan_keep(il, keep_after, fills, n_hit, evicted);
+        }
         // sorted misses usually get consecutive slots, so the uploads can be merged
         std::sort(uniq.begin(), uniq.end());
         if (grow_q16 > 0) {
@@ -497,6 +503,93 @@ struct moe_cache_lru {
             key_of[s] = il*n_expert + e;
             slots[e] = s;
             touch(s);
+            fills.push_back({ e, s });
+        }
+        return true;
+    }
+
+    // plan with keep_after (the hits of uniq are already touched). The victims come in three tiers, each in the order plan uses (lowest
+    // counters, else LRU order): empty slots and slots of layers up to keep_after that this prompt pass has not seeded; then slots of the
+    // layers after keep_after (not copied yet in this pass); then the slots this pass seeded. Every miss gets a slot, as in plan: only
+    // the order differs, so the experts of the layers ahead stay where an older expert of a finished layer can go instead
+    uint32_t keep_pass = 0;                // the prompt pass of the caller (llama_moe_cache seed)
+    std::vector<uint32_t> keep_mark;       // [n_slots] the pass that last seeded the slot (a hit or a fill)
+    std::vector<int32_t> keep_tier[3];
+    uint64_t keep_used[3] = { 0, 0, 0 }; // victims taken from each tier (statistics)
+    std::vector<int32_t> keep_vict;
+    std::vector<int32_t> keep_miss;
+    bool plan_keep(int32_t il, int32_t keep_after, std::vector<fill> & fills, size_t & n_hit, std::vector<std::pair<int32_t, int32_t>> * evicted) {
+        GGML_UNUSED(n_hit);
+        if (keep_mark.size() != (size_t) n_slots) {
+            keep_mark.assign(n_slots, 0);
+        }
+        int32_t * slots = slot_map[il];
+        keep_miss.clear();
+        for (int32_t e : uniq) {
+            if (slots[e] < 0) {
+                keep_miss.push_back(e);
+            } else {
+                keep_mark[slots[e]] = keep_pass;
+            }
+        }
+        if (keep_miss.empty()) {
+            return true;
+        }
+        for (auto & t : keep_tier) {
+            t.clear();
+        }
+        for (int32_t s = head; s >= 0; s = next[s]) {
+            const int32_t k = key_of[s];
+            int tier = 0;
+            if (k >= 0) {
+                const int32_t kl = k / n_expert;
+                if (kl == il && seen[k % n_expert] == seen_gen) {
+                    continue; // a hit of this plan
+                }
+                tier = keep_mark[s] == keep_pass ? 2 : kl > keep_after ? 1 : 0;
+            }
+            keep_tier[tier].push_back(s);
+        }
+        keep_vict.clear();
+        for (auto & t : keep_tier) {
+            const size_t need = keep_miss.size() - keep_vict.size();
+            if (need == 0) {
+                break;
+            }
+            if (grow_q16 > 0 && t.size() > need) {
+                // the lowest counters of the tier, ties by LRU order (t is in LRU order)
+                cand.clear();
+                for (size_t pos = 0; pos < t.size(); ++pos) {
+                    const int32_t s = t[pos];
+                    const int64_t v = key_of[s] >= 0 ? scores[key_of[s]] : -1;
+                    cand.push_back({ (v + 1) << 32 | (int64_t) pos, s });
+                }
+                std::nth_element(cand.begin(), cand.begin() + (need - 1), cand.end());
+                for (size_t j = 0; j < need; ++j) {
+                    keep_vict.push_back(cand[j].second);
+                }
+            } else {
+                keep_vict.insert(keep_vict.end(), t.begin(), t.begin() + std::min(need, t.size()));
+            }
+            keep_used[&t - keep_tier] += keep_vict.size() - (keep_miss.size() - need);
+        }
+        GGML_ASSERT(keep_vict.size() == keep_miss.size());
+        // sorted misses on sorted slots, so the uploads can be merged
+        std::sort(keep_miss.begin(), keep_miss.end());
+        std::sort(keep_vict.begin(), keep_vict.end());
+        for (size_t j = 0; j < keep_miss.size(); ++j) {
+            const int32_t e = keep_miss[j];
+            const int32_t s = keep_vict[j];
+            if (key_of[s] >= 0) {
+                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
+                if (evicted != nullptr) {
+                    evicted->emplace_back(s, key_of[s]);
+                }
+            }
+            key_of[s] = il*n_expert + e;
+            slots[e] = s;
+            touch(s);
+            keep_mark[s] = keep_pass;
             fills.push_back({ e, s });
         }
         return true;
@@ -878,6 +971,10 @@ struct llama_moe_cache::impl {
     };
 
     size_t n_large_ubatches = 0; // ubatches of more than max_batch tokens
+    size_t   n_seed_keep_calls = 0;         // prompt seeds planned with the layers ahead kept last (LLAMA_MOE_SEED_KEEP_AHEAD)
+    uint32_t seed_pass         = 0;         // the prompt pass of those seeds (see seed)
+    bool     lm_merged         = false;     // a merged layer-major graph runs (set_lm_merged)
+    int32_t  seed_pass_il      = INT32_MAX; // the layer of the last one
 
     static constexpr int64_t max_batch = 32;
 
@@ -14485,9 +14582,27 @@ struct llama_moe_cache::impl {
                 sd.old_scores = g.lru.scores;
                 sd.old_w      = g.lru.w;
             }
+            // (LLAMA_MOE_SEED_KEEP_AHEAD=1, opt-in; default: the least recently used slots of the group): the seed's misses take the
+            // slots of the layers the graph has already copied first and those of the layers ahead (the same group shares one slot list)
+            // last, so those layers find their cached experts in their own copies instead of uploading them again. Only in a merged
+            // layer-major graph (one copy per expert for several ubatches). Every seed is admitted as before, only the victims' order
+            // changes, so the cache the decode starts from differs: A100 80 GB (12 GB/s link), Flash-Next 4-bit 48 GB, 8k prompt 4.57 ->
+            // 4.36 s (uploads 35.1 -> ~24 GB), but other text (the misses the host computes in the decode differ) and 8k decode -2..-4%
+            static const bool keep_ahead_env = getenv("LLAMA_MOE_SEED_KEEP_AHEAD") != nullptr && atoi(getenv("LLAMA_MOE_SEED_KEEP_AHEAD")) != 0;
+            const bool keep_ahead = keep_ahead_env && lm_merged;
+            if (keep_ahead) {
+                // a new pass starts where the layers stop increasing (the next prompt graph)
+                if (b.il <= seed_pass_il) {
+                    seed_pass++;
+                }
+                seed_pass_il = b.il;
+                g.lru.keep_pass = seed_pass;
+                n_seed_keep_calls++;
+            }
             size_t n_hit = 0;
             const bool tiered = host_layer(b.il) && host->exclusive();
-            const bool ok = g.lru.plan(b.il, seed_ids.data(), seed_ids.size(), sd.fills, n_hit, tiered ? &evicted_tmp : nullptr);
+            const bool ok = g.lru.plan(b.il, seed_ids.data(), seed_ids.size(), sd.fills, n_hit, tiered ? &evicted_tmp : nullptr,
+                keep_ahead ? b.il : INT32_MAX);
             GGML_ASSERT(ok);
             sd.gen = g.lru.gen;
             if (tiered) {
@@ -15077,6 +15192,16 @@ struct llama_moe_cache::impl {
         }
         if (stats_seed.misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu experts admitted to the cache, %.2f MiB\n", tag, stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
+            if (n_seed_keep_calls > 0) {
+                uint64_t u[3] = { 0, 0, 0 };
+                for (const group & g : groups) {
+                    for (int t = 0; t < 3; ++t) {
+                        u[t] += g.lru.keep_used[t];
+                    }
+                }
+                LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu layer seeds kept the layers ahead last: victims %" PRIu64 " of finished layers, %" PRIu64
+                    " of layers ahead, %" PRIu64 " of this pass's seeds (LLAMA_MOE_SEED_KEEP_AHEAD=1)\n", tag, n_seed_keep_calls, u[0], u[1], u[2]);
+            }
         }
         if (n_prompt_inplace + n_prompt_fallback > 0 || prompt_hits + prompt_misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches in place: %zu layer copies (%zu admitting), %zu experts read from the slots, %zu uploaded "
@@ -15734,6 +15859,10 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor 
 
 void llama_moe_cache::count_batch(const ggml_tensor * w, const std::vector<ggml_backend_copy_region> & regions) {
     pimpl->count_batch(w, regions);
+}
+
+void llama_moe_cache::set_lm_merged(bool on) {
+    pimpl->lm_merged = on;
 }
 
 void llama_moe_cache::count_large_ubatch() {
