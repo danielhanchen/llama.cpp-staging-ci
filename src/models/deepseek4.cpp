@@ -3,6 +3,7 @@
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-iswa.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,7 +14,8 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     if (hparams.n_layer_nextn > 0) {
         const uint32_t n_layer_main = hparams.n_layer_all - hparams.n_layer_nextn;
         const std::string mtp_probe = "blk." + std::to_string(n_layer_main) + ".nextn.eh_proj.weight";
-        if (ml.get_weight(mtp_probe.c_str()) == nullptr) {
+        // (a model built from metadata alone has no weights to probe: its creator states the NextN block)
+        if (!ml.weights_map.empty() && ml.get_weight(mtp_probe.c_str()) == nullptr) {
             hparams.n_layer_nextn = 0;
         }
     }
@@ -883,6 +885,39 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
     return build_attention_impl(model, nullptr, inp_mtp, cur, inp_pos, il);
 }
 
+// the K half of build_attention_impl for an MTP block (compress ratio 0, no compressor or indexer state): the same ops on the
+// same rows (kv projection, norm, RoPE), then the cache write of build_attn
+void llama_model_deepseek4::graph::build_mtp_k_store(
+        const llama_model & model,
+        llm_graph_input_attn_k_iswa * inp_mtp,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        int il) const {
+    const auto & layer = model.layers[il];
+
+    const int64_t n_embd_head      = hparams.n_embd_head_k();
+    const int64_t n_embd_head_rope = hparams.n_rot();
+    const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
+    const int64_t nt               = cur->ne[1];
+
+    GGML_ASSERT(hparams.dsv4_compress_ratios[il] == 0 && "DEEPSEEK4 MTP blocks attend densely");
+
+    // the rope parameters of build_attention_impl at compress ratio 0
+    const float attn_factor_l = dsv4_rope_attn_factor(1.0f, 0.0f);
+
+    ggml_tensor * kv = build_lora_mm(layer.wkv, cur);
+    kv = build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt);
+    cb(kv, "kv_norm", il);
+
+    kv = ggml_rope_ext(ctx0, kv, inp_pos, nullptr, n_embd_head_rope, rope_type, 0,
+            freq_base, 1.0f, 0.0f, attn_factor_l, 0.0f, 0.0f);
+    kv = ggml_rope_set_offset(kv, n_embd_head_nope);
+    cb(kv, "kv", il);
+
+    build_attn_k_store(inp_mtp, kv, il);
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         const llama_model & model,
         llm_graph_input_dsv4 * inp_dsv4,
@@ -1364,6 +1399,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 }
 
 
+// LLAMA_MTP_KV_ONLY_DSV4=0: the MTP block of a batch with no output row runs whole (see llm_graph_context::mtp_kv_only)
+static bool dsv4_mtp_kv_only_on() {
+    static const bool on = getenv("LLAMA_MTP_KV_ONLY_DSV4") == nullptr || atoi(getenv("LLAMA_MTP_KV_ONLY_DSV4")) != 0;
+    return on;
+}
+
 llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(params) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "DEEPSEEK4 MTP requires n_layer_nextn > 0");
@@ -1410,8 +1451,13 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     res->add_input(std::move(inp));
 
+    // a batch with no output row (prompt and catch-up passes) is read later only through the K rows it writes (the MTP block
+    // has no compressor or indexer state): the graph ends after those writes, no query, attention, MoE FFN or head
+    const bool kv_only = mtp_kv_only(dsv4_mtp_kv_only_on(),
+            static_cast<const llama_kv_cache_iswa_context *>(mctx)->get_base()->win_on());
+
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
     llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
 
     ggml_tensor * h_norm = build_norm(h_state, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
@@ -1441,6 +1487,11 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
+
+    if (kv_only) {
+        build_mtp_k_store(model, inp_attn, cur, inp_pos, il);
+        return;
+    }
 
     cur = build_attention(model, inp_attn, cur, inp_pos, il);
 

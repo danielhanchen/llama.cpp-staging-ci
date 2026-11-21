@@ -4204,6 +4204,73 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
+// the switches are shared with the Flash-Next drafter (src/models/qwen4exp.cpp): LLAMA_MTP_PROMPT_KV_ONLY=0 off,
+// LLAMA_MTP_CATCHUP_KV_ONLY=0 only from 64 rows, LLAMA_MTP_PROMPT_KV_ONLY_MIN=N from N rows, LLAMA_MTP_PROMPT_KV_ONLY_UB=0 no
+// lowering of that minimum to a smaller n_ubatch
+static std::atomic<int64_t> g_mtp_kv_only_graphs { 0 };
+
+bool llm_graph_context::mtp_kv_only(bool arch_on, bool win_on) const {
+    static const bool kv_only_env     = getenv("LLAMA_MTP_PROMPT_KV_ONLY") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY")) != 0;
+    static const bool kv_only_catchup = getenv("LLAMA_MTP_CATCHUP_KV_ONLY") == nullptr || atoi(getenv("LLAMA_MTP_CATCHUP_KV_ONLY")) != 0;
+    static const int64_t kv_only_min  = getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN") ? std::max(1, atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN"))) :
+        kv_only_catchup ? 1 : 64;
+    static const bool kv_only_ub      = getenv("LLAMA_MTP_PROMPT_KV_ONLY_UB") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_UB")) != 0;
+
+    const int64_t kv_min = kv_only_ub && (int64_t) cparams.n_ubatch < kv_only_min ? std::max<int64_t>(1, cparams.n_ubatch) : kv_only_min;
+
+    // an unmasked h_nextn would be read for every row, output or not
+    const bool h_unread = !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
+
+    const bool on = arch_on && kv_only_env && !win_on && !cparams.training && h_unread &&
+        n_outputs == 0 && n_tokens >= kv_min;
+    if (on) {
+        if (g_mtp_kv_only_graphs++ == 0) {
+            LLAMA_LOG_INFO("%s: MTP drafter batches of at least %lld rows with no output row compute the block's K / V cache writes only "
+                "(LLAMA_MTP_PROMPT_KV_ONLY=0 off)\n", __func__, (long long) kv_only_min);
+        }
+    }
+    return on;
+}
+
+int64_t llama_graph_mtp_kv_only_count() {
+    return g_mtp_kv_only_graphs.load();
+}
+
+void llm_graph_context::build_attn_kv_store(llm_graph_input_attn_kv * inp, ggml_tensor * k_cur, ggml_tensor * v_cur, int il) const {
+    if (inp->self_k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    // as build_attn: v, then k (rope fusion writes k into the cache); a host cache gets the same rows build_attn writes after its
+    // attention
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+}
+
+void llm_graph_context::build_attn_k_store(llm_graph_input_attn_k_iswa * inp, ggml_tensor * k_cur, int il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
+    if (k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
+    }
+
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur  = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    const auto & k_idxs    = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
