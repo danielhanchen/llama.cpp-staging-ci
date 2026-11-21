@@ -559,6 +559,8 @@ llama_build_and_test(test-fit-small-reserve.cpp)
 llama_build_and_test(test-fit-plain-spill.cpp)
 # --fit: the full margin beside a MoE cache without flash attention, and the flash attention the measure reads back (common/fit.h)
 llama_build_and_test(test-fit-faoff.cpp)
+# --fit: the MoE cache size of a decode-sized placement, at most the size requested (common/fit.h)
+llama_build_and_test(test-fit-place8-grow.cpp)
 # token-tiled gated delta-net vs the AR kernel, byte for byte on the GPU backend (SKIP without one)
 llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 # the ops added here (KQ_MASK, MOE_CACHE_LOOKUP, the GDN replay window) are refused by the meta backend (-sm tensor) and RPC and run on the CPU

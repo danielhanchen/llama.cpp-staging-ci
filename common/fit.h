@@ -98,6 +98,13 @@ bool    common_fit_place8_mid();
 //     LLAMA_FIT_SMALL_RESERVE_MIN_CACHE_MIB (64)
 int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, int64_t floor_mib);
 
+// the MoE cache size of a decode-sized placement (graphs reserved at a small ubatch, the cache takes the prompt compute memory), in bytes:
+// from size_ok + grow, at most size_cap (the requested --moe-cache-mib), down by what each measurement misses the margin by, at most
+// 3 measurements and at least 128 MiB above size_ok. measure(req, over) sets over = free - total - margin of the measurement
+// at req and returns false where it failed; ctx_ub is the context memory the measurement does not hold at run time. -1: no larger cache
+int64_t common_fit_place8_grow_size(int64_t size_ok, int64_t size_cap, int64_t grow, int64_t ctx_ub,
+        const std::function<bool(int64_t req, int64_t & over)> & measure);
+
 // the margin beside a MoE cache without flash attention. The fit may take part of the default margin m for the cache
 // (m_reduced, LLAMA_MOE_FIT_MARGIN); without flash attention (flash_attn = false: -fa off, or auto resolved off at the measured
 // context) the full margin stays when keep_faoff (LLAMA_FIT_FAOFF_MARGIN, default 1): the KQ / KQV mat-muls take F16 copies of the
