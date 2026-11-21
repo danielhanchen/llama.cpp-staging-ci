@@ -7912,7 +7912,7 @@ struct llama_moe_cache::impl {
     bool in_prepare  = false;
     bool rf_allow    = false; // the unlend being run gives the slots back to a small batch's graph (the only case that refills beside a graph)
     // only after a graph of at least this many tokens lent the slots (LLAMA_MOE_REFILL_ASYNC_MIN_TOKENS, default 1024): a short prompt's
-    // tail is too short to hide the refill, which then ran into the decode (G4 Qwen3.8-Flash-Next 32 GB, 42-token chat: decode -1.0 /
+    // tail is too short to hide the refill, which then ran into the decode (RTX PRO 6000, a 4-bit MoE at 32 GB, 42-token chat: decode -1.0 /
     // -1.3% on two VMs with the chat TTFT unchanged); the 8k prompt's tail hides it (decode level)
     int64_t rf_min_tokens = [] {
         const char * e = getenv("LLAMA_MOE_REFILL_ASYNC_MIN_TOKENS");
