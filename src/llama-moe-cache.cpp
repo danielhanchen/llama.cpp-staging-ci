@@ -1,5 +1,6 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "llama-moe-cache.h"
+#include "llama-env-alias.h"
 #include "llama-sysmem.h"
 
 #include "llama-ext.h"
@@ -3122,7 +3123,7 @@ struct llama_moe_cache::impl {
         // the eager split (which overlaps a little device work per layer) is level or better: RTX PRO 6000 Flash-Next at 4 bits 16 GB (14.8% cached) chat -0.6%, 8k
         // -4.5% (same text), 12 GB DFlash2 admitted -4% (prof_1105_small 2d, w7 37-41 -> 47.8 ms); 24 GB (27.5%) +6 / +3.5%, 32 GB (42%)
         // +6.7%
-        // default 0.12 (LLAMA_MOE_G4PASS=0: 0.20). Since (one activation quantization, no id -1 rows) the mailbox
+        // default 0.12 (LLAMA_MOE_MAILBOX_WIDE_OVERLAP=0: 0.20). Since (one activation quantization, no id -1 rows) the mailbox
         // wins at 16 GB too: RTX PRO 6000 Flash-Next at 4 bits DFlash2 n6, 16 GB (15.5% cached), same text, w7 27.1 -> 24.9 ms, chat 161.9 ->
         // 179.1 tok/s, 8k 120.9 -> 126.9 (2 launches). nsys (node trace, ms per w7 pass): eager split 33.5 wall = 25.0 busy + 7.7 idle
         // inside the verify (111 launches, the device waiting on each layer's host split) vs the mailbox 29.8 = 27.3 + 1.6 (29 launches,
@@ -9553,12 +9554,12 @@ struct llama_moe_cache::impl {
         // (the rule only with LLAMA_MOE_PREFETCH_AUTO=1; a long48 KLD run put one position of the 48 GB DFlash2 cell above
         // the -fa off band's max in 2 of 3 runs, 0.135 / 0.159 vs 0.116, and the 512-token chat texts differ from it off after ~300 tokens)
         // LLAMA_MOE_PREFETCH_AUTO=2 (set by the server beside an MTP drafter, see its rule): only the band where
-        // the placed cache holds LLAMA_MOE_G4TAIL_FRAC_LO .. _HI (0.10 .. 0.20) of the host experts, on compute capability 12.0
+        // the placed cache holds LLAMA_MOE_SMALLCACHE_PREFETCH_FRAC_LO .. _HI (0.10 .. 0.20) of the host experts, on compute capability 12.0
         // devices with device lookups: top 10 predicted experts, at most 1 copied per layer (generation and verify windows only)
         const char * ea_g4t = getenv("LLAMA_MOE_PREFETCH_AUTO");
         if (ea_g4t != nullptr && atoi(ea_g4t) == 2) {
-            const double flo = getenv("LLAMA_MOE_G4TAIL_FRAC_LO") ? atof(getenv("LLAMA_MOE_G4TAIL_FRAC_LO")) : 0.10;
-            const double fhi = getenv("LLAMA_MOE_G4TAIL_FRAC_HI") ? atof(getenv("LLAMA_MOE_G4TAIL_FRAC_HI")) : 0.20;
+            const double flo = llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_FRAC_LO") ? atof(llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_FRAC_LO")) : 0.10;
+            const double fhi = llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_FRAC_HI") ? atof(llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH_FRAC_HI")) : 0.20;
             int  cmin = INT_MAX;
             int  cmax = -1;
             bool anyg = false;
@@ -9583,14 +9584,14 @@ struct llama_moe_cache::impl {
                 // (only "1" is written: another cache of the process, e.g. a drafter's, never clears the target's verdict)
                 if (on) {
 #if defined(_WIN32)
-                    _putenv_s("LLAMA_MOE_G4TAIL_PLACED", "1");
+                    _putenv_s("LLAMA_MOE_SMALLCACHE_PREFETCH_PLACED", "1");
 #else
-                    setenv("LLAMA_MOE_G4TAIL_PLACED", "1", 1);
+                    setenv("LLAMA_MOE_SMALLCACHE_PREFETCH_PLACED", "1", 1);
 #endif
                 }
                 LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch beside the MTP drafter %s: %.1f%% of the host experts "
                     "cached (band %.2f .. %.2f), %s (top %d predicted experts, at most %d per layer, generation and verify windows only; "
-                    "LLAMA_MOE_G4TAIL=0 off)\n", tag, on ? "on" : "off", 100.0*cache_frac, flo, fhi, !anyg ? "no device lookups" :
+                    "LLAMA_MOE_SMALLCACHE_PREFETCH=0 off)\n", tag, on ? "on" : "off", 100.0*cache_frac, flo, fhi, !anyg ? "no device lookups" :
                     !(cmin == 1200 && cmax == 1200) ? "not a compute capability 12.0 device" : on ? "in the band" : "outside the band", c.n, c.max_fill);
             }
             pf_cfg = c;
@@ -9659,10 +9660,10 @@ struct llama_moe_cache::impl {
 
     // this batch is a prompt's and the prefetch is on: no prefetch op (see prefetch_ok); also a graph key (hybrid_mode)
     bool pf_prompt_off() const {
-        // (LLAMA_MOE_G4TAIL=0 too: the int3 behaviour of an explicit LLAMA_MOE_PREFETCH)
+        // (LLAMA_MOE_SMALLCACHE_PREFETCH=0 too: the behaviour of an explicit LLAMA_MOE_PREFETCH)
         static const bool pf_prompt = [] {
             const char * e = getenv("LLAMA_MOE_PREFETCH_PROMPT");
-            const char * k = getenv("LLAMA_MOE_G4TAIL");
+            const char * k = llama_getenv_alias("LLAMA_MOE_SMALLCACHE_PREFETCH");
             return e != nullptr ? atoi(e) != 0 : k != nullptr && atoi(k) == 0;
         }();
         return cm_prompt_now && !pf_prompt && pf_resolved && pf_cfg.n > 0;
@@ -9802,20 +9803,20 @@ struct llama_moe_cache::impl {
     // chat / 8k +5.1 / +5.8%, 24 GB +2.9 / +4.0% (device beside the host 100 -> 83 us per layer). DFlash2 7-row windows (N = 8): 32 GB
     // +3.6 / +5.9% but 24 GB -2.5 / -3.6%, so the default stops at 4. Ubatches whose host path is off (48 GB) keep the plain lookup:
     // taking the hybrid lookup there for the overlap changed the text, so hybrid_layer does not widen for it
-    // (default on; LLAMA_MOE_G4PASS=0 or an explicit LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL: off): a window of 5..8 rows that
+    // (default on; LLAMA_MOE_MAILBOX_WIDE_OVERLAP=0 or an explicit LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL: off): a window of 5..8 rows that
     // publishes its host experts to the single-graph mailbox (single_usable: a many-core host, see single_max) takes the overlap too.
     // The 24 GB loss above was an earlier build (before LEAN, 2 launches). On the mailbox the admitted experts' copies
     // (moe_cache_fetch, 8.0 of 29.8 ms per traced w7 pass at 16 GB) ran serially before the hits while the host computed; beside the
     // hits they shorten the device side of every host layer. RTX PRO 6000 Flash-Next at 4 bits DFlash2 n6 16 GB, same text: w7 24.9 -> 23.8
     // ms, chat 179.1 -> 186.6 tok/s, 8k 126.9 -> 136.5 (2 launches). Windows on the eager split (fewer CPUs, smaller caches)
-    // keep the 4-token limit. Only below LLAMA_MOE_G4PASS_OV_MAX_FRAC (default 0.20) of the host experts cached, the share where the
+    // keep the 4-token limit. Only below LLAMA_MOE_MAILBOX_WIDE_OVERLAP_MAX_FRAC (default 0.20) of the host experts cached, the share where the
     // wide mailbox is new (see single_max) and the copies are largest. Two A/B runs (RTX PRO 6000, 3-4 interleaved launches, same text): 16 GB
     // chat 167.2 -> 178.3 (launches 2+: 166-168 -> 174.9-186.1), 8k 120.6 -> 134.8; above the share it was mixed: 24 GB (27.5%) chat
     // 203.7 -> 199.3 median over 7 launches (head 189-211, its host batches slower in the slow launches), 8k +2.4%; 32 GB (42%) chat /
-    // 8k +4.3 / +2.9% (3 launches). LLAMA_MOE_G4PASS_OV_MAX_FRAC=1: every mailbox window
+    // 8k +4.3 / +2.9% (3 launches). LLAMA_MOE_MAILBOX_WIDE_OVERLAP_MAX_FRAC=1: every mailbox window
     static bool g4pass_on() {
         static const bool on = [] {
-            const char * e = getenv("LLAMA_MOE_G4PASS");
+            const char * e = llama_getenv_alias("LLAMA_MOE_MAILBOX_WIDE_OVERLAP");
             return e == nullptr || atoi(e) != 0;
         }();
         return on;
@@ -9826,7 +9827,7 @@ struct llama_moe_cache::impl {
         if (!overlap || n_ubatch <= 1) {
             return false;
         }
-        static const double ov_max_frac = getenv("LLAMA_MOE_G4PASS_OV_MAX_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_G4PASS_OV_MAX_FRAC")) : 0.20;
+        static const double ov_max_frac = llama_getenv_alias("LLAMA_MOE_MAILBOX_WIDE_OVERLAP_MAX_FRAC") != nullptr ? atof(llama_getenv_alias("LLAMA_MOE_MAILBOX_WIDE_OVERLAP_MAX_FRAC")) : 0.20;
         if (e == nullptr && n_ubatch > mx && g4pass_on() && cache_frac >= 0.0 && cache_frac < ov_max_frac && single_usable(n_ubatch)) {
             n_ov_wide_host++;
             return true;
@@ -9840,8 +9841,8 @@ struct llama_moe_cache::impl {
     mutable uint64_t n_ov_wide_host = 0; // overlap_small_batch calls answered by the mailbox rule above (engagement)
     mutable uint64_t n_ov_wide_mid  = 0; // the same, answered by the band rule (g4mid_ov_band)
 
-    // (default on; LLAMA_MOE_G4MID=0 off): the side-stream copy overlap of a 5..8-row mailbox window (above) also where
-    // the cache holds LLAMA_MOE_G4MID_OV_MIN_FRAC (0.35) .. LLAMA_MOE_G4MID_OV_MAX_FRAC (0.60) of the host experts (RTX PRO 6000 Flash-Next at 4 bits 32 GB: 41.4%).
+    // (default on; LLAMA_MOE_MAILBOX_MID_OVERLAP=0 off): the side-stream copy overlap of a 5..8-row mailbox window (above) also where
+    // the cache holds LLAMA_MOE_MAILBOX_MID_OVERLAP_MIN_FRAC (0.35) .. LLAMA_MOE_MAILBOX_MID_OVERLAP_MAX_FRAC (0.60) of the host experts (RTX PRO 6000 Flash-Next at 4 bits 32 GB: 41.4%).
     // There a wide window's device side (the admitted experts' copies, then the hits) is the longer of the two per layer: RTX PRO 6000
     // Flash-Next at 4 bits DFlash2 n6 32 GB chat, GGML_MOE_MAILBOX_TIMING: device beside the host 126.2 us, host 115.4 us per batch, merge
     // wait 23.5 us; nsys (node trace, 0am): moe_cache_fetch of a 7-row window 110-125 us per layer, serial before the hits. Beside the hits
@@ -9852,17 +9853,17 @@ struct llama_moe_cache::impl {
     // (70.7%) is outside the band, its windows have the host path off). Not below the band by default: at 24 GB (27.5% cached) the device
     // side and the host batch are already level (144.9 vs 145.6-163.7 us), so with the overlap the pass follows the host batch time, which varies by
     // launch on the RTX PRO 6000 host (145-170 us, in both arms): the A/B chat median -2.2% over 7 launches (spread 10.8%), another run +3.9% chat
-    // / +2.5% 8k over 3 (host 144-146 us in every overlapped launch). LLAMA_MOE_G4MID_OV_MIN_FRAC=0.2 takes 24 GB in
+    // / +2.5% 8k over 3 (host 144-146 us in every overlapped launch). LLAMA_MOE_MAILBOX_MID_OVERLAP_MIN_FRAC=0.2 takes 24 GB in
     static bool g4mid_on() {
         static const bool on = [] {
-            const char * e = getenv("LLAMA_MOE_G4MID");
+            const char * e = llama_getenv_alias("LLAMA_MOE_MAILBOX_MID_OVERLAP");
             return e == nullptr || atoi(e) != 0;
         }();
         return on;
     }
     bool g4mid_ov_band() const {
-        static const double lo = getenv("LLAMA_MOE_G4MID_OV_MIN_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_G4MID_OV_MIN_FRAC")) : 0.35;
-        static const double hi = getenv("LLAMA_MOE_G4MID_OV_MAX_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_G4MID_OV_MAX_FRAC")) : 0.60;
+        static const double lo = llama_getenv_alias("LLAMA_MOE_MAILBOX_MID_OVERLAP_MIN_FRAC") != nullptr ? atof(llama_getenv_alias("LLAMA_MOE_MAILBOX_MID_OVERLAP_MIN_FRAC")) : 0.35;
+        static const double hi = llama_getenv_alias("LLAMA_MOE_MAILBOX_MID_OVERLAP_MAX_FRAC") != nullptr ? atof(llama_getenv_alias("LLAMA_MOE_MAILBOX_MID_OVERLAP_MAX_FRAC")) : 0.60;
         return g4mid_on() && cache_frac >= 0.0 && cache_frac >= lo && cache_frac < hi;
     }
 
@@ -14959,9 +14960,9 @@ struct llama_moe_cache::impl {
                 "copies, %llu of them 5+ tokens (LLAMA_MOE_OVERLAP_PLAIN_MAX) (LLAMA_MOE_OVERLAP_SMALL_PLAIN=%d)\n", tag,
                 (unsigned long long) n_ov_plain, (int) GGML_MOE_MAILBOX_MAX_TOKENS, (unsigned long long) n_ov_plain_wide, overlap_plain_on() ? 1 : 0);
             LLAMA_LOG_INFO("llama_moe_cache%s: %llu overlap queries of 5-%d token windows on the single-graph mailbox took the copy "
-                "overlap (LLAMA_MOE_G4PASS=%d)\n", tag, (unsigned long long) n_ov_wide_host, (int) GGML_MOE_MAILBOX_MAX_TOKENS, g4pass_on() ? 1 : 0);
+                "overlap (LLAMA_MOE_MAILBOX_WIDE_OVERLAP=%d)\n", tag, (unsigned long long) n_ov_wide_host, (int) GGML_MOE_MAILBOX_MAX_TOKENS, g4pass_on() ? 1 : 0);
             LLAMA_LOG_INFO("llama_moe_cache%s: %llu overlap queries of 5-%d token mailbox windows took the copy overlap in the "
-                "%.1f%% cached band (LLAMA_MOE_G4MID=%d)\n", tag, (unsigned long long) n_ov_wide_mid, (int) GGML_MOE_MAILBOX_MAX_TOKENS,
+                "%.1f%% cached band (LLAMA_MOE_MAILBOX_MID_OVERLAP=%d)\n", tag, (unsigned long long) n_ov_wide_mid, (int) GGML_MOE_MAILBOX_MAX_TOKENS,
                 100.0*cache_frac, g4mid_on() ? 1 : 0);
             if (ext_on) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: decode extension: %lld grows, %lld parks, at most %.2f MiB above the fitted slots, "

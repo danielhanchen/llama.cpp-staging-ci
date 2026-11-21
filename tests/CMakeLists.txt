@@ -610,6 +610,8 @@ if (NOT WIN32)
     target_link_libraries(test-cal-build-id PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
+llama_build_and_test(test-env-alias.cpp) # renamed environment switches: earlier names still read
+
 # the weight store is internal to libllama (exported symbols on non-Windows builds), the test uses the CPU backend directly
 if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-weight-store.cpp)
