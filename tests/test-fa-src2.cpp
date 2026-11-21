@@ -51,7 +51,7 @@ static void make_masks(std::vector<ggml_fp16_t> & m, std::vector<ggml_fp16_t> & 
 static std::vector<float> run(const shape & sh, ggml_type tk, ggml_type tv, ggml_type tk2, ggml_type tv2, int concat,
         const std::vector<float> & q, const std::vector<float> & k, const std::vector<float> & v, const std::vector<float> & k2,
         const std::vector<float> & v2, const std::vector<ggml_fp16_t> & m, const std::vector<ggml_fp16_t> & m2,
-        const std::vector<float> & sinks, int n_threads) {
+        const std::vector<float> & sinks, int n_threads, bool binv = false) {
     ggml_init_params ip = { (size_t) 1024*1024*1024, nullptr, false };
     ggml_context * ctx = ggml_init(ip);
 
@@ -97,6 +97,9 @@ static std::vector<float> run(const shape & sh, ggml_type tk, ggml_type tv, ggml
     }
     ggml_flash_attn_ext_add_sinks(out, S);
     ggml_prec_set_acc(out, GGML_PREC_F32);
+    if (binv) {
+        out->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT; // computed one query at a time
+    }
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
@@ -254,20 +257,26 @@ int main() {
                     (long long) sh.hs, (long long) sh.nb);
             }
         }
+        // also batch invariant (one query at a time): every query reads its own rows of both masks
         for (const auto & t : mixed) {
-            const auto a = run(sh, t.k, t.v, t.k2, t.v2, false, q, k, v, k2, v2, m, m2, sinks, 4);
             const auto r = reference(sh, t.k, t.v, t.k2, t.v2, q, k, v, k2, v2, m, m2, sinks);
-            double e = 0.0, n = 0.0;
-            for (size_t i = 0; i < a.size(); ++i) {
-                e += (double) (a[i] - r[i])*(a[i] - r[i]);
-                n += (double) r[i]*r[i];
-            }
-            const double nmse = n > 0 ? e/n : e;
-            ++n_case;
-            if (!(nmse < 5e-4)) {
-                ++n_fail;
-                printf("FAIL mixed types %s/%s + %s/%s hs %lld nb %lld: nmse %.3g vs the reference\n", ggml_type_name(t.k), ggml_type_name(t.v),
-                    ggml_type_name(t.k2), ggml_type_name(t.v2), (long long) sh.hs, (long long) sh.nb, nmse);
+            for (bool binv : { false, true }) {
+                if (binv && sh.nb < 2) {
+                    continue;
+                }
+                const auto a = run(sh, t.k, t.v, t.k2, t.v2, false, q, k, v, k2, v2, m, m2, sinks, 4, binv);
+                double e = 0.0, n = 0.0;
+                for (size_t i = 0; i < a.size(); ++i) {
+                    e += (double) (a[i] - r[i])*(a[i] - r[i]);
+                    n += (double) r[i]*r[i];
+                }
+                const double nmse = n > 0 ? e/n : e;
+                ++n_case;
+                if (!(nmse < 5e-4)) {
+                    ++n_fail;
+                    printf("FAIL mixed types %s/%s + %s/%s hs %lld nb %lld%s: nmse %.3g vs the reference\n", ggml_type_name(t.k), ggml_type_name(t.v),
+                        ggml_type_name(t.k2), ggml_type_name(t.v2), (long long) sh.hs, (long long) sh.nb, binv ? " batch invariant" : "", nmse);
+                }
             }
         }
     }
