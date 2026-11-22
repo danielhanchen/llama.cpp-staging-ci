@@ -38,6 +38,8 @@ int llama_fit_params(int argc, char ** argv) {
         // as common_init_from_params: an explicit -ub is kept by the fit without flash attention
         common_fit_set_ubatch_user(params.n_ubatch_set);
         common_fit_faoff_ubatch_reset();
+        // as common_init_from_params: an explicit --fit-target is kept beside a MoE cache (the printed arguments are replayed with it)
+        common_fit_set_moe_margin_auto(!params.fit_params_target_set);
         // the small-device placement of the fit (LLAMA_FIT_PLACE8) sizes the MoE cache for prompt buffers that only this process
         // shrinks (LLAMA_MOE_PLACE8_UB, set in its environment): the printed arguments cannot carry that, so a launch with them would
         // reserve the full prompt buffers beside the larger cache. Off here unless set explicitly
