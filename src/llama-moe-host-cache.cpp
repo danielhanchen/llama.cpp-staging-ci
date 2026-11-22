@@ -504,9 +504,33 @@ void llama_moe_host_cache::evict(int32_t s) {
 void llama_moe_host_cache::set_dup(int32_t s, bool dup) {
     slot_t & sl = slots[s];
     if (dup && !sl.dup && (sl.state == SLOT_VALID || sl.state == SLOT_WRITING)) {
-        classes[slot_class[s]].dups.push_back(s);
+        auto & d = classes[slot_class[s]].dups;
+        d.push_back(s);
+        // a cleared flag leaves its entry (pruned only when reserve walks the list): drop stale entries and repeats once the
+        // list outgrows the layout, keeping the newest entry of each slot in order, so that a long run does not grow it per miss
+        if (d.size() > 2*(size_t) classes[slot_class[s]].n + 64) {
+            std::vector<char> seen(slots.size(), 0);
+            size_t w = d.size();
+            for (size_t i = d.size(); i-- > 0; ) {
+                const int32_t c = d[i];
+                const slot_t & sc = slots[c];
+                if (!seen[c] && sc.dup && (sc.state == SLOT_VALID || sc.state == SLOT_WRITING)) {
+                    seen[c] = 1;
+                    d[--w] = c;
+                }
+            }
+            d.erase(d.begin(), d.begin() + w);
+        }
     }
     sl.dup = dup && (sl.state == SLOT_VALID || sl.state == SLOT_WRITING) ? 1 : 0;
+}
+
+size_t llama_moe_host_cache::n_dup_entries() const {
+    size_t n = 0;
+    for (const klass & c : classes) {
+        n += c.dups.size();
+    }
+    return n;
 }
 
 int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, uint32_t min_age, bool take_spec, const std::vector<bool> * keep) {

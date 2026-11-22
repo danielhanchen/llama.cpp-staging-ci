@@ -703,6 +703,13 @@ static void test_fill_take() {
         hc.publish(r);
         CHECK(hc.find(1, 1) == r && hc.n_filling() == 0);
     }
+    // a slot whose duplicate flag toggles at every device miss: the list stays bounded, the newest flags still count
+    for (int i = 0; i < 100000; ++i) {
+        hc.set_dup(s3, true);
+        hc.set_dup(s3, false);
+    }
+    hc.set_dup(s3, true);
+    CHECK(hc.n_dup_entries() <= 2*4 + 64 + 1 && hc.n_dup_slots() == 1);
 }
 
 int main(int argc, char ** argv) {
