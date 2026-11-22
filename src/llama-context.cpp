@@ -7242,7 +7242,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // Where the group will release the banks (a tiny cache, the member is not the first: the group has 2+ members), that lookup
         // aborted ("the MoE cache is too small": one slot is left). Such a member is built as a large ubatch, as the tail and a ubatch
         // under the tiny-ubatch release are: the narrowed layer reads the host experts. Groups that keep their banks are unchanged
-        const bool out_large = !tail && n_out > 0 && k >= 1 && lm_release_on() && lm_tiny_cache(moe_cache->cache_frac());
+        // Also with the graphs reserved at the decode size (place8_rel: the group releases the banks however large the cache), and
+        // while the banks are still released from a ubatch before the group (they have no memory to read; any member)
+        const bool out_large = !tail && n_out > 0 && lm_release_on() &&
+            ((k >= 1 && (lm_tiny_cache(moe_cache->cache_frac()) || place8_rel)) || moe_cache->released());
         if (tail || out_large) {
             moe_cache->set_force_large(true);
         }
