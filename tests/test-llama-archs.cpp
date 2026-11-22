@@ -2113,13 +2113,19 @@ static int check_moe_released_seed(const size_t seed, const float stdev) {
 // q, k, v and the mask, the attention and a concat: rows over the same cells share one node only for F16 K and V), so a verify window
 // of W tokens adds about 6*W nodes per layer that the per-tensor graph budget does not hold. Qwen3-1.7B with a q8_0 cache and the
 // default n-gram drafts (8-token windows) ran out of graph context memory (GGML_ASSERT(obj_new) in build_attn_mha). The verify rows
-// must match the same rows decoded one at a time (within rounding: the CPU matmuls of a 32-row batch reassociate), for an F16 control
-// cache and a q8_0 cache.
-static int g_vq_fa = 0;
+// must match the same rows decoded one at a time (within rounding: the CPU matmuls of a batch reassociate), for an F16 control cache
+// and a q8_0 cache, with windows of 32 and 128 rows. The graphs hold n_outputs_max rows (the server's drafter windows) or 64 without
+// it, and decode splits a longer verify batch into ubatches of that many rows: 128 rows run as two ubatches by default, as one with
+// n_outputs_max 128 (a fixed budget of 64 rows ran out there), as four with n_outputs_max 32.
+static int g_vq_fa  = 0;
+static int g_vq_out = 0;
 static bool verify_quant_kv_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
     if (ask && t->op == GGML_OP_FLASH_ATTN_EXT) {
         g_vq_fa++;
+    }
+    if (ask && strcmp(t->name, "result_output") == 0) {
+        g_vq_out++;
     }
     return false;
 }
@@ -2127,7 +2133,7 @@ static bool verify_quant_kv_cb(struct ggml_tensor * t, bool ask, void * user_dat
 static int check_verify_quant_kv(const size_t seed, const float stdev) {
     const uint32_t n_layer  = 12;
     const int32_t  n_prompt = 32;
-    const int32_t  n_verify = 32;
+    const int32_t  n_verify_max = 128;
 
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN3, false);
     {
@@ -2177,9 +2183,9 @@ static int check_verify_quant_kv(const size_t seed, const float stdev) {
         return 1;
     }
     const uint32_t n_vocab = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
-    const std::vector<llama_token> toks = get_tokens(n_prompt + n_verify, n_vocab, seed);
+    const std::vector<llama_token> toks = get_tokens(n_prompt + n_verify_max, n_vocab, seed);
 
-    auto make_ctx = [&](ggml_type type_kv, bool count_fa) {
+    auto make_ctx = [&](ggml_type type_kv, bool count_fa, uint32_t n_outputs_max) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx           = 256;
         cp.n_batch         = 256;
@@ -2190,19 +2196,21 @@ static int check_verify_quant_kv(const size_t seed, const float stdev) {
         cp.type_v          = type_kv;
         cp.n_threads       = 4;
         cp.n_threads_batch = 4;
+        cp.n_outputs_max   = n_outputs_max;
         if (count_fa) {
             cp.cb_eval = verify_quant_kv_cb;
         }
         return llama_context_ptr(llama_init_from_model(model.get(), cp));
     };
-    auto decode = [&](llama_context * ctx, int32_t i0, int32_t n, bool logits_all) {
+    // the last n_logits rows ask for logits
+    auto decode = [&](llama_context * ctx, int32_t i0, int32_t n, int32_t n_logits) {
         llama_batch b = llama_batch_init(n, 0, 1);
         for (int32_t i = 0; i < n; ++i) {
             b.token[i]     = toks[i0 + i];
             b.pos[i]       = i0 + i;
             b.n_seq_id[i]  = 1;
             b.seq_id[i][0] = 0;
-            b.logits[i]    = logits_all || i == n - 1;
+            b.logits[i]    = i >= n - n_logits;
         }
         b.n_tokens = n;
         const bool ok = llama_decode(ctx, b) == 0;
@@ -2211,17 +2219,29 @@ static int check_verify_quant_kv(const size_t seed, const float stdev) {
     };
 
     int ret = 0;
-    for (const ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+    // the outputs of a batch are at most n_outputs_max, its other rows are not: with n_outputs_max 32 the last 32 rows ask for logits
+    struct verify_case { ggml_type type_kv; int32_t n_verify; uint32_t n_outputs_max; int n_ubatch_want; };
+    const verify_case cases[] = {
+        { GGML_TYPE_F16,  32,  0, 1 },
+        { GGML_TYPE_Q8_0, 32,  0, 1 },
+        { GGML_TYPE_F16,  128, 0, 1 },
+        { GGML_TYPE_Q8_0, 128, 0, 2 },
+        { GGML_TYPE_Q8_0, 128, 128, 1 },
+        { GGML_TYPE_Q8_0, 128, 32, 4 },
+    };
+    for (const verify_case & vc : cases) {
+        const ggml_type type_kv  = vc.type_kv;
+        const int32_t   n_verify = vc.n_verify;
         // the rows decoded one token at a time
         std::vector<float> ref;
         {
-            llama_context_ptr ctx = make_ctx(type_kv, false);
-            if (!ctx || !decode(ctx.get(), 0, n_prompt, false)) {
+            llama_context_ptr ctx = make_ctx(type_kv, false, 0);
+            if (!ctx || !decode(ctx.get(), 0, n_prompt, 1)) {
                 fprintf(stderr, "%s: FAIL: %s: reference prompt\n", __func__, ggml_type_name(type_kv));
                 return 1;
             }
             for (int32_t k = 0; k < n_verify; ++k) {
-                if (!decode(ctx.get(), n_prompt + k, 1, true)) {
+                if (!decode(ctx.get(), n_prompt + k, 1, 1)) {
                     fprintf(stderr, "%s: FAIL: %s: reference decode %d\n", __func__, ggml_type_name(type_kv), k);
                     return 1;
                 }
@@ -2230,15 +2250,17 @@ static int check_verify_quant_kv(const size_t seed, const float stdev) {
             }
         }
         // the same rows as one exact verify batch
-        llama_context_ptr ctx = make_ctx(type_kv, true);
-        if (!ctx || !decode(ctx.get(), 0, n_prompt, false)) {
+        llama_context_ptr ctx = make_ctx(type_kv, true, vc.n_outputs_max);
+        if (!ctx || !decode(ctx.get(), 0, n_prompt, 1)) {
             fprintf(stderr, "%s: FAIL: %s: prompt\n", __func__, ggml_type_name(type_kv));
             return 1;
         }
-        g_vq_fa = 0;
+        g_vq_fa  = 0;
+        g_vq_out = 0;
         llama_set_verify(ctx.get(), true);
         llama_set_verify_exact(ctx.get(), true);
-        const bool ok = decode(ctx.get(), n_prompt, n_verify, true);
+        const int32_t n_logits = vc.n_outputs_max > 0 ? (int32_t) vc.n_outputs_max : n_verify;
+        const bool ok = decode(ctx.get(), n_prompt, n_verify, n_logits);
         llama_set_verify(ctx.get(), false);
         if (!ok) {
             fprintf(stderr, "%s: FAIL: %s: verify batch\n", __func__, ggml_type_name(type_kv));
@@ -2246,7 +2268,7 @@ static int check_verify_quant_kv(const size_t seed, const float stdev) {
         }
         bool   same = true;
         double err  = 0.0;
-        for (int32_t k = 0; k < n_verify; ++k) {
+        for (int32_t k = n_verify - n_logits; k < n_verify; ++k) {
             const float * l = llama_get_logits_ith(ctx.get(), k);
             same = same && memcmp(ref.data() + (size_t) k*n_vocab, l, n_vocab*sizeof(float)) == 0;
             err  = std::max(err, nmse(std::vector<float>(ref.begin() + (size_t) k*n_vocab, ref.begin() + (size_t) (k + 1)*n_vocab),
@@ -2254,9 +2276,10 @@ static int check_verify_quant_kv(const size_t seed, const float stdev) {
         }
         // the per-row nodes must have been built: one attention per row and layer outside F16, one per layer for F16
         const int n_fa_want = (int) n_layer * (type_kv == GGML_TYPE_F16 ? 1 : n_verify);
-        const bool ok_fa = g_vq_fa == n_fa_want;
-        printf("%s: %-4s KV: verify rows %s single decodes (nmse %.3e), %d attention nodes (want %d)\n", __func__,
-            ggml_type_name(type_kv), same ? "equal to" : "differ from", err, g_vq_fa, n_fa_want);
+        const bool ok_fa = g_vq_fa == n_fa_want && g_vq_out == vc.n_ubatch_want;
+        printf("%s: %-4s KV, %3d rows, n_outputs_max %3u: verify rows %s single decodes (nmse %.3e), %d attention nodes (want %d), "
+            "%d ubatches (want %d)\n", __func__, ggml_type_name(type_kv), n_verify, vc.n_outputs_max, same ? "equal to" : "differ from", err,
+            g_vq_fa, n_fa_want, g_vq_out, vc.n_ubatch_want);
         ret |= !(err < 1e-6) || !ok_fa;
     }
     printf("%s: %s\n", __func__, ret == 0 ? "OK" : "FAIL");
