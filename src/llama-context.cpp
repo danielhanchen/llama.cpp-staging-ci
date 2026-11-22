@@ -7648,6 +7648,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     }
     const bool lm_release_env = lm_release_on();
     bool lm_released = false;
+    // the banks were released before the group, by a large ubatch that ran alone before it (tiny_rel_enter; e.g. the first ubatch of
+    // a batch of two prompts holds both sequences and runs outside a group) and stay released through it: the release below finds
+    // nothing to release, and the group must not seed or replay into banks that have no memory (the seed copied into a bank without
+    // a buffer). It runs as the ubatches of a released window do: no seed, the banks come back after it
+    const bool lm_rel_before = moe_cache->released();
+    if (lm_rel_before) {
+        static int n_rel_before_log = 0;
+        if (n_rel_before_log++ < 4) {
+            LLAMA_LOG_INFO("%s: a layer-major group after released banks (%zu ubatches): it does not seed the cache\n", __func__, group.size());
+        }
+    }
     // the release also where the cache is above LLAMA_MOE_LM_RELEASE_FRAC but the group's merged graph does not allocate in
     // the free memory (it would be split): 3-bit 4 GB without MTP holds 5.1% of the host experts at ctx 16384 (699 MiB) and 4.5% at 20480;
     // at 5.1% the 16-ubatch group of an 8k prompt was split in halves down to single ubatches (T4 8k prompt 440 vs 830 tok/s, RTX PRO 6000 2063 vs
@@ -7864,7 +7875,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     static const bool lm_replay_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY")) != 0;
     size_t rp_k = 0; // members before the break (0: no replay)
     // merge: a group whose cache banks were released seeds nothing, so it replays nothing either
-    if (!lm_released && lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
+    if (!lm_released && !lm_rel_before && lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
         const auto & last = group.back();
         const int64_t b = last.n_tokens_before;
         const auto & brk = balloc->ubatch_breaks;
@@ -7874,7 +7885,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             rp_k = group.size() - 1;
         }
     }
-    if (!lm_released && lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
+    if (!lm_released && !lm_rel_before && lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
         // with the replay: the seed of the batch that ends at the break
         const int64_t n_seed_all = rp_k > 0 ? group[rp_k].n_tokens_before : n_tokens_all;
         for (size_t k = 0; k < (rp_k > 0 ? rp_k : group.size()); ++k) {
