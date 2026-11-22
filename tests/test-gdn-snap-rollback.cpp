@@ -11,6 +11,14 @@
 #include <cstdlib>
 #include <vector>
 
+#if defined(_WIN32)
+static void setenv(const char * k, const char * v, int overwrite) {
+    if (overwrite || getenv(k) == nullptr) {
+        _putenv_s(k, v);
+    }
+}
+#endif
+
 static bool run(llama_model * model, int n_pre, int n_rm, int n_rs_seq, std::vector<float> & out) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx           = 1024;
