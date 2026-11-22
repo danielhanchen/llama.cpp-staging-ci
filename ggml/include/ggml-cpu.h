@@ -184,6 +184,17 @@ extern "C" {
     typedef const void * (*ggml_cpu_row_source_t)(void * ud, const struct ggml_tensor * t, int64_t row, void * tmp);
     GGML_BACKEND_API bool ggml_backend_cpu_set_row_source(const struct ggml_tensor * t, ggml_cpu_row_source_t fn, void * ud);
 
+    // GET_ROWS of a quantized host matrix gathered ahead of its graph (e.g. the next prompt batch's embedding rows while the current
+    // batch computes on a GPU): n_threads threads convert rows ids[0..n) of t into a buffer of n rows of ne[0] floats. A later GET_ROWS of
+    // t into a contiguous F32 destination takes its row i from the buffer when it gathers row ids[i], and converts every other row as
+    // before; the buffer rows are converted as the gather converts them (the row source of t, then the type's to_float), so the result
+    // is bit-identical. A call waits for the threads of the earlier result of t and replaces it; n == 0 drops it (do this before t's
+    // data is freed or changed). At most 4 tensors. Returns false when t is not a quantized 2D host matrix (nothing gathered).
+    // Also reachable as the proc address "ggml_backend_cpu_get_rows_ahead".
+    GGML_BACKEND_API bool ggml_backend_cpu_get_rows_ahead(const struct ggml_tensor * t, const int32_t * ids, int64_t n, int n_threads);
+    // rows the gathers took from such results so far (all tensors); proc address "ggml_backend_cpu_get_rows_ahead_taken"
+    GGML_BACKEND_API int64_t ggml_backend_cpu_get_rows_ahead_taken(void);
+
 #ifdef __cplusplus
 }
 #endif

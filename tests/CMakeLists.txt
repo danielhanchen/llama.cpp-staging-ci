@@ -613,6 +613,8 @@ llama_build_and_test(test-fit-placemid-lent.cpp)
 llama_build_and_test(test-fit-dflash-swa.cpp)
 # token-tiled gated delta-net vs the AR kernel, byte for byte on the GPU backend (SKIP without one)
 llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
+# CPU GET_ROWS results gathered ahead (the next prompt batch's embedding rows) vs the plain gather, byte for byte
+llama_build_and_test(test-get-rows-ahead.cpp LINK ggml)
 # the ops added here (KQ_MASK, MOE_CACHE_LOOKUP, the GDN replay window) are refused by the meta backend (-sm tensor) and RPC and run on the CPU
 llama_build_and_test(test-meta-k15-ops.cpp LINK ggml)
 # prompt fusions of qwen4exp (PLE conv taps, conv-input concat, QSA mask) vs the plain graphs, byte for byte (F4 also on the CPU)
