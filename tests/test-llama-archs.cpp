@@ -2281,7 +2281,7 @@ static int check_moe_released_out(const size_t seed, const float stdev) {
     // the cache: 8 slots of the two cached layers' experts (more than LLAMA_MOE_LM_RELEASE_FRAC of the host experts)
     const size_t cache_size = getenv("LLAMA_TEST_MOE_CACHE_KIB") != nullptr ? (size_t) atoll(getenv("LLAMA_TEST_MOE_CACHE_KIB"))*1024 : 8*700*1024;
     int ret = 0;
-    for (bool two_seq : { true, false }) {
+    for (bool two_seq : { false, true }) {
         std::vector<std::vector<float>> ref, got;
         if (!run(two_seq, 0, ref)) {
             fprintf(stderr, "%s: FAIL: the run without the cache failed\n", __func__);
@@ -2394,7 +2394,7 @@ static int check_moe_encode_release(const size_t seed, const float stdev) {
     }
     g_rel_encode = g_rel_back = 0;
     llama_log_set(released_out_log, nullptr);
-    const size_t cache_size = getenv("LLAMA_TEST_MOE_CACHE_KIB") != nullptr ? (size_t) atoll(getenv("LLAMA_TEST_MOE_CACHE_KIB"))*1024 : 2*1024*1024;
+    const size_t cache_size = getenv("LLAMA_TEST_MOE_CACHE_KIB") != nullptr ? (size_t) atoll(getenv("LLAMA_TEST_MOE_CACHE_KIB"))*1024 : 10*1024*1024;
     const bool ok = run(cache_size, got);
     llama_log_set(nullptr, nullptr);
     if (!ok) {
