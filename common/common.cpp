@@ -4294,18 +4294,14 @@ uma_restart:
                     const std::vector<size_t>  mg_d  = mg;
                     const common_params_fit_status st_d = st4;
                     bool found = false;
+                    // memory added to the default margin before the fit (the server's multimodal projector) stays on top of each step
+                    const std::vector<size_t> sd_reserve = common_fit_margin_reserve(margins_in, common_params().fit_params_target);
                     for (const size_t m_step : steps) {
-                        std::vector<size_t> mgs = margins_in;
-                        bool lower = false;
-                        for (auto & m : mgs) {
-                            if (m > m_step) {
-                                m = m_step;
-                                lower = true;
-                            }
-                        }
-                        if (!lower) {
+                        const std::vector<std::vector<size_t>> sd_tr = common_fit_margin_trials(margins_in, { m_step }, sd_reserve);
+                        if (sd_tr.empty()) {
                             continue;
                         }
+                        std::vector<size_t> mgs = sd_tr[0];
                         llama_model_params   mps = mp0;
                         llama_context_params cps = cp0;
                         std::vector<float>   tss = ts0;
@@ -4880,6 +4876,7 @@ uma_restart:
                 fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (getenv("LLAMA_KV_SEL_AFTER_DROP") == nullptr || atoi(getenv("LLAMA_KV_SEL_AFTER_DROP")) != 0)) {
             llama_model_params   mp  = mparams_in;
             llama_context_params cp  = cparams_in;
+            cp.n_state_capture = cparams.n_state_capture;   // the capture count (or the guard's drop) chosen above
             std::vector<float>   ts  = ts_in;
             std::vector<llama_model_tensor_buft_override> tbo = tbo_in;
             std::vector<size_t>  mg  = margins_in;
