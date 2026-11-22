@@ -104,6 +104,8 @@ extern "C" {
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    // a whole-tensor upload of this meta tensor can take the backend's set_tensor_async
+    GGML_API bool           ggml_backend_meta_set_async_ok  (const struct ggml_tensor * tensor);
 
     //
     // Backend (stream)
