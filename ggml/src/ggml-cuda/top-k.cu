@@ -907,7 +907,13 @@ static __global__ void top_k_two_stage(const float * __restrict__ src, int * __r
         uint32_t bk = 0;
         int      bc = TOP_K_TWO_STAGE_NONE;
         for (int i = tid; i < n_cand; i += BLOCK_SIZE) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             const uint2 e = __ldcg(row_part + i);
+#else
+            // no __ldcg on HIP / MUSA: volatile loads also skip the non-coherent L1 for the other blocks' candidates
+            const volatile unsigned int * ev = (const volatile unsigned int *) (row_part + i);
+            const uint2 e = make_uint2(ev[0], ev[1]);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             const uint32_t key = e.x;
             const int      c   = (int) e.y;
             if (c == TOP_K_TWO_STAGE_NONE) {
