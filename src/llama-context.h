@@ -533,18 +533,27 @@ private:
     std::unique_ptr<llama_row_prefetcher> ple_prefetcher;
     // the next prompt batch announced before a decode (llama_set_batch_ahead): when that decode has queued its last ubatch, the
     // host gathers of the announced batch (token and PLE embedding rows) are converted on host threads while the GPU computes
-    // (ggml_backend_cpu_get_rows_ahead); the next decode's gathers copy the rows that match. Same conversions, so exact
+    // (ggml_backend_cpu_get_rows_ahead); the next decode's gathers copy the rows that match. A prompt decode not announced starts
+    // its first ubatch's gathers the same way before building its graph. Same conversions, so exact; LLAMA_BATCH_GATHER_AHEAD=0 off
     struct batch_ahead_state {
         std::vector<llama_token> tok;
         llama_pos                pos0    = 0;
         llama_seq_id             seq_id  = 0;
         bool                     pending = false;
         std::vector<const ggml_tensor *> started; // tables with a result, dropped with the context
+        // the batch the last announcement gathered: a decode of it needs no gathers of its first ubatch
+        std::vector<llama_token> last_tok;
+        llama_pos                last_pos0 = -1;
+        llama_seq_id             last_seq  = -1;
         int64_t                  n_started = 0;
+        int64_t                  n_first   = 0;
         int64_t                  n_rows    = 0;
         int64_t                  t_us      = 0;
     } batch_ahead;
     void batch_ahead_start(const llama_memory_context_i * mctx);
+    // the first ubatch of a decode, when no announced batch covered it: its gathers on host threads while the graph is built
+    void batch_ahead_first(const llama_ubatch & ub, const llama_memory_context_i * mctx);
+    bool batch_ahead_gather(const llama_ubatch & ub, const llama_memory_context_i * mctx);
     void batch_ahead_drop();
     // the PLE table read-in after the load (LLAMA_PLE_RESIDENT), stopped and joined when the context goes (also from a
     // constructor that throws later)
