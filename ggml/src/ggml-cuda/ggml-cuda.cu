@@ -8399,13 +8399,27 @@ static void ggml_cuda_preload_mul_mat(ggml_backend_cuda_context & ctx, ggml_tens
             node->type != GGML_TYPE_F32 || (node->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
         return;
     }
+    // only shapes the graph evaluation launches (a graph of this shape at load may hold degenerate products, e.g. of no rows, that
+    // the evaluation never reaches): every source non-empty, the channel and sample ratios of the launch whole and non-zero
+    const ggml_tensor * ids = node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : nullptr;
+    if (ggml_is_empty(src0) || ggml_is_empty(src1) || (node->op == GGML_OP_MUL_MAT_ID && (ids == nullptr || ggml_is_empty(ids))) ||
+            src0->ne[3] == 0 || node->ne[3] % src0->ne[3] != 0 || node->ne[3] < src0->ne[3] ||
+            (ids == nullptr && (node->ne[2] % src0->ne[2] != 0 || node->ne[2] < src0->ne[2]))) {
+        return;
+    }
+    static const bool log = getenv("GGML_CUDA_PRELOAD_LOG") != nullptr && atoi(getenv("GGML_CUDA_PRELOAD_LOG")) != 0;
+    if (log) {
+        GGML_LOG_INFO("%s: %s %s %s [%lld,%lld,%lld,%lld] x [%lld,%lld,%lld,%lld] -> [%lld,%lld,%lld,%lld]\n", __func__, ggml_op_name(node->op),
+            node->name, ggml_type_name(src0->type), (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2],
+            (long long) src0->ne[3], (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+            (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
+    }
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
     ggml_cuda_mm_fusion_args_host fused{};
     fused.gate = src0;
     if (node->op == GGML_OP_MUL_MAT_ID) {
         // (as ggml_cuda_mul_mat_id)
-        const ggml_tensor * ids = node->src[2];
         if (node->ne[2] <= MMVQ_MAX_BATCH_SIZE && ggml_is_quantized(src0->type) && node->ne[2] <= ggml_cuda_mmvq_mmid_max_batch(src0->type, cc)) {
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, node, nullptr);
             if (ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
