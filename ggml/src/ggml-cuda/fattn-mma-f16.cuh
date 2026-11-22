@@ -2036,7 +2036,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // the staged int8 Q rows (fattn_i8_stride(DKQ) bytes, their scale behind the quants) as they are into the int8 tile, rows
         // outside the tile's queries / heads as zeros; then each warp keeps the A fragments of its 16 query columns and the scales of
         // its rows lane/4 and 8 + lane/4 in registers
+#if defined(TURING_MMA_AVAILABLE)
         static_assert(Q_in_reg && cols_per_warp == 16, "bad INT8 KQ config");
+#else
+        NO_DEVICE_CODE; // the INT8 kernels exit at entry below Turing (flash_attn_ext_f16)
+#endif // defined(TURING_MMA_AVAILABLE)
         constexpr int nblk = DKQ/QK8_1;
         constexpr int row  = fattn_i8_stride(DKQ);
         constexpr int cpr  = row/16;
@@ -2071,7 +2075,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // Q * scale quantised per 32 values as the vector kernel does (quantize_q8_1_to_shared: d = amax/127 in f32,
         // q = roundf(v/d)), 8 lanes per block, into an int8 tile (rows fattn_i8_stride(DKQ) bytes) + the scales behind it; then each
         // warp keeps the A fragments of its 16 query columns (one per block) and their scales in registers
+#if defined(TURING_MMA_AVAILABLE)
         static_assert(Q_in_reg && cols_per_warp == 16, "bad INT8 KQ config");
+#else
+        NO_DEVICE_CODE; // the INT8 kernels exit at entry below Turing (flash_attn_ext_f16)
+#endif // defined(TURING_MMA_AVAILABLE)
         constexpr int nblk      = DKQ/QK8_1;
         constexpr int stride_q8 = fattn_i8_stride(DKQ);
         char  * tile_Q8 = (char *) tile_Q;
