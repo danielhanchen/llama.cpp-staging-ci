@@ -4787,7 +4787,11 @@ uma_restart:
             const auto all_on_device = [&](const llama_model_params & mp) {
                 return mp.n_gpu_layers == llama_model_default_params().n_gpu_layers && n_tbo(mp) <= n_tbo_in;
             };
-            if (on && !model_only && !has_draft && !spec_mtp && !params.fit_params_target_set &&
+            // a GPU projector loaded after the fit (llama-mtmd-cli, the server) takes its memory from the margin: step down only
+            // where its reserve sits in the margins of the fitted devices (the server with the default device list)
+            const bool proj_ok = common_fit_plain_spill_proj_ok(!params.mmproj.path.empty() && params.mmproj_use_gpu,
+                !params.devices.empty(), common_fit_margin_reserve(margins_in, common_params().fit_params_target));
+            if (on && !model_only && !has_draft && !spec_mtp && !params.load_mtp && proj_ok && !params.fit_params_target_set &&
                     fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && !all_on_device(mparams) &&
                     mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers && [&] {
                         std::vector<uint8_t> exps;

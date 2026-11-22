@@ -72,6 +72,15 @@ int main() {
         // a margin already at or below the step (a --fit-target below it) is not a step
         CHECK(common_fit_margin_trials({400*MiB}, {512*MiB}, common_fit_margin_reserve({400*MiB}, {1024*MiB})).empty());
     }
+    // a GPU projector loaded after the fit: the step-down only where its reserve is in the margins (the server, default devices)
+    {
+        CHECK( common_fit_plain_spill_proj_ok(false, false, {}));          // no projector
+        CHECK( common_fit_plain_spill_proj_ok(false, true,  {0}));         // no projector, a device list
+        CHECK(!common_fit_plain_spill_proj_ok(true,  false, {0}));         // llama-mtmd-cli: nothing reserved
+        CHECK(!common_fit_plain_spill_proj_ok(true,  false, {}));
+        CHECK( common_fit_plain_spill_proj_ok(true,  false, {768*MiB}));   // the server: reserve on the fitted device
+        CHECK(!common_fit_plain_spill_proj_ok(true,  true,  {0, 768*MiB})); // --device: the reserve may sit in another slot
+    }
     // the display gate
     {
         CHECK( common_fit_plain_spill_gate({1}, nullptr));

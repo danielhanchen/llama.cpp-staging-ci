@@ -3103,6 +3103,13 @@ std::vector<size_t> common_fit_margin_reserve(const std::vector<size_t> & margin
     return reserve;
 }
 
+bool common_fit_plain_spill_proj_ok(bool proj_gpu, bool devices_given, const std::vector<size_t> & reserve) {
+    if (!proj_gpu) {
+        return true;
+    }
+    return !devices_given && std::any_of(reserve.begin(), reserve.end(), [](size_t r) { return r > 0; });
+}
+
 bool common_fit_plain_spill_gate(const std::vector<int> & headless, const char * force) {
     if (force != nullptr && force[0] != '\0') {
         return atoi(force) != 0;
