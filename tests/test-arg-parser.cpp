@@ -119,6 +119,17 @@ static void test(void) {
             const auto draft = common_base_params_to_speculative(base);
             assert(draft.n_ubatch == 8);
         }
+        base.speculative.draft.n_ubatch = 0;
+
+        // a block drafter decodes the noise blocks of all sequences in one non-causal ubatch: the 512-row cap keeps them whole
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        base.speculative.draft.mparams.path = "draft.gguf";
+        base.speculative.draft.n_max = 15;
+        base.n_ubatch = 2048;
+        base.n_parallel = 64;
+        assert(common_base_params_to_speculative(base).n_ubatch == 64*16);
+        base.n_parallel = 4;
+        assert(common_base_params_to_speculative(base).n_ubatch == 512);
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
