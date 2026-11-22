@@ -165,6 +165,8 @@ struct llama_context {
     // target lends only its own drafter's weights
     bool    mtp_drafts_for(const llama_context * tgt) const;
     float * nextn_rows_early();
+    // llama_nextn_rows_ready: an event after the copies of the last decode's nextn rows to the host (nullptr when it made none)
+    void *  nextn_rows_ready();
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -872,6 +874,9 @@ private:
     ggml_backend_event_ptr rows_ev;
     ggml_backend_dev_t     rows_ev_dev = nullptr;
     int64_t                rows_ev_n   = 0;
+    // the backend that queued the last decode's copies of nextn rows to the host (nullptr: none, or several backends)
+    ggml_backend_t         nextn_host_be    = nullptr;
+    bool                   nextn_host_multi = false;
     const ggml_cgraph * lm_copy_graph = nullptr; // the split graph of the last expert copy, lm_copy_seq counts its changes
     int64_t lm_copy_seq = 0;
     std::unordered_map<const ggml_tensor *, int64_t> lm_staged_seq; // expert tensor -> lm_copy_seq of its copy

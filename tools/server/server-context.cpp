@@ -7108,19 +7108,34 @@ private:
                 }
             }
             const float * h_bg = nullptr;
+            // a pass in group mode (the target's next batch waits for it before writing the rows) waits for the rows itself: the
+            // decoding thread goes on to the next batch while this one still computes (llama_nextn_rows_ready); the pass then reads
+            // every row from the target's store, which the hold keeps as it is until the pass ends (the same bytes the stash holds)
+            void * rows_rdy = nullptr;
             if (bg) {
                 // the target's rows, resolved here (the worker calls nothing of the target); unmasked: row i at h + i * floats
                 const int64_t nf = common_speculative_rows_ext_floats(spec.get());
                 const int32_t n_rows = batch.view.size();
-                h_bg = llama_get_embeddings_nextn(ctx_tgt);
-                bg = h_bg != nullptr && llama_get_embeddings_nextn_ith(ctx_tgt, n_rows - 1) == h_bg + (size_t) (n_rows - 1) * nf;
+                if (n_rest > spec_bg_tail_max && nf == (int64_t) llama_model_n_embd_out(model_tgt)) {
+                    h_bg = llama_get_embeddings_nextn_early(ctx_tgt);
+                    rows_rdy = h_bg != nullptr ? llama_nextn_rows_ready(ctx_tgt) : nullptr;
+                }
+                if (rows_rdy == nullptr) {
+                    h_bg = llama_get_embeddings_nextn(ctx_tgt);
+                    bg = h_bg != nullptr && llama_get_embeddings_nextn_ith(ctx_tgt, n_rows - 1) == h_bg + (size_t) (n_rows - 1) * nf;
+                }
                 if (bg) {
                     // an earlier asynchronous draft save (a checkpoint's draft part) completes here, not at the worker's first decode,
                     // so the main thread's checkpoint evictions beside the pass never free a buffer still being written
                     if (ctx_dft) {
                         llama_state_seq_async_wait(ctx_dft);
                     }
-                    bg = common_speculative_rows_ext_set(spec.get(), h_bg, n_rows, std::min<int32_t>(n_rows, 256));
+                    bg = common_speculative_rows_ext_set(spec.get(), h_bg, n_rows, rows_rdy ? 0 : std::min<int32_t>(n_rows, 256));
+                }
+                if (!bg && rows_rdy != nullptr) {
+                    // the pass runs in line below, after its own wait for the rows
+                    llama_nextn_rows_ready_wait(rows_rdy);
+                    rows_rdy = nullptr;
                 }
             }
             if (bg) {
@@ -7148,7 +7163,9 @@ private:
                 spec_bg.ok       = true;
                 spec_bg.t_launch = ggml_time_us();
                 common_speculative * sp = spec.get();
-                spec_bg.thr = std::thread([this, sp, whole, segs = std::move(segs), segs_a = std::move(segs_a)]() {
+                spec_bg.thr = std::thread([this, sp, whole, rows_rdy, segs = std::move(segs), segs_a = std::move(segs_a)]() {
+                    // the target's rows of this batch are on the host first
+                    llama_nextn_rows_ready_wait(rows_rdy);
                     bool ok_w = true;
                     for (size_t k = 0; k < segs.size() && ok_w; ++k) {
                         // as the in-line pass: one process() of the whole view without breaks, else one per segment at its row offset

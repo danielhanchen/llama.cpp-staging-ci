@@ -339,6 +339,12 @@ LLAMA_API int64_t llama_nextn_rows_wait(struct llama_context * ctx, int64_t n_ro
 // the nextn rows without a synchronization (unmasked: row i at i*n_embd); nullptr when outputs are to be reordered.
 // Valid for rows [0, llama_nextn_rows_wait(...)) until the next decode
 LLAMA_API float * llama_get_embeddings_nextn_early(struct llama_context * ctx);
+// a handle for the host copies of the last decode's nextn rows (unmasked, one backend): llama_nextn_rows_ready_wait(handle), from any
+// thread, returns once those rows are on the host and frees the handle (call it exactly once). nullptr when the last decode copied no
+// rows to the host this way (the caller synchronizes as before). The rows stay valid until the context writes them again (see
+// llama_set_nextn_hold). LLAMA_MTP_PROMPT_ROWS_ASYNC=0: always nullptr
+LLAMA_API void * llama_nextn_rows_ready(struct llama_context * ctx);
+LLAMA_API void   llama_nextn_rows_ready_wait(void * handle);
 // fn(user_data) is called once, on the calling thread of a later decode / encode / output read, before the context writes,
 // reorders or frees its next-n rows, or frees an MTP drafter's compute buffers (a reader of the rows outside the context, e.g. a drafter's
 // prompt pass on another thread, is waited for there). nullptr clears it. Not thread-safe: set it from the thread that decodes

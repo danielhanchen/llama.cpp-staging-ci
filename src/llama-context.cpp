@@ -4436,6 +4436,28 @@ float * llama_context::nextn_rows_early() {
     return output_swaps.empty() ? embd_nextn.data : nullptr;
 }
 
+void * llama_context::nextn_rows_ready() {
+    static const bool env = getenv("LLAMA_MTP_PROMPT_ROWS_ASYNC") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_ROWS_ASYNC")) != 0;
+    nextn_join();
+    if (!env || nextn_host_be == nullptr || nextn_host_multi || mtp_dev_h_this || !output_swaps.empty() || !embd_nextn.data ||
+            cparams.embeddings_nextn_masked) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(nextn_host_be);
+    ggml_backend_event_t ev = dev ? ggml_backend_event_new(dev) : nullptr;
+    if (ev == nullptr) {
+        return nullptr;
+    }
+    // queued after the copies on the same stream: complete once they are
+    ggml_backend_event_record(ev, nextn_host_be);
+    static std::atomic<int> n_log{0};
+    if (n_log++ == 0) {
+        LLAMA_LOG_INFO("%s: the next-n rows of a prompt batch are waited for by their reader, not by the decoding thread "
+            "(LLAMA_MTP_PROMPT_ROWS_ASYNC=0 off)\n", __func__);
+    }
+    return ev;
+}
+
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     nextn_join();
     output_reorder();
@@ -6192,6 +6214,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // the next batch announced for after this decode (llama_set_batch_ahead): its gathers start when this decode's last ubatch is queued
     const bool batch_ahead_now = batch_ahead.pending;
     batch_ahead.pending = false;
+    nextn_host_be    = nullptr;
+    nextn_host_multi = false;
     ubatch_breaks_next.clear();
     // the captures asked for this decode (llama_set_state_capture); those of an earlier decode are dropped
     bool cap_active = false;
@@ -6790,6 +6814,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     float * embd_nextn_out = embd_nextn.data + offset*n_embd;
                     GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                     ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                    nextn_host_multi |= nextn_host_be != nullptr && nextn_host_be != backend_h;
+                    nextn_host_be = backend_h;
                 }
                 extract_all_idxs = extract_all_idxs || !masked;
             }
@@ -8162,6 +8188,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     if (!(mtp_dev_h_this && mtp_dev_h_store(backend_h, t_h_nextn, ubatch, offset))) {
                         GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
+                        nextn_host_multi |= nextn_host_be != nullptr && nextn_host_be != backend_h;
+                        nextn_host_be = backend_h;
                     }
                     extract_all_idxs = extract_all_idxs || !masked;
                 }
@@ -14277,6 +14305,17 @@ bool llama_mtp_draft_weights_restore(llama_context * ctx) {
 
 float * llama_get_embeddings_nextn_early(llama_context * ctx) {
     return ctx->nextn_rows_early();
+}
+
+void * llama_nextn_rows_ready(llama_context * ctx) {
+    return ctx->nextn_rows_ready();
+}
+
+void llama_nextn_rows_ready_wait(void * handle) {
+    if (handle != nullptr) {
+        ggml_backend_event_synchronize((ggml_backend_event_t) handle);
+        ggml_backend_event_free((ggml_backend_event_t) handle);
+    }
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
