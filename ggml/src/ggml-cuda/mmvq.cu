@@ -4770,7 +4770,7 @@ void ggml_cuda_mul_mat_vec_q(
     // ratios the launch divides by whole and non-zero; any other is named once and left out
     if (preload && (ncols_dst <= 0 || (ids ? nchannels_y <= 0 : (ne02 <= 0 || nchannels_dst < ne02 || nchannels_dst % ne02 != 0)) ||
                     ne03 <= 0 || ne3 < ne03 || ne3 % ne03 != 0)) {
-        static std::atomic<int> n_logged { 0 };
+        static int n_logged = 0; // (the preload walk holds a mutex)
         if (n_logged++ < 4) {
             GGML_LOG_INFO("%s: kernel preload: %s '%s' %s [%lld,%lld,%lld,%lld] x [%lld,%lld,%lld,%lld] -> [%lld,%lld,%lld,%lld] left out\n",
                 __func__, ids ? "MUL_MAT_ID" : "MUL_MAT", dst->name, ggml_type_name(src0->type), (long long) ne00, (long long) ne01,
