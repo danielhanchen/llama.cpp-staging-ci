@@ -10792,6 +10792,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                // Debug (GGML_CUDA_SIDE_JOIN_AUDIT=1): a fused group that covers the reader of a side-stream branch whose join is
+                // still pending ran without waiting for that branch (logged with the group's first node, counted per process)
+                static const bool join_audit = ggml_cuda_env_flag("GGML_CUDA_SIDE_JOIN_AUDIT");
+                if (join_audit && nodes_to_skip > 0) {
+                    static int64_t n_unjoined = 0;
+                    for (const auto & pj : side_mv_pending) {
+                        if (pj.first > i && pj.first <= i + nodes_to_skip) {
+                            if (n_unjoined++ < 8) {
+                                GGML_LOG_INFO("side-join audit: fused group at %d (%s %s, %d nodes) covers branch reader %d (%s) with its join pending (%lld)\n",
+                                    i, ggml_op_desc(node), node->name, nodes_to_skip + 1, pj.first, cgraph->nodes[pj.first]->name, (long long) n_unjoined);
+                            }
+                        }
+                    }
+                }
                 bool fused_multi = false; // a multi-matrix mul_mat_vec_q launch took node i (and maybe nodes after it)
                 if (nodes_to_skip == 0 && node->op == GGML_OP_MUL_MAT && !is_concurrent_event_active) {
                     int run = ggml_cuda_try_fuse_mmvq_multi(cuda_ctx, cgraph, i);
