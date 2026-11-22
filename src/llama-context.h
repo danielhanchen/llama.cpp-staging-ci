@@ -410,6 +410,7 @@ private:
 public:
     // (LLAMA_LM_CKPT_MERGE)
     void set_ubatch_breaks(const int32_t * breaks, int32_t n);
+    bool set_batch_ahead(const llama_token * tokens, int32_t n, llama_pos pos0, llama_seq_id seq_id);
     bool set_state_capture(llama_seq_id seq_id, int32_t i_batch);
     bool state_capture_supported() const;
     bool state_captured(llama_seq_id seq_id, llama_pos * pos_max) const;
@@ -530,6 +531,21 @@ private:
     // the rows are predicted on the main thread before the ubatch before them is processed, the workers warm the
     // page cache meanwhile; set_input still computes the authoritative rows, so nothing here changes the results
     std::unique_ptr<llama_row_prefetcher> ple_prefetcher;
+    // the next prompt batch announced before a decode (llama_set_batch_ahead): when that decode has queued its last ubatch, the
+    // host gathers of the announced batch (token and PLE embedding rows) are converted on host threads while the GPU computes
+    // (ggml_backend_cpu_get_rows_ahead); the next decode's gathers copy the rows that match. Same conversions, so exact
+    struct batch_ahead_state {
+        std::vector<llama_token> tok;
+        llama_pos                pos0    = 0;
+        llama_seq_id             seq_id  = 0;
+        bool                     pending = false;
+        std::vector<const ggml_tensor *> started; // tables with a result, dropped with the context
+        int64_t                  n_started = 0;
+        int64_t                  n_rows    = 0;
+        int64_t                  t_us      = 0;
+    } batch_ahead;
+    void batch_ahead_start(const llama_memory_context_i * mctx);
+    void batch_ahead_drop();
     // the PLE table read-in after the load (LLAMA_PLE_RESIDENT), stopped and joined when the context goes (also from a
     // constructor that throws later)
     struct ple_res_runner {

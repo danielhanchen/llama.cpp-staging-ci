@@ -160,6 +160,11 @@ LLAMA_API void llama_set_verify(struct llama_context * ctx, bool value);
 // (LLAMA_LM_CKPT_MERGE): the next llama_decode() of a single sequence batch ends ubatches at these batch indices (each segment is split as
 // a batch of its own would be: the same ubatches as separate decode() calls, in one layer-major group); cleared by that call
 LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t * breaks, int32_t n);
+// the tokens of the prompt batch expected after the next llama_decode() (one sequence, positions pos0, pos0 + 1, ...): once that decode
+// has queued its last ubatch, the host gathers of these tokens' embedding rows run on host threads while the device computes, and the
+// decode after it takes every row that matches from them (the others are gathered as before; same bytes either way). A hint only:
+// nothing changes when the next batch differs. Cleared by the next decode. LLAMA_BATCH_GATHER_AHEAD=0: off (returns false)
+LLAMA_API bool llama_set_batch_ahead(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id);
 // the next llama_decode() keeps the partial state of seq_id (the recurrent rows) as it is before batch token i_batch, for a
 // checkpoint there that the decode does not stop at (the merged prompt checkpoint of llama-server, LLAMA_LM_CKPT_MERGE). After the
 // decode, llama_state_seq_captured() says whether it was taken, and llama_state_seq_get_size_ext / get_data_ext with

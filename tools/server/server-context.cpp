@@ -6846,6 +6846,51 @@ private:
                 SRV_INF("srv phase n=%d: %-22s %8.2f ms\n", batch.view.size(), what, (ggml_time_us() - t_ph0)/1e3);
             }
         };
+        // a prompt batch of one slot whose prompt goes on after it: the next batch's tokens are announced, so their embedding-row
+        // gathers run on host threads while this batch computes (llama_set_batch_ahead; only a hint, LLAMA_BATCH_GATHER_AHEAD=0 off)
+        if (has_prompt) {
+            const int32_t id0 = batch.tokens[off].id_slot;
+            bool one = true;
+            for (int i = off; one && i < off + batch.view.size(); ++i) {
+                one = batch.tokens[i].id_slot == id0 && batch.tokens[i].is_prompt && batch.tokens[i].token != LLAMA_TOKEN_NULL &&
+                      batch.view.tokens[i - off].seq_ids_extra.empty() && batch.view.tokens[i - off].seq_id == batch.view.tokens[0].seq_id;
+            }
+            std::vector<llama_token> next;
+            llama_pos pos0 = 0;
+            const int32_t n_next_max = (int32_t) llama_n_ubatch(ctx_tgt);
+            const int end = off + batch.view.size();
+            if (one && end < (int) batch.tokens.size()) {
+                // the next view of this batch
+                pos0 = batch.tokens[end].pos[0];
+                for (int i = end; i < (int) batch.tokens.size() && (int32_t) next.size() < n_next_max; ++i) {
+                    const auto & bt = batch.tokens[i];
+                    if (bt.id_slot != id0 || !bt.is_prompt || bt.token == LLAMA_TOKEN_NULL) {
+                        break;
+                    }
+                    next.push_back(bt.token);
+                }
+            } else if (one) {
+                // the slot's prompt after this batch
+                for (auto & sl : slots) {
+                    if (sl.id != id0 || sl.state != SLOT_STATE_PROCESSING_PROMPT || !sl.task || sl.task->tokens.has_mtmd) {
+                        continue;
+                    }
+                    const int32_t done  = sl.prompt.n_tokens();
+                    const int32_t total = sl.task->n_tokens();
+                    pos0 = sl.prompt.tokens.pos_next();
+                    for (int32_t k = done; k < total && (int32_t) next.size() < n_next_max; ++k) {
+                        const llama_token t = sl.task->tokens[k];
+                        if (t == LLAMA_TOKEN_NULL) {
+                            break;
+                        }
+                        next.push_back(t);
+                    }
+                }
+            }
+            if (!next.empty()) {
+                llama_set_batch_ahead(ctx_tgt, next.data(), (int32_t) next.size(), pos0, batch.view.tokens[0].seq_id);
+            }
+        }
         const bool pt_on = srv_pass_timer().on && batch.view.size() <= 32;
         if (pt_on) {
             srv_pass_timer().stamp(server_pass_timer::DEC0);
