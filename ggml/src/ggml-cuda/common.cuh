@@ -1318,6 +1318,10 @@ struct ggml_cuda_graph {
     int64_t  n_launch_total = 0;
     int      n_direct_streak = 0;
     int64_t last_used_time = 0;
+    // the last capture of this key made a cuBLAS call. On Hopper and newer such a graph is instantiated again instead of updated:
+    // cuBLAS launches some GEMMs as thread block clusters, and an exec updated to one with a wider grid (other shapes, e.g. a KV
+    // view that grew) never finished on a B200 (driver 590.48, cuBLAS 13.2), while a new instantiation of the same graph runs
+    bool cublas = false;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1907,6 +1911,8 @@ struct ggml_backend_cuda_context {
     // graphs computed once (a merged layer-major group: its node addresses are freed after it) skip the CUDA graph
     // bookkeeping (the per-node properties a warmup compares, ~1 KB per node), see ggml_backend_graph_skip_records
     bool graphs_skip = false;
+    // a cuBLAS call was made since the current CUDA graph capture began (set by cublas_handle, see ggml_cuda_graph::cublas)
+    bool cublas_in_capture = false;
 
     int64_t last_graph_eviction_sweep = 0;
 
@@ -2005,6 +2011,9 @@ struct ggml_backend_cuda_context {
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
     cublasHandle_t cublas_handle() {
+#ifdef USE_CUDA_GRAPH
+        cublas_in_capture = true;
+#endif
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));

@@ -4429,19 +4429,20 @@ static bool ggml_cuda_graph_drop_failed_instance(ggml_cuda_graph * graph, cudaEr
 // returns false when the exec could not be instantiated again (see ggml_cuda_graph_drop_failed_instance): the caller runs eagerly
 // one chunk of the graph, its exec and its newly captured graph (chunk 0: the graph's own graph / instance; the chunks after
 // it: chunk_graphs / chunk_instances)
-static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_t & instance, cudaGraph_t cgraph_chunk) {
+static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_t & instance, cudaGraph_t cgraph_chunk, bool reinstantiate = false) {
     // GGML_CUDA_GRAPH_UPDATE_DEBUG=1 (debug): the error pending before the update and whether the exec handle is still valid, logged
     // when the update fails with another error than an update failure (a sticky / earlier error vs a bad handle)
     static const bool update_debug = ggml_cuda_env_flag("GGML_CUDA_GRAPH_UPDATE_DEBUG");
     const cudaError_t pending = update_debug ? cudaPeekAtLastError() : cudaSuccess;
 
+    // reinstantiate: the exec is not updated, it is instantiated again from the new graph (see ggml_cuda_graph::cublas)
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
-    cudaError_t stat = cudaGraphExecUpdate(instance, cgraph_chunk, &result_info);
+    cudaError_t stat = reinstantiate ? cudaErrorGraphExecUpdateFailure : cudaGraphExecUpdate(instance, cgraph_chunk, &result_info);
 #else
     cudaGraphNode_t errorNode;
     cudaGraphExecUpdateResult result_info;
-    cudaError_t stat = cudaGraphExecUpdate(instance, cgraph_chunk, &errorNode, &result_info);
+    cudaError_t stat = reinstantiate ? cudaErrorGraphExecUpdateFailure : cudaGraphExecUpdate(instance, cgraph_chunk, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
     // GGML_CUDA_GRAPH_UPDATE_FAULT=N (debug) makes every Nth update fail as if the device were out of memory
@@ -4485,7 +4486,9 @@ static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_
 
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
-        (void)cudaGetLastError();
+        if (!reinstantiate) {
+            (void)cudaGetLastError();
+        }
         if (update_error) {
             // after another error than an update failure (seen after a launch stalled for minutes on a crowded GPU: the
             // update returned invalid argument and so did this destroy, which aborted) the exec is destroyed at most once and a
@@ -4534,9 +4537,25 @@ static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_
 // returns false when an exec could not be instantiated again (see ggml_cuda_graph_drop_failed_instance): the caller runs eagerly
 // every chunk of a newly captured graph: the execs of the chunks it kept are updated, a chunk new to it is instantiated, the
 // execs of chunks it no longer has (a shorter graph) are destroyed
-static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+// fresh: graph->instance was instantiated from this capture just before (only the chunks after it can be stale)
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key, bool fresh) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (!ggml_cuda_graph_update_chunk(graph, graph->instance, graph->graph)) {
+    // a capture with a cuBLAS call is instantiated again on Hopper and newer, not updated (see ggml_cuda_graph::cublas)
+    // GGML_CUDA_GRAPH_CUBLAS_UPDATE=1: updated as before
+    bool reinstantiate = false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool cublas_update = getenv("GGML_CUDA_GRAPH_CUBLAS_UPDATE") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_CUBLAS_UPDATE")) != 0;
+    reinstantiate = graph->cublas && !cublas_update && ggml_cuda_info().devices[cuda_ctx->device].cc >= GGML_CUDA_CC_HOPPER;
+    if (reinstantiate && !(fresh && graph->chunk_instances.empty())) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: a CUDA graph with cuBLAS calls is instantiated again instead of updated (GGML_CUDA_GRAPH_CUBLAS_UPDATE=1: updated)\n",
+                __func__);
+        }
+    }
+#endif
+    if (!ggml_cuda_graph_update_chunk(graph, graph->instance, graph->graph, reinstantiate && !fresh)) {
         return false;
     }
     while (graph->chunk_instances.size() > graph->chunk_graphs.size()) {
@@ -4547,7 +4566,7 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     }
     for (size_t k = 0; k < graph->chunk_graphs.size(); ++k) {
         if (k < graph->chunk_instances.size() && graph->chunk_instances[k] != nullptr) {
-            if (!ggml_cuda_graph_update_chunk(graph, graph->chunk_instances[k], graph->chunk_graphs[k])) {
+            if (!ggml_cuda_graph_update_chunk(graph, graph->chunk_instances[k], graph->chunk_graphs[k], reinstantiate)) {
                 return false;
             }
             continue;
@@ -10731,6 +10750,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             }
             chunks_captured.clear();
+            graph->cublas = cuda_ctx->cublas_in_capture;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
             // Debug (GGML_CUDA_GRAPH_CAPTURE_LOG=1): every capture, with the launches of the key's previous exec
             static const bool cap_log = getenv("GGML_CUDA_GRAPH_CAPTURE_LOG") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_CAPTURE_LOG")) != 0;
@@ -10812,14 +10832,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         bool graph_ok = true;
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
+        const bool fresh = graph->instance == nullptr;
+        if (fresh) { // Create executable graph from captured graph.
             const cudaError_t inst = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
             if (inst != cudaSuccess) {
                 graph_ok = ggml_cuda_graph_drop_failed_instance(graph, inst, "after its capture");
             }
         }
         if (graph_ok && cuda_graph_update_required) { // Update graph executable
-            graph_ok = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            graph_ok = ggml_cuda_graph_update_executable(cuda_ctx, graph_key, fresh);
         }
         if (!graph_ok) {
             // nothing of this evaluation ran (its nodes were only captured): run them now without the graph
@@ -10969,6 +10990,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        cuda_ctx->cublas_in_capture = false;
         // the copies of this capture only (here: only with the stats on, GGML_CUDA_GRAPH_NODE_STATS >= 3, the only writer
         // of the map: an unlocked global map lookup on every capture raced with a capture of another context on another thread)
         static const bool exec_stats_cap = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 3;
