@@ -419,6 +419,11 @@ public:
 
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
+    // an exact verify ubatch builds one attention per row (LLAMA_EXACT_FA_GROUP=0, or flash attention over a K / V cache that is not
+    // F16); its rows are at most exact_rows_max(), the budget of graph_max_nodes (decode splits a longer verify batch)
+    bool     exact_rows_per_query() const;
+    uint32_t exact_rows_max() const;
+
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 

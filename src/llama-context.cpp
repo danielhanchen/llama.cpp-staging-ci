@@ -680,6 +680,10 @@ llama_context::llama_context(
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+    // the rows of an exact verify ubatch with one attention per row: the outputs a caller allows per ubatch (the server sets
+    // n_outputs_max to its drafter's verify windows), else 64; decode splits a longer verify batch, whose rows are batch invariant
+    cparams.n_exact_rows = std::max<uint32_t>(1u, std::min({ cparams.n_ubatch,
+            params.n_outputs_max > 0 && !llama_model_has_encoder(&model) ? cparams.n_outputs_max : 64u }));
 
     // one top-k over all the verify rows of a sequence instead of one per row, where the output device's top-k returns
     // for each row of a multi-row input what that row alone returns (same set, same order): the CPU (std::partial_sort per row) and
@@ -6349,8 +6353,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // (a recurrent memory keeps the last 1 + n_rs_seq tokens of a sequence in one ubatch, so the split needs ubatches longer than
     // that: deeper speculative windows than the decode size can hold keep the one-ubatch prompt instead)
     const bool place8_split_ok = cparams.n_rs_seq == 0 || (int64_t) tiny_rel_ub > (int64_t) cparams.n_rs_seq + 1;
-    const uint32_t n_ubatch_split = place8_rel && place8_chunk_max > 0 && tiny_rel_ub > 0 && !cparams.verify && !embd_all && place8_split_ok &&
+    uint32_t n_ubatch_split = place8_rel && place8_chunk_max > 0 && tiny_rel_ub > 0 && !cparams.verify && !embd_all && place8_split_ok &&
         (int64_t) n_tokens_all > tiny_rel_ub && (int64_t) n_tokens_all <= place8_chunk_max ? (uint32_t) tiny_rel_ub : cparams.n_ubatch;
+    // an exact verify batch with one attention per row runs as ubatches of at most the rows graph_max_nodes budgets (rows without
+    // outputs can exceed n_outputs_max); its rows are batch invariant, so the split leaves every row's bytes unchanged
+    if (exact_verify && exact_rows_per_query()) {
+        n_ubatch_split = std::min(n_ubatch_split, exact_rows_max());
+    }
 
     while (true) {
         mctx = memory->init_batch(*balloc, n_ubatch_split, embd_all);
@@ -9438,14 +9447,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     // LLAMA_EXACT_FA_GROUP=0 (kill switch of grouping) builds one attention per query of a batch invariant verify
     // batch: 4 views, the mask copy, the attention and the concat per query and layer. The 8 x n_tensors budget of a small dense model
     // ran out there (T4 Phi-4-mini Q4_K_M, kill-switch set, n-gram verify window: GGML_ASSERT(obj_new) in ggml_flash_attn_ext)
-    static const bool fa_group_off = [] {
-        const char * e = getenv("LLAMA_EXACT_FA_GROUP");
-        return e != nullptr && atoi(e) == 0;
-    }();
     // queries share one attention node only over F16 K and V, so a cache of another type (q8_0) builds one per query as well
-    // (RTX PRO 6000 Qwen3-1.7B Q4_K_M, -ctk q8_0 -ctv q8_0 -fa on, default n-gram verify window: GGML_ASSERT(obj_new) in build_attn_mha)
-    if (fa_group_off || (cparams.flash_attn && !cparams.kv_f16)) {
-        res += 8u * model.hparams.n_layer() * std::min<uint32_t>(n_tokens, 64u);
+    // (RTX PRO 6000 Qwen3-1.7B Q4_K_M, -ctk q8_0 -ctv q8_0 -fa on, default n-gram verify window: GGML_ASSERT(obj_new) in build_attn_mha).
+    // The rows of such a ubatch are at most exact_rows_max() (the drafter's verify windows where the caller sets n_outputs_max), and
+    // decode splits a verify batch with more rows, so the budget follows the longest window instead of n_ubatch
+    if (exact_rows_per_query()) {
+        res += 8u * model.hparams.n_layer() * std::min<uint32_t>(n_tokens, exact_rows_max());
     }
 
     if (cparams.training) {
@@ -9453,6 +9460,18 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     }
 
     return res;
+}
+
+bool llama_context::exact_rows_per_query() const {
+    static const bool fa_group_off = [] {
+        const char * e = getenv("LLAMA_EXACT_FA_GROUP");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    return fa_group_off || (cparams.flash_attn && !cparams.kv_f16);
+}
+
+uint32_t llama_context::exact_rows_max() const {
+    return std::max<uint32_t>(1u, std::min(cparams.n_ctx, cparams.n_exact_rows));
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
