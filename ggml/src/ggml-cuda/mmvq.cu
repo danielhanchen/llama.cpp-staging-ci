@@ -4628,7 +4628,7 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const float   * src1_d =       (const float   *) src1->data;
-    const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
+    const int32_t *  ids_d = (const int32_t *) ggml_cuda_preload_ptr(ids);
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};

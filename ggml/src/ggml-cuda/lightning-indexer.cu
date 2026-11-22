@@ -721,7 +721,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         GGML_ASSERT(c->ne[1] == n_batch && c->ne[2] == 1 && c->ne[3] == n_stream);
         const int bs = ggml_get_op_params_i32(dst, 0);
         GGML_ASSERT(bs > 0 && c->ne[0]*bs <= INT_MAX);
-        cand = { (const char *) c->data, (int) (c->ne[0]*bs), bs, c->nb[1], c->nb[3] };
+        cand = { (const char *) ggml_cuda_preload_ptr(c), (int) (c->ne[0]*bs), bs, c->nb[1], c->nb[3] };
     }
     const bool tile = n_embd == 128 && n_head == 4 && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS &&
         !(dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT);

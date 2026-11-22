@@ -13,6 +13,12 @@ static __inline__ bool ggml_cuda_preload_on() {
 
 void ggml_cuda_preload_func(const void * fn);
 
+// the address a launch site takes for a tensor during a kernel preload: the graph walked is not allocated, and a site that branches
+// on a present input (ids, candidates) must see one; nothing is read or written there
+static __inline__ const void * ggml_cuda_preload_ptr(const ggml_tensor * t) {
+    return t == nullptr ? nullptr : t->data != nullptr || !ggml_cuda_preload_on() ? t->data : reinterpret_cast<const void *>(uintptr_t(256));
+}
+
 // ggml_cuda_kernel_launch, or during a kernel preload the load of its function
 template<typename Kernel, typename... Args>
 static __inline__ void ggml_cuda_kernel_launch_pl(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
