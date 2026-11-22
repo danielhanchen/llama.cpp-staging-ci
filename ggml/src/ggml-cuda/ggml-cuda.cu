@@ -2829,6 +2829,41 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+// On datacenter Blackwell, cuBLAS beats mmf for wide BF16 weights with few destination columns,
+// which is the batched decode shape. Measured on a B200 (cc 1000), Qwen3.8-27B BF16 decode:
+// 2 seqs 1.75x, 4 seqs 1.59x, 8 seqs 1.51x, 16 seqs 1.49x, and exactly neutral at 1 seq (mmvf
+// takes it) and at 24/32 seqs (already past the mmf cap). Prefill is unchanged.
+//
+// The bounds are deliberately narrow, each one covering only what was measured:
+//  - mul_mat_id is excluded because there cuBLAS is 2-4x SLOWER than mmf.
+//  - only the plain 2D cuBLAS entry point, so this cannot select the pointer-batched path.
+//  - only cc 1000..1099. Blackwell spans cc 1000/1100/1200 and only 1000 was measured.
+static bool ggml_cuda_mmf_loses_to_cublas(const ggml_tensor * src0, const ggml_tensor * src1,
+        const int cc, const int64_t ne11) {
+    // Off by default: cuBLAS converts the activations to BF16, so the output differs from mmf.
+    // GGML_CUDA_BF16_CUBLAS=1: on for cc 1000..1099, 2: on for every NVIDIA cc >= 1000 (cc 1100 / 1200 included)
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_BF16_CUBLAS");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    if (mode <= 0 || src0->type != GGML_TYPE_BF16 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < 1000 || (mode == 1 && cc >= 1100)) {
+        return false;
+    }
+    // ne11 == 1 belongs to mmvf, which is faster than both mmf and cuBLAS there.
+    if (ne11 < 2) {
+        return false;
+    }
+    if (src0->ne[2]*src0->ne[3] != 1 || src1->ne[2]*src1->ne[3] != 1) {
+        return false;
+    }
+    // Small weights cannot amortise the cuBLAS launch and the F32->BF16 activation conversion.
+    // 20 Mi elements. A sweep over 0, 1, 4, 16, 20 and 32 Mi on both models shows the dense win
+    // is flat from 4 to 20 Mi and drops about 5 percent at 32 Mi, so this is the largest floor
+    // that costs nothing. It also leaves the MoE model bit-identical, since its widest routed
+    // weight is 16.8 Mi.
+    return src0->ne[0]*src0->ne[1] >= 20*1024*1024;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -3100,6 +3135,39 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 
+    // A weight with one channel, broadcast over ne12 src1 channels with a single column each, is
+    // one GEMM with ne12 columns rather than ne12 separate GEMVs. Left as is, the weight crosses
+    // memory ne12 times. Fold the channel axis into the column axis so it is read once; the
+    // dispatch below then picks mmf or cuBLAS for the wider shape.
+    // Require both operands contiguous. The folded channel stride becomes the GEMM leading
+    // dimension, and a padded view could present ldb < K, which cuBLAS rejects, or a layout mmf
+    // does not accept. Contiguity makes the promoted strides exactly the packed ones.
+    // GGML_CUDA_MUL_MAT_FOLD=0: off
+    static const bool fold_on = [] {
+        const char * e = getenv("GGML_CUDA_MUL_MAT_FOLD");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (fold_on && ne11 == 1 && src1->ne[2] > 1 && src1->ne[3] == 1
+            && src0->ne[2] == 1 && src0->ne[3] == 1
+            && dst->ne[1] == 1
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        ggml_tensor src1_folded = *src1;
+        src1_folded.ne[1] = src1->ne[2];
+        src1_folded.ne[2] = 1;
+        src1_folded.nb[1] = src1->nb[2];
+        src1_folded.nb[2] = src1->nb[3];
+
+        ggml_tensor dst_folded = *dst;
+        dst_folded.ne[1] = dst->ne[2];
+        dst_folded.ne[2] = 1;
+        dst_folded.nb[1] = dst->nb[2];
+        dst_folded.nb[2] = dst->nb[3];
+        dst_folded.src[1] = &src1_folded;
+
+        ggml_cuda_mul_mat(ctx, src0, &src1_folded, &dst_folded);
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -3120,7 +3188,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    if (!ggml_cuda_mmf_loses_to_cublas(src0, src1, cc, ne11)
+            && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
