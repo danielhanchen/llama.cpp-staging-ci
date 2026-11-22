@@ -651,6 +651,7 @@ llama_build_and_test(test-mmid-tail.cpp LINK ggml)
 # the CUDA mat-vec does not read past the last weight row of a partial last row block (weights before an unmapped page,
 # CPU reference, same bytes as an ordinary buffer; SKIP without a CUDA device)
 llama_build_and_test(test-mmvq-lastrow.cpp LINK ggml)
+target_link_libraries(test-mmvq-lastrow PRIVATE ${CMAKE_DL_LIBS}) # dlopen / dlsym (libdl before glibc 2.34)
 # single token MUL_MAT_ID warp per row launch (short K-quant / IQ4 expert rows) vs the launch it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-q4xt-exact.cpp LINK ggml)
 # DeepSeek-V4.1 candidate scoring (lightning indexer over the candidate blocks only) == indexer + block mask, byte for byte
