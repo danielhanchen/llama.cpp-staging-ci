@@ -171,7 +171,12 @@ void common_memory_breakdown_print(const llama_context * ctx);
 std::vector<size_t>              common_fit_margin_steps_mib(const char * spec);
 std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size_t> & margins, const std::vector<size_t> & steps,
                                                            const std::vector<size_t> & reserve = {});
+// the part of each margin above the default one (memory added before the fit for a later load, e.g. the server's projector)
+std::vector<size_t>              common_fit_margin_reserve(const std::vector<size_t> & margins, const std::vector<size_t> & defaults);
 bool                             common_fit_plain_spill_gate(const std::vector<int> & headless, const char * force);
+// whether the step-down may act beside a projector loaded after the fit: always without a GPU projector; with one, only if no
+// device list was given (the server adds the projector to the margins by registry index) and some margin carries its reserve
+bool                             common_fit_plain_spill_proj_ok(bool proj_gpu, bool devices_given, const std::vector<size_t> & reserve);
 std::vector<int>                 common_fit_devices_headless(const std::vector<ggml_backend_dev_t> & devs);
 
 struct common_device_memory_data {

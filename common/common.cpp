@@ -4123,6 +4123,9 @@ uma_restart:
                 // the fit of the 512 MiB step when it leaves exactly one block on the host (the fallback, see sq_margin2)
                 struct sq_fit { llama_model_params mp; llama_context_params cp; std::vector<float> ts; std::vector<llama_model_tensor_buft_override> tbo;
                                 std::vector<size_t> mg; common_params_fit_status st; bool set = false; } one_off;
+                // memory added to the default margin before the fit (the server's multimodal projector, loaded after the model)
+                // stays on top of each step, as in the plain-launch step-down
+                const std::vector<size_t> sq_reserve = common_fit_margin_reserve(margins_in, common_params().fit_params_target);
                 for (int step = 0; step < 3; ++step) {
                     std::vector<size_t> mg = margins_in;
                     if (step >= 1) {
@@ -4130,16 +4133,11 @@ uma_restart:
                             break;
                         }
                         const size_t mstep = step == 1 ? sq_margin : sq_margin2;
-                        bool lower = false;
-                        for (auto & m : mg) {
-                            if (m > mstep) {
-                                m = mstep;
-                                lower = true;
-                            }
-                        }
-                        if (!lower) {
+                        const std::vector<std::vector<size_t>> sq_tr = common_fit_margin_trials(margins_in, { mstep }, sq_reserve);
+                        if (sq_tr.empty()) {
                             continue;
                         }
+                        mg = sq_tr[0];
                     }
                     llama_model_params   mp = mparams_in;
                     llama_context_params cp = cparams_in;
@@ -4296,18 +4294,14 @@ uma_restart:
                     const std::vector<size_t>  mg_d  = mg;
                     const common_params_fit_status st_d = st4;
                     bool found = false;
+                    // memory added to the default margin before the fit (the server's multimodal projector) stays on top of each step
+                    const std::vector<size_t> sd_reserve = common_fit_margin_reserve(margins_in, common_params().fit_params_target);
                     for (const size_t m_step : steps) {
-                        std::vector<size_t> mgs = margins_in;
-                        bool lower = false;
-                        for (auto & m : mgs) {
-                            if (m > m_step) {
-                                m = m_step;
-                                lower = true;
-                            }
-                        }
-                        if (!lower) {
+                        const std::vector<std::vector<size_t>> sd_tr = common_fit_margin_trials(margins_in, { m_step }, sd_reserve);
+                        if (sd_tr.empty()) {
                             continue;
                         }
+                        std::vector<size_t> mgs = sd_tr[0];
                         llama_model_params   mps = mp0;
                         llama_context_params cps = cp0;
                         std::vector<float>   tss = ts0;
@@ -4789,7 +4783,11 @@ uma_restart:
             const auto all_on_device = [&](const llama_model_params & mp) {
                 return mp.n_gpu_layers == llama_model_default_params().n_gpu_layers && n_tbo(mp) <= n_tbo_in;
             };
-            if (on && !model_only && !has_draft && !spec_mtp && !params.fit_params_target_set &&
+            // a GPU projector loaded after the fit (llama-mtmd-cli, the server) takes its memory from the margin: step down only
+            // where its reserve sits in the margins of the fitted devices (the server with the default device list)
+            const bool proj_ok = common_fit_plain_spill_proj_ok(!params.mmproj.path.empty() && params.mmproj_use_gpu,
+                !params.devices.empty(), common_fit_margin_reserve(margins_in, common_params().fit_params_target));
+            if (on && !model_only && !has_draft && !spec_mtp && !params.load_mtp && proj_ok && !params.fit_params_target_set &&
                     fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && !all_on_device(mparams) &&
                     mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers && [&] {
                         std::vector<uint8_t> exps;
@@ -4822,11 +4820,7 @@ uma_restart:
                     const char * e_m = getenv("LLAMA_FIT_PLAIN_SPILL_MARGINS_MIB");
                     // memory added to the default margin before the fit (the server's multimodal projector, loaded after
                     // the model) is kept on top of every step
-                    const std::vector<size_t> def_margins = common_params().fit_params_target;
-                    std::vector<size_t> reserve(margins_in.size(), 0);
-                    for (size_t i = 0; i < margins_in.size() && i < def_margins.size(); i++) {
-                        reserve[i] = margins_in[i] > def_margins[i] ? margins_in[i] - def_margins[i] : 0;
-                    }
+                    const std::vector<size_t> reserve = common_fit_margin_reserve(margins_in, common_params().fit_params_target);
                     const std::vector<std::vector<size_t>> trials = common_fit_margin_trials(margins_in,
                         common_fit_margin_steps_mib(e_m != nullptr ? e_m : "512,448,256,192"), reserve);
                     for (const std::vector<size_t> & mgs : trials) {
@@ -4882,6 +4876,7 @@ uma_restart:
                 fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (getenv("LLAMA_KV_SEL_AFTER_DROP") == nullptr || atoi(getenv("LLAMA_KV_SEL_AFTER_DROP")) != 0)) {
             llama_model_params   mp  = mparams_in;
             llama_context_params cp  = cparams_in;
+            cp.n_state_capture = cparams.n_state_capture;   // the capture count (or the guard's drop) chosen above
             std::vector<float>   ts  = ts_in;
             std::vector<llama_model_tensor_buft_override> tbo = tbo_in;
             std::vector<size_t>  mg  = margins_in;
