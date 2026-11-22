@@ -7443,9 +7443,13 @@ private:
                 }
                 // the probabilities of the accepted tokens come from their verify rows, read now (a rollback below may decode
                 // again); they were left empty, so drafted positions looked like a uniform distribution to the KLD gate
-                slot.spec_probs.clear();
-                if (slot.task->params.sampling.n_probs > 0 && !slot.spec_is_replay && synth_probs.empty()) {
-                    for (size_t i = 0; i < accepted.size() && i < slot.spec_i_batch.size(); ++i) {
+                // a checkpoint replay keeps the ones read at the verify before the rollback (the replayed tokens) and adds the rows
+                // of the tokens past them
+                if (!slot.spec_is_replay) {
+                    slot.spec_probs.clear();
+                }
+                if (slot.task->params.sampling.n_probs > 0 && synth_probs.empty()) {
+                    for (size_t i = slot.spec_probs.size(); i < accepted.size() && i < slot.spec_i_batch.size(); ++i) {
                         completion_token_output r;
                         r.tok  = accepted[i];
                         r.prob = 1.0f;
