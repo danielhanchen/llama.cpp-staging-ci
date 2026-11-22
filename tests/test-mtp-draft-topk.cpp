@@ -25,6 +25,13 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+// the child processes run on POSIX only (main), but the test is built on Windows static builds too
+#define popen  _popen
+#define pclose _pclose
+static void setenv(const char * k, const char * v, int) { _putenv_s(k, v); }
+#endif
+
 // ---------------------------------------------------------------------------------------------------------------------- part 1
 
 struct head_case {
