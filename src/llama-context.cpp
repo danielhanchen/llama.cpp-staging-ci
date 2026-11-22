@@ -5784,6 +5784,19 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     //       ref: upstream llama.cpp discussion of this case
     cparams.causal_attn = false;
 
+    // a model without a memory module runs its whole sequence here (decode() calls encode()): with the graphs reserved at the decode
+    // size (the fit's decode-sized placement), a longer sequence runs with the cache banks released and a shorter one gets them back,
+    // as the ubatches of decode() do. Before, the banks stayed and the compute buffers grew into the memory the fit gave them
+    if (tiny_rel_ub > 0 && moe_cache) {
+        if ((int64_t) n_tokens > tiny_rel_ub) {
+            if (!moe_cache->released()) {
+                tiny_rel_enter("encode");
+            }
+        } else if (tiny_rel_held) {
+            tiny_rel_leave();
+        }
+    }
+
     ggml_status status;
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
