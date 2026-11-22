@@ -1908,6 +1908,206 @@ static int check_small_graph_backends(const size_t seed, const float stdev) {
     return 0;
 }
 
+// a layer-major prompt group that starts while the MoE cache banks are already released. With the banks released for ubatches
+// larger than the decode-sized graphs (LLAMA_MOE_PLACE8_UB, set by common's fit), a large ubatch that cannot run in a group (it holds
+// two sequences: the server's first batch of two prompts in a unified KV cache) runs alone and releases the banks; the group of the
+// one-sequence ubatches after it found nothing to release, took the banks as present and seeded them from the group's routing, and
+// the seed copied into a bank without a buffer (GGML_ASSERT in ggml_backend_view_init). The cache needs a CUDA / ROCm / MUSA device
+// (skipped without one); the experts stay in host memory. The logits must match a run without the cache.
+static int g_rel_enter = 0;
+static int g_rel_group = 0;
+static void released_seed_log(enum ggml_log_level level, const char * text, void * user_data) {
+    GGML_UNUSED(level);
+    GGML_UNUSED(user_data);
+    if (text == nullptr) {
+        return;
+    }
+    static const bool verbose = getenv("LLAMA_TEST_VERBOSE") != nullptr;
+    if (verbose) {
+        fputs(text, stderr);
+    }
+    if (strstr(text, "MoE cache banks released (prompt") != nullptr) {
+        g_rel_enter++;
+    }
+    if (strstr(text, "layer-major group after released banks") != nullptr) {
+        g_rel_group++;
+    }
+}
+
+static int check_moe_released_seed(const size_t seed, const float stdev) {
+    ggml_backend_dev_t gpu_dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count() && gpu_dev == nullptr; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * name = reg != nullptr ? ggml_backend_reg_name(reg) : "";
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0)) {
+            gpu_dev = dev;
+        }
+    }
+    if (gpu_dev == nullptr) {
+        printf("%s: no CUDA / ROCm / MUSA device, skipped\n", __func__);
+        return 0;
+    }
+    // what the fit sets for a cache that took the memory of the prompt graphs: graphs reserved at 31 tokens, larger ubatches with the
+    // banks released, layer-major groups kept
+#ifdef _WIN32
+    _putenv_s("LLAMA_MOE_LAYER_MAJOR", "1");
+    _putenv_s("LLAMA_MOE_PLACE8_UB", "31");
+    _putenv_s("LLAMA_MOE_PLACE8_MID", "64");
+#else
+    setenv("LLAMA_MOE_LAYER_MAJOR", "1", 1);
+    setenv("LLAMA_MOE_PLACE8_UB", "31", 1);
+    setenv("LLAMA_MOE_PLACE8_MID", "64", 1);
+#endif
+
+    const int32_t n_ubatch = 128;
+    const int32_t n_s1     = 40;                              // the second sequence: the first ubatch holds both
+    const int32_t n_s0     = n_ubatch - n_s1 + 3*n_ubatch + 16; // then three one-sequence ubatches and a tail of 16
+    const int32_t n_steps  = 4;
+
+    const llama_model_tensor_buft_override overrides[] = {
+        { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() },
+        { nullptr, nullptr },
+    };
+    auto run = [&](size_t moe_cache_size, std::vector<std::vector<float>> & out) -> bool {
+        // three layers: the MoE layers 1 and 2 share one cache group, layer 1 keeps every row (the last one is narrowed to the
+        // outputs, none in a member without them); one used expert and a cache of one slot, so the seed of layer 1 fills that slot
+        // (with more slots per layer than the one a release leaves, the seed of a group of two layers plans nothing and copies nothing)
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_DEEPSEEK2, true);
+        {
+            const std::string arch = llm_arch_name(LLM_ARCH_DEEPSEEK2);
+            gguf_set_val_u32(gguf_ctx.get(), (arch + ".expert_used_count").c_str(), 1);
+            const uint32_t n_layer0 = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
+            const uint32_t n_layer  = 3;
+            gguf_set_val_u32(gguf_ctx.get(), (arch + ".block_count").c_str(), n_layer);
+            // per-layer arrays of the generated model: the first entries repeated
+            for (int64_t k = 0; k < gguf_get_n_kv(gguf_ctx.get()); ++k) {
+                if (gguf_get_kv_type(gguf_ctx.get(), k) != GGUF_TYPE_ARRAY || gguf_get_arr_n(gguf_ctx.get(), k) != n_layer0) {
+                    continue;
+                }
+                const enum gguf_type t = gguf_get_arr_type(gguf_ctx.get(), k);
+                size_t es = 0;
+                switch (t) {
+                    case GGUF_TYPE_UINT8:   case GGUF_TYPE_INT8:   case GGUF_TYPE_BOOL: es = 1; break;
+                    case GGUF_TYPE_UINT16:  case GGUF_TYPE_INT16:  es = 2; break;
+                    case GGUF_TYPE_UINT32:  case GGUF_TYPE_INT32:  case GGUF_TYPE_FLOAT32: es = 4; break;
+                    case GGUF_TYPE_UINT64:  case GGUF_TYPE_INT64:  case GGUF_TYPE_FLOAT64: es = 8; break;
+                    default: break;
+                }
+                if (es == 0) {
+                    continue;
+                }
+                const uint8_t * d = (const uint8_t *) gguf_get_arr_data(gguf_ctx.get(), k);
+                std::vector<uint8_t> v(es*n_layer);
+                for (uint32_t il = 0; il < n_layer; ++il) {
+                    memcpy(v.data() + il*es, d + (il % n_layer0)*es, es);
+                }
+                const std::string key = gguf_get_key(gguf_ctx.get(), k);
+                gguf_set_arr_data(gguf_ctx.get(), key.c_str(), t, v.data(), n_layer);
+            }
+        }
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        ggml_backend_dev_t devs[2] = { gpu_dev, nullptr };
+        model_params.devices               = devs;
+        model_params.split_mode            = LLAMA_SPLIT_MODE_LAYER;
+        model_params.n_gpu_layers          = 99;
+        model_params.tensor_buft_overrides = overrides;
+        tensor_data_params tensor_params = { seed, stdev };
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+        if (!model) {
+            fprintf(stderr, "%s: failed to create the model\n", __func__);
+            return false;
+        }
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 2048;
+        ctx_params.n_batch         = 1024;
+        ctx_params.n_ubatch        = n_ubatch;
+        ctx_params.n_seq_max       = 2;
+        ctx_params.kv_unified      = true;
+        ctx_params.n_threads       = 4;
+        ctx_params.n_threads_batch = 4;
+        ctx_params.moe_cache_size  = moe_cache_size;
+        llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+        if (!lctx) {
+            fprintf(stderr, "%s: failed to create the context\n", __func__);
+            return false;
+        }
+        const uint32_t n_vocab = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> toks = get_tokens(n_s0 + n_s1 + 2*n_steps, n_vocab, seed);
+        llama_batch batch = llama_batch_init(n_s0 + n_s1, 0, 1);
+        auto add = [&](llama_token t, llama_pos pos, llama_seq_id s, bool logits) {
+            const int32_t i = batch.n_tokens++;
+            batch.token[i]     = t;
+            batch.pos[i]       = pos;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = s;
+            batch.logits[i]    = logits;
+        };
+        // one batch as the server builds it for two new prompts: the second slot's prompt first, then the first's
+        batch.n_tokens = 0;
+        size_t it = 0;
+        for (int32_t p = 0; p < n_s1; ++p) {
+            add(toks[it++], p, 1, false);
+        }
+        for (int32_t p = 0; p < n_s0; ++p) {
+            add(toks[it++], p, 0, p == n_s0 - 1);
+        }
+        bool ok = llama_decode(lctx.get(), batch) == 0;
+        if (ok) {
+            const float * lg = llama_get_logits_ith(lctx.get(), batch.n_tokens - 1);
+            out.emplace_back(lg, lg + n_vocab);
+        }
+        // a few steps of both sequences (the banks come back with the small batches)
+        for (int32_t k = 0; k < n_steps && ok; ++k) {
+            batch.n_tokens = 0;
+            add(toks[it++], n_s0 + k, 0, true);
+            add(toks[it++], n_s1 + k, 1, true);
+            ok = llama_decode(lctx.get(), batch) == 0;
+            for (int32_t i = 0; i < 2 && ok; ++i) {
+                const float * lg = llama_get_logits_ith(lctx.get(), i);
+                out.emplace_back(lg, lg + n_vocab);
+            }
+        }
+        llama_batch_free(batch);
+        return ok;
+    };
+
+    std::vector<std::vector<float>> ref, got;
+    if (!run(0, ref)) {
+        fprintf(stderr, "%s: FAIL: the run without the cache failed\n", __func__);
+        return 1;
+    }
+    llama_log_set(released_seed_log, nullptr);
+    const bool ok = run(700*1024, got); // one slot of the two layers' 288 KiB experts
+    llama_log_set(nullptr, nullptr);
+    if (!ok) {
+        fprintf(stderr, "%s: FAIL: the run with the cache failed\n", __func__);
+        return 1;
+    }
+    int ret = 0;
+    if (ref.size() != got.size()) {
+        fprintf(stderr, "%s: FAIL: %zu vs %zu logit rows\n", __func__, ref.size(), got.size());
+        ret = 1;
+    }
+    for (size_t i = 0; i < ref.size() && i < got.size(); ++i) {
+        const double e = nmse(ref[i], got[i]);
+        if (!(e < 1e-4)) {
+            fprintf(stderr, "%s: FAIL: row %zu: logits differ from the run without the cache, nmse %g\n", __func__, i, e);
+            ret = 1;
+        }
+    }
+    // the case must have run: the two-sequence ubatch released the banks, then a group started with them released
+    if (g_rel_enter == 0 || g_rel_group == 0) {
+        fprintf(stderr, "%s: FAIL: the case did not run (%d releases for a ubatch, %d groups after released banks)\n", __func__,
+            g_rel_enter, g_rel_group);
+        ret = 1;
+    }
+    printf("%s: %s (%zu logit rows, %d groups after released banks)\n", __func__, ret == 0 ? "OK" : "FAIL", got.size(), g_rel_group);
+    return ret;
+}
+
 int main(int argc, char ** argv) {
     // exact speculative verify is checked by default (LLAMA_MTP_EXACT=0 skips the check)
 #ifdef _WIN32
@@ -1933,6 +2133,7 @@ int main(int argc, char ** argv) {
     bool rs_replay_sched  = false; // delta-net replay commits of a split state
     bool small_backends   = false; // small backends
     bool mtp_kv_only      = false; // MTP no-output batches
+    bool released_seed    = false; // a layer-major group after released MoE cache banks
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1995,6 +2196,8 @@ int main(int argc, char ** argv) {
             mtp_kv_only = true;
         } else if (strcmp(argv[i], "--small-backends") == 0) {
             small_backends = true;
+        } else if (strcmp(argv[i], "--moe-released-seed") == 0) {
+            released_seed = true;
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
             if (i + 1 < argc) {
                 const char * backend_name = argv[++i];
@@ -2040,6 +2243,9 @@ int main(int argc, char ** argv) {
         }
         if (mtp_kv_only) {
             return check_mtp_kv_only(arch_filter, seed, stdev);
+        }
+        if (released_seed) {
+            return check_moe_released_seed(seed, stdev);
         }
         int ret = 0;
         if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP) && target_backend == nullptr) {
