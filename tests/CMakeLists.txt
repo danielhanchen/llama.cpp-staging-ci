@@ -331,6 +331,22 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --moe-released-seed -s 1
     )
+    # a layer-major group member with outputs beside released banks, or beside banks the group must release, reads the host experts
+    # (skipped without a CUDA / ROCm / MUSA device)
+    llama_test(
+        test-llama-archs
+        NAME test-moe-released-out
+        LABEL main
+        ARGS --moe-released-out -s 1
+    )
+    # a long sequence of a model without memory (diffusion) runs with the MoE cache banks released, a short one gets them back
+    # (skipped without a CUDA / ROCm / MUSA device)
+    llama_test(
+        test-llama-archs
+        NAME test-moe-encode-release
+        LABEL main
+        ARGS --moe-encode-release -s 1
+    )
 
     # an exact verify row keeps every cell of its sequence when the cells do not follow the positions (two sequences in a unified KV)
     llama_build(test-exact-verify-cells.cpp)
