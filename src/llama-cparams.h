@@ -17,6 +17,7 @@ struct llama_cparams {
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
+    uint32_t n_exact_rows = 1; // rows of an exact verify ubatch with one attention per row (llama_context::exact_rows_max)
     // build_sampling may run the leading backend top-k of a sequence's chains once over all its rows of the ubatch (the
     // output device's top-k gives each row of a multi-row input the result of that row alone; LLAMA_DEV_TOPK_BATCH=0: off)
     bool     topk_batch = false;

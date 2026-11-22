@@ -331,7 +331,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --moe-released-seed -s 1
     )
-    # an exact verify batch over a q8_0 KV cache with flash attention (one attention per row) fits the graph and equals single decodes
+    # an exact verify batch over a q8_0 KV cache with flash attention (one attention per row, windows of 32 and 128 rows) fits the
+    # graph and matches single decodes
     llama_test(
         test-llama-archs
         NAME test-verify-quant-kv
