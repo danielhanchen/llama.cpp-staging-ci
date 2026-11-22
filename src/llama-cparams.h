@@ -52,6 +52,7 @@ struct llama_cparams {
     bool kq_mask_dev = true;   // every device of the model runs GGML_OP_KQ_MASK (llm_graph's device KQ mask)
     bool flash_attn;
     bool auto_fa;
+    bool kv_f16 = false;     // K and V cache types are both F16
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
