@@ -658,6 +658,7 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.kv_f16     = params.type_k == GGML_TYPE_F16 && params.type_v == GGML_TYPE_F16;
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
@@ -9441,7 +9442,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         const char * e = getenv("LLAMA_EXACT_FA_GROUP");
         return e != nullptr && atoi(e) == 0;
     }();
-    if (fa_group_off) {
+    // queries share one attention node only over F16 K and V, so a cache of another type (q8_0) builds one per query as well
+    // (RTX PRO 6000 Qwen3-1.7B Q4_K_M, -ctk q8_0 -ctv q8_0 -fa on, default n-gram verify window: GGML_ASSERT(obj_new) in build_attn_mha)
+    if (fa_group_off || (cparams.flash_attn && !cparams.kv_f16)) {
         res += 8u * model.hparams.n_layer() * std::min<uint32_t>(n_tokens, 64u);
     }
 
