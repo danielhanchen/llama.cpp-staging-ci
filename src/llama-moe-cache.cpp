@@ -11013,7 +11013,7 @@ struct llama_moe_cache::impl {
     }
     // A replayed firm "off" record whose host was slower than calibrated runs its trial with the host path off in every block
     // (llama_moe_tp::replay_off_fetch; LLAMA_MOE_CPU_MISS_REPLAY_OFF_FETCH=0: its two "on" blocks compute their misses on the host as the
-    // recording launch did). The replay never times a verdict, so those blocks only slowed the request they fell in: Colab A100 80 GB
+    // recording launch did). The replay never times a verdict, so those blocks only slowed the request they fell in: A100 80 GB
     // (12 vCPU), Qwen3.8-Flash-Next at 4 bits with its DFlash2 drafter capped at 48 GB (70.5% cached), recorded t_on / t_off 2.0-2.6:
     // the "on" blocks fell in the chat request (25-31 ms per small batch off, 62-72 ms on; their 4-row windows on the mailbox, 43 -> 32
     // ms), chat 113.3 -> 119.9 tok/s (56 GB: 137.3 -> 144.7), same text. Its MTP head (t_on / t_off 1.10-1.17) keeps them: there the
