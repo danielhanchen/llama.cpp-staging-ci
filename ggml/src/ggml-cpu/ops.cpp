@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -5413,7 +5414,8 @@ struct ggml_cpu_rows_ahead_entry {
     std::atomic<const ggml_tensor *> t {nullptr};
     int64_t                   nc = 0;
     std::vector<int32_t>      ids;
-    std::vector<float>        out;
+    std::unique_ptr<float[]>  out;     // not zero-filled: the gather threads write (and first touch) it
+    size_t                    out_cap = 0;
     std::vector<std::thread>  thr;
     std::shared_mutex         use;
     std::mutex                m;
@@ -5482,7 +5484,8 @@ bool ggml_backend_cpu_get_rows_ahead(const ggml_tensor * t, const int32_t * ids,
     e->running = 0;
     if (drop) {
         e->ids.clear();
-        std::vector<float>().swap(e->out);
+        e->out.reset();
+        e->out_cap = 0;
         std::lock_guard<std::mutex> lock(g_rows_ahead_mtx);
         e->t = nullptr;
         g_rows_ahead_n.fetch_sub(1, std::memory_order_release);
@@ -5497,7 +5500,10 @@ bool ggml_backend_cpu_get_rows_ahead(const ggml_tensor * t, const int32_t * ids,
             id = -1; // never matches a gathered row
         }
     }
-    e->out.resize((size_t) (n*nc));
+    if (e->out_cap < (size_t) (n*nc)) {
+        e->out.reset(new float[(size_t) (n*nc)]);
+        e->out_cap = (size_t) (n*nc);
+    }
     const int nth = (int) std::max<int64_t>(1, std::min<int64_t>(std::max(1, n_threads), n));
     e->running = nth;
     const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(t);
@@ -5509,7 +5515,7 @@ bool ggml_backend_cpu_get_rows_ahead(const ggml_tensor * t, const int32_t * ids,
             const int64_t i1 = std::min(i0 + dr, n);
             for (int64_t i = i0; i < i1; ++i) {
                 if (e->ids[i] >= 0) {
-                    ggml_cpu_get_row_q(t, tr->to_float, rs, e->ids[i], 0, 0, e->out.data() + i*nc, tmp);
+                    ggml_cpu_get_row_q(t, tr->to_float, rs, e->ids[i], 0, 0, e->out.get() + i*nc, tmp);
                 }
             }
             std::lock_guard<std::mutex> lock(e->m);
@@ -5594,7 +5600,7 @@ static void ggml_compute_forward_get_rows_q(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         if (i10 < ra_n && ra_ids[i10] == i01) {
-            memcpy((char *) dst->data + i10*nb1, ra->out.data() + i10*nc, nc*sizeof(float));
+            memcpy((char *) dst->data + i10*nb1, ra->out.get() + i10*nc, nc*sizeof(float));
             n_taken++;
             continue;
         }
