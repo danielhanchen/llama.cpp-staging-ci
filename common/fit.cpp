@@ -3095,6 +3095,14 @@ std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size
     return trials;
 }
 
+std::vector<size_t> common_fit_margin_reserve(const std::vector<size_t> & margins, const std::vector<size_t> & defaults) {
+    std::vector<size_t> reserve(margins.size(), 0);
+    for (size_t i = 0; i < margins.size() && i < defaults.size(); i++) {
+        reserve[i] = margins[i] > defaults[i] ? margins[i] - defaults[i] : 0;
+    }
+    return reserve;
+}
+
 bool common_fit_plain_spill_gate(const std::vector<int> & headless, const char * force) {
     if (force != nullptr && force[0] != '\0') {
         return atoi(force) != 0;

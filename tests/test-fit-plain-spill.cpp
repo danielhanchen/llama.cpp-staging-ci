@@ -58,6 +58,20 @@ int main() {
         const auto tr2 = common_fit_margin_trials({(1024 + 300)*MiB, 1024*MiB}, steps, {300*MiB, 0});
         CHECK(tr2.size() == 4 && tr2[0][0] == (512 + 300)*MiB && tr2[0][1] == 512*MiB);
     }
+    // the reserve is the part of each margin above the default; one step of the MTP drafter squeeze (512, then 448 MiB) keeps it
+    {
+        const std::vector<size_t> res = common_fit_margin_reserve({(1024 + 880)*MiB, 1024*MiB, 512*MiB}, {1024*MiB, 1024*MiB});
+        CHECK(res.size() == 3 && res[0] == 880*MiB && res[1] == 0 && res[2] == 0);
+        const auto sq = common_fit_margin_trials({(1024 + 880)*MiB}, {512*MiB}, common_fit_margin_reserve({(1024 + 880)*MiB}, {1024*MiB}));
+        CHECK(sq.size() == 1 && sq[0][0] == (512 + 880)*MiB);
+        const auto sq2 = common_fit_margin_trials({(1024 + 880)*MiB}, {448*MiB}, common_fit_margin_reserve({(1024 + 880)*MiB}, {1024*MiB}));
+        CHECK(sq2.size() == 1 && sq2[0][0] == (448 + 880)*MiB);
+        // without a projector the squeeze step is the plain cap, as before
+        const auto sq0 = common_fit_margin_trials({1024*MiB}, {512*MiB}, common_fit_margin_reserve({1024*MiB}, {1024*MiB}));
+        CHECK(sq0.size() == 1 && sq0[0][0] == 512*MiB);
+        // a margin already at or below the step (a --fit-target below it) is not a step
+        CHECK(common_fit_margin_trials({400*MiB}, {512*MiB}, common_fit_margin_reserve({400*MiB}, {1024*MiB})).empty());
+    }
     // the display gate
     {
         CHECK( common_fit_plain_spill_gate({1}, nullptr));

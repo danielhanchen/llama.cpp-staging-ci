@@ -4123,6 +4123,9 @@ uma_restart:
                 // the fit of the 512 MiB step when it leaves exactly one block on the host (the fallback, see sq_margin2)
                 struct sq_fit { llama_model_params mp; llama_context_params cp; std::vector<float> ts; std::vector<llama_model_tensor_buft_override> tbo;
                                 std::vector<size_t> mg; common_params_fit_status st; bool set = false; } one_off;
+                // memory added to the default margin before the fit (the server's multimodal projector, loaded after the model)
+                // stays on top of each step, as in the plain-launch step-down
+                const std::vector<size_t> sq_reserve = common_fit_margin_reserve(margins_in, common_params().fit_params_target);
                 for (int step = 0; step < 3; ++step) {
                     std::vector<size_t> mg = margins_in;
                     if (step >= 1) {
@@ -4130,16 +4133,11 @@ uma_restart:
                             break;
                         }
                         const size_t mstep = step == 1 ? sq_margin : sq_margin2;
-                        bool lower = false;
-                        for (auto & m : mg) {
-                            if (m > mstep) {
-                                m = mstep;
-                                lower = true;
-                            }
-                        }
-                        if (!lower) {
+                        const std::vector<std::vector<size_t>> sq_tr = common_fit_margin_trials(margins_in, { mstep }, sq_reserve);
+                        if (sq_tr.empty()) {
                             continue;
                         }
+                        mg = sq_tr[0];
                     }
                     llama_model_params   mp = mparams_in;
                     llama_context_params cp = cparams_in;
@@ -4822,11 +4820,7 @@ uma_restart:
                     const char * e_m = getenv("LLAMA_FIT_PLAIN_SPILL_MARGINS_MIB");
                     // memory added to the default margin before the fit (the server's multimodal projector, loaded after
                     // the model) is kept on top of every step
-                    const std::vector<size_t> def_margins = common_params().fit_params_target;
-                    std::vector<size_t> reserve(margins_in.size(), 0);
-                    for (size_t i = 0; i < margins_in.size() && i < def_margins.size(); i++) {
-                        reserve[i] = margins_in[i] > def_margins[i] ? margins_in[i] - def_margins[i] : 0;
-                    }
+                    const std::vector<size_t> reserve = common_fit_margin_reserve(margins_in, common_params().fit_params_target);
                     const std::vector<std::vector<size_t>> trials = common_fit_margin_trials(margins_in,
                         common_fit_margin_steps_mib(e_m != nullptr ? e_m : "512,448,256,192"), reserve);
                     for (const std::vector<size_t> & mgs : trials) {
