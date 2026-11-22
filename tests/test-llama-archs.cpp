@@ -146,6 +146,7 @@ static void usage(char ** argv) {
     LOG("  --rs-decode-parity       Only check CPU single-token decodes against one prompt for RWKV6 / RWKV7 / Mamba\n");
     LOG("  --rs-replay-sched        Only check qwen35 replay commits through the scheduler on two in-process RPC devices\n");
     LOG("  --small-backends         Only check that kept small graphs keep the graph builder's backend assignments\n");
+    LOG("  --verify-quant-kv        Only check an exact verify batch over a q8_0 KV cache with flash attention (CPU)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2108,6 +2109,160 @@ static int check_moe_released_seed(const size_t seed, const float stdev) {
     return ret;
 }
 
+// an exact verify batch over a KV cache that is not F16 with flash attention. Each of its rows gets its own attention node (views of
+// q, k, v and the mask, the attention and a concat: rows over the same cells share one node only for F16 K and V), so a verify window
+// of W tokens adds about 6*W nodes per layer that the per-tensor graph budget does not hold. Qwen3-1.7B with a q8_0 cache and the
+// default n-gram drafts (8-token windows) ran out of graph context memory (GGML_ASSERT(obj_new) in build_attn_mha). The verify rows
+// must match the same rows decoded one at a time (within rounding: the CPU matmuls of a 32-row batch reassociate), for an F16 control
+// cache and a q8_0 cache.
+static int g_vq_fa = 0;
+static bool verify_quant_kv_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    GGML_UNUSED(user_data);
+    if (ask && t->op == GGML_OP_FLASH_ATTN_EXT) {
+        g_vq_fa++;
+    }
+    return false;
+}
+
+static int check_verify_quant_kv(const size_t seed, const float stdev) {
+    const uint32_t n_layer  = 12;
+    const int32_t  n_prompt = 32;
+    const int32_t  n_verify = 32;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN3, false);
+    {
+        const std::string arch = llm_arch_name(LLM_ARCH_QWEN3);
+        const uint32_t n_layer0 = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
+        gguf_set_val_u32(gguf_ctx.get(), (arch + ".block_count").c_str(), n_layer);
+        // per-layer arrays of the generated model: the first entries repeated
+        for (int64_t k = 0; k < gguf_get_n_kv(gguf_ctx.get()); ++k) {
+            if (gguf_get_kv_type(gguf_ctx.get(), k) != GGUF_TYPE_ARRAY || gguf_get_arr_n(gguf_ctx.get(), k) != n_layer0) {
+                continue;
+            }
+            const enum gguf_type t = gguf_get_arr_type(gguf_ctx.get(), k);
+            size_t es = 0;
+            switch (t) {
+                case GGUF_TYPE_UINT8:   case GGUF_TYPE_INT8:   case GGUF_TYPE_BOOL: es = 1; break;
+                case GGUF_TYPE_UINT16:  case GGUF_TYPE_INT16:  es = 2; break;
+                case GGUF_TYPE_UINT32:  case GGUF_TYPE_INT32:  case GGUF_TYPE_FLOAT32: es = 4; break;
+                case GGUF_TYPE_UINT64:  case GGUF_TYPE_INT64:  case GGUF_TYPE_FLOAT64: es = 8; break;
+                default: break;
+            }
+            if (es == 0) {
+                continue;
+            }
+            const uint8_t * d = (const uint8_t *) gguf_get_arr_data(gguf_ctx.get(), k);
+            std::vector<uint8_t> v(es*n_layer);
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                memcpy(v.data() + il*es, d + (il % n_layer0)*es, es);
+            }
+            const std::string key = gguf_get_key(gguf_ctx.get(), k);
+            gguf_set_arr_data(gguf_ctx.get(), key.c_str(), t, v.data(), n_layer);
+        }
+    }
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == nullptr) {
+        fprintf(stderr, "%s: FAIL: no CPU device\n", __func__);
+        return 1;
+    }
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t devs[2] = { cpu_dev, nullptr };
+    model_params.devices      = devs;
+    model_params.n_gpu_layers = 0;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        fprintf(stderr, "%s: failed to create the model\n", __func__);
+        return 1;
+    }
+    const uint32_t n_vocab = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const std::vector<llama_token> toks = get_tokens(n_prompt + n_verify, n_vocab, seed);
+
+    auto make_ctx = [&](ggml_type type_kv, bool count_fa) {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx           = 256;
+        cp.n_batch         = 256;
+        cp.n_ubatch        = 256;
+        cp.n_seq_max       = 1;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.type_k          = type_kv;
+        cp.type_v          = type_kv;
+        cp.n_threads       = 4;
+        cp.n_threads_batch = 4;
+        if (count_fa) {
+            cp.cb_eval = verify_quant_kv_cb;
+        }
+        return llama_context_ptr(llama_init_from_model(model.get(), cp));
+    };
+    auto decode = [&](llama_context * ctx, int32_t i0, int32_t n, bool logits_all) {
+        llama_batch b = llama_batch_init(n, 0, 1);
+        for (int32_t i = 0; i < n; ++i) {
+            b.token[i]     = toks[i0 + i];
+            b.pos[i]       = i0 + i;
+            b.n_seq_id[i]  = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i]    = logits_all || i == n - 1;
+        }
+        b.n_tokens = n;
+        const bool ok = llama_decode(ctx, b) == 0;
+        llama_batch_free(b);
+        return ok;
+    };
+
+    int ret = 0;
+    for (const ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        // the rows decoded one token at a time
+        std::vector<float> ref;
+        {
+            llama_context_ptr ctx = make_ctx(type_kv, false);
+            if (!ctx || !decode(ctx.get(), 0, n_prompt, false)) {
+                fprintf(stderr, "%s: FAIL: %s: reference prompt\n", __func__, ggml_type_name(type_kv));
+                return 1;
+            }
+            for (int32_t k = 0; k < n_verify; ++k) {
+                if (!decode(ctx.get(), n_prompt + k, 1, true)) {
+                    fprintf(stderr, "%s: FAIL: %s: reference decode %d\n", __func__, ggml_type_name(type_kv), k);
+                    return 1;
+                }
+                const float * l = llama_get_logits_ith(ctx.get(), -1);
+                ref.insert(ref.end(), l, l + n_vocab);
+            }
+        }
+        // the same rows as one exact verify batch
+        llama_context_ptr ctx = make_ctx(type_kv, true);
+        if (!ctx || !decode(ctx.get(), 0, n_prompt, false)) {
+            fprintf(stderr, "%s: FAIL: %s: prompt\n", __func__, ggml_type_name(type_kv));
+            return 1;
+        }
+        g_vq_fa = 0;
+        llama_set_verify(ctx.get(), true);
+        llama_set_verify_exact(ctx.get(), true);
+        const bool ok = decode(ctx.get(), n_prompt, n_verify, true);
+        llama_set_verify(ctx.get(), false);
+        if (!ok) {
+            fprintf(stderr, "%s: FAIL: %s: verify batch\n", __func__, ggml_type_name(type_kv));
+            return 1;
+        }
+        bool   same = true;
+        double err  = 0.0;
+        for (int32_t k = 0; k < n_verify; ++k) {
+            const float * l = llama_get_logits_ith(ctx.get(), k);
+            same = same && memcmp(ref.data() + (size_t) k*n_vocab, l, n_vocab*sizeof(float)) == 0;
+            err  = std::max(err, nmse(std::vector<float>(ref.begin() + (size_t) k*n_vocab, ref.begin() + (size_t) (k + 1)*n_vocab),
+                                      std::vector<float>(l, l + n_vocab)));
+        }
+        // the per-row nodes must have been built: one attention per row and layer outside F16, one per layer for F16
+        const int n_fa_want = (int) n_layer * (type_kv == GGML_TYPE_F16 ? 1 : n_verify);
+        const bool ok_fa = g_vq_fa == n_fa_want;
+        printf("%s: %-4s KV: verify rows %s single decodes (nmse %.3e), %d attention nodes (want %d)\n", __func__,
+            ggml_type_name(type_kv), same ? "equal to" : "differ from", err, g_vq_fa, n_fa_want);
+        ret |= !(err < 1e-6) || !ok_fa;
+    }
+    printf("%s: %s\n", __func__, ret == 0 ? "OK" : "FAIL");
+    return ret;
+}
+
 int main(int argc, char ** argv) {
     // exact speculative verify is checked by default (LLAMA_MTP_EXACT=0 skips the check)
 #ifdef _WIN32
@@ -2134,6 +2289,7 @@ int main(int argc, char ** argv) {
     bool small_backends   = false; // small backends
     bool mtp_kv_only      = false; // MTP no-output batches
     bool released_seed    = false; // a layer-major group after released MoE cache banks
+    bool verify_quant_kv  = false; // an exact verify batch over a quantized KV cache with flash attention
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2198,6 +2354,8 @@ int main(int argc, char ** argv) {
             small_backends = true;
         } else if (strcmp(argv[i], "--moe-released-seed") == 0) {
             released_seed = true;
+        } else if (strcmp(argv[i], "--verify-quant-kv") == 0) {
+            verify_quant_kv = true;
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
             if (i + 1 < argc) {
                 const char * backend_name = argv[++i];
@@ -2246,6 +2404,9 @@ int main(int argc, char ** argv) {
         }
         if (released_seed) {
             return check_moe_released_seed(seed, stdev);
+        }
+        if (verify_quant_kv) {
+            return check_verify_quant_kv(seed, stdev);
         }
         int ret = 0;
         if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP) && target_backend == nullptr) {

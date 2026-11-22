@@ -331,6 +331,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --moe-released-seed -s 1
     )
+    # an exact verify batch over a q8_0 KV cache with flash attention (one attention per row) fits the graph and equals single decodes
+    llama_test(
+        test-llama-archs
+        NAME test-verify-quant-kv
+        LABEL main
+        ARGS --verify-quant-kv -s 1
+    )
 
     # an exact verify row keeps every cell of its sequence when the cells do not follow the positions (two sequences in a unified KV)
     llama_build(test-exact-verify-cells.cpp)
