@@ -4766,6 +4766,20 @@ void ggml_cuda_mul_mat_vec_q(
 
     const bool exact = (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) != 0;
 
+    // a kernel preload (a graph built at load, never run) takes only a product whose launch is well formed: the channel / sample
+    // ratios the launch divides by whole and non-zero; any other is named once and left out
+    if (preload && (ncols_dst <= 0 || (ids ? nchannels_y <= 0 : (ne02 <= 0 || nchannels_dst < ne02 || nchannels_dst % ne02 != 0)) ||
+                    ne03 <= 0 || ne3 < ne03 || ne3 % ne03 != 0)) {
+        static std::atomic<int> n_logged { 0 };
+        if (n_logged++ < 4) {
+            GGML_LOG_INFO("%s: kernel preload: %s '%s' %s [%lld,%lld,%lld,%lld] x [%lld,%lld,%lld,%lld] -> [%lld,%lld,%lld,%lld] left out\n",
+                __func__, ids ? "MUL_MAT_ID" : "MUL_MAT", dst->name, ggml_type_name(src0->type), (long long) ne00, (long long) ne01,
+                (long long) ne02, (long long) ne03, (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+                (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3);
+        }
+        return;
+    }
+
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
