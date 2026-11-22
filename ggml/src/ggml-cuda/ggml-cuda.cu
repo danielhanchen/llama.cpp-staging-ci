@@ -4540,12 +4540,14 @@ static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_
 // fresh: graph->instance was instantiated from this capture just before (only the chunks after it can be stale)
 static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key, bool fresh) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    // a capture with a cuBLAS call is instantiated again on Hopper and newer, not updated (see ggml_cuda_graph::cublas)
-    // GGML_CUDA_GRAPH_CUBLAS_UPDATE=1: updated as before
+    // a capture with a cuBLAS call is instantiated again on Hopper and datacenter Blackwell (cc 9.0 up to 12.0), not updated (see
+    // ggml_cuda_graph::cublas); cc 12.x updated these graphs correctly and keeps the update. GGML_CUDA_GRAPH_CUBLAS_UPDATE=1: updated
+    // on every device, =0: instantiated again on every device
     bool reinstantiate = false;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    static const bool cublas_update = getenv("GGML_CUDA_GRAPH_CUBLAS_UPDATE") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_CUBLAS_UPDATE")) != 0;
-    reinstantiate = graph->cublas && !cublas_update && ggml_cuda_info().devices[cuda_ctx->device].cc >= GGML_CUDA_CC_HOPPER;
+    static const int cublas_update = getenv("GGML_CUDA_GRAPH_CUBLAS_UPDATE") != nullptr ? atoi(getenv("GGML_CUDA_GRAPH_CUBLAS_UPDATE")) != 0 : -1;
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    reinstantiate = graph->cublas && (cublas_update == 0 || (cublas_update < 0 && cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL));
     if (reinstantiate && !(fresh && graph->chunk_instances.empty())) {
         static bool logged = false;
         if (!logged) {

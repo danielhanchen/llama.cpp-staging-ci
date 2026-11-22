@@ -1318,7 +1318,7 @@ struct ggml_cuda_graph {
     int64_t  n_launch_total = 0;
     int      n_direct_streak = 0;
     int64_t last_used_time = 0;
-    // the last capture of this key made a cuBLAS call. On Hopper and newer such a graph is instantiated again instead of updated:
+    // the last capture of this key made a cuBLAS call. On Hopper and datacenter Blackwell such a graph is instantiated again instead of updated:
     // cuBLAS launches some GEMMs as thread block clusters, and an exec updated to one with a wider grid (other shapes, e.g. a KV
     // view that grew) never finished on a B200 (driver 590.48, cuBLAS 13.2), while a new instantiation of the same graph runs
     bool cublas = false;
