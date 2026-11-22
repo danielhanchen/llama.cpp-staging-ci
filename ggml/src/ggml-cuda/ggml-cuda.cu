@@ -13174,7 +13174,9 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
 #else
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_COPY_BATCH");
-        return env == nullptr || atoi(env) != 0;
+        // a 12.8 build on an older driver (minor version compatibility) has no cudaMemcpyBatchAsync: the callers' per-copy path
+        int drv = 0;
+        return (env == nullptr || atoi(env) != 0) && cudaDriverGetVersion(&drv) == cudaSuccess && drv >= 12080;
     }();
     if (!enabled || !ggml_backend_is_cuda(backend)) {
         return false;
