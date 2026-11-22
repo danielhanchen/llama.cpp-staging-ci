@@ -311,6 +311,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --small-backends -s 1
     )
+    # a layer-major prompt group after a large two-sequence ubatch that released the MoE cache banks seeds nothing and gives the
+    # logits of a run without the cache (skipped without a CUDA / ROCm / MUSA device)
+    llama_test(
+        test-llama-archs
+        NAME test-moe-released-seed
+        LABEL main
+        ARGS --moe-released-seed -s 1
+    )
 
     # an exact verify row keeps every cell of its sequence when the cells do not follow the positions (two sequences in a unified KV)
     llama_build(test-exact-verify-cells.cpp)
