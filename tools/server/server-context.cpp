@@ -2752,7 +2752,8 @@ private:
             const char * e = getenv("LLAMA_SERVER_DEVICE_GREEDY");
             // on by default again with 928828cc004 (pre-sampling n_probs read the raw logits): the n_probs / logprobs check passes 4 / 4
             // (completion + chat, streaming + not) with it on. LLAMA_SERVER_DEVICE_GREEDY=0 off
-            device_greedy_ok = (e == nullptr || atoi(e) != 0) && llama_model_n_devices(model_tgt) > 0;
+            // not on an embedding / reranking server: it samples nothing, and a sampler caps its every-token outputs at one per sequence
+            device_greedy_ok = (e == nullptr || atoi(e) != 0) && !params_base.embedding && llama_model_n_devices(model_tgt) > 0;
             for (int i = 0; device_greedy_ok && i < llama_model_n_devices(model_tgt); ++i) {
                 ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
