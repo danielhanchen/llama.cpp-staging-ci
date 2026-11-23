@@ -1973,16 +1973,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // cut inside it. A user's --spec-draft-n-max below it is kept. Not beside a MoE cache (LLAMA_DFLASH_N_MAX_SM80_CACHED=1: there
                 // too): there the measured EV window (eva_t) already picks the width, and the route tail skip makes the text follow the
                 // window: A100 80 GB at a 48 GB cap, chat 119.5 vs 115.0 tok/s (same text), 8k 84.0 vs 93.9 (other text, 2.98 vs 3.41
-                // tokens per pass at about the same pass time)
+                // tokens per pass at about the same pass time). Beside a cache where no window rule runs (no cached / mid / low
+                // band window, no measured EV window: the EV-auto default is off on compute capability 8.0, LLAMA_DFLASH_EV_AUTO_SM80) the cap
+                // applies by default: there every pass verified the whole 7-row draft. A100 80 GB (12 vCPU), Qwen3.8-Flash-Next 4-bit at a 48 GB cap
+                // (70.5% cached), 3 interleaved launches on one VM: chat 125.5 vs 119.9 tok/s, 8k 114.3 vs 110.7, the same texts (md5 equal).
+                // LLAMA_DFLASH_N_MAX_SM80_CACHED=0: not beside a cache (as before), =1: beside every cache, also under a window rule
                 const int32_t df2_n_max_sm80 = common_dflash_n_max_sm80();
-                static const bool df2_n_max_sm80_cached = [] {
+                static const int df2_n_max_sm80_cached = [] {
                     const char * e = getenv("LLAMA_DFLASH_N_MAX_SM80_CACHED");
-                    return e != nullptr && atoi(e) != 0;
+                    return e != nullptr ? (atoi(e) != 0 ? 1 : 0) : -1;
                 }();
+                const bool df2_cache_now = params.ctx_tgt != nullptr && llama_moe_cache_active(params.ctx_tgt);
                 const bool df2_cap_here = is_dflash2 && df2_n_max_sm80 > 0 &&
-                    (df2_n_max_sm80_cached || params.ctx_tgt == nullptr || !llama_moe_cache_active(params.ctx_tgt));
+                    (!df2_cache_now || df2_n_max_sm80_cached > 0 || (df2_n_max_sm80_cached < 0 && !use_df2w && !use_eva && !use_ev));
+                if (is_dflash2 && df2_n_max_sm80 > 0 && df2_cache_now && df2_cap_here && df2_n_max_sm80_cached < 0 && df2_n_max_sm80 < params.n_max) {
+                    static bool logged_cached = false;
+                    if (!logged_cached) {
+                        logged_cached = true;
+                        LOG_INF("DFlash2 drafts of at most %d steps beside the MoE cache on a compute capability 8.0 GPU: no window rule runs here "
+                                "(LLAMA_DFLASH_N_MAX_SM80_CACHED=0 off)\n", df2_n_max_sm80);
+                    }
+                }
                 const int32_t df2_n_max = df2_cap_here ? std::min(params.n_max, df2_n_max_sm80) : params.n_max;
-                if (is_dflash2 && df2_n_max < params.n_max) {
+                if (is_dflash2 && df2_n_max < params.n_max && !df2_cache_now) {
                     static bool logged = false;
                     if (!logged) {
                         logged = true;
