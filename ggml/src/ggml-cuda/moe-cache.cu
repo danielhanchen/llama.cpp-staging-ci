@@ -2000,15 +2000,37 @@ static void moe_stg_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
         ids = p.buf + (size_t) il*MOE_PF_STRIDE;
     }
+    // on the cache's side stream (GGML_CUDA_MOE_STAGE_SIDE=0: the main stream), beside the next layer's attention: nothing on the main
+    // stream reads what the pick writes (a fetch reads key and number as a pair and checks them again, see moe_stg_source); an
+    // overlapped fetch of the next layer runs after it on the same stream, and the main stream's next cache op or the end of the
+    // graph waits for it (moe_join). On the main stream the two kernels cost an A100 ~35 us per layer (~1.6 ms per verify pass)
+    static const bool on_side = [] {
+        const char * e = getenv("GGML_CUDA_MOE_STAGE_SIDE");
+        return e == nullptr || atoi(e) != 0;
+    }();
     cudaStream_t stream = ctx.stream();
-    moe_pf_topn<<<n_tokens, MOE_PF_THREADS, (size_t) n_expert*sizeof(float), stream>>>((const float *) logits->data, n_expert, n_top,
+    cudaStream_t run    = stream;
+    if (on_side) {
+        if (ctx.moe_fork == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_fork, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_join, cudaEventDisableTiming));
+        }
+        run = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);
+        CUDA_CHECK(cudaEventRecord(ctx.moe_fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(run, ctx.moe_fork, 0));
+    }
+    moe_pf_topn<<<n_tokens, MOE_PF_THREADS, (size_t) n_expert*sizeof(float), run>>>((const float *) logits->data, n_expert, n_top,
         n_tokens, ids);
     CUDA_CHECK(cudaGetLastError());
     const int min_score = std::max(1, ggml_get_op_params_i32(dst, 14) >> 8); // votes an expert needs (ggml_moe_cache_prefetch_set_stage)
-    moe_stg_pick<<<1, 32, (size_t) n_expert*sizeof(int32_t), stream>>>(ids, n_ids, n_tokens, n_top,
+    moe_stg_pick<<<1, 32, (size_t) n_expert*sizeof(int32_t), run>>>(ids, n_ids, n_tokens, n_top,
         (const int32_t *) map->data + (int64_t) il*n_expert, n_expert, il, g.dstate, g.n_stg,
         std::min(std::max(max_fill, 1), g.n_stg), min_score, d.h_dev, d.ctr, reg, d.stat);
     CUDA_CHECK(cudaGetLastError());
+    if (on_side) {
+        CUDA_CHECK(cudaEventRecord(ctx.moe_join, run));
+        ctx.moe_join_pending = true;
+    }
 }
 #else
 static moe_stg_view moe_stg_view_of(const void * bank0, const int il) {
