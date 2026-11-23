@@ -1420,7 +1420,7 @@ static void common_params_fit_impl(
         // "the cache fits whole" (then experts move to the device). LLAMA_FIT_MOE_CACHE_ALLFIT=0 keeps the old behaviour
         const char * e_allfit = getenv("LLAMA_FIT_MOE_CACHE_ALLFIT");
         const bool   allfit   = e_allfit == nullptr || atoi(e_allfit) != 0;
-        if (allfit && cparams->moe_cache_size >= (size_t(1) << 40)) { // COMMON_MOE_CACHE_AUTO_BYTES: not shrunk, so the whole cache fits
+        if (allfit && cparams->moe_cache_size >= (size_t) std::min<uint64_t>((uint64_t) 1 << 40, SIZE_MAX)) { // COMMON_MOE_CACHE_AUTO_BYTES: not shrunk, so the whole cache fits
             llama_context_params cparams_nc = *cparams;
             cparams_nc.moe_cache_size = 0;
             LOG_TRC("%s: getting device memory data without the MoE cache (the whole cache fits):\n", __func__);

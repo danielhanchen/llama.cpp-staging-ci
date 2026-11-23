@@ -703,6 +703,10 @@ static __device__ int mmvq_grid_smem_off = 0;
 void ggml_cuda_mmvq_grid_init(int device);
 
 void ggml_cuda_mmvq_grid_init(int device) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    // no cudaMemcpyToSymbol there: the shared-memory tables (same entries, same bytes)
+    GGML_UNUSED(device);
+#else
     const char * e = getenv("GGML_CUDA_MMVQ_GRID_SMEM");
     const bool arch_off = ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_AMPERE; // sm_80 default
     if (e != nullptr ? atoi(e) == 0 : arch_off) {
@@ -716,6 +720,7 @@ void ggml_cuda_mmvq_grid_init(int device) {
                 e != nullptr ? "GGML_CUDA_MMVQ_GRID_SMEM=0" : "compute capability 8.0 default (GGML_CUDA_MMVQ_GRID_SMEM=1: shared memory)");
         }
     }
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 static constexpr __host__ __device__ int mmvq_grid_smem_n(ggml_type type) {

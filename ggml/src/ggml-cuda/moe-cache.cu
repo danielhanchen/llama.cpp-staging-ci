@@ -1519,7 +1519,9 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
                         s = 2;
                         break;
                     }
+#if __CUDA_ARCH__ >= 700
                     __nanosleep(100);
+#endif
                 }
                 // GGML_MOE_MAILBOX_TIMING: the block of the batch's first host row adds this batch to the sums
                 bool first = timing != 0 && s == 1;

@@ -5,6 +5,7 @@
 // it sizes is resident at decode beside the drafter's device weights and compute buffers, so a lent (context only) measurement
 // grows the cache into them.
 
+#include "common.h"
 #include "fit.h"
 
 #include <cstdio>
@@ -52,13 +53,13 @@ int main() {
     CHECK(!common_fit_extra_lent_excluded(true,  true));
 
     // the switch: on by default, LLAMA_FIT_PLACEMID_DECODE_SIZED=0 measures lent as before
-    unsetenv("LLAMA_FIT_PLACEMID_DECODE_SIZED");
+    common_set_env("LLAMA_FIT_PLACEMID_DECODE_SIZED", "");
     CHECK(common_fit_placemid_decode_sized());
-    setenv("LLAMA_FIT_PLACEMID_DECODE_SIZED", "0", 1);
+    common_set_env("LLAMA_FIT_PLACEMID_DECODE_SIZED", "0");
     CHECK(!common_fit_placemid_decode_sized());
-    setenv("LLAMA_FIT_PLACEMID_DECODE_SIZED", "1", 1);
+    common_set_env("LLAMA_FIT_PLACEMID_DECODE_SIZED", "1");
     CHECK(common_fit_placemid_decode_sized());
-    unsetenv("LLAMA_FIT_PLACEMID_DECODE_SIZED");
+    common_set_env("LLAMA_FIT_PLACEMID_DECODE_SIZED", "");
 
     // RTX PRO 6000 at a 16 GB budget, Qwen3.8-Flash-Next 4-bit ctx 262144 -ub 2048 + its Q8_0 MTP drafter with host experts
     // (n_ubatch 16): 4154 MiB of prompt compute freed at 31 tokens, drafter 190 MiB weights, 340 MiB K/V, 176 MiB compute

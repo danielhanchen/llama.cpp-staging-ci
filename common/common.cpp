@@ -2717,7 +2717,7 @@ static bool common_fit_draft_on_cpu(
     std::vector<size_t> margins = params.fit_params_target;
     common_fit_set_moe_margin_auto(!params.fit_params_target_set);
     const size_t requested = cparams.moe_cache_size;
-    cp.moe_cache_size = std::max<size_t>(requested, (size_t) 1 << 40);
+    cp.moe_cache_size = std::max<size_t>(requested, (size_t) std::min<uint64_t>((uint64_t) 1 << 40, SIZE_MAX));
 
     LOG_INF("%s: --fit with a draft model: fitting the main model and its MoE cache first\n", __func__);
     const auto status = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
@@ -3272,7 +3272,7 @@ static bool common_moe_resident_ubatch_try(common_params & params, llama_model_p
 
 // the request --moe-cache-mib auto stands for: larger than any device, so that the fit gives the cache what the layers leave
 // (the fit caps the cache at the bytes of the host experts and at the free device memory)
-static constexpr size_t COMMON_MOE_CACHE_AUTO_BYTES = (size_t) 1 << 40;
+static constexpr size_t COMMON_MOE_CACHE_AUTO_BYTES = (size_t) std::min<uint64_t>((uint64_t) 1 << 40, SIZE_MAX); // 32-bit size_t: SIZE_MAX
 
 // unified memory: every offload device an integrated GPU (e.g. AMD Strix Halo gfx1151, GGML_BACKEND_DEVICE_TYPE_IGPU
 // from the device's integrated attribute); LLAMA_MOE_UMA=1 / 0 forces the decision

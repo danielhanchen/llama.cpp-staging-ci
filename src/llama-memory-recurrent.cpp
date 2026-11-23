@@ -275,6 +275,11 @@ llama_memory_recurrent::llama_memory_recurrent(
             ggml_backend_buffer_clear(buf, 0);
         }
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        // OpenVINO's VIEW on the stateless path keeps the whole source (its consumers re-slice a view of the gather only), so a
+        // cache-row view of the states in place would read every cell: the states are gathered there (get_rs_alias)
+        if (strncmp(ggml_backend_buft_name(buft), "OPENVINO", 8) == 0) {
+            rs_alias_ok = false;
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -2137,7 +2142,7 @@ int32_t llama_memory_recurrent_context::get_rs_alias(const llama_ubatch & ubatch
         return env == nullptr || atoi(env) != 0;
     }();
 
-    if (!enabled || is_full || ubatch.n_seqs == 0 || ubatch.n_tokens != ubatch.n_seqs) {
+    if (!enabled || !mem->rs_alias_ok || is_full || ubatch.n_seqs == 0 || ubatch.n_tokens != ubatch.n_seqs) {
         return -1;
     }
 

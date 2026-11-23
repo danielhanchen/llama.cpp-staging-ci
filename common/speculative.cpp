@@ -4745,7 +4745,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // compute buffer and its sliding-window cache (Qwen3.8-Flash-Next + DFlash2 at -ub 2048: 1980 -> 30 MiB of compute with
     // llama_context::sched_reserve, K/V 80 -> 50 MiB). Capped like a separate MTP drafter (LLAMA_DRAFT_UBATCH_MAX, default 512)
     if (has_block_draft && has_draft) {
-        const uint32_t cap = common_draft_ubatch_max();
+        // draft() decodes the noise blocks of every drafting sequence in one non-causal ubatch: the cap never goes below them
+        const uint32_t need = (uint32_t) std::max(1, params.n_parallel) * (uint32_t) std::max(1, params_spec.n_max + 1);
+        const uint32_t cap  = common_draft_ubatch_max() > 0 ? std::max(common_draft_ubatch_max(), need) : 0;
         if (cap > 0 && (uint32_t) result.n_ubatch > cap) {
             result.n_ubatch = (int32_t) cap;
             result.n_batch  = std::max(result.n_batch, params.n_ubatch);

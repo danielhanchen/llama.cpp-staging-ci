@@ -585,9 +585,9 @@ class ModelBase:
                     w_shape, s_shape = w().shape, s().shape
                     block_size = None
                     if s_shape.numel() != 1:
-                        if len(s_shape) != len(w_shape) or any(ws % ss for ws, ss in zip(w_shape, s_shape)):
+                        block_size = fp8_scale_block_size(list(w_shape), list(s_shape), quant_config.get("weight_block_size"))
+                        if block_size is None:
                             raise ValueError(f"FP8 weight {weight_name!r} {list(w_shape)} is not tiled by its scale {list(s_shape)}")
-                        block_size = [ws // ss for ws, ss in zip(w_shape, s_shape)]
                     self.model_tensors[weight_name] = lambda w=w, s=s, bs=block_size: dequant_simple(w(), s(), bs)
                     tensors_to_remove.append(name)
                     if self._fp8_as_q8:
@@ -3119,6 +3119,20 @@ else:
     # Older torch builds do not expose F8_E8M0. Keep the raw bytes so callers
     # that know the format can decode them explicitly.
     LazyTorchTensor._dtype_str_map["F8_E8M0"] = torch.uint8
+
+
+def fp8_scale_block_size(w_shape: list[int], s_shape: list[int], cfg_block: Any = None) -> list[int] | None:
+    """Block size of a per-block FP8 scale. ModelOpt pads each dim to its block (128 unless the config names one) and crops
+    the weight back, so a dim that is not a multiple of the block has ceil(dim / block) scales: inferring dim // n_scales
+    would give 96 for a 192-row weight with 2 scales. Exact tilings with another block keep the inferred size. None: no tiling."""
+    if len(s_shape) != len(w_shape):
+        return None
+    bs = list(cfg_block) if isinstance(cfg_block, (list, tuple)) and len(cfg_block) == len(w_shape) else [128] * len(w_shape)
+    if all(b > 0 and (ws + b - 1) // b == ss for ws, b, ss in zip(w_shape, bs, s_shape)):
+        return bs
+    if all(ss > 0 and ws % ss == 0 for ws, ss in zip(w_shape, s_shape)):
+        return [ws // ss for ws, ss in zip(w_shape, s_shape)]
+    return None
 
 
 def jinja_str_or_json(name: str) -> str:

@@ -179,6 +179,8 @@ public:
     bool    can_take_alloc(int32_t il) const;
     // ... the number of such duplicates over every layout (the diagnostics)
     int32_t n_dup_slots() const;
+    // ... entries of the duplicate lists (stale ones included; bounded by the layout, the tests)
+    size_t  n_dup_entries() const;
     // slots being filled (reserved, not published yet)
     int32_t n_filling() const;
     // ... of the layout of layer il, and its slots

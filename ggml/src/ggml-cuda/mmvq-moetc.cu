@@ -490,25 +490,30 @@ static __global__ void mul_mat_vec_q_moe_tc(const moetc_args args) {
         return;
     }
 
-    // leave unless this is the expert's first entry (token-major); every warp decides alike
+    // an expert's entries in token-major order go in groups of cap columns (a stage holds ntok activation columns): an expert can
+    // repeat within a token (GroveMoE chunk experts, ids / n_group_experts), so it can have more than ntok (or 8) entries.
+    // Leave unless this entry starts a group; every warp decides alike
     const int my   = tok*nslots + slot;
     const int nent = args.ntok*nslots;
+    const int cap  = min(8, args.ntok);
+    int nprev = 0;
     for (int i0 = 0; i0 < my; i0 += WARP_SIZE) {
         const int  i = i0 + lane;
         const bool m = i < my && args.ids[(i % nslots) + (i / nslots)*args.ids_stride] == e;
-        if (__any_sync(FULL, m)) {
-            return;
-        }
+        nprev += __popc(__ballot_sync(FULL, m));
+    }
+    if (nprev % cap != 0) {
+        return;
     }
     // the columns: this expert's entries in token-major order; lane c < ncols holds column c's offsets
     int     ncols = 0;
     int64_t yoff  = 0;
     int64_t doff  = 0;
-    for (int i0 = my; i0 < nent && ncols < 8; i0 += WARP_SIZE) {
+    for (int i0 = my; i0 < nent && ncols < cap; i0 += WARP_SIZE) {
         const int  i = i0 + lane;
         const bool m = i < nent && args.ids[(i % nslots) + (i / nslots)*args.ids_stride] == e;
         unsigned b = __ballot_sync(FULL, m);
-        while (b != 0 && ncols < 8) {
+        while (b != 0 && ncols < cap) {
             const int ent = i0 + __ffs(b) - 1;
             b &= b - 1;
             if (lane == ncols) {
