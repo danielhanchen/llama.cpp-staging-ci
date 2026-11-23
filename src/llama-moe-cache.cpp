@@ -1961,17 +1961,24 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // (decode extension, LLAMA_MOE_DECODE_EXT=1: on where it can be; unset or 0 off, opt-in until it is measured beyond
-        // the T4 12 / 8 GB caps and its long48 max outliers are decided): the banks of the cache of the main
+        // (decode extension, LLAMA_MOE_DECODE_EXT=1: on where it can be; 0 off; unset: on by default only on a host of 8-11
+        // usable CPUs whose cache holds less than LLAMA_MOE_DECODE_EXT_AUTO_FRAC (0.30) of the host experts, decided below once the
+        // slots are sized): the banks of the cache of the main
         // model (not an MTP context's) on a single device with CUDA VMM get room for LLAMA_MOE_DECODE_EXT_MAX_FRAC (0.6) more slots per
         // group, unbacked at load; the context grows the cache into the device memory the decode leaves free (llama_context::ext_unpark).
-        // Not with the lazy KV cache's shrink (LLAMA_KV_LAZY), which retires slots for good
+        // Not with the lazy KV cache's shrink (LLAMA_KV_LAZY), which retires slots for good.
+        // The default domain: T4 8 VCPUs, the 4-bit Qwen3.6-35B-A3B + MTP n2 at 8 GB (17.5% cached), the decode is miss-bound and the
+        // host path is slow (85 us per expert): 8k 60.8 -> 67.9 tok/s. With 12 or more CPUs the host path is fast enough that the
+        // larger cache flips its decisions and loses (L4 12 GB, 39% cached: chat / 8k 0.93 / 0.95x; L4 16 GB chat 0.93x)
         double ext_frac = 0.0;
+        bool   ext_auto = false;
         {
             const char * e  = getenv("LLAMA_MOE_DECODE_EXT");
             const char * ef = getenv("LLAMA_MOE_DECODE_EXT_MAX_FRAC");
             ext_frac = ef != nullptr ? std::max(0.0, atof(ef)) : 0.6;
-            const bool want = (e != nullptr && atoi(e) != 0) && ext_frac > 0.0 && set != layer_set::nextn && !model.hparams.no_alloc &&
+            const uint32_t cpus = llama_sysmem::usable_cpus();
+            ext_auto = e == nullptr && cpus >= 8u && cpus < 12u;
+            const bool want = ((e != nullptr && atoi(e) != 0) || ext_auto) && ext_frac > 0.0 && set != layer_set::nextn && !model.hparams.no_alloc &&
                 devices.size() == 1 && !llama_kv_lazy_alloc_on();
             ext_on = want && ext_probe(devices[0]);
             if (!ext_on) {
@@ -2030,6 +2037,22 @@ struct llama_moe_cache::impl {
             cache_frac    = host > 0.0 ? std::min(1.0, cached/host) : 1.0;
             host_uncached = std::max(0.0, host - cached);
             host_total    = host;
+        }
+        // the default decode extension needs a small cache (see ext_auto above); a larger one keeps the fitted banks, as with
+        // LLAMA_MOE_DECODE_EXT=0
+        if (ext_on && ext_auto) {
+            const char * e = getenv("LLAMA_MOE_DECODE_EXT_AUTO_FRAC");
+            const double max_frac = e != nullptr ? std::max(0.0, atof(e)) : 0.30;
+            if (cache_frac >= max_frac) {
+                ext_on = false;
+                for (group & g : groups) {
+                    g.n_slots_cap = g.n_slots;
+                }
+            } else {
+                LLAMA_LOG_INFO("%s: MoE cache holds %.1f%% of the host experts on %u usable CPUs: decode extension on by default (below "
+                    "%.0f%%, LLAMA_MOE_DECODE_EXT_AUTO_FRAC, and fewer than 12 CPUs; LLAMA_MOE_DECODE_EXT=0 off)\n", __func__,
+                    100.0*cache_frac, llama_sysmem::usable_cpus(), 100.0*max_frac);
+            }
         }
         tail_skip_init(model, set);
         // the default single-graph host misses need a cache that holds a real share of the experts. With almost every expert
