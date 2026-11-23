@@ -301,16 +301,8 @@ gated_delta_net_cuda(const float * q,
 // gdn_token_step, but q / k / v / g / beta of TOKEN_TILE tokens are first staged into shared memory by the whole block
 // with coalesced loads, so the per-token critical path no longer waits on scattered global loads. Bit-identical to the
 // AR kernel by construction (same arithmetic, same reduction order); only the load source differs.
-// PF (prefetch form): q / k are staged per lane (the rows_per_lane rows a lane reads, contiguous, a padded row per lane, so one
-// lane's k / q of a token are rows_per_lane/4 16-byte shared loads instead of rows_per_lane 4-byte ones), and the next tile's
-// q / k / v / g / beta are read from global memory into registers while the current tile runs, then stored after its last
-// token (the base form waits for every tile's loads). The same values reach the same gdn_token_step calls: bit-identical.
-// PF also takes the raw gates (beta_raw / ga, ggml_cuda_try_gdn_gates) and applies them as the AR kernel does (the same functions of
-// the same inputs) when it stages a tile; the base form is only launched without them.
-// PF at up to 8 warps: two blocks per SM (at most 128 registers), as the base form gets with its fewer registers; the prompt grid
-// (A100, 48 value heads: 192 blocks of 8 warps) then runs in one wave
-template <int S_v, bool keep_rs_t, int num_warps, int TOKEN_TILE, bool PF = false>
-__global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps, PF && num_warps <= 8 ? 2 : 1)
+template <int S_v, bool keep_rs_t, int num_warps, int TOKEN_TILE>
+__global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps, 1)
 gated_delta_net_tiled_cuda(const float * q,
                            const float * k,
                            const float * v,
@@ -334,11 +326,7 @@ gated_delta_net_tiled_cuda(const float * q,
                            const uint3   rq3_magic,
                            float         scale,
                            int64_t       state_slot_stride,
-                           int           K,
-                           const float * beta_raw,
-                           const float * ga,
-                           const float * ga_bias,
-                           const float * ga_scale) {
+                           int           K) {
     constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
     constexpr int cols_per_warp = gdn_cols_per_warp;
     constexpr int lanes_per_col = warp_size / cols_per_warp;
@@ -348,11 +336,8 @@ gated_delta_net_tiled_cuda(const float * q,
     static_assert(S_v % lanes_per_col == 0, "S_v must be a multiple of lanes_per_col");
     static_assert(S_v % block_cols == 0, "the block columns must divide S_v");
 
-    // PF: [token][lane_in_col][row of the lane] with lane_pad floats per lane (16-byte aligned rows, conflict-free stores)
-    constexpr int lane_pad = rows_per_lane + 4;
-    static_assert(!PF || rows_per_lane % 4 == 0, "the prefetch form reads a lane's rows as float4");
-    __shared__ __align__(16) float q_sh[TOKEN_TILE][PF ? lanes_per_col * lane_pad : S_v];
-    __shared__ __align__(16) float k_sh[TOKEN_TILE][PF ? lanes_per_col * lane_pad : S_v];
+    __shared__ float q_sh[TOKEN_TILE][S_v];
+    __shared__ float k_sh[TOKEN_TILE][S_v];
     __shared__ float v_sh[TOKEN_TILE][block_cols];
     __shared__ float g_sh[TOKEN_TILE];
     __shared__ float b_sh[TOKEN_TILE];
@@ -391,120 +376,6 @@ gated_delta_net_tiled_cuda(const float * q,
         s_shard[r]  = curr_state[i];
     }
 
-    if constexpr (PF) {
-        // per thread: NQK elements of the tile's q and of its k, NV of v; g / beta by the first TOKEN_TILE threads
-        constexpr int NQK = (TOKEN_TILE * S_v + nthreads - 1) / nthreads;
-        constexpr int NV  = (TOKEN_TILE * block_cols + nthreads - 1) / nthreads;
-        float pq[NQK], pk[NQK], pv[NV], pg = 0.0f, pb = 0.0f;
-        auto fetch = [&](const int64_t t0, const int tile) {
-#pragma unroll
-            for (int e = 0; e < NQK; ++e) {
-                const int idx = tid + e * nthreads;
-                if (idx < tile * S_v) {
-                    const int     tt = idx / S_v;
-                    const int     i  = idx - tt * S_v;
-                    const int64_t t  = t0 + tt;
-                    pq[e] = q_s[t * sq2 + i];
-                    pk[e] = k_s[t * sq2 + i];
-                }
-            }
-#pragma unroll
-            for (int e = 0; e < NV; ++e) {
-                const int idx = tid + e * nthreads;
-                if (idx < tile * block_cols) {
-                    const int tt = idx / block_cols;
-                    const int c  = idx - tt * block_cols;
-                    pv[e] = v_s[(t0 + tt) * sv2 + c];
-                }
-            }
-            if (tid < tile) {
-                const int64_t gb_offset = gb0 + (t0 + tid) * sb2;
-                pg = ga != nullptr ? gdn_gate_softplus(ga[gb_offset] + ga_bias[h_idx]) * ga_scale[h_idx] : g[gb_offset];
-                pb = beta_raw != nullptr ? gdn_gate_sigmoid(beta_raw[gb_offset]) : beta[gb_offset];
-            }
-        };
-        auto stage = [&](const int tile) {
-#pragma unroll
-            for (int e = 0; e < NQK; ++e) {
-                const int idx = tid + e * nthreads;
-                if (idx < tile * S_v) {
-                    const int tt = idx / S_v;
-                    const int i  = idx - tt * S_v;
-                    // row i is row r of lane lic: i = r * lanes_per_col + lic (the AR kernel's mapping)
-                    const int r   = i / lanes_per_col;
-                    const int lic = i - r * lanes_per_col;
-                    q_sh[tt][lic * lane_pad + r] = pq[e];
-                    k_sh[tt][lic * lane_pad + r] = pk[e];
-                }
-            }
-#pragma unroll
-            for (int e = 0; e < NV; ++e) {
-                const int idx = tid + e * nthreads;
-                if (idx < tile * block_cols) {
-                    const int tt = idx / block_cols;
-                    const int c  = idx - tt * block_cols;
-                    v_sh[tt][c] = pv[e];
-                }
-            }
-            if (tid < tile) {
-                g_sh[tid] = pg;
-                b_sh[tid] = pb;
-            }
-        };
-
-        int tile = n_tokens < TOKEN_TILE ? (int) n_tokens : TOKEN_TILE;
-        fetch(0, tile);
-        stage(tile);
-        __syncthreads();
-        for (int64_t t0 = 0; t0 < n_tokens; t0 += TOKEN_TILE) {
-            const int64_t t1        = t0 + TOKEN_TILE;
-            const int     tile_next = t1 < n_tokens ? (n_tokens - t1 < TOKEN_TILE ? (int) (n_tokens - t1) : TOKEN_TILE) : 0;
-            if (tile_next > 0) {
-                fetch(t1, tile_next);
-            }
-
-            for (int tt = 0; tt < tile; ++tt) {
-                const int64_t t = t0 + tt;
-
-                float k_reg[rows_per_lane];
-                float q_reg[rows_per_lane];
-                const float4 * k4 = (const float4 *) &k_sh[tt][lane_in_col * lane_pad];
-                const float4 * q4 = (const float4 *) &q_sh[tt][lane_in_col * lane_pad];
-#pragma unroll
-                for (int r4 = 0; r4 < rows_per_lane / 4; r4++) {
-                    const float4 kk = k4[r4];
-                    const float4 qq = q4[r4];
-                    k_reg[4*r4 + 0] = kk.x; k_reg[4*r4 + 1] = kk.y; k_reg[4*r4 + 2] = kk.z; k_reg[4*r4 + 3] = kk.w;
-                    q_reg[4*r4 + 0] = qq.x; q_reg[4*r4 + 1] = qq.y; q_reg[4*r4 + 2] = qq.z; q_reg[4*r4 + 3] = qq.w;
-                }
-
-                const float attn_col = gdn_token_step<rows_per_lane, lanes_per_col>(s_shard, k_reg, q_reg, g_sh[tt], b_sh[tt], v_sh[tt][col_blk]);
-
-                if (lane_in_col == 0) {
-                    attn_data[t * (S_v * H) + col] = attn_col * scale;
-                }
-
-                if constexpr (keep_rs_t) {
-                    const int target_slot = (int) (n_tokens - 1 - t);
-                    if (target_slot >= 0 && target_slot < K) {
-                        float * snap = state + target_slot * state_slot_stride;
-#pragma unroll
-                        for (int r = 0; r < rows_per_lane; r++) {
-                            const int i = r * lanes_per_col + lane_in_col;
-                            snap[col * S_v + i] = s_shard[r];
-                        }
-                    }
-                }
-            }
-            __syncthreads(); // every lane is done with this tile's staged inputs
-            if (tile_next > 0) {
-                stage(tile_next);
-                __syncthreads();
-            }
-            tile = tile_next;
-        }
-    } else {
-    GGML_UNUSED_VARS(beta_raw, ga, ga_bias, ga_scale);
     for (int64_t t0 = 0; t0 < n_tokens; t0 += TOKEN_TILE) {
         const int tile = n_tokens - t0 < TOKEN_TILE ? (int) (n_tokens - t0) : TOKEN_TILE;
 
@@ -560,7 +431,6 @@ gated_delta_net_tiled_cuda(const float * q,
         }
         __syncthreads(); // the next tile overwrites the staged inputs
     }
-    } // PF
 
     if constexpr (!keep_rs_t) {
 #pragma unroll
@@ -608,22 +478,7 @@ static bool gdn_use_tiled(int device, int64_t S_v, int64_t n_heads, int64_t n_to
     return arch && n_tokens >= gdn_tiled_rdna3_5_min_tokens && n_heads >= gdn_tiled_rdna3_5_min_heads;
 }
 
-// GGML_CUDA_GDN_TILED_PF: the prefetch form of the token-tiled kernel (gated_delta_net_tiled_cuda PF: per-lane staged q / k read
-// as float4, the next tile's inputs loaded during the current one; bit-identical). Unset = on for the A100 (cc 8.0) only, 0 = the
-// base form everywhere, 1 = the prefetch form wherever the tiled kernel runs (tests / timing)
-static bool gdn_tiled_pf(int device) {
-    static const int env = [] {
-        const char * e = getenv("GGML_CUDA_GDN_TILED_PF");
-        return e == nullptr || *e == '\0' ? -1 : atoi(e);
-    }();
-    if (env >= 0) {
-        return env != 0;
-    }
-    const int cc = ggml_cuda_info().devices[device].cc;
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE;
-}
-
-template <int S_v, bool keep_rs_t, int num_warps, bool PF>
+template <int S_v, bool keep_rs_t, int num_warps>
 static void launch_gated_delta_net_tiled_nw(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
@@ -633,15 +488,14 @@ static void launch_gated_delta_net_tiled_nw(
         int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3,
         const uint3 neqk1_magic, const uint3 rq3_magic,
-        float scale, int64_t state_slot_stride, int K,
-        const float * beta_raw, const float * ga, const float * ga_bias, const float * ga_scale, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     constexpr int block_cols = gdn_cols_per_warp * num_warps;
     const dim3 grid_dims(H, n_seqs, S_v / block_cols);
     const dim3 block_dims(32, num_warps, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
-    ggml_cuda_kernel_launch(gated_delta_net_tiled_cuda<S_v, keep_rs_t, num_warps, gdn_tiled_token_tile, PF>, launch_params,
+    ggml_cuda_kernel_launch(gated_delta_net_tiled_cuda<S_v, keep_rs_t, num_warps, gdn_tiled_token_tile>, launch_params,
         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
-        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_raw, ga, ga_bias, ga_scale);
+        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 }
 
 template <int S_v, bool keep_rs_t>
@@ -654,9 +508,7 @@ static void launch_gated_delta_net_tiled(
         int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3,
         const uint3 neqk1_magic, const uint3 rq3_magic,
-        float scale, int64_t state_slot_stride, int K, const bool pf,
-        const float * beta_raw, const float * ga, const float * ga_bias, const float * ga_scale, cudaStream_t stream) {
-    GGML_ASSERT(pf || (beta_raw == nullptr && ga == nullptr)); // the base form takes no raw gates
+        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     // wide blocks amortise the staging of q / k (every block of a head stages them); halve while the grid would leave
     // SMs / CUs without a block
     const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
@@ -664,29 +516,12 @@ static void launch_gated_delta_net_tiled(
     while (num_warps > 4 && H*n_seqs*(S_v / (gdn_cols_per_warp * num_warps)) < nsm) {
         num_warps /= 2;
     }
-    {
-        // engagement: the first launch of each form (GGML_CUDA_GDN_TILED_LOG=1 logs every tiled launch in the caller)
-        static std::atomic<bool> logged[2] = { {false}, {false} };
-        if (!logged[pf].exchange(true)) {
-            GGML_LOG_INFO("%s: token-tiled gated delta-net, %s form (S_v %d, %d warps; GGML_CUDA_GDN_TILED_PF=0 / 1 sets it)\n", __func__,
-                pf ? "prefetch" : "base", (int) S_v, num_warps);
-        }
-    }
-#define GDN_TILED_LAUNCH(nw, pf_) launch_gated_delta_net_tiled_nw<S_v, keep_rs_t, nw, pf_>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, \
-        H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, \
-        beta_raw, ga, ga_bias, ga_scale, stream)
-    if (pf) {
-        switch (num_warps) {
-            case 16: GDN_TILED_LAUNCH(16, true); break;
-            case  8: GDN_TILED_LAUNCH( 8, true); break;
-            default: GDN_TILED_LAUNCH( 4, true); break;
-        }
-    } else {
-        switch (num_warps) {
-            case 16: GDN_TILED_LAUNCH(16, false); break;
-            case  8: GDN_TILED_LAUNCH( 8, false); break;
-            default: GDN_TILED_LAUNCH( 4, false); break;
-        }
+#define GDN_TILED_LAUNCH(nw) launch_gated_delta_net_tiled_nw<S_v, keep_rs_t, nw>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, \
+        H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, stream)
+    switch (num_warps) {
+        case 16: GDN_TILED_LAUNCH(16); break;
+        case  8: GDN_TILED_LAUNCH( 8); break;
+        default: GDN_TILED_LAUNCH( 4); break;
     }
 #undef GDN_TILED_LAUNCH
 }
@@ -728,10 +563,7 @@ static void launch_gated_delta_net(
     if constexpr (!KDA) {
         // the tiled kernel reads neither an in-place state (s_ids, commit 24dbe0fcacd) nor raw gates (commit 153a4696ebb): those run the
         // AR kernel, as they skip the chunked MMA kernel
-        // the prefetch form also applies the raw gates (as the AR kernel does), so with it a gated op takes the tiled kernel too
-        const bool pf = gdn_tiled_pf(ggml_cuda_get_device());
-        if (!WIN && s_ids == nullptr && (pf || (beta_raw == nullptr && ga == nullptr)) && n_tokens_dst == n_tokens &&
-                gdn_use_tiled(ggml_cuda_get_device(), S_v, H*n_seqs, n_tokens)) {
+        if (!WIN && s_ids == nullptr && beta_raw == nullptr && ga == nullptr && n_tokens_dst == n_tokens && gdn_use_tiled(ggml_cuda_get_device(), S_v, H*n_seqs, n_tokens)) {
             // GGML_CUDA_GDN_TILED_LOG=1: every launch (test-gdn-tiled-exact counts them), else the first one
             static const bool log_all = getenv("GGML_CUDA_GDN_TILED_LOG") != nullptr && atoi(getenv("GGML_CUDA_GDN_TILED_LOG")) != 0;
             static std::atomic<bool> logged {false};
@@ -740,12 +572,10 @@ static void launch_gated_delta_net(
             }
             if (S_v == 128) {
                 launch_gated_delta_net_tiled<128, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs,
-                    sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, pf,
-                    beta_raw, ga, ga_bias, ga_scale, stream);
+                    sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, stream);
             } else {
                 launch_gated_delta_net_tiled<64, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs,
-                    sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, pf,
-                    beta_raw, ga, ga_bias, ga_scale, stream);
+                    sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, stream);
             }
             return;
         }
