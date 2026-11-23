@@ -23,6 +23,7 @@ extern "C" { GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int3
 extern "C" { GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_context * ctx, struct ggml_tensor * logits, struct ggml_tensor * map,
         struct ggml_tensor * state, struct ggml_tensor ** banks, const void ** host, int n_banks, int il, int n_top, int max_fill,
         int n_core, struct ggml_tensor * scores, struct ggml_tensor * dep); }
+extern "C" { GGML_API void ggml_moe_cache_prefetch_set_stage(struct ggml_tensor * op, int n_stg, int owner); }
 
 #include <algorithm>
 #include <array>
@@ -9662,9 +9663,16 @@ struct llama_moe_cache::impl {
         int n        = 0;
         int max_fill = 0;
         int min_tok  = 1; // windows of fewer tokens do not prefetch
+        int stage    = 0; // staging slots per group: the staged form through the copy engine (see prefetch_stage_cfg)
     };
     mutable bool     pf_resolved = false;
     mutable pf_cfg_t pf_cfg;
+    // a number of this cache instance for the staged prefetch (the backend resets a group's staging when its banks reuse the address
+    // of an earlier cache's)
+    int              pf_owner = [] {
+        static std::atomic<int> n{0};
+        return ++n;
+    }();
     bool             pf_quiet    = false; // a no_alloc (fit) instance: no log
 
     // the compute capability of the CUDA device of a backend (major*100 + minor*10), -1 if it is not one
@@ -9675,6 +9683,26 @@ struct llama_moe_cache::impl {
         return cc_fn != nullptr ? cc_fn(dev) : -1;
     }
 
+    // staged prefetch (the CUDA backend's copy engine, see moe_stg_view in moe-cache.cu): the same predicted experts (top N of the next
+    // layer's router on this layer's MoE input) are copied by the DMA engine into a few staging slots per cache group instead of being
+    // admitted into the cache by SM copies; the next layer's lookup decides exactly as without it, and its fetch copies a staged expert
+    // from device memory instead of reading it over the link. The cache holds the same experts and every product reads the same bytes,
+    // so the text is the one without it. On an A100 80 GB at 48 GB (70.5% of the host experts cached, ~12 GB/s link) the misses' copies
+    // are the critical path of every MoE layer of a verify window (DFlash2 n6 chat: 39 ms per pass, of it ~21 ms with a miss copy in
+    // flight), while the SM form of the prefetch slowed the attention beside its copies (chat -7%).
+    // Opt-in: LLAMA_MOE_PREFETCH_STAGE=N on with N slots per group (1..16; 4 measured), unset or 0 off. Top LLAMA_MOE_PREFETCH (10)
+    // predicted experts per token, at most LLAMA_MOE_PREFETCH_MAX (1) staged per layer and window: fewer than a third of the staged
+    // experts turn out to be fills, and every copy shares the link with the fills. Not on by default: the bytes are exact, but the
+    // timed rules around it see the faster fetches. A100 80 GB at 48 GB, 3 launches each: MTP chat +2.7% and 8k +14%, DFlash2 chat
+    // +4.1%, but DFlash2 8k -10..-32%: its window widths, chosen from timed verify costs, came out narrower for fewer tokens per pass,
+    // and the CPU-miss timing trial ran in another request and kept the host path. Not tied to LLAMA_MOE_PREFETCH_AUTO (the cache is
+    // unchanged); LLAMA_MOE_PREFETCH=0 turns both forms off
+    // returns the slots per group (0: off)
+    static int prefetch_stage_cfg() {
+        const char * es = getenv("LLAMA_MOE_PREFETCH_STAGE");
+        return es != nullptr ? std::max(0, std::min(16, atoi(es))) : 0;
+    }
+
     pf_cfg_t prefetch_cfg() const {
         if (pf_resolved) {
             return pf_cfg;
@@ -9683,6 +9711,18 @@ struct llama_moe_cache::impl {
         const char * em = getenv("LLAMA_MOE_PREFETCH_MAX");
         const char * et = getenv("LLAMA_MOE_PREFETCH_MIN_TOKENS");
         pf_cfg_t c;
+        if (e == nullptr || atoi(e) != 0) {
+            const int n_stg = prefetch_stage_cfg();
+            if (n_stg > 0) {
+                c.n        = e != nullptr ? std::max(1, std::min(32, atoi(e))) : 10;
+                c.max_fill = em != nullptr ? std::max(1, std::min(n_stg, atoi(em))) : 1;
+                c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
+                c.stage    = n_stg;
+                pf_cfg = c;
+                pf_resolved = true;
+                return c;
+            }
+        }
         if (e != nullptr) {
             c.n        = std::max(0, std::min(32, atoi(e)));
             c.max_fill = em != nullptr ? std::max(0, atoi(em)) : 0;
@@ -9857,9 +9897,17 @@ struct llama_moe_cache::impl {
         std::vector<const void *>  host  = l.host_dev;
         ggml_tensor * op = ggml_moe_cache_prefetch(ctx, logits, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il, n_top,
             max_fill, g.lru.n_core, g.scores, dep);
+        if (cfg.stage > 0) {
+            ggml_moe_cache_prefetch_set_stage(op, cfg.stage, pf_owner);
+        }
         if (n_prefetch_ops++ == 0) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch of the top %d predicted experts per token (max %d per layer, "
-                "0 = no cap; LLAMA_MOE_PREFETCH=0 off)\n", tag, n_top, max_fill);
+            if (cfg.stage > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch of the top %d predicted experts per token, staged through the "
+                    "copy engine (%d slots per group, at most %d per layer; LLAMA_MOE_PREFETCH_STAGE=0 off)\n", tag, n_top, cfg.stage, max_fill);
+            } else {
+                LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch of the top %d predicted experts per token (max %d per layer, "
+                    "0 = no cap; LLAMA_MOE_PREFETCH=0 off)\n", tag, n_top, max_fill);
+            }
         }
         return op;
     }
