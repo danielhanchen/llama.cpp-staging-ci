@@ -552,6 +552,7 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+    cparams.other_moe_cache = params.ctx_other != nullptr && params.ctx_other->moe_cache_active();
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {

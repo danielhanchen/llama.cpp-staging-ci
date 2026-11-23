@@ -645,15 +645,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     // a batch of prompt rows multiplies eh_proj as one 2-D product over its hc * n_tokens columns: as a 3-D [2*n_embd, hc, n_tokens]
     // input the CUDA backend took the hc columns of each token as their own mat-vec channel and read the whole weight once per token
-    // (RTX PRO 6000, Qwen3.8-Flash-Next Q8_0 drafter: ~9 ms per 2048-row prompt ubatch, beside the target's next ubatch). Below
-    // LLAMA_MTP_EH_PROJ_FLAT_MIN rows (64; the draft steps and the catch-up batches after a verify) the product keeps its 3-D form and
-    // its kernels; LLAMA_MTP_EH_PROJ_FLAT=0 keeps it everywhere. Same weights and inputs; the drafter's prompt-row K / V come from
-    // the matrix-matrix kernel there, the target's computation is unchanged
-    static const bool eh_flat_on = getenv("LLAMA_MTP_EH_PROJ_FLAT") == nullptr || atoi(getenv("LLAMA_MTP_EH_PROJ_FLAT")) != 0;
+    // (RTX PRO 6000, Qwen3.8-Flash-Next Q8_0 drafter: ~9 ms per 2048-row prompt ubatch, beside the target's next ubatch; the full card's
+    // 8k prompt -28 ms with the same text). Below LLAMA_MTP_EH_PROJ_FLAT_MIN rows (64; the draft steps and the catch-up batches after a
+    // verify) the product keeps its 3-D form and its kernels. The drafter's prompt-row K / V then come from the matrix-matrix kernel, so
+    // its drafts may differ: beside a target without a MoE cache the target's text did not move, beside one it did (RTX PRO 6000 16 / 24 GB
+    // 8k), so by default only for a target without a MoE cache. LLAMA_MTP_EH_PROJ_FLAT=0: never, =2: also beside a MoE cache
+    static const int eh_flat_mode = getenv("LLAMA_MTP_EH_PROJ_FLAT") == nullptr ? 1 : atoi(getenv("LLAMA_MTP_EH_PROJ_FLAT"));
     static const int64_t eh_flat_min = getenv("LLAMA_MTP_EH_PROJ_FLAT_MIN") ? std::max(1, atoi(getenv("LLAMA_MTP_EH_PROJ_FLAT_MIN"))) : 64;
+    const bool eh_flat = eh_flat_mode == 2 || (eh_flat_mode == 1 && !cparams.other_moe_cache);
     ggml_tensor * eh_in  = ggml_concat(ctx0, e_norm, h_norm, 0); // [2*n_embd, hc, n_tokens]
     ggml_tensor * res_hc = nullptr;
-    if (eh_flat_on && n_tokens >= eh_flat_min) {
+    if (eh_flat && n_tokens >= eh_flat_min) {
         res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_reshape_2d(ctx0, eh_in, eh_in->ne[0], eh_in->ne[1]*eh_in->ne[2]));
         res_hc = ggml_reshape_3d(ctx0, res_hc, res_hc->ne[0], eh_in->ne[1], eh_in->ne[2]); // [n_embd, hc, n_tokens]
     } else {
