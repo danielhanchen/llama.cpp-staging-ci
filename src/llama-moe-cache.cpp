@@ -11520,6 +11520,30 @@ struct llama_moe_cache::impl {
         pt_count = 0;
     }
 
+    // LLAMA_MOE_CPU_MISS_TRIAL_SETTLE (default 32; 0 = off): a prompt ubatch of at least LLAMA_MOE_CPU_MISS_TRIAL_SETTLE_TOKENS (512)
+    // tokens seen while a trial runs or waits ends that trial without a verdict and starts it again only after this many counted small
+    // batches (a short chat prompt does not: its trial runs as before). A long prompt lends
+    // and refills the cache slots, so the first decode batches after it miss far more than later ones, and a trial timed across that
+    // stretch compares its first "off" block on a cold cache with "on" blocks on a warmer one: A100 80 GB (12 vCPU), Qwen3.8-Flash-Next
+    // at 4 bits with its DFlash2 drafter at 48 GB, staged prefetch on (the cost model kept every size off until the end of the chat
+    // request, so the trial fell right after the 8k prompt): 56 ms per small batch off vs 36 ms on -> "on", and the 8k decode ran the
+    // host path at 68 tok/s against 92 with it off. Decided by ubatch sizes only, so a launch that replays the record runs the same schedule
+    static int cmt_settle() {
+        static const int n = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_SETTLE");
+            return e != nullptr ? std::max(0, atoi(e)) : 32;
+        }();
+        return n;
+    }
+    static int64_t cmt_settle_tokens() {
+        static const int64_t n = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_SETTLE_TOKENS");
+            return e != nullptr ? std::max<int64_t>(1, atoll(e)) : (int64_t) 512;
+        }();
+        return n;
+    }
+    int cmt_n_settle = 0; // trials ended by a prompt ubatch
+
     // before the graph of every ubatch while a trial runs or waits
     void cmt_tick(int64_t n_tokens) {
         if (!cmt_pending()) {
@@ -11528,6 +11552,29 @@ struct llama_moe_cache::impl {
         const bool counted = cmt_counted(n_tokens);
         const int64_t now = ggml_time_us();
         cmt_t_prev = -1;
+        if (n_tokens > max_batch && n_tokens >= cmt_settle_tokens() && cmt_settle() > 0) {
+            if (cmt_done >= 0) {
+                if (cmt_n_settle++ < 4 || cm_dbg) {
+                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: a %" PRId64 "-token prompt ubatch after %d of its small batches: "
+                        "started again after %d small batches (LLAMA_MOE_CPU_MISS_TRIAL_SETTLE)\n", tag, cmt_n + 1, n_tokens, cmt_done, cmt_settle());
+                }
+                cmt_done = -1;
+                cmt_wait = cmt_settle();
+                cmt_t[0].clear();
+                cmt_t[1].clear();
+                cmt_tn[0].clear();
+                cmt_tn[1].clear();
+                // back to the path the small batches had before the trial (before the first verdict: the warm phase's plain cache)
+                const bool live = cmt_n > 0 && cm_small_ok;
+                if (live != cm_small_live) {
+                    cm_small_live = live;
+                    cm_gen++;
+                }
+            } else if (cmt_wait >= 0) {
+                cmt_wait = std::max(cmt_wait, cmt_settle());
+            }
+            return;
+        }
         if (cmt_done < 0) {
             if (!counted || --cmt_wait > 0) {
                 return;
