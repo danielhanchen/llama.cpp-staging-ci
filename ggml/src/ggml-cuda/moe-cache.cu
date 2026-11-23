@@ -180,7 +180,7 @@ static __global__ void moe_cache_assign(
         int32_t * __restrict__ scores, const int grow, const int advance, const int n_scores, const int frozen = 0,
         const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr, int ids_s1 = 0, const int defer = 0,
         const int margin_q = 0, const int margin_add_q = 0, const int lookup_counts = 0, const int lo = 0,
-        const moe_pf_args pf = moe_pf_args{nullptr, nullptr, nullptr, 0, 0}, const int rf = -1, const int share_binds = 0) {
+        const moe_pf_args pf = moe_pf_args{nullptr, nullptr, nullptr, 0, 0}, const int rf = -1) {
     if (ids_s1 <= 0) {
         ids_s1 = ne0;
     }
@@ -359,8 +359,7 @@ static __global__ void moe_cache_assign(
     if (counts != nullptr) {
         take_e = victim + n_ids;
         const int64_t acc = (int64_t) (uint32_t) stat[2] + (int64_t) fetch_q*n_miss;
-        // share_binds (LLAMA_MOE_CACHE_EMPTY_FILL=0, below share 1 only): the share admits, empty slots too
-        n_take = max((int) (acc >> 16), share_binds ? 0 : min(n_miss, n_slots - state[6]));
+        n_take = max((int) (acc >> 16), min(n_miss, n_slots - state[6]));
         // (LLAMA_MOE_HYBRID_WIDE): a window whose experts may outnumber the slots admits at most the slots this lookup does
         // not pin (its hits); the rest go to the host. Never binds while the distinct ids fit the slots (every earlier caller)
         int n_pin = n_hit;
@@ -1835,12 +1834,6 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         // share 1 fetches every miss and its graph has no host path (the plain lookup stand-in, prompt ubatches), so the
         // admission margin, which leaves rejected misses to the host, applies only below share 1
         const int margin_q = n_expert >= 8 && fetch_q < 65536 ? admit_margin_q : 0;
-        // LLAMA_MOE_CACHE_EMPTY_FILL (default 1; 0 = test arm): a hybrid assign below share 1 admits every miss while the group has
-        // empty slots (filling one evicts nothing); 0: the fetch share admits there as well, the other misses go to the host
-        static const int empty_fill = [] {
-            const char * e = getenv("LLAMA_MOE_CACHE_EMPTY_FILL");
-            return e == nullptr || atoi(e) != 0 ? 1 : 0;
-        }();
         moe_cache_assign<<<1, MOE_CACHE_LANES, (3*n_ids + (scores != nullptr ? 2*MOE_CACHE_WINDOW : 0))*sizeof(int32_t), stream>>>(
             (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
             n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q,
@@ -1848,7 +1841,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             // the skip counter is words 4..5 of the statistics row: only a row of 6+ experts has them
             tail_rank, tail_rank > 0 && counts->ne[0] >= 6 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
             ggml_get_op_params_i32(dst, 9), margin_q, admit_add_q, ggml_get_op_params_i32(dst, 8),
-            ggml_get_op_params_i32(dst, 7), moe_pf_real_args(state), moe_rf_real(state), fetch_q < 65536 && !empty_fill ? 1 : 0);
+            ggml_get_op_params_i32(dst, 7), moe_pf_real_args(state), moe_rf_real(state));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
