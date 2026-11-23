@@ -9723,52 +9723,17 @@ struct llama_moe_cache::impl {
     // so the text is the one without it. On an A100 80 GB at 48 GB (70.5% of the host experts cached, ~12 GB/s link) the misses' copies
     // are the critical path of every MoE layer of a verify window (DFlash2 n6 chat: 39 ms per pass, of it ~21 ms with a miss copy in
     // flight), while the SM form of the prefetch slowed the attention beside its copies (chat -7%).
-    // LLAMA_MOE_PREFETCH_STAGE=N: on with N slots per group (1..16; 4 measured), =0 off. Unset: on with LLAMA_MOE_PREFETCH_STAGE_SLOTS
-    // (4) slots where every device with device-lookup cache slots is a CUDA device of compute capability 8.0, the host has 12..31
-    // logical CPUs (single_wide_mid_host) and the cache holds at least LLAMA_MOE_PREFETCH_STAGE_MIN_FRAC (0.50) of the host experts'
-    // bytes. Top LLAMA_MOE_PREFETCH (10) predicted experts per token, at most LLAMA_MOE_PREFETCH_MAX (1) staged per layer and window:
-    // fewer than a third of the staged experts turn out to be fills, and every copy shares the link with the fills. The bytes are
-    // exact, but the timed rules around it see the faster fetches: before the CPU-miss trial compared its batches width by width
-    // (LLAMA_MOE_CPU_MISS_TRIAL_PER_WIDTH) and the DFlash2 measured window left the trial's passes out (LLAMA_DFLASH_EV_AUTO_SKIP_TRIAL),
-    // A100 80 GB at 48 GB gave MTP chat +2.7% and 8k +14%, DFlash2 chat +4.1% but DFlash2 8k -10..-32% (narrower windows, and a trial
-    // that kept the host path). Not on compute capability 12.0 at 48 GB (the host path computes most misses there: forced on, chat
-    // -12%) nor 8.6 / 8.9 (not measured). Not tied to LLAMA_MOE_PREFETCH_AUTO (the cache is unchanged); LLAMA_MOE_PREFETCH=0 turns
-    // both forms off
-    // returns the slots per group (0: off), or -1 while the slots are not sized yet
-    int prefetch_stage_cfg() const {
+    // Opt-in: LLAMA_MOE_PREFETCH_STAGE=N on with N slots per group (1..16; 4 measured), unset or 0 off. Top LLAMA_MOE_PREFETCH (10)
+    // predicted experts per token, at most LLAMA_MOE_PREFETCH_MAX (1) staged per layer and window: fewer than a third of the staged
+    // experts turn out to be fills, and every copy shares the link with the fills. Not on by default: the bytes are exact, but the
+    // timed rules around it see the faster fetches. A100 80 GB at 48 GB, 3 launches each: MTP chat +2.7% and 8k +14%, DFlash2 chat
+    // +4.1%, but DFlash2 8k -10..-32%: its window widths, chosen from timed verify costs, came out narrower for fewer tokens per pass,
+    // and the CPU-miss timing trial ran in another request and kept the host path. Not tied to LLAMA_MOE_PREFETCH_AUTO (the cache is
+    // unchanged); LLAMA_MOE_PREFETCH=0 turns both forms off
+    // returns the slots per group (0: off)
+    static int prefetch_stage_cfg() {
         const char * es = getenv("LLAMA_MOE_PREFETCH_STAGE");
-        if (es != nullptr) {
-            return std::max(0, std::min(16, atoi(es)));
-        }
-        if (cache_frac < 0.0) {
-            return -1;
-        }
-        const char * en = getenv("LLAMA_MOE_PREFETCH_STAGE_SLOTS");
-        const char * ef = getenv("LLAMA_MOE_PREFETCH_STAGE_MIN_FRAC");
-        const int    n_stg = en != nullptr ? std::max(1, std::min(16, atoi(en))) : 4;
-        const double fmin  = ef != nullptr ? atof(ef) : 0.50;
-        int  cmin = INT_MAX;
-        int  cmax = -1;
-        bool any  = false;
-        for (const group & g : groups) {
-            if (g.n_slots == 0 || !g.dev_lookup) {
-                continue;
-            }
-            const int cc = pf_backend_cc(devices[g.id].backend);
-            cmin = std::min(cmin, cc);
-            cmax = std::max(cmax, cc);
-            any  = true;
-        }
-        const bool cc_ok  = any && cmin >= 800 && cmax < 810;
-        const bool cpu_ok = single_wide_mid_host();
-        const bool on     = cc_ok && cpu_ok && cache_frac >= fmin;
-        if (!pf_quiet && any) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: staged prefetch through the copy engine %s by default: %s (compute capability %d, %.1f%% of "
-                "the host experts cached; LLAMA_MOE_PREFETCH_STAGE=0 off, =N on with N slots)\n", tag, on ? "on" : "off",
-                on ? "compute capability 8.0, 12..31 CPUs, in the band" : !cc_ok ? "not a compute capability 8.0 device" :
-                !cpu_ok ? "not a 12..31 CPU host" : "the cached share is below LLAMA_MOE_PREFETCH_STAGE_MIN_FRAC", cmax, 100.0*cache_frac);
-        }
-        return on ? n_stg : 0;
+        return es != nullptr ? std::max(0, std::min(16, atoi(es))) : 0;
     }
 
     pf_cfg_t prefetch_cfg() const {
@@ -9781,9 +9746,6 @@ struct llama_moe_cache::impl {
         pf_cfg_t c;
         if (e == nullptr || atoi(e) != 0) {
             const int n_stg = prefetch_stage_cfg();
-            if (n_stg < 0) {
-                return c; // the slots are not sized yet: decided later
-            }
             if (n_stg > 0) {
                 c.n        = e != nullptr ? std::max(1, std::min(32, atoi(e))) : 10;
                 c.max_fill = em != nullptr ? std::max(1, std::min(n_stg, atoi(em))) : 1;
