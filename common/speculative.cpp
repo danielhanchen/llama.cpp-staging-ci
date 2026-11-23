@@ -1088,6 +1088,27 @@ static int32_t common_dflash_n_max_sm80() {
     return n_max;
 }
 
+// every GPU is compute capability 8.0 (and there is at least one)
+static bool common_all_gpus_cc80() {
+    static const bool v = [] {
+        int n_gpu = 0;
+        for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(d);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+            if (cc_fn == nullptr || cc_fn(dev) != 800) {
+                return false;
+            }
+            ++n_gpu;
+        }
+        return n_gpu > 0;
+    }();
+    return v;
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // process() reads the target's layer inputs at the segment's rows of the decode (nextn_row_offset), so a merged prompt
@@ -1915,8 +1936,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
                 // the measured EV window (see eva_t), where neither LLAMA_DFLASH_EV nor a two-width window runs
+                // LLAMA_DFLASH_EV_AUTO_SM80 (default 0; 1 = as before): the default mode 2 does not run where every GPU is compute
+                // capability 8.0. A100 80 GB (12 vCPU), Qwen3.8-Flash-Next at 4 bits with its DFlash2 drafter at 48 GB (70.5% cached), the
+                // same VM, 3 launches each: the windows of the other rules (no measured window) gave chat 119.9-123.6 tok/s against 114.6-115.0
+                // and 8k 108.8-110.2 against 103.9-104.8; its measured costs of the wide windows came from the cold first passes and
+                // the timing trial's blocks, so the window settled 1-2 rows narrower than the passes paid for. LLAMA_DFLASH_EV_AUTO=1 forces it
+                static const bool eva_sm80 = [] {
+                    const char * e = getenv("LLAMA_DFLASH_EV_AUTO_SM80");
+                    return e != nullptr && atoi(e) != 0;
+                }();
                 const bool use_eva = is_dflash2 && !use_ev && !use_df2w && eva_mode() != 0 && (df2_meas ||
-                    eva_mode() == 1 || (n_seq == 1 && df2_cache_on && !df2_cached && df2_frac >= df2_mid_hi && !llama_exact_verify_enabled()));
+                    eva_mode() == 1 || (n_seq == 1 && df2_cache_on && !df2_cached && df2_frac >= df2_mid_hi && !llama_exact_verify_enabled() &&
+                        (eva_sm80 || !common_all_gpus_cc80())));
                 if (use_eva) {
                     eva_init();
                     eva.small = eva.small || df2_meas;
