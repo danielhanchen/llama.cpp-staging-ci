@@ -8990,9 +8990,37 @@ struct llama_moe_cache::impl {
                 return cmt_ps_state == 1 && cmt_rec_file > 0 ? &cmt_rec[0] : nullptr;
             }, cmt_trust_tries(), cmt_ps_min_gain());
         }
-        const bool skip = skip_share || skip_firm;
+        // A first trial recorded as firm "off" by a launch that found the host clearly slower than calibrated (host_ok 0: t_on at least
+        // cmt_host_bad x t_off, the record a replay runs with the host path off in every block, llama_moe_tp::replay_off_fetch) runs no
+        // warm phase and no trials either: small batches and short prompts stay on the plain cache, as that replay does, without its
+        // synchronized, timed blocks (LLAMA_MOE_CPU_MISS_FIRM_OFF_SKIP=0: replayed). A100 80 GB (12 vCPU), Qwen3.8-Flash-Next at 4 bits with
+        // its DFlash2 drafter capped at 48 GB (70.5% cached, recorded t_on / t_off 1.55): the replayed trial fell in the chat request,
+        // 115 tok/s against 124 with LLAMA_MOE_CPU_MISS=0, same text, no expert computed on the host in either
+        bool skip_off = false;
+        if (!skip_share && !skip_firm && cm_trial && !cm_force && cmt_n == 0 && cmt_done < 0 && cmt_firm_off_skip_on() && cmt_replay_off_fetch_on()) {
+            cmt_ps_setup();
+            skip_off = cmt_ps_state == 1 && cmt_rec_file > 0 && llama_moe_tp::replay_off_fetch(true, cmt_rec[0]);
+        }
+        const bool skip = skip_share || skip_firm || skip_off;
         if (late) {
             cm_trials_late_done = true;
+        }
+        if (skip_off) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no warm phase or timing trials at %.1f%% of the host experts cached: the first trial is "
+                "firm off with the host slower than calibrated (t_on / t_off %.3f) in %s, small batches and short prompts stay on the plain "
+                "cache%s (LLAMA_MOE_CPU_MISS_FIRM_OFF_SKIP=0: replayed)\n", tag, 100.0*cache_frac, cmt_rec[0].ratio, cmt_ps_path.c_str(),
+                late ? ", from now on" : "");
+            cm_trials_skipped = true;
+            cmt_done      = -1;
+            cmt_wait      = -1;
+            cmt_t_prev    = -1;
+            cmw_on        = false;
+            cmt_n         = (int) cmt_rec_file;
+            cm_small_ok   = false;
+            cm_small_live = false;
+            cmt_host_ok   = false;
+            cm_gen++;
+            return true;
         }
         if (skip_firm) {
             LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no warm phase or timing trials at %.1f%% of the host experts cached: the first trial is "
@@ -11266,6 +11294,11 @@ struct llama_moe_cache::impl {
     // host products of the "on" blocks steer the long request's text (fetched instead: another text, 8k 102.8 -> 79.5 tok/s)
     static bool cmt_replay_off_fetch_on() {
         static const bool on = llama_moe_tp::env_on(getenv("LLAMA_MOE_CPU_MISS_REPLAY_OFF_FETCH"));
+        return on;
+    }
+    // LLAMA_MOE_CPU_MISS_FIRM_OFF_SKIP=0: a first trial recorded firm "off" with the host slower than calibrated replays its blocks (see cm_skip_trials)
+    static bool cmt_firm_off_skip_on() {
+        static const bool on = llama_moe_tp::env_on(getenv("LLAMA_MOE_CPU_MISS_FIRM_OFF_SKIP"));
         return on;
     }
     // LLAMA_MOE_CPU_MISS_FIRM_SKIP=0: a first trial made firm "on" by agreeing marginal timings replays its blocks (see cm_skip_trials)
