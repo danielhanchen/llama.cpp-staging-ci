@@ -1145,6 +1145,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // width: the trial's batches with the host path on cost up to 3x a steady pass, and they fall on the widths the drafter used then,
     // so the windows came out narrower in the launches that ran a trial (A100 80 GB, Qwen3.8-Flash-Next at 4 bits, DFlash2, 48 GB:
     // 2.98-3.08 vs 3.66 tokens per pass at 8k)
+    static double eva_stale() {
+        static const double d = [] {
+            const char * e = getenv("LLAMA_DFLASH_EV_AUTO_STALE");
+            return e != nullptr ? std::min(1.0, std::max(0.0, atof(e))) : 0.99;
+        }();
+        return d;
+    }
     static bool eva_skip_trial() {
         static const bool on = [] {
             const char * e = getenv("LLAMA_DFLASH_EV_AUTO_SKIP_TRIAL");
@@ -1193,7 +1200,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const double m_ref = eva.v_sum[wr] / eva.v_n[wr];
         const double prior = m_ref * (0.3 + 0.1 * w) / (0.3 + 0.1 * wr);
         const double k     = 4.0;
-        const double n     = w < eva_t::W ? eva.v_n[w] : 0.0;
+        // a width's mean decays only when that width is verified again, so one verified mostly in a slow stretch (the warm passes keep
+        // the whole draft in the first, cold request; a long prompt's refill) kept that cost and was rarely picked again: A100 80 GB,
+        // Qwen3.8-Flash-Next at 4 bits, DFlash2, 48 GB, 8k: w7 46.7 ms against ~36 ms in the fixed-width run, 2.98 vs 4.13 tokens per pass.
+        // Its weight against the shape prior shrinks by LLAMA_DFLASH_EV_AUTO_STALE (0.99; 1 = off) per pass measured at other widths
+        const double age   = w < eva_t::W ? (double) std::max<int64_t>(0, eva.n_meas - eva.last_meas[w]) : 0.0;
+        const double n     = w < eva_t::W ? eva.v_n[w] * (eva_stale() < 1.0 ? std::pow(eva_stale(), age) : 1.0) : 0.0;
         const double m     = n > 0.0 ? eva.v_sum[w] / n : prior;
         return (n * m + k * prior) / (n + k);
     }
