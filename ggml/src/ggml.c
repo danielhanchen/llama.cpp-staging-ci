@@ -3918,14 +3918,12 @@ GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_context * ctx,
 
 // the prefetch op stages its experts in n_stg slots of device memory per cache group through the copy engine instead of admitting
 // them into the cache (the cache and the lookups are unchanged; a fetch copies a staged expert from its slot), see moe_stg_view in
-// the CUDA backend. owner: a number of the cache instance (a new one resets the staging of a group whose banks reuse an address);
-// min_score: the votes a predicted expert needs to be staged (each token's rank r of n_top adds n_top - r).
+// the CUDA backend. owner: a number of the cache instance (a new one resets the staging of a group whose banks reuse an address).
 // Declared by its caller, as ggml_moe_cache_prefetch
-GGML_API void ggml_moe_cache_prefetch_set_stage(struct ggml_tensor * op, int n_stg, int owner, int min_score);
-GGML_API void ggml_moe_cache_prefetch_set_stage(struct ggml_tensor * op, int n_stg, int owner, int min_score) {
+GGML_API void ggml_moe_cache_prefetch_set_stage(struct ggml_tensor * op, int n_stg, int owner);
+GGML_API void ggml_moe_cache_prefetch_set_stage(struct ggml_tensor * op, int n_stg, int owner) {
     GGML_ASSERT(op->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(op, 10) == 8 && n_stg >= 0 && n_stg <= 16);
-    GGML_ASSERT(min_score >= 0 && min_score < (1 << 22));
-    ggml_set_op_params_i32(op, 14, n_stg | (min_score << 8));
+    ggml_set_op_params_i32(op, 14, n_stg);
     ggml_set_op_params_i32(op, 15, owner);
 }
 

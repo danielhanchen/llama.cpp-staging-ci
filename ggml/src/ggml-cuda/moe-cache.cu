@@ -741,19 +741,10 @@ enum {
     MOE_STG_STAT_TIMEOUT,  // fills whose acknowledged copy took longer than MOE_STG_WAIT_NS: read from host memory
     MOE_STG_STAT_N
 };
-// after the counters: experts staged, then fills that found their expert staged, per vote bucket (votes / MOE_STG_BUCKET_W)
-#define MOE_STG_BUCKETS  16
-#define MOE_STG_BUCKET_W 5
-#define MOE_STG_STAT_ALL (MOE_STG_STAT_N + 2*MOE_STG_BUCKETS)
-static __device__ __forceinline__ int moe_stg_bucket(const int votes) {
-    return min(MOE_STG_BUCKETS - 1, max(0, votes/MOE_STG_BUCKET_W));
-}
 struct moe_stg_req {   // written by moe_stg_pick, read by the copy thread
     int32_t reg;       // registered group
     int32_t s;         // staging slot
     int32_t key;       // il << 16 | expert
-    int32_t first;     // number of the first request of the same pick
-    int32_t n;         // requests of that pick
     int32_t seq;       // written last: the request is complete once seq is the number the thread expects
 };
 struct moe_stg_host {  // mapped host memory, one per device
@@ -766,7 +757,6 @@ struct moe_stg_view {
     const int32_t * seq;   // [n] number of the slot's last request
     const int32_t * done;  // [n] written on the copy stream after the copies of a request
     const int32_t * ack;   // [n] mapped host memory, see moe_stg_host
-    const int32_t * score; // [n] votes of the slot's expert at its pick (statistics)
     const char    * buf[4];
     unsigned long long * stat;
     int             n;
@@ -825,9 +815,6 @@ static __device__ int moe_stg_source(const moe_stg_view & stg, const int32_t e, 
             return -1; // rewritten meanwhile
         }
         *q = want;
-        if (count) {
-            atomicAdd(stg.stat + MOE_STG_STAT_N + MOE_STG_BUCKETS + moe_stg_bucket(stg.score[s]), 1ull);
-        }
         if (moe_stg_load_acquire_sys(stg.ack + s) != want) {
             if (count) {
                 atomicAdd(stg.stat + MOE_STG_STAT_NOACK, 1ull);
@@ -1188,7 +1175,7 @@ bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
     if (mode == 8) {
         const int n_expert = (int) op->src[1]->ne[0];
 #if !defined(MOE_STG_OK)
-        if ((ggml_get_op_params_i32(op, 14) & 0xff) > 0) {
+        if (ggml_get_op_params_i32(op, 14) > 0) {
             return false; // staged prefetch: CUDA only
         }
 #endif
@@ -1590,106 +1577,60 @@ static void moe_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 // ---- staged prefetch through the copy engine (see moe_stg_view) ----
 #if defined(MOE_STG_OK)
 
-// one block of 32 threads: every predicted id (rank-major, see moe_pf_topn: rank r of a token weighs n_top - r) votes for its expert;
-// of the experts layer il does not hold and no staging slot holds, the max_fill with the most votes (ties: the lower id) and at
-// least min_score get the next slots of the group's round robin, each a request in the ring. An expert the window's tokens predict
-// at good ranks is the one most likely routed; the first-come order of the earlier form staged mostly unrouted ones
-static __global__ void moe_stg_pick(const int32_t * __restrict__ ids, const int n_ids, const int n_tokens, const int n_top,
-        const int32_t * __restrict__ row, const int n_expert, const int il, int32_t * __restrict__ dstate, const int n_stg,
-        const int max_fill, const int min_score, moe_stg_host * __restrict__ h, int32_t * __restrict__ ctr, const int reg,
-        unsigned long long * __restrict__ stat) {
-    extern __shared__ int32_t stg_votes[]; // [n_expert]
-    const int lane = threadIdx.x;
-    int32_t * key = dstate;
-    int32_t * seq = dstate + MOE_STG_MAX_SLOTS;
-    int32_t * scr = dstate + 3*MOE_STG_MAX_SLOTS;
-    int32_t * cur = dstate + 4*MOE_STG_MAX_SLOTS;
-    for (int e = lane; e < n_expert; e += 32) {
-        stg_votes[e] = 0;
-    }
-    __syncthreads();
-    for (int i = lane; i < n_ids; i += 32) {
-        const int32_t e = ids[i];
-        if ((uint32_t) e < (uint32_t) n_expert) {
-            atomicAdd(stg_votes + e, n_top - i/n_tokens);
-        }
-    }
-    __syncthreads();
-    for (int e = lane; e < n_expert; e += 32) {
-        if (stg_votes[e] > 0 && row[e] >= 0) {
-            stg_votes[e] = 0; // cached for layer il
-        }
-    }
-    if (lane < n_stg) {
-        const int32_t k = key[lane];
-        if (k >= 0 && (k >> 16) == il && (k & 0xffff) < n_expert) {
-            stg_votes[k & 0xffff] = 0; // staged already (its copy is queued or done)
-        }
-    }
-    __syncthreads();
-    int32_t picked[MOE_STG_MAX_SLOTS];
-    int32_t pvotes[MOE_STG_MAX_SLOTS];
-    int n_pick = 0;
-    for (int p = 0; p < max_fill; ++p) {
-        int bv = 0;
-        int be = INT_MAX;
-        for (int e = lane; e < n_expert; e += 32) {
-            const int v = stg_votes[e];
-            if (v > bv || (v == bv && v > 0 && e < be)) {
-                bv = v;
-                be = e;
-            }
-        }
-        for (int o = 16; o > 0; o >>= 1) {
-            const int v2 = __shfl_xor_sync(0xffffffffu, bv, o, 32);
-            const int e2 = __shfl_xor_sync(0xffffffffu, be, o, 32);
-            if (v2 > bv || (v2 == bv && e2 < be)) {
-                bv = v2;
-                be = e2;
-            }
-        }
-        if (bv <= 0 || bv < min_score || be >= n_expert) {
-            break;
-        }
-        if (lane == 0) {
-            stg_votes[be] = 0;
-        }
-        pvotes[n_pick]   = bv;
-        picked[n_pick++] = be;
-        __syncthreads();
-    }
-    if (lane != 0 || n_pick == 0) {
+// one block, one thread: of the predicted ids (rank-major, see moe_pf_topn) the first max_fill experts that layer il does not hold
+// and that no staging slot of the group holds get the next slots of the group's round robin, each a request in the ring
+static __global__ void moe_stg_pick(const int32_t * __restrict__ ids, const int n_ids, const int32_t * __restrict__ row, const int n_expert,
+        const int il, int32_t * __restrict__ dstate, const int n_stg, const int max_fill, moe_stg_host * __restrict__ h,
+        int32_t * __restrict__ ctr, const int reg, unsigned long long * __restrict__ stat) {
+    if (threadIdx.x != 0) {
         return;
     }
-    const int32_t idx0 = atomicAdd(ctr, n_pick);
-    for (int p = 0; p < n_pick; ++p) {
-        const int32_t k   = (il << 16) | picked[p];
-        const int     s   = *cur;
+    int32_t * key = dstate;
+    int32_t * seq = dstate + MOE_STG_MAX_SLOTS;
+    int32_t * cur = dstate + 3*MOE_STG_MAX_SLOTS;
+    int32_t picked[MOE_STG_MAX_SLOTS];
+    int n_pick = 0;
+    for (int i = 0; i < n_ids && n_pick < max_fill; ++i) {
+        const int32_t e = ids[i];
+        if ((uint32_t) e >= (uint32_t) n_expert || row[e] >= 0) {
+            continue; // cached for layer il (or out of range)
+        }
+        const int32_t k = (il << 16) | e;
+        bool have = false;
+        for (int s = 0; s < n_stg && !have; ++s) {
+            have = key[s] == k;
+        }
+        for (int p = 0; p < n_pick && !have; ++p) {
+            have = picked[p] == k;
+        }
+        if (have) {
+            continue;
+        }
+        const int s = *cur;
         *cur = s + 1 < n_stg ? s + 1 : 0;
-        const int32_t idx = idx0 + p;
+        const int32_t idx = atomicAdd(ctr, 1);
         const int32_t sq  = idx + 1;
         // key emptied first, then the number, then the key (read as a pair by moe_stg_source)
         *(volatile int32_t *) (key + s) = -1;
         __threadfence();
         *(volatile int32_t *) (seq + s) = sq;
-        scr[s] = pvotes[p];
-        atomicAdd(stat + MOE_STG_STAT_N + moe_stg_bucket(pvotes[p]), 1ull);
         __threadfence();
         *(volatile int32_t *) (key + s) = k;
         moe_stg_req * r = h->req + (uint32_t) idx % MOE_STG_RING;
-        *(volatile int32_t *) &r->reg   = reg;
-        *(volatile int32_t *) &r->s     = s;
-        *(volatile int32_t *) &r->key   = k;
-        *(volatile int32_t *) &r->first = idx0 + 1;
-        *(volatile int32_t *) &r->n     = n_pick;
+        *(volatile int32_t *) &r->reg = reg;
+        *(volatile int32_t *) &r->s   = s;
+        *(volatile int32_t *) &r->key = k;
         __threadfence_system();
 #if __CUDA_ARCH__ >= 700
         asm volatile("st.release.sys.b32 [%0], %1;" :: "l"(&r->seq), "r"(sq) : "memory");
 #else
         *(volatile int32_t *) &r->seq = sq;
 #endif
+        picked[n_pick++] = k;
     }
-    atomicAdd(stat + MOE_STG_STAT_REQ, (unsigned long long) n_pick);
+    if (n_pick > 0) {
+        atomicAdd(stat + MOE_STG_STAT_REQ, (unsigned long long) n_pick);
+    }
 }
 
 static __global__ void moe_stg_done(int32_t * __restrict__ done, const int32_t v) {
@@ -1707,7 +1648,7 @@ struct moe_stg_group {
     int64_t      nb[4]   = {};
     int64_t      cap_nb[4] = {};     // bytes per slot the buffers hold
     char *       buf[4]  = {};
-    int32_t *    dstate  = nullptr;  // key [MOE_STG_MAX_SLOTS], seq [..], done [..], votes [..], round-robin cursor [1]
+    int32_t *    dstate  = nullptr;  // key [MOE_STG_MAX_SLOTS], seq [..], done [..], round-robin cursor [1]
     const void * bank0   = nullptr;
     int          n_layer = 0;
     // per layer: the host experts of each bank (set by the layer's pick op at graph build); fixed size, read by the copy thread
@@ -1728,7 +1669,6 @@ static std::atomic<int>    moe_stg_n_groups{0};
 static moe_stg_dev         moe_stg_devs[GGML_CUDA_MAX_DEVICES];
 static std::atomic<bool>   moe_stg_stop{false};
 static std::atomic<unsigned long long> moe_stg_lost{0};
-static std::atomic<unsigned long long> moe_stg_skipped{0}; // requests not queued: a later pick came first
 
 // the copy thread of a device: queues the copies of each request in ring order, then the done word, then the acknowledgement
 static void moe_stg_thread(const int device) {
@@ -1758,19 +1698,11 @@ static void moe_stg_thread(const int device) {
             moe_stg_lost.fetch_add((unsigned long long) (sq - next), std::memory_order_relaxed);
             next = sq;
         }
-        const int     reg   = __atomic_load_n(&r->reg, __ATOMIC_RELAXED);
-        const int     s     = __atomic_load_n(&r->s, __ATOMIC_RELAXED);
-        const int32_t k     = __atomic_load_n(&r->key, __ATOMIC_RELAXED);
-        const int32_t first = __atomic_load_n(&r->first, __ATOMIC_RELAXED);
-        const int32_t n_req = __atomic_load_n(&r->n, __ATOMIC_RELAXED);
+        const int     reg = __atomic_load_n(&r->reg, __ATOMIC_RELAXED);
+        const int     s   = __atomic_load_n(&r->s, __ATOMIC_RELAXED);
+        const int32_t k   = __atomic_load_n(&r->key, __ATOMIC_RELAXED);
         last = std::chrono::steady_clock::now();
-        // a later pick exists (its first request is published): the layer of this one has started its own lookup, so its copies
-        // would only compete with that layer's misses for the link; the request stays unacknowledged
-        const int32_t nx = first + n_req;
-        const bool superseded = __atomic_load_n(&d.h->req[(uint32_t) (nx - 1) % MOE_STG_RING].seq, __ATOMIC_ACQUIRE) - nx >= 0;
-        if (superseded) {
-            moe_stg_skipped.fetch_add(1, std::memory_order_relaxed);
-        } else if (reg >= 0 && reg < moe_stg_n_groups.load(std::memory_order_acquire) && s >= 0 && s < moe_stg_groups[reg].n_stg) {
+        if (reg >= 0 && reg < moe_stg_n_groups.load(std::memory_order_acquire) && s >= 0 && s < moe_stg_groups[reg].n_stg) {
             const moe_stg_group & g = moe_stg_groups[reg];
             const int il = k >> 16;
             const int e  = k & 0xffff;
@@ -1789,7 +1721,6 @@ static void moe_stg_thread(const int device) {
                 }
                 moe_stg_done<<<1, 1, 0, d.stream>>>(g.dstate + 2*MOE_STG_MAX_SLOTS + s, next);
                 ok = ok && cudaGetLastError() == cudaSuccess;
-
             }
             if (ok) {
                 __atomic_store_n(&d.h->ack[reg][s], next, __ATOMIC_RELEASE);
@@ -1809,24 +1740,14 @@ static void moe_stg_report() {
         if (d.th.joinable()) {
             d.th.join();
         }
-        unsigned long long c[MOE_STG_STAT_ALL] = {};
+        unsigned long long c[MOE_STG_STAT_N] = {};
         if (d.stat == nullptr || cudaSetDevice(id) != cudaSuccess || cudaMemcpy(c, d.stat, sizeof(c), cudaMemcpyDeviceToHost) != cudaSuccess) {
             continue;
         }
         fprintf(stderr, "ggml_cuda: device %d: staged prefetch through the copy engine: %llu experts staged, %llu fills looked at, "
-            "%llu copied from staging (%llu waited for their copy), %llu staged but not queued, %llu waits too long, %llu requests not queued "
-            "(a later pick came first), %llu lost; LLAMA_MOE_PREFETCH_STAGE=0 off\n", id, c[MOE_STG_STAT_REQ],
-            c[MOE_STG_STAT_FILLS], c[MOE_STG_STAT_USED], c[MOE_STG_STAT_WAITED], c[MOE_STG_STAT_NOACK], c[MOE_STG_STAT_TIMEOUT],
-            moe_stg_skipped.load(), moe_stg_lost.load());
-        fprintf(stderr, "ggml_cuda: device %d: staged prefetch by votes (bucket of %d: staged / fills that found it staged):", id, MOE_STG_BUCKET_W);
-        for (int b = 0; b < MOE_STG_BUCKETS; ++b) {
-            const unsigned long long nr = c[MOE_STG_STAT_N + b];
-            const unsigned long long nm = c[MOE_STG_STAT_N + MOE_STG_BUCKETS + b];
-            if (nr > 0 || nm > 0) {
-                fprintf(stderr, " %d+ %llu/%llu", b*MOE_STG_BUCKET_W, nr, nm);
-            }
-        }
-        fprintf(stderr, "\n");
+            "%llu copied from staging (%llu waited for their copy), %llu staged but not queued yet, %llu waits too long, %llu requests lost; "
+            "LLAMA_MOE_PREFETCH_STAGE=0 off\n", id, c[MOE_STG_STAT_REQ], c[MOE_STG_STAT_FILLS], c[MOE_STG_STAT_USED],
+            c[MOE_STG_STAT_WAITED], c[MOE_STG_STAT_NOACK], c[MOE_STG_STAT_TIMEOUT], moe_stg_lost.load());
     }
 }
 
@@ -1852,7 +1773,7 @@ static int moe_stg_register(ggml_backend_cuda_context & ctx, const ggml_tensor *
         if (cudaHostAlloc((void **) &d.h, sizeof(moe_stg_host), cudaHostAllocMapped) != cudaSuccess ||
                 cudaHostGetDevicePointer((void **) &d.h_dev, d.h, 0) != cudaSuccess ||
                 cudaMalloc((void **) &d.ctr, sizeof(int32_t)) != cudaSuccess ||
-                cudaMalloc((void **) &d.stat, MOE_STG_STAT_ALL*sizeof(unsigned long long)) != cudaSuccess ||
+                cudaMalloc((void **) &d.stat, MOE_STG_STAT_N*sizeof(unsigned long long)) != cudaSuccess ||
                 cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking) != cudaSuccess) {
             (void) cudaGetLastError();
             d.failed = true;
@@ -1861,7 +1782,7 @@ static int moe_stg_register(ggml_backend_cuda_context & ctx, const ggml_tensor *
         }
         memset(d.h, 0, sizeof(moe_stg_host));
         CUDA_CHECK(cudaMemset(d.ctr, 0, sizeof(int32_t)));
-        CUDA_CHECK(cudaMemset(d.stat, 0, MOE_STG_STAT_ALL*sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(d.stat, 0, MOE_STG_STAT_N*sizeof(unsigned long long)));
         static const bool reg_exit = std::atexit(moe_stg_report) == 0;
         GGML_UNUSED(reg_exit);
         d.th = std::thread(moe_stg_thread, ctx.device);
@@ -1880,7 +1801,7 @@ static int moe_stg_register(ggml_backend_cuda_context & ctx, const ggml_tensor *
     moe_stg_group & g = moe_stg_groups[fresh ? moe_stg_n_groups.load() : reg];
     if (fresh || g.owner != owner) {
         // a new group, or the group of a new cache whose banks took the address of an old one's: sizes, buffers, empty keys
-        bool ok = g.dstate != nullptr || cudaMalloc((void **) &g.dstate, (size_t) (4*MOE_STG_MAX_SLOTS + 1)*sizeof(int32_t)) == cudaSuccess;
+        bool ok = g.dstate != nullptr || cudaMalloc((void **) &g.dstate, (size_t) (3*MOE_STG_MAX_SLOTS + 1)*sizeof(int32_t)) == cudaSuccess;
         bool realloc_all = n_stg > g.cap_stg;
         for (int b = 0; ok && b < n_banks; ++b) {
             const int64_t nb = dst->src[3 + b]->nb[2];
@@ -1912,7 +1833,7 @@ static int moe_stg_register(ggml_backend_cuda_context & ctx, const ggml_tensor *
         // counting, so an acknowledgement of an old request never matches a new one
         CUDA_CHECK(cudaMemset(g.dstate, 0xff, (size_t) MOE_STG_MAX_SLOTS*sizeof(int32_t)));
         if (fresh) {
-            CUDA_CHECK(cudaMemset(g.dstate + MOE_STG_MAX_SLOTS, 0, (size_t) (3*MOE_STG_MAX_SLOTS + 1)*sizeof(int32_t)));
+            CUDA_CHECK(cudaMemset(g.dstate + MOE_STG_MAX_SLOTS, 0, (size_t) (2*MOE_STG_MAX_SLOTS + 1)*sizeof(int32_t)));
         }
         g.device  = ctx.device;
         g.owner   = owner;
@@ -1952,7 +1873,6 @@ static moe_stg_view moe_stg_view_of(const void * bank0, const int il) {
         v.key  = g.dstate;
         v.seq  = g.dstate + MOE_STG_MAX_SLOTS;
         v.done = g.dstate + 2*MOE_STG_MAX_SLOTS;
-        v.score = g.dstate + 3*MOE_STG_MAX_SLOTS;
         v.ack  = d.h_dev->ack[i];
         for (int b = 0; b < g.n_banks; ++b) {
             v.buf[b] = g.buf[b];
@@ -1971,7 +1891,7 @@ static void moe_stg_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int il       = ggml_get_op_params_i32(dst, 0);
     const int n_top    = ggml_get_op_params_i32(dst, 11);
     const int max_fill = ggml_get_op_params_i32(dst, 12);
-    const int n_stg    = ggml_get_op_params_i32(dst, 14) & 0xff;
+    const int n_stg    = ggml_get_op_params_i32(dst, 14);
     const int n_expert = (int) map->ne[0];
     const int n_tokens = (int) logits->ne[1];
     const int n_ids    = n_top*n_tokens;
@@ -2000,37 +1920,13 @@ static void moe_stg_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
         ids = p.buf + (size_t) il*MOE_PF_STRIDE;
     }
-    // on the cache's side stream (GGML_CUDA_MOE_STAGE_SIDE=0: the main stream), beside the next layer's attention: nothing on the main
-    // stream reads what the pick writes (a fetch reads key and number as a pair and checks them again, see moe_stg_source); an
-    // overlapped fetch of the next layer runs after it on the same stream, and the main stream's next cache op or the end of the
-    // graph waits for it (moe_join). On the main stream the two kernels cost an A100 ~35 us per layer (~1.6 ms per verify pass)
-    static const bool on_side = [] {
-        const char * e = getenv("GGML_CUDA_MOE_STAGE_SIDE");
-        return e == nullptr || atoi(e) != 0;
-    }();
     cudaStream_t stream = ctx.stream();
-    cudaStream_t run    = stream;
-    if (on_side) {
-        if (ctx.moe_fork == nullptr) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_fork, cudaEventDisableTiming));
-            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_join, cudaEventDisableTiming));
-        }
-        run = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);
-        CUDA_CHECK(cudaEventRecord(ctx.moe_fork, stream));
-        CUDA_CHECK(cudaStreamWaitEvent(run, ctx.moe_fork, 0));
-    }
-    moe_pf_topn<<<n_tokens, MOE_PF_THREADS, (size_t) n_expert*sizeof(float), run>>>((const float *) logits->data, n_expert, n_top,
+    moe_pf_topn<<<n_tokens, MOE_PF_THREADS, (size_t) n_expert*sizeof(float), stream>>>((const float *) logits->data, n_expert, n_top,
         n_tokens, ids);
     CUDA_CHECK(cudaGetLastError());
-    const int min_score = std::max(1, ggml_get_op_params_i32(dst, 14) >> 8); // votes an expert needs (ggml_moe_cache_prefetch_set_stage)
-    moe_stg_pick<<<1, 32, (size_t) n_expert*sizeof(int32_t), run>>>(ids, n_ids, n_tokens, n_top,
-        (const int32_t *) map->data + (int64_t) il*n_expert, n_expert, il, g.dstate, g.n_stg,
-        std::min(std::max(max_fill, 1), g.n_stg), min_score, d.h_dev, d.ctr, reg, d.stat);
+    moe_stg_pick<<<1, 32, 0, stream>>>(ids, n_ids, (const int32_t *) map->data + (int64_t) il*n_expert, n_expert, il, g.dstate, g.n_stg,
+        std::min(std::max(max_fill, 1), g.n_stg), d.h_dev, d.ctr, reg, d.stat);
     CUDA_CHECK(cudaGetLastError());
-    if (on_side) {
-        CUDA_CHECK(cudaEventRecord(ctx.moe_join, run));
-        ctx.moe_join_pending = true;
-    }
 }
 #else
 static moe_stg_view moe_stg_view_of(const void * bank0, const int il) {
@@ -2280,7 +2176,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
 
     if (mode == 8) {
 #if defined(MOE_STG_OK)
-        if ((ggml_get_op_params_i32(dst, 14) & 0xff) > 0) {
+        if (ggml_get_op_params_i32(dst, 14) > 0) {
             moe_stg_run(ctx, dst); // staged through the copy engine, see moe_stg_view
             return;
         }

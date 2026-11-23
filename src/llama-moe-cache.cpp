@@ -23,7 +23,7 @@ extern "C" { GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int3
 extern "C" { GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_context * ctx, struct ggml_tensor * logits, struct ggml_tensor * map,
         struct ggml_tensor * state, struct ggml_tensor ** banks, const void ** host, int n_banks, int il, int n_top, int max_fill,
         int n_core, struct ggml_tensor * scores, struct ggml_tensor * dep); }
-extern "C" { GGML_API void ggml_moe_cache_prefetch_set_stage(struct ggml_tensor * op, int n_stg, int owner, int min_score); }
+extern "C" { GGML_API void ggml_moe_cache_prefetch_set_stage(struct ggml_tensor * op, int n_stg, int owner); }
 
 #include <algorithm>
 #include <array>
@@ -9620,7 +9620,6 @@ struct llama_moe_cache::impl {
         int max_fill = 0;
         int min_tok  = 1; // windows of fewer tokens do not prefetch
         int stage    = 0; // staging slots per group: the staged form through the copy engine (see prefetch_stage_cfg)
-        int min_score = 0; // staged form: votes a predicted expert needs (rank r of a token's top n adds n - r)
     };
     mutable bool     pf_resolved = false;
     mutable pf_cfg_t pf_cfg;
@@ -9650,8 +9649,9 @@ struct llama_moe_cache::impl {
     // LLAMA_MOE_PREFETCH_STAGE=N: on with N slots per group (1..16), =0 off. Unset: on with LLAMA_MOE_PREFETCH_STAGE_SLOTS (4) slots
     // where every device with device-lookup cache slots is a CUDA device of compute capability 8.x and the cache holds at least
     // LLAMA_MOE_PREFETCH_STAGE_MIN_FRAC (0.50) of the host experts' bytes. Top LLAMA_MOE_PREFETCH (10) predicted experts per token, at
-    // most LLAMA_MOE_PREFETCH_MAX (2) staged per layer and window. Not tied to LLAMA_MOE_PREFETCH_AUTO (the cache is unchanged);
-    // LLAMA_MOE_PREFETCH=0 turns both forms off
+    // most LLAMA_MOE_PREFETCH_MAX (1) staged per layer and window: fewer than a third of the staged experts turn out to be fills, and
+    // every copy shares the link with the fills. Not tied to LLAMA_MOE_PREFETCH_AUTO (the cache is unchanged); LLAMA_MOE_PREFETCH=0
+    // turns both forms off
     // returns the slots per group (0: off), or -1 while the slots are not sized yet
     int prefetch_stage_cfg(bool & forced) const {
         forced = false;
@@ -9705,11 +9705,9 @@ struct llama_moe_cache::impl {
             }
             if (n_stg > 0) {
                 c.n        = e != nullptr ? std::max(1, std::min(32, atoi(e))) : 10;
-                c.max_fill = em != nullptr ? std::max(1, std::min(n_stg, atoi(em))) : std::min(2, n_stg);
+                c.max_fill = em != nullptr ? std::max(1, std::min(n_stg, atoi(em))) : 1;
                 c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
                 c.stage    = n_stg;
-                const char * ev = getenv("LLAMA_MOE_PREFETCH_STAGE_MIN_SCORE");
-                c.min_score = ev != nullptr ? std::max(0, std::min((1 << 21), atoi(ev))) : c.n;
                 pf_cfg = c;
                 pf_resolved = true;
                 return c;
@@ -9890,7 +9888,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * op = ggml_moe_cache_prefetch(ctx, logits, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il, n_top,
             max_fill, g.lru.n_core, g.scores, dep);
         if (cfg.stage > 0) {
-            ggml_moe_cache_prefetch_set_stage(op, cfg.stage, pf_owner, cfg.min_score);
+            ggml_moe_cache_prefetch_set_stage(op, cfg.stage, pf_owner);
         }
         if (n_prefetch_ops++ == 0) {
             if (cfg.stage > 0) {
