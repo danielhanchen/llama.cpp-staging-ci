@@ -2072,15 +2072,20 @@ static void mmq_exact_tiles_stats(const bool exact, const int32_t * tile_prefix,
     mmq_log_decades(v[1] ? n_tiles : n_split, v[1] ? "device form: one block per tile" : "device form: stream-k split");
 }
 
-// GGML_CUDA_MMQ_EXACT_CVT: unset / 1 = the exact int-to-float product in the q8_0 mma vec_dot (ggml_cuda_mmq_cvt_mul: no conversion
-// instruction, the same values), 0 = the conversion instruction as before. Engagement: MMQ launches of these types on the mma
-// path with the exact product, logged at 1, 10, 100, ...
-static bool ggml_cuda_mmq_exact_cvt_env() {
-    static const bool on = [] {
+// GGML_CUDA_MMQ_EXACT_CVT: the exact int-to-float product in the q8_0 mma vec_dot (ggml_cuda_mmq_cvt_mul: no conversion instruction,
+// the same values). Unset = on for the A100 (cc 8.0: separate integer and FP32 pipes, the conversion unit at a quarter of the FP32
+// rate) only, 0 = the conversion instruction everywhere (as before), 1 = the exact product on every NVIDIA arch (tests / timing).
+// RTX PRO 6000 (sm 120) measured 1-5% slower with it (test-mmq-pipe): its integer adds share the FP32 lanes.
+// Engagement: MMQ launches of these types on the mma path with the exact product, logged at 1, 10, 100, ...
+static bool ggml_cuda_mmq_exact_cvt_env(const int cc) {
+    static const int env = [] {
         const char * e = getenv("GGML_CUDA_MMQ_EXACT_CVT");
-        return e == nullptr || *e == '\0' || atoi(e) != 0;
+        return e == nullptr || *e == '\0' ? -1 : atoi(e);
     }();
-    return on;
+    if (env >= 0) {
+        return env != 0;
+    }
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE;
 }
 
 static void mmq_exact_cvt_count(const ggml_type type) {
@@ -2112,7 +2117,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     int flags = 0;
     if (ggml_cuda_mmq_exact_cvt_build && ggml_cuda_mmq_exact_cvt_type(type) && config.use_mma_data_layout(cc)) {
-        if (ggml_cuda_mmq_exact_cvt_env()) {
+        if (ggml_cuda_mmq_exact_cvt_env(cc)) {
             mmq_exact_cvt_count(type);
         } else {
             flags |= MMQ_FLAG_CVT;

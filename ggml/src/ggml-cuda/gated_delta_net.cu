@@ -307,8 +307,10 @@ gated_delta_net_cuda(const float * q,
 // token (the base form waits for every tile's loads). The same values reach the same gdn_token_step calls: bit-identical.
 // PF also takes the raw gates (beta_raw / ga, ggml_cuda_try_gdn_gates) and applies them as the AR kernel does (the same functions of
 // the same inputs) when it stages a tile; the base form is only launched without them.
+// PF at up to 8 warps: two blocks per SM (at most 128 registers), as the base form gets with its fewer registers; the prompt grid
+// (A100, 48 value heads: 192 blocks of 8 warps) then runs in one wave
 template <int S_v, bool keep_rs_t, int num_warps, int TOKEN_TILE, bool PF = false>
-__global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps, 1)
+__global__ void __launch_bounds__(ggml_cuda_get_physical_warp_size() * num_warps, PF && num_warps <= 8 ? 2 : 1)
 gated_delta_net_tiled_cuda(const float * q,
                            const float * k,
                            const float * v,

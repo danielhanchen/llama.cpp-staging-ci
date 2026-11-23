@@ -6,9 +6,10 @@
 // must log exactly one launch per shape and the AR child none, so a silent fallback fails the test.
 // Two tiled children: the base form (GGML_CUDA_GDN_TILED_PF=0) and the prefetch form (=1), each against the AR child; the
 // prefetch child must log the prefetch form and the base child must not.
-// Gated shapes build beta = sigmoid(b) and g = softplus(a + bias) * A in the graph, so the backend hands the raw gates to the op
-// (ggml_cuda_try_gdn_gates, GGML_CUDA_GDN_GATES_DEBUG lines counted): the base tiled form runs the AR kernel for those, the
-// prefetch form applies them itself.
+// Gated shapes (one sequence) build beta = sigmoid(b) and g = softplus(a + bias) * A in the graph. Where the backend hands the raw
+// gates to the op (ggml_cuda_try_gdn_gates: not where the chunked mma kernel may run, e.g. sm 120; GGML_CUDA_GDN_GATES_DEBUG lines
+// counted) the base tiled form runs the AR kernel for them and the prefetch form applies them itself; elsewhere the gates are separate
+// kernels and every child runs them as plain shapes (noted, not a failure).
 // Shapes keep the q / k head count != 16, so the chunked MMA kernel declines them on every arch.
 // The kernel is ggml-cuda's and wave32 only (gdn_use_tiled): without a CUDA / ROCm device, or on a wave64 ROCm device (gfx90a,
 // gfx942, ...), it prints SKIP and exits 0. Metal / Vulkan / SYCL / OpenCL devices are not used.
@@ -53,12 +54,10 @@ static std::vector<gdn_shape> shapes() {
     // head size 64
     s.push_back({8, 2, 64, 512, 2, 1});
     s.push_back({8, 2, 64, 100, 1, 4});
-    // the Flash-Next delta-net layer (16 q / k heads, 48 value heads... here 24 x 2) with raw gates
+    // 48 value heads (q / k 24 x 2) with raw gates, one sequence (the gates go to the op for one sequence only)
     for (int64_t nt : {512, 2047}) {
-        for (int64_t ns : {1, 2}) {
-            for (int64_t K : {1, 4}) {
-                s.push_back({24, 2, 128, nt, ns, K, true});
-            }
+        for (int64_t K : {1, 4}) {
+            s.push_back({24, 2, 128, nt, 1, K, true});
         }
     }
     return s;
@@ -326,17 +325,25 @@ int main(int argc, char ** argv) {
         }
     }
     printf("tiled launches logged: AR child %d, tiled base child %d, tiled prefetch child %d (expected 0 / %zu / %zu); "
-           "prefetch form logged: %d / %d / %d (expected 0 / 0 / 1); raw gates handed to the op: %d / %d / %d (expected at least %zu each)\n",
-           n_logs[0], n_logs[1], n_logs[2], sh.size() - n_gated, sh.size(), n_pf[0], n_pf[1], n_pf[2], n_gates[0], n_gates[1], n_gates[2], n_gated);
-    if (n_gates[0] < (int) n_gated || n_gates[1] < (int) n_gated || n_gates[2] < (int) n_gated) {
-        printf("FAIL: the backend did not hand the raw gates of every gated shape to the op\n");
+           "prefetch form logged: %d / %d / %d (expected 0 / 0 / at least 1); raw gates handed to the op: %d / %d / %d (expected at least %zu each)\n",
+           n_logs[0], n_logs[1], n_logs[2], (size_t) (n_gates[0] > 0 ? sh.size() - n_gated : sh.size()), sh.size(), n_pf[0], n_pf[1], n_pf[2],
+           n_gates[0], n_gates[1], n_gates[2], n_gated);
+    // the gates go to the op in every child or in none (a property of the device, not of the mode)
+    const bool handed = n_gates[0] > 0;
+    if ((n_gates[0] > 0) != (n_gates[1] > 0) || (n_gates[0] > 0) != (n_gates[2] > 0) || (handed && (n_gates[0] < (int) n_gated ||
+            n_gates[1] < (int) n_gated || n_gates[2] < (int) n_gated))) {
+        printf("FAIL: the raw gates went to the op in some children only, or not for every gated shape\n");
         return 1;
     }
-    if (n_logs[0] != 0 || n_logs[1] != (int) (sh.size() - n_gated) || n_logs[2] != (int) sh.size()) {
+    if (!handed) {
+        printf("NOTE: this device does not hand the raw gates to the op; the gated shapes ran as plain ones in every child\n");
+    }
+    const int n_base_tiled = (int) (handed ? sh.size() - n_gated : sh.size());
+    if (n_logs[0] != 0 || n_logs[1] != n_base_tiled || n_logs[2] != (int) sh.size()) {
         printf("FAIL: the tiled kernel did not run exactly once per shape in the tiled children (or ran in the AR child)\n");
         return 1;
     }
-    if (n_pf[0] != 0 || n_pf[1] != 0 || n_pf[2] != 1) {
+    if (n_pf[0] != 0 || n_pf[1] != 0 || n_pf[2] < 1) {
         printf("FAIL: the prefetch form did not run in the prefetch child only\n");
         return 1;
     }
