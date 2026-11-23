@@ -399,19 +399,26 @@ bool llm_graph_input_dsv41::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+ggml_tensor * llama_model_deepseek41::graph::build_engram_rows(
+        const llama_model_deepseek41 & model,
+        ggml_tensor * ids,
+        int il) const {
+    ggml_tensor * rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, ids);
+    rows = ggml_reshape_2d(ctx0, rows, model.engram_head_dim*model.engram_n_cols(), n_tokens);
+    cb(rows, "engram_rows", il);
+    return rows;
+}
+
 ggml_tensor * llama_model_deepseek41::graph::build_engram(
         const llama_model_deepseek41 & model,
         ggml_tensor * x,
-        ggml_tensor * ids,
+        ggml_tensor * rows,
         ggml_tensor * keep,
         int il) const {
     const auto & layer = model.layers[il];
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[2];
-
-    ggml_tensor * rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, ids);
-    rows = ggml_reshape_2d(ctx0, rows, model.engram_head_dim*model.engram_n_cols(), nt);
-    cb(rows, "engram_rows", il);
+    GGML_ASSERT(rows->ne[1] == nt);
 
     ggml_tensor * kv = build_lora_mm(layer.engram_kv, rows);
     cb(kv, "engram_kv", il);
@@ -986,6 +993,17 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         ggml_set_name(ids, ("engram_ids-" + std::to_string(model.engram_layers[e])).c_str());
         inp41->engram_ids.push_back(ids);
     }
+    // the table stays on the host: gathering every Engram layer's rows right after the token embeddings keeps them in the
+    // graph's first split; gathered at their layers, each costs two more splits (a device -> host -> device round trip per
+    // layer and token). LLAMA_DSV41_ENGRAM_EARLY=0 gathers them at their layers. Same rows, same values either way.
+    static const bool engram_early_env = dsv41_env_on("LLAMA_DSV41_ENGRAM_EARLY");
+    std::vector<ggml_tensor *> engram_rows(inp41->engram_ids.size(), nullptr);
+    if (engram_early_env) {
+        for (size_t e = 0; e < engram_rows.size(); ++e) {
+            engram_rows[e] = build_engram_rows(model, inp41->engram_ids[e], (int) model.engram_layers[e]);
+            ggml_build_forward_expand(gf, engram_rows[e]);
+        }
+    }
     ggml_tensor * engram_keep = nullptr;
     if (!model.engram_layers.empty() && ubatch.token && ubatch.embd) {
         engram_keep = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_tokens);
@@ -1042,7 +1060,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         const int e = model.engram_index(il);
         if (e >= 0 && !inp41_ptr->engram_ids.empty()) {
-            inpL = build_engram(model, inpL, inp41_ptr->engram_ids[e], engram_keep, il);
+            ggml_tensor * rows = engram_rows[e] ? engram_rows[e] : build_engram_rows(model, inp41_ptr->engram_ids[e], il);
+            inpL = build_engram(model, inpL, rows, engram_keep, il);
             cb(inpL, "engram_out", il);
         }
 

@@ -1494,10 +1494,16 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // the Engram table rows of one layer's n-gram ids, [head_dim*n_cols, n_tokens]
+        ggml_tensor * build_engram_rows(
+                const llama_model_deepseek41 & model,
+                ggml_tensor * ids,
+                int il) const;
+
         ggml_tensor * build_engram(
                 const llama_model_deepseek41 & model,
                 ggml_tensor * x,
-                ggml_tensor * ids,
+                ggml_tensor * rows,
                 ggml_tensor * keep,
                 int il) const;
 
