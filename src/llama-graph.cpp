@@ -53,13 +53,14 @@ static bool kq_mask_settable(const ggml_tensor * t) {
 // cells and the tokens (I32 inputs of 3 x n_kv and 5 x n_tokens) instead of a host mask of n_kv x n_tokens, the same values
 // (llama_kv_cache::set_input_kq_mask fills either). A layer-major group kept the host masks of all its members until computed
 // (16384 tokens: 288 MiB of f16 host masks, plus their build on the host). Only where the host mask has no ALiBi, sequence ids
-// < 64, and not the non-causal SWA_FULL span, with the attention offloaded; LLAMA_KQ_MASK_DEVICE=0 off
+// < 64, and not the non-causal SWA_FULL span, with the attention offloaded to devices that run the op (cparams.kq_mask_dev);
+// LLAMA_KQ_MASK_DEVICE=0 off
 // decode / verify ubatches (fewer than LLAMA_KQ_MASK_DEVICE_MIN_TOKENS, 64) keep the host mask: their host masks are small, while the
 // cells input is n_kv rows each step (RTX PRO 6000 the 4-bit model 12 GB with device masks at every ubatch: decode 8k / 16k -13 / -18%)
 static bool kq_mask_device_ok(const llama_ubatch & ubatch, const llama_hparams & hparams, const llama_cparams & cparams) {
     static const bool env = getenv("LLAMA_KQ_MASK_DEVICE") == nullptr || atoi(getenv("LLAMA_KQ_MASK_DEVICE")) != 0;
     static const uint32_t min_tokens = getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS"))) : 64;
-    return env && ubatch.n_tokens >= min_tokens && cparams.offload_kqv && !hparams.use_alibi && cparams.n_seq_max <= 64 &&
+    return env && ubatch.n_tokens >= min_tokens && cparams.offload_kqv && cparams.kq_mask_dev && !hparams.use_alibi && cparams.n_seq_max <= 64 &&
         (cparams.causal_attn || hparams.non_causal_type != LLAMA_NON_CAUSAL_TYPE_SWA_FULL);
 }
 
@@ -4202,6 +4203,73 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     res->t_kv_len_n_kv = mctx_cur->get_n_kv();
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+}
+
+// the switches are shared with the Flash-Next drafter (src/models/qwen4exp.cpp): LLAMA_MTP_PROMPT_KV_ONLY=0 off,
+// LLAMA_MTP_CATCHUP_KV_ONLY=0 only from 64 rows, LLAMA_MTP_PROMPT_KV_ONLY_MIN=N from N rows, LLAMA_MTP_PROMPT_KV_ONLY_UB=0 no
+// lowering of that minimum to a smaller n_ubatch
+static std::atomic<int64_t> g_mtp_kv_only_graphs { 0 };
+
+bool llm_graph_context::mtp_kv_only(bool arch_on, bool win_on) const {
+    static const bool kv_only_env     = getenv("LLAMA_MTP_PROMPT_KV_ONLY") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY")) != 0;
+    static const bool kv_only_catchup = getenv("LLAMA_MTP_CATCHUP_KV_ONLY") == nullptr || atoi(getenv("LLAMA_MTP_CATCHUP_KV_ONLY")) != 0;
+    static const int64_t kv_only_min  = getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN") ? std::max(1, atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN"))) :
+        kv_only_catchup ? 1 : 64;
+    static const bool kv_only_ub      = getenv("LLAMA_MTP_PROMPT_KV_ONLY_UB") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_UB")) != 0;
+
+    const int64_t kv_min = kv_only_ub && (int64_t) cparams.n_ubatch < kv_only_min ? std::max<int64_t>(1, cparams.n_ubatch) : kv_only_min;
+
+    // an unmasked h_nextn would be read for every row, output or not
+    const bool h_unread = !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
+
+    const bool on = arch_on && kv_only_env && !win_on && !cparams.training && h_unread &&
+        n_outputs == 0 && n_tokens >= kv_min;
+    if (on) {
+        if (g_mtp_kv_only_graphs++ == 0) {
+            LLAMA_LOG_INFO("%s: MTP drafter batches of at least %lld rows with no output row compute the block's K / V cache writes only "
+                "(LLAMA_MTP_PROMPT_KV_ONLY=0 off)\n", __func__, (long long) kv_only_min);
+        }
+    }
+    return on;
+}
+
+int64_t llama_graph_mtp_kv_only_count() {
+    return g_mtp_kv_only_graphs.load();
+}
+
+void llm_graph_context::build_attn_kv_store(llm_graph_input_attn_kv * inp, ggml_tensor * k_cur, ggml_tensor * v_cur, int il) const {
+    if (inp->self_k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    // as build_attn: v, then k (rope fusion writes k into the cache); a host cache gets the same rows build_attn writes after its
+    // attention
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+}
+
+void llm_graph_context::build_attn_k_store(llm_graph_input_attn_k_iswa * inp, ggml_tensor * k_cur, int il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
+    if (k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
+    }
+
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur  = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    const auto & k_idxs    = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
 }
 
 ggml_tensor * llm_graph_context::build_attn(

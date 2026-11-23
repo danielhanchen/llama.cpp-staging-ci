@@ -2492,7 +2492,8 @@ static size_t common_fit_dflash_estimate(const std::string & path_dft, const lla
     const int64_t n_seq = std::max<int64_t>(1, cp.n_seq_max);
     const int64_t n_ub  = std::max<int64_t>(1, std::min<int64_t>(cp.n_ubatch, cp.n_ctx));
     int64_t cells = cp.n_ctx;
-    if (all_swa) {
+    // --swa-full: the sliding layers get the full context too (llama_kv_cache_iswa)
+    if (all_swa && !cp.swa_full) {
         cells = std::min<int64_t>(cp.n_ctx, GGML_PAD(n_swa*n_seq + n_ub, 256));
     }
     const double kv_row = (double) n_head_kv*((double) d_k*ggml_type_size(cp.type_k)/ggml_blck_size(cp.type_k) +
@@ -2638,6 +2639,44 @@ struct common_fit_draft_hx {
 
 // set while the launch is fitted again with K/V host chunks for its DFlash / DSpark drafter (the small-device refit below)
 static bool g_fit_dflash_kv_host = false;
+
+// bytes of a GGUF file and its splits (NAME-0000k-of-0000n.gguf), 0 if unknown
+static uint64_t common_fit_gguf_bytes(const std::string & path) {
+    std::error_code ec;
+    if (path.empty()) {
+        return 0;
+    }
+    int k = 0, n = 0;
+    const size_t at = path.rfind("-of-");
+    if (at != std::string::npos && at >= 6 && path.size() >= at + 4 + 5 + 5 &&
+            sscanf(path.c_str() + at - 5, "%5d-of-%5d.gguf", &k, &n) == 2 && n > 1) {
+        const std::string prefix = path.substr(0, at - 6);
+        uint64_t sum = 0;
+        for (int i = 0; i < n; ++i) {
+            char sp[4096];
+            llama_split_path(sp, sizeof(sp), prefix.c_str(), i, n);
+            const auto b = std::filesystem::file_size(sp, ec);
+            if (ec) {
+                return 0;
+            }
+            sum += b;
+        }
+        return sum;
+    }
+    const auto b = std::filesystem::file_size(path, ec);
+    return ec ? 0 : (uint64_t) b;
+}
+
+// the target is read from the disk during decode: its GGUF is larger than the available host memory and not on a memory file
+// system, so the expert misses the RAM tier does not hold come from the disk (as the server's deep-window rule decides it)
+static bool common_fit_target_on_disk(const std::string & path) {
+    if (common_fit_file_in_ram_fs(path)) {
+        return false;
+    }
+    const uint64_t bytes = common_fit_gguf_bytes(path);
+    const uint64_t avail = llama_available_memory();
+    return bytes > 0 && avail > 0 && bytes > avail;
+}
 
 static bool common_fit_draft_on_cpu(
         const common_params & params, const llama_model_params & mparams, const llama_context_params & cparams,
@@ -2909,6 +2948,20 @@ static bool common_fit_draft_on_cpu(
         const char * em = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT_MULTI");
         rq_min_tok = em != nullptr ? std::max(0.0, atof(em)) : 0.75;
     }
+    // (LLAMA_FIT_DRAFT_DISK, default 1; 0 = the rescue below there too): where the target's expert misses are read from the disk
+    // (common_fit_target_on_disk), a draft refused at its file's types is not requantized: the host-expert placement below (its
+    // experts in host memory, a few hundred MiB on the device) or no draft takes it. The requantized rescue was measured with the
+    // target in RAM, where a verify row reads its misses from pinned memory and costs a fraction of a token; from the disk each verify
+    // row reads its own misses and costs about a token, so the 1.6 GB the requantized drafter takes from the cache cost more than
+    // its drafts save. L4, Qwen3.8-Flash-Next at 4 bits (93.7 GB on the VM disk, 52 GB of RAM) + its Q8_0 MTP drafter, Studio argv,
+    // the same text: 12 GB (requantized 3.7 tokens per layer, cache 3775 MiB) chat 4.84 -> 5.11 tok/s (host-expert drafter, 5007
+    // MiB), 8k 4.34 -> 4.64; 13 GB (4.6 tokens, 4799 MiB) 5.01 -> 5.54 (6444 MiB). A draft admitted at its types and requantized by
+    // the share rule below is unchanged (14 GB, A100 40 GB at 16 GB)
+    const bool rq_disk = [&] {
+        const char * e = getenv("LLAMA_FIT_DRAFT_DISK");
+        return (e == nullptr || atoi(e) != 0) && getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT") == nullptr &&
+            common_fit_target_on_disk(params.model.path);
+    }();
     if (const char * e = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT")) {
         rq_min_tok = std::max(0.0, atof(e));
     }
@@ -2925,7 +2978,12 @@ static bool common_fit_draft_on_cpu(
     const bool rq_heavy = gpu && rq_share > 0.0 && cache > 0 && take > rq_share*(double) cache;
     double rq_tok = -1.0, rq_dft = 0.0;
     bool   rq_taken = false;
-    if ((!gpu || rq_heavy) && !rq_off && !rq_set && rq_min_tok > 0.0 && host > 0.0 && (needs_target == nullptr || !*needs_target)) {
+    const bool rq_disk_skip = rq_disk && !gpu && !rq_heavy && !rq_off && !rq_set && hx_ok;
+    if (rq_disk_skip) {
+        LOG_INF("%s: the target's expert misses are read from the disk: the draft refused at its types is not requantized, the "
+            "host-expert placement is weighed instead (LLAMA_FIT_DRAFT_DISK=0: requantized)\n", __func__);
+    }
+    if ((!gpu || rq_heavy) && !rq_disk_skip && !rq_off && !rq_set && rq_min_tok > 0.0 && host > 0.0 && (needs_target == nullptr || !*needs_target)) {
         std::vector<llama_model_kv_override> kvo;
         if (mparams_dft.kv_overrides != nullptr) {
             for (const llama_model_kv_override * p = mparams_dft.kv_overrides; p->key[0] != 0; ++p) {
@@ -2987,7 +3045,10 @@ static bool common_fit_draft_on_cpu(
     } else if (!gpu && rq_off) {
         LOG_INF("%s: draft refused at its file's types; requantization off (LLAMA_DRAFT_REQUANT=off)\n", __func__);
     }
-    if (!gpu && !rq_set && (needs_target == nullptr || !*needs_target)) {
+    // (LLAMA_FIT_DRAFT_DISK_HX, default 1; 0 = not tried there): the draft with its experts in host memory where the disk-tier
+    // rule above skipped the requantized one (0: no draft there; the 8k text then differs from the drafted one)
+    static const bool disk_hx = getenv("LLAMA_FIT_DRAFT_DISK_HX") == nullptr || atoi(getenv("LLAMA_FIT_DRAFT_DISK_HX")) != 0;
+    if (!gpu && !rq_set && (needs_target == nullptr || !*needs_target) && (disk_hx || !rq_disk)) {
         gpu = try_hx();
     }
     return !gpu;
@@ -3041,16 +3102,31 @@ static void common_draft_mem_reserve(const common_params & params, const llama_m
         const size_t kv = has_draft && mparams_dft.n_gpu_layers != 0 ? common_fit_dflash_estimate(params_dft.model.path, cparams_dft, compute, params.model.path, cparams.n_ubatch) : 0;
         ggml_backend_dev_t dev = nullptr;
         if (kv > 0) {
+            std::vector<ggml_backend_dev_t> cand;
             if (!params_dft.devices.empty()) {
-                dev = params_dft.devices[0]; // nullptr: the draft is not offloaded
+                for (ggml_backend_dev_t d : params_dft.devices) {
+                    if (d == nullptr) {
+                        break; // a leading nullptr: the draft is not offloaded
+                    }
+                    cand.push_back(d);
+                }
             } else {
-                for (size_t i = 0; i < ggml_backend_dev_count() && dev == nullptr; ++i) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                     ggml_backend_dev_t d = ggml_backend_dev_get(i);
                     if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                        dev = d;
+                        cand.push_back(d);
                     }
                 }
             }
+            // -sm none: the model loader keeps only device main_gpu of that list (llama_model_load_from_file_impl)
+            size_t idx = 0;
+            if (mparams_dft.split_mode == LLAMA_SPLIT_MODE_NONE && mparams_dft.main_gpu > 0 && (size_t) mparams_dft.main_gpu < cand.size()) {
+                idx = (size_t) mparams_dft.main_gpu;
+            }
+            if (mparams_dft.split_mode == LLAMA_SPLIT_MODE_NONE && mparams_dft.main_gpu < 0) {
+                cand.clear();
+            }
+            dev = idx < cand.size() ? cand[idx] : nullptr;
         }
         size_t weights = 0;
         if (dev != nullptr) {
@@ -3317,6 +3393,10 @@ uma_restart:
     if (params.split_mode_auto) {
         params.split_mode      = LLAMA_SPLIT_MODE_LAYER;
         params.split_mode_auto = false;
+        if (params.moe_cache_size == 0 && params.moe_cache_size_auto > 0) {
+            params.moe_cache_size = params.moe_cache_size_auto;
+        }
+        params.moe_cache_size_auto = 0;
     }
 
     auto mparams = common_model_params_to_llama_impl(params, params.fit_params);
@@ -3808,6 +3888,18 @@ uma_restart:
                 return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; })) {
             draft_needs_target = true;
         }
+        // a gemma-4 assistant reads the target's KV cache: the small-device placement above refuses it before it is measured,
+        // which is where it would be found to need its target
+        if (draft_cpu && !draft_needs_target && common_gguf_arch(params_dft.model.path) == "gemma4-assistant") {
+            draft_needs_target = true;
+        }
+        // a tool that cannot leave the draft out (no fit_can_drop: llama-speculative-simple, llama-dflash-tfa) keeps a draft that
+        // needs its target on its device placement: on the CPU it would abort in its first graph reservation
+        if (draft_cpu && draft_needs_target && !params.speculative.draft.fit_can_drop) {
+            COM_WRN("%s: --fit: the draft model does not fit beside the main model and its MoE cache, but it runs on the target's tensors "
+                "and cannot run on the CPU: it keeps its device placement\n", __func__);
+            draft_cpu = false;
+        }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
         // a draft that runs on the target's context (a gemma-4 assistant reads the target's KV cache) cannot run on the CPU
         // while that cache is on the device: T4 4 GB with LLAMA_FIT_DRAFT_CPU=1 aborted in its first graph reservation (a CPU context
@@ -4031,6 +4123,9 @@ uma_restart:
                 // the fit of the 512 MiB step when it leaves exactly one block on the host (the fallback, see sq_margin2)
                 struct sq_fit { llama_model_params mp; llama_context_params cp; std::vector<float> ts; std::vector<llama_model_tensor_buft_override> tbo;
                                 std::vector<size_t> mg; common_params_fit_status st; bool set = false; } one_off;
+                // memory added to the default margin before the fit (the server's multimodal projector, loaded after the model)
+                // stays on top of each step, as in the plain-launch step-down
+                const std::vector<size_t> sq_reserve = common_fit_margin_reserve(margins_in, common_params().fit_params_target);
                 for (int step = 0; step < 3; ++step) {
                     std::vector<size_t> mg = margins_in;
                     if (step >= 1) {
@@ -4038,16 +4133,11 @@ uma_restart:
                             break;
                         }
                         const size_t mstep = step == 1 ? sq_margin : sq_margin2;
-                        bool lower = false;
-                        for (auto & m : mg) {
-                            if (m > mstep) {
-                                m = mstep;
-                                lower = true;
-                            }
-                        }
-                        if (!lower) {
+                        const std::vector<std::vector<size_t>> sq_tr = common_fit_margin_trials(margins_in, { mstep }, sq_reserve);
+                        if (sq_tr.empty()) {
                             continue;
                         }
+                        mg = sq_tr[0];
                     }
                     llama_model_params   mp = mparams_in;
                     llama_context_params cp = cparams_in;
@@ -4080,6 +4170,10 @@ uma_restart:
                     if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && !all_dev && step == 1 && n_layer_sq > 0 && n_tbo(tbo) == n_tbo(tbo_in) &&
                             mp.n_gpu_layers + 1 == n_layer_sq + 1 - (mp.load_mtp ? 0 : n_nextn_sq)) {
                         one_off = { mp, cp, ts, tbo, mg, st, true };
+                        // this step's tbo is freed at the end of the iteration: point the saved fit at the saved copy
+                        if (mp.tensor_buft_overrides != nullptr && mp.tensor_buft_overrides == tbo.data()) {
+                            one_off.mp.tensor_buft_overrides = one_off.tbo.data();
+                        }
                     }
                     const bool fits_all     = st == COMMON_PARAMS_FIT_STATUS_SUCCESS && all_dev;
                     const bool take_one_off = !fits_all && step == 2 && one_off.set;
@@ -4200,18 +4294,14 @@ uma_restart:
                     const std::vector<size_t>  mg_d  = mg;
                     const common_params_fit_status st_d = st4;
                     bool found = false;
+                    // memory added to the default margin before the fit (the server's multimodal projector) stays on top of each step
+                    const std::vector<size_t> sd_reserve = common_fit_margin_reserve(margins_in, common_params().fit_params_target);
                     for (const size_t m_step : steps) {
-                        std::vector<size_t> mgs = margins_in;
-                        bool lower = false;
-                        for (auto & m : mgs) {
-                            if (m > m_step) {
-                                m = m_step;
-                                lower = true;
-                            }
-                        }
-                        if (!lower) {
+                        const std::vector<std::vector<size_t>> sd_tr = common_fit_margin_trials(margins_in, { m_step }, sd_reserve);
+                        if (sd_tr.empty()) {
                             continue;
                         }
+                        std::vector<size_t> mgs = sd_tr[0];
                         llama_model_params   mps = mp0;
                         llama_context_params cps = cp0;
                         std::vector<float>   tss = ts0;
@@ -4693,7 +4783,11 @@ uma_restart:
             const auto all_on_device = [&](const llama_model_params & mp) {
                 return mp.n_gpu_layers == llama_model_default_params().n_gpu_layers && n_tbo(mp) <= n_tbo_in;
             };
-            if (on && !model_only && !has_draft && !spec_mtp && !params.fit_params_target_set &&
+            // a GPU projector loaded after the fit (llama-mtmd-cli, the server) takes its memory from the margin: step down only
+            // where its reserve sits in the margins of the fitted devices (the server with the default device list)
+            const bool proj_ok = common_fit_plain_spill_proj_ok(!params.mmproj.path.empty() && params.mmproj_use_gpu,
+                !params.devices.empty(), common_fit_margin_reserve(margins_in, common_params().fit_params_target));
+            if (on && !model_only && !has_draft && !spec_mtp && !params.load_mtp && proj_ok && !params.fit_params_target_set &&
                     fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && !all_on_device(mparams) &&
                     mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers && [&] {
                         std::vector<uint8_t> exps;
@@ -4724,8 +4818,11 @@ uma_restart:
                         "the margin stays (LLAMA_FIT_PLAIN_HEADLESS=1 steps it down)\n", __func__, mparams.n_gpu_layers, sig.c_str());
                 } else {
                     const char * e_m = getenv("LLAMA_FIT_PLAIN_SPILL_MARGINS_MIB");
+                    // memory added to the default margin before the fit (the server's multimodal projector, loaded after
+                    // the model) is kept on top of every step
+                    const std::vector<size_t> reserve = common_fit_margin_reserve(margins_in, common_params().fit_params_target);
                     const std::vector<std::vector<size_t>> trials = common_fit_margin_trials(margins_in,
-                        common_fit_margin_steps_mib(e_m != nullptr ? e_m : "512,448,256,192"));
+                        common_fit_margin_steps_mib(e_m != nullptr ? e_m : "512,448,256,192"), reserve);
                     for (const std::vector<size_t> & mgs : trials) {
                         llama_model_params   mps  = mparams_in;
                         llama_context_params cps  = cparams_in;
@@ -4779,6 +4876,7 @@ uma_restart:
                 fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (getenv("LLAMA_KV_SEL_AFTER_DROP") == nullptr || atoi(getenv("LLAMA_KV_SEL_AFTER_DROP")) != 0)) {
             llama_model_params   mp  = mparams_in;
             llama_context_params cp  = cparams_in;
+            cp.n_state_capture = cparams.n_state_capture;   // the capture count (or the guard's drop) chosen above
             std::vector<float>   ts  = ts_in;
             std::vector<llama_model_tensor_buft_override> tbo = tbo_in;
             std::vector<size_t>  mg  = margins_in;
@@ -5162,6 +5260,7 @@ uma_restart:
                         mparams.tensor_buft_overrides = mparams_in.tensor_buft_overrides != nullptr && !params.tensor_buft_overrides.empty() ?
                             params.tensor_buft_overrides.data() : mparams_in.tensor_buft_overrides;
                         cparams.moe_cache_size = 0;
+                        params.moe_cache_size_auto = params.moe_cache_size;
                         params.moe_cache_size  = 0;
                     }
                     if (fits) {

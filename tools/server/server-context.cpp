@@ -1218,6 +1218,11 @@ struct server_slot {
             return 0;
         }
 
+        // post-sampling probabilities are read from the sampler after each token, but a verify window samples all its rows first
+        if (task->params.sampling.n_probs > 0 && task->params.post_sampling_probs) {
+            return 0;
+        }
+
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
@@ -2752,11 +2757,12 @@ private:
                 ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
                 const char * rn = reg ? ggml_backend_reg_name(reg) : "";
-                // an integrated GPU too (ggml-cuda reports prop.integrated as IGPU: Strix Halo gfx1151, Jetson, DGX Spark); the
-                // argmax runs in the same graph on the same backend, nothing is sized from memory
+                // an integrated GPU too (ggml-cuda reports prop.integrated as IGPU: Strix Halo gfx1151, Jetson, DGX Spark), and Metal
+                // (its argmax takes the lowest column on a tie, as the host greedy sampler); the argmax runs in the same graph on the
+                // same backend, nothing is sized from memory
                 const enum ggml_backend_dev_type dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
                 device_greedy_ok = dev && (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
-                    (strcmp(rn, "CUDA") == 0 || strcmp(rn, "ROCm") == 0);
+                    (strcmp(rn, "CUDA") == 0 || strcmp(rn, "ROCm") == 0 || strcmp(rn, "MTL") == 0);
             }
         }
 
@@ -3913,6 +3919,9 @@ private:
             if (use_backend_sampling) {
                 slot.smpl_dev_set = false;
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                // the raw-logits mode of the device greedy chains (set at load and by earlier requests) leaves the sequence's
+                // sampler out of the graph, while the host chain skips the stages the backend initialized: no stage would pick a token
+                llama_set_sampler_raw_logits(ctx_tgt, slot.id, false);
             } else if (slot.smpl_dev) {
                 if (!slot.smpl_dev_set) {
                     // back from a backend sampling request: the largest chain is set for the reserve
@@ -5793,16 +5802,22 @@ private:
                         // slots, where the text tokens are the tokens): the same vector, without copying the whole context every
                         // pass (8k context on a A100 host: ~17 us per pass, with the GPU idle)
                         static const bool incr_env = getenv("LLAMA_SPEC_PROMPT_INCR") == nullptr || atoi(getenv("LLAMA_SPEC_PROMPT_INCR")) != 0;
-                        const llama_tokens & cur = slot.prompt.tokens.get_tokens();
                         auto & sp = slot.spec_prompt;
-                        if (incr_env && !slot.prompt.tokens.has_mtmd && sp.size() <= cur.size() &&
-                                (sp.empty() || memcmp(sp.data(), cur.data(), sp.size()*sizeof(llama_token)) == 0)) {
-                            for (size_t k = sp.size(); k < cur.size(); ++k) {
-                                if (cur[k] != LLAMA_TOKEN_NULL) {
-                                    sp.push_back(cur[k]); // (as get_text_tokens: a prefix that matched holds no null token)
+                        bool sp_extended = false;
+                        // get_tokens() asserts on multimodal slots: only text-only slots take the incremental path
+                        if (incr_env && !slot.prompt.tokens.has_mtmd) {
+                            const llama_tokens & cur = slot.prompt.tokens.get_tokens();
+                            if (sp.size() <= cur.size() &&
+                                    (sp.empty() || memcmp(sp.data(), cur.data(), sp.size()*sizeof(llama_token)) == 0)) {
+                                for (size_t k = sp.size(); k < cur.size(); ++k) {
+                                    if (cur[k] != LLAMA_TOKEN_NULL) {
+                                        sp.push_back(cur[k]); // (as get_text_tokens: a prefix that matched holds no null token)
+                                    }
                                 }
+                                sp_extended = true;
                             }
-                        } else {
+                        }
+                        if (!sp_extended) {
                             sp = slot.prompt.tokens.get_text_tokens();
                         }
 
@@ -7428,9 +7443,13 @@ private:
                 }
                 // the probabilities of the accepted tokens come from their verify rows, read now (a rollback below may decode
                 // again); they were left empty, so drafted positions looked like a uniform distribution to the KLD gate
-                slot.spec_probs.clear();
-                if (slot.task->params.sampling.n_probs > 0 && !slot.spec_is_replay && synth_probs.empty()) {
-                    for (size_t i = 0; i < accepted.size() && i < slot.spec_i_batch.size(); ++i) {
+                // a checkpoint replay keeps the ones read at the verify before the rollback (the replayed tokens) and adds the rows
+                // of the tokens past them
+                if (!slot.spec_is_replay) {
+                    slot.spec_probs.clear();
+                }
+                if (slot.task->params.sampling.n_probs > 0 && synth_probs.empty()) {
+                    for (size_t i = slot.spec_probs.size(); i < accepted.size() && i < slot.spec_i_batch.size(); ++i) {
                         completion_token_output r;
                         r.tok  = accepted[i];
                         r.prob = 1.0f;

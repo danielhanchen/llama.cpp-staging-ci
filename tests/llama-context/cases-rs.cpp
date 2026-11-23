@@ -6,6 +6,7 @@
 #include "test-util.h"
 
 #include "common.h"
+#include "../../src/llama-ext.h" // llama_set_state_capture
 
 #include <algorithm>
 #include <array>
@@ -950,6 +951,217 @@ struct case_swa_prepare : ctx_test {
 };
 
 
+// a state capture asked at a batch index of a batch of two sequences: the equal split runs [A@0, B@0, A@1, B@1] first, so after
+// four rows the state of A already holds A@1, the row the capture at index 4 must come before. Such a capture is not taken (the
+// caller makes no checkpoint from it); a batch of one sequence still takes its capture with the position of the row before it
+struct case_capture_multi_seq : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "capture_multi_seq"; }
+    const char * description() const override {
+        return "a state capture in a batch of several sequences is not taken where the rows run before it are not the batch rows before its index";
+    }
+    std::string skip_reason(model_run & mr) const override {
+        if (arch_reserves_single_seq(mr.model)) {
+            return "multi-seq graphs";
+        }
+        return ctx_test::skip_reason(mr);
+    }
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        ctx_opts opts;
+        opts.n_ctx = 256; opts.n_batch = 64; opts.n_ubatch = 4; opts.n_seq_max = 2; opts.kv_unified = 1;
+        llama_context_ptr ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+        if (!llama_state_capture_supported(ctx.get())) {
+            return case_result::skip("no state capture in this context");
+        }
+        const auto run_one = [&](const int (&seqs)[5], const int (&poss)[5], bool & got, llama_pos & pm) {
+            llama_memory_clear(llama_get_memory(ctx.get()), true);
+            common_batch batch(ctx.get());
+            for (int i = 0; i < 5; ++i) {
+                batch.add(gen_token(n_vocab, seqs[i], poss[i]), poss[i], seqs[i], true);
+            }
+            CTX_REQUIRE(llama_set_state_capture(ctx.get(), 0, 4), "capture request refused");
+            CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "decode failed");
+            llama_synchronize(ctx.get());
+            pm  = -1;
+            got = llama_state_seq_captured_at(ctx.get(), 0, 4, &pm);
+            return case_result::pass();
+        };
+        bool got = false;
+        llama_pos pm = -1;
+        // A@0, B@0, B@1, B@2, A@1
+        if (auto r = run_one({ 0, 1, 1, 1, 0 }, { 0, 0, 1, 2, 1 }, got, pm); r.status != test_status::PASS) {
+            return r;
+        }
+        CTX_REQUIRE(!got || pm == 0, "the capture before row 4 holds A up to pos " + std::to_string(pm) + " instead of 0");
+        // one sequence: A@0 .. A@4, the capture before row 4 holds A up to pos 3
+        if (auto r = run_one({ 0, 0, 0, 0, 0 }, { 0, 1, 2, 3, 4 }, got, pm); r.status != test_status::PASS) {
+            return r;
+        }
+        CTX_REQUIRE(got && pm == 3, "the capture of a one-sequence batch was not taken at pos 3 (got " + std::to_string((int) got) +
+                ", pos " + std::to_string(pm) + ")");
+        return case_result::pass();
+    }
+};
+
+// llama-server --parallel 2 with two draft types: in one verify decode seq 0 drafts past n_rs_seq and seq 1 within it. Seq 0 restores
+// its checkpoint (a state read for seq 0 only), then seq 1 rolls its window back. The restore must leave the pending window of seq 1
+// alone: committed with its rejected tokens, the rollback of seq 1 was refused (llama-server aborted in seq_rm). Replay against the
+// snapshot rows, logits and the recurrent state of seq 1 compared
+struct case_replay_restore_scoped : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "replay_restore_scoped"; }
+
+    const char * description() const override {
+        return "a checkpoint restore of one sequence keeps the pending verify window of another one, replay against snapshot rows";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        if (arch_reserves_single_seq(mr.model)) {
+            return "the verify batch is a multi-seq graph";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr uint32_t  n_seqs = 2;
+        constexpr llama_pos n_pre  = 8;
+
+        const char * env_prev = getenv("LLAMA_RS_REPLAY");
+        const std::string prev = env_prev ? env_prev : "";
+        const auto make = [&](const char * replay) {
+            setenv("LLAMA_RS_REPLAY", replay, 1);
+            ctx_opts opts;
+            opts.n_ctx      = 256;
+            opts.n_batch    = 64;
+            opts.n_ubatch   = 32;
+            opts.n_seq_max  = n_seqs;
+            opts.n_rs_seq   = 2;
+            opts.kv_unified = 1;
+            auto ctx = mr.ctx(opts);
+            if (env_prev) {
+                setenv("LLAMA_RS_REPLAY", prev.c_str(), 1);
+            } else {
+                unsetenv("LLAMA_RS_REPLAY");
+            }
+            return ctx;
+        };
+
+        llama_context_ptr ctx_rp   = make("1");
+        llama_context_ptr ctx_snap = make("0");
+        if (!ctx_rp || !ctx_snap) {
+            return case_result::fail();
+        }
+        if (llama_n_rs_seq(ctx_rp.get()) < 2) {
+            return case_result::skip("n_rs_seq is too small");
+        }
+
+        llama_context * ctxs[2] = { ctx_rp.get(), ctx_snap.get() };
+
+        logits_diff diff;
+        const auto both = [&](const std::vector<std::array<llama_pos, 3>> & spans) {
+            int32_t n_out = 0;
+            for (llama_context * ctx : ctxs) {
+                common_batch batch(ctx);
+                n_out = 0;
+                for (const auto & sp : spans) {
+                    for (llama_pos p = sp[1]; p < sp[2]; ++p) {
+                        batch.add(gen_token(n_vocab, (llama_seq_id) sp[0], p), p, (llama_seq_id) sp[0], true);
+                        n_out++;
+                    }
+                }
+                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                    return false;
+                }
+            }
+            for (int32_t i = 0; i < n_out; ++i) {
+                const float * a = llama_get_logits_ith(ctx_rp.get(), i);
+                const float * b = llama_get_logits_ith(ctx_snap.get(), i);
+                if (a == nullptr || b == nullptr) {
+                    return false;
+                }
+                diff.add(a, b, n_vocab);
+            }
+            return true;
+        };
+
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            CTX_REQUIRE(both({ { (llama_pos) s, 0, n_pre } }), "prefill failed");
+        }
+
+        // the checkpoint of seq 0 before its draft (the server's speculative checkpoint: recurrent part only)
+        const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        std::vector<uint8_t> ckpt[2];
+        for (int c = 0; c < 2; ++c) {
+            const size_t n = llama_state_seq_get_size_ext(ctxs[c], 0, fl);
+            ckpt[c].resize(n);
+            CTX_REQUIRE(n > 0 && llama_state_seq_get_data_ext(ctxs[c], ckpt[c].data(), n, 0, fl) == n, "checkpoint save failed");
+        }
+
+        // one verify decode: a window of 3 tokens for each sequence
+        CTX_REQUIRE(both({ { 0, n_pre, n_pre + 3 }, { 1, n_pre, n_pre + 3 } }), "verify decode failed");
+
+        // seq 0 restores its checkpoint and drops its draft, then seq 1 keeps 1 of its 3 tokens
+        for (int c = 0; c < 2; ++c) {
+            CTX_REQUIRE(llama_state_seq_set_data_ext(ctxs[c], ckpt[c].data(), ckpt[c].size(), 0, fl) == ckpt[c].size(),
+                    "checkpoint restore failed");
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctxs[c]), 0, n_pre, -1), "seq_rm after the restore failed");
+        }
+        for (int c = 0; c < 2; ++c) {
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctxs[c]), 1, n_pre + 1, -1),
+                    std::string("the window of seq 1 cannot be rolled back after the restore of seq 0 (") +
+                    (c == 0 ? "replay" : "snapshot rows") + ")");
+        }
+
+        llama_pos pos[2] = { n_pre, n_pre + 1 };
+        for (int step = 0; step < 3; ++step) {
+            CTX_REQUIRE(both({ { 0, pos[0], pos[0] + 1 }, { 1, pos[1], pos[1] + 1 } }), "decode failed at step " + std::to_string(step));
+            pos[0]++;
+            pos[1]++;
+        }
+
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            std::vector<uint8_t> st[2];
+            for (int c = 0; c < 2; ++c) {
+                const size_t n = llama_state_seq_get_size_ext(ctxs[c], (llama_seq_id) s, fl);
+                st[c].resize(n);
+                CTX_REQUIRE(n > 0 && llama_state_seq_get_data_ext(ctxs[c], st[c].data(), n, (llama_seq_id) s, fl) == n, "state save failed");
+            }
+            CTX_REQUIRE(st[0].size() == st[1].size(), "the state of seq " + std::to_string(s) + " differs in size");
+            float d_max = 0.0f;
+            float a_max = 0.0f;
+            for (size_t i = 0; i + sizeof(float) <= st[0].size(); i += sizeof(float)) {
+                float a, b;
+                memcpy(&a, st[0].data() + i, sizeof(float));
+                memcpy(&b, st[1].data() + i, sizeof(float));
+                if (std::isfinite(a) && std::isfinite(b)) {
+                    d_max = std::max(d_max, std::fabs(a - b));
+                    a_max = std::max(a_max, std::fabs(b));
+                }
+            }
+            TLOG_INF("%s: seq %u replay state: max diff %g (max %g) against the snapshot rows\n", __func__, s, (double) d_max, (double) a_max);
+            CTX_REQUIRE(d_max <= 1e-3f*a_max + 1e-7f, "the replay state of seq " + std::to_string(s) +
+                    " differs from the snapshot rows (max diff " + std::to_string(d_max) + " of " + std::to_string(a_max) + ")");
+        }
+
+        constexpr float nmse_eps = 1e-4f;
+        CTX_REQUIRE(diff.nmse() <= nmse_eps,
+                "replay logits differ from the snapshot rows (max diff " + std::to_string(diff.diff_max) +
+                ", nmse " + std::to_string(diff.nmse()) + ")");
+
+        TLOG_INF("%s: replay matched the snapshot rows (max diff %g, nmse %g)\n", __func__, (double) diff.diff_max, diff.nmse());
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -958,8 +1170,10 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
     cases.push_back(std::make_unique<case_replay_overlap>());
     cases.push_back(std::make_unique<case_k19_move>());
+    cases.push_back(std::make_unique<case_replay_restore_scoped>());
     cases.push_back(std::make_unique<case_k19_fuzz>());
     cases.push_back(std::make_unique<case_swa_prepare>());
+    cases.push_back(std::make_unique<case_capture_multi_seq>());
 
     return cases;
 }

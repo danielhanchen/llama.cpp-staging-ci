@@ -74,6 +74,10 @@ ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type);
 // logs which IQ3_S kernel runs (AVX-512 or AVX2; nothing in builds without AVX-512)
 void ggml_cpu_iq_kernels_log(void);
 #endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+// logs how Q8_K activations are quantized (NEON with the reference's rounding rule, or the reference)
+void ggml_cpu_arm_kernels_log(void);
+#endif
 void ggml_vec_dot_iq4_nl_q8_0 (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq4_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq3_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

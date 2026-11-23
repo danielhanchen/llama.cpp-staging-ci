@@ -1039,6 +1039,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+int common_speculative_dflash_ev_auto_mode(const char * env) {
+    if (env == nullptr) {
+        return 2;
+    }
+    const int v = atoi(env);
+    return v == 2 ? 2 : (v != 0 ? 1 : 0);
+}
+
 // Diagnostics of the DFlash2 drafter (all off by default; none changes a draft except LLAMA_DFLASH_CYCLE)
 common_dflash_diag_t & common_dflash_diag() {
     static common_dflash_diag_t d = [] {
@@ -1150,8 +1158,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // some batch sizes on the CPU (ac_a48 48 GB 8k: EV-auto on / off gave two exact texts); =1 forces it
     static int eva_mode() {
         static const int m = [] {
-            const char * e = getenv("LLAMA_DFLASH_EV_AUTO");
-            return e == nullptr ? 2 : (atoi(e) != 0 ? 1 : 0);
+            return common_speculative_dflash_ev_auto_mode(getenv("LLAMA_DFLASH_EV_AUTO"));
         }();
         return m;
     }
@@ -1563,6 +1570,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        // LLAMA_DFLASH_FULL_BLOCK=1: a DFlash2 draft decodes the whole trained block (the anchor + block_size - 1 masks)
+        // and walks only its first n_max rows. The attention over the block is not causal, so a block cut to n_max + 1 rows changes
+        // every row's draft against the block the drafter was trained on. The blocks of one decode share one width (the selector
+        // splits the rows into equal blocks), so the whole block is used only when it fits for every drafting sequence
+        static const bool full_block = getenv("LLAMA_DFLASH_FULL_BLOCK") != nullptr && atoi(getenv("LLAMA_DFLASH_FULL_BLOCK")) != 0;
+        bool full_block_fits = is_dflash2 && full_block;
+        for (llama_seq_id seq_id = 0; full_block_fits && seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const auto & dp = dparams[seq_id];
+            if (dp.drafting && (int32_t) dp.pos0 + block_size > (int32_t) llama_n_ctx(ctx_dft)) {
+                full_block_fits = false;
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1574,12 +1594,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_draft = params.n_max;
-            // LLAMA_DFLASH_FULL_BLOCK=1: a DFlash2 draft decodes the whole trained block (the anchor + block_size - 1 masks)
-            // and walks only its first n_max rows. The attention over the block is not causal, so a block cut to n_max + 1 rows changes
-            // every row's draft against the block the drafter was trained on
-            static const bool full_block = getenv("LLAMA_DFLASH_FULL_BLOCK") != nullptr && atoi(getenv("LLAMA_DFLASH_FULL_BLOCK")) != 0;
             const int32_t n_block_tokens = is_lilicorr ? block_size :
-                (is_dflash2 && full_block && n + block_size <= (int32_t) llama_n_ctx(ctx_dft)) ? std::max<int32_t>(block_size, n_draft + 1) : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+                full_block_fits ? std::max<int32_t>(block_size, n_draft + 1) : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -2281,6 +2297,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     const bool handoff_copy = common_mtp_handoff_on("COPY");
     // LLAMA_MTP_HANDOFF_VH=0: verify_h keeps every row of a prompt ubatch, as before
     const bool verify_h_trim = handoff_copy && common_mtp_handoff_on("VH");
+    // the fewest rows a trimmed verify_h keeps: accept() also runs for another drafter's window (is_other), whose accepted
+    // count can reach that drafter's n_max (ngram-mod up to 1024), so every enabled type's longest draft is kept
+    int32_t verify_h_keep_min = 256;
 
     // LLAMA_MTP_DEV_H=1 (opt-in: decode -0.7..-1.0% on Qwen3.6 at 32 GB, Flash-Next 8k prompt -8% on an RTX PRO 6000; default = host rows, as before):
     // (single-sequence batches of LLAMA_MTP_DEV_H_MIN = 64 tokens or more) they stay on the device (llama_mtp_dev_h_attach) and the
@@ -2411,6 +2430,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
+        verify_h_keep_min = std::max<int32_t>(256, common_speculative_n_max(&params) + 2);
 
         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
@@ -2970,7 +2990,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float * h_end = handoff_copy ? tgt_row(nextn_row_offset + i_batch_end[seq_id]) : nullptr;
             if (ext && handoff_copy) {
                 // the copy below row by row (the stash breaks the rows' contiguity): the same n_keep rows and pending row
-                const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(256, n_max + 2)) : n_rows;
+                const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(verify_h_keep_min, n_max + 2)) : n_rows;
                 verify_h_kept[seq_id] = n_keep;
                 if (verify_h[seq_id].size() < (size_t) n_keep * n_embd) {
                     verify_h[seq_id].resize((size_t) n_keep * n_embd);
@@ -2985,7 +3005,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // accept() reads row min(n_accepted, n_rows - 1) and n_accepted <= n_max: a prompt ubatch (thousands of rows,
                 // 160 MiB at 4096 x 10240 floats) keeps its first n_keep rows and the last one (in pending_h), not all of them;
                 // the copy ran on the main thread after the draft was queued, with the GPU idle (LLAMA_MTP_HANDOFF_VH=0: all rows)
-                const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(256, n_max + 2)) : n_rows;
+                const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(verify_h_keep_min, n_max + 2)) : n_rows;
                 verify_h_kept[seq_id] = n_keep;
                 if (verify_h[seq_id].size() < (size_t) n_keep * n_embd) {
                     verify_h[seq_id].resize((size_t) n_keep * n_embd);

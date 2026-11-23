@@ -93,8 +93,14 @@ static __device__ __forceinline__ float op_expm1(float x) {
     return expm1f(x);
 }
 
+// log(1 + e) as before; only where 1 + e rounds to 1 (e <= 2^-24, x < -16.6, where it returned 0) it returns e = log1p(e) to F32 precision.
+// The test is on e, not on 1 + e == 1, which fast-math compilers may fold to e == 0
 static __device__ __forceinline__ float op_softplus(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+    if (x > 20.0f) {
+        return x;
+    }
+    const float e = expf(x);
+    return (e <= 5.9604644775390625e-8f) ? e : logf(1.0f + e);
 }
 
 static __device__ __forceinline__ float op_elu(float x) {

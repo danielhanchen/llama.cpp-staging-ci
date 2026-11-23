@@ -2352,6 +2352,8 @@ int llama_bench(int argc, char ** argv) {
             uint32_t n_ctx_needed = std::max<uint32_t>(inst.n_prompt + inst.n_gen + inst.n_depth, inst.fit_min_ctx);
             cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
 
+            // every benchmark ubatch is explicit (the reported one): the fit keeps it without flash attention
+            common_fit_set_ubatch_user(true);
             common_fit_params(inst.model.c_str(), &mparams, &cparams,
                 fit_tensor_split.data(),
                 fit_overrides.data(),

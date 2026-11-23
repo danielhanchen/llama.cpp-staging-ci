@@ -301,6 +301,38 @@ int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, in
     return std::min(reserve_mib, cache_mib - floor_mib);
 }
 
+void common_fit_place8_grow_of(int64_t total_full, int64_t ctx_full, int64_t total_rel, int64_t ctx_rel, int64_t & grow, int64_t & ctx_ub) {
+    ctx_ub = std::max<int64_t>(0, ctx_full - ctx_rel);
+    grow   = total_full - total_rel - ctx_ub;
+}
+
+int64_t common_fit_place8_grow_size(int64_t size_ok, int64_t size_cap, int64_t grow, int64_t ctx_ub,
+        const std::function<bool(int64_t req, int64_t & over)> & measure) {
+    constexpr int64_t MiB = 1024*1024;
+    int64_t req = std::min(size_ok + grow, size_cap);
+    for (int it = 0; it < 3 && req >= size_ok + 128*MiB; it++) {
+        int64_t over = 0;
+        if (!measure(req, over)) {
+            return -1;
+        }
+        over -= ctx_ub;
+        if (over >= 0) {
+            return req;
+        }
+        req += over - 16*MiB;
+    }
+    return -1;
+}
+
+bool common_fit_extra_lent_excluded(bool lent, bool decode_sized) {
+    return lent && !decode_sized;
+}
+
+bool common_fit_placemid_decode_sized() {
+    const char * e = getenv("LLAMA_FIT_PLACEMID_DECODE_SIZED");
+    return e == nullptr || atoi(e) != 0;
+}
+
 // (lazy KV): the MoE cache sizes a fit raised by the unbacked KV, and by how much (every fit of the process)
 static std::vector<std::pair<size_t, size_t>> g_kv_lazy_grants;
 
@@ -863,12 +895,19 @@ static void common_params_fit_impl(
             bool estimated = false; // a DFlash draft priced from its GGUF (below)
             const int nextn_main = g_fit_nextn;
             g_fit_nextn = 0; // the extra model is not the target
+            // the flash attention state and KQ reserve the placement reads are the main model's, not the extra model's
+            const bool    fa_off_main = g_fit_fa_off;
+            const int64_t kq_main     = g_fit_faoff_kq;
             try {
                 measured = common_get_device_memory_data_impl(
                     extra->path_model, &mp_x, &cp_x, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
-                g_fit_nextn = nextn_main;
+                g_fit_nextn    = nextn_main;
+                g_fit_fa_off   = fa_off_main;
+                g_fit_faoff_kq = kq_main;
             } catch (const std::runtime_error & e) {
-                g_fit_nextn = nextn_main;
+                g_fit_nextn    = nextn_main;
+                g_fit_fa_off   = fa_off_main;
+                g_fit_faoff_kq = kq_main;
                 dmds_extra = dmds_t(devs.size() + 1);
                 key_extra = key;
                 // a DFlash / DSpark draft needs its target to be created: its estimate (weights, K/V, compute and the target's growth for
@@ -920,7 +959,7 @@ static void common_params_fit_impl(
         }
 
         // a lent extra model (common_fit_extra_model::lent) holds only its context while the main model's prompt ubatches run
-        const bool lent = extra->lent && !decode_sized;
+        const bool lent = common_fit_extra_lent_excluded(extra->lent, decode_sized);
         for (size_t id = 0; id < dmds.size(); id++) {
             dmds[id].mb.model   += lent ? 0 : dmds_extra[id].mb.model;
             dmds[id].mb.context += dmds_extra[id].mb.context;
@@ -1483,7 +1522,11 @@ static void common_params_fit_impl(
             return false;
         }
         // step 3 can only spill if it is allowed to change the weight placement:
-        if (mparams->n_gpu_layers != default_mparams.n_gpu_layers || !tensor_buft_overrides ||
+        bool ts_user = false; // a tensor split given by the user (step 3 aborts on it)
+        for (size_t id = 0; mparams->tensor_split != nullptr && id < nd; id++) {
+            ts_user = ts_user || mparams->tensor_split[id] != 0.0f;
+        }
+        if (mparams->n_gpu_layers != default_mparams.n_gpu_layers || !tensor_buft_overrides || (nd > 1 && ts_user) ||
                 (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft) && tbo_user.empty()) ||
                 (nd > 1 && (!tensor_split || mparams->split_mode == LLAMA_SPLIT_MODE_ROW))) {
             return false;
@@ -1850,6 +1893,11 @@ static void common_params_fit_impl(
         if (fit_moe_cache) {
             // order: the dense weights of all layers, then the cache (up to the requested size), then experts in device memory
             const size_t size_before = cparams->moe_cache_size;
+            // the decode-sized placements below grow the cache up to the requested size, the margin part included
+            const int64_t size_cap = int64_t(std::min<size_t>(size_before, size_t(INT64_MAX)));
+            auto cap_gain = [&]() {
+                g_moe_margin_gain = std::max<int64_t>(0, std::min<int64_t>(g_moe_margin_gain, size_cap - int64_t(cparams->moe_cache_size)));
+            };
             dmds_t dmds_cpu_moe_req = dmds_cpu_moe; // the measurement at the requested cache size, for the retry below
             fit_moe_cache_size(dmds_cpu_moe, mparams, true);
             bool fits_per_device = cparams->moe_cache_size > 0;
@@ -2111,37 +2159,39 @@ static void common_params_fit_impl(
                             return true;
                         };
                         dmds_t d_s;
-                        // context that grows with n_ubatch (the KV window ring holds n_ubatch slots beside its window) keeps the
+                        // context that grows with n_ubatch (the SWA cache and the KV window ring hold n_ubatch cells beside their window) keeps the
                         // size of the full n_ubatch at run time (only the graphs are reserved at ub_rel): not part of the growth, added back below
                         int64_t ctx_ub = 0;
                         if (measure8(size_ok, d_s)) {
-                            ctx_ub = kv_win_on ? std::max<int64_t>(0, int64_t(dmds_ok[0].mb.context) - int64_t(d_s[0].mb.context)) : 0;
-                            grow   = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total()) - ctx_ub;
+                            common_fit_place8_grow_of(int64_t(dmds_ok[0].mb.total()), int64_t(dmds_ok[0].mb.context),
+                                int64_t(d_s[0].mb.total()), int64_t(d_s[0].mb.context), grow, ctx_ub);
                         }
                         // a host-bound device takes even a smaller difference (LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB, 256 as elsewhere)
                         static const int64_t hb_min = int64_t(getenv("LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB") != nullptr ?
                             std::max(1, atoi(getenv("LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB"))) : 256)*MiB;
                         if (grow >= (hostbound ? hb_min : 256*MiB)) {
-                            int64_t req = int64_t(size_ok) + grow;
-                            for (int it = 0; it < 3 && req >= int64_t(size_ok) + 128*MiB; it++) {
-                                dmds_t d8;
-                                if (!measure8(size_t(req), d8)) {
-                                    break;
-                                }
-                                const int64_t s8 = int64_t(d8[0].free) - int64_t(d8[0].mb.total()) - ctx_ub - margins[0];
-                                LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
-                                    " MiB over the margin\n", __func__, ub_rel, req/MiB, (size_t) (d8[0].mb.compute/MiB), s8/MiB);
-                                if (s8 >= 0) {
-                                    d8[0].mb.context += size_t(ctx_ub);
-                                    dmds_cpu_moe = d8;
-                                    got = true;
-                                    break;
-                                }
-                                req += s8 - 16*MiB;
+                            dmds_t d8;
+                            const int64_t req = common_fit_place8_grow_size(int64_t(size_ok), size_cap, grow, ctx_ub,
+                                [&](int64_t r, int64_t & over) {
+                                    if (!measure8(size_t(r), d8)) {
+                                        return false;
+                                    }
+                                    over = int64_t(d8[0].free) - int64_t(d8[0].mb.total()) - margins[0];
+                                    LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
+                                        " MiB over the margin\n", __func__, ub_rel, r/MiB, (size_t) (d8[0].mb.compute/MiB), (over - ctx_ub)/MiB);
+                                    return true;
+                                });
+                            if (req >= 0) {
+                                d8[0].mb.context += size_t(ctx_ub);
+                                dmds_cpu_moe = d8;
+                                got = true;
                             }
                         }
                         cparams->n_ubatch = ub_full;
                         p8_got = got;
+                        if (got) {
+                            cap_gain();
+                        }
                         if (got) {
                             LOG_INF("%s: small device: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> "
                                 "%zu MiB; ubatches of more than %u tokens run with the cache banks released (LLAMA_FIT_PLACE8=0 off)\n",
@@ -2310,6 +2360,9 @@ static void common_params_fit_impl(
                     int64_t        grow    = 0;
                     cparams->n_ubatch = ub_rel;
                     common_fit_place8_env(ub_rel, true, 0, false, devs[0]);
+                    // decode-sized as in the small-device branch: the cache sized here is resident at decode beside a lent drafter's
+                    // device weights and compute buffers (only prompt ubatches over ub_rel run with the banks released and borrow them)
+                    const bool mid_decode = common_fit_placemid_decode_sized();
                     auto measure_mid = [&](size_t cache, dmds_t & d) {
                         cparams->moe_cache_size = cache;
                         try {
@@ -2317,37 +2370,44 @@ static void common_params_fit_impl(
                         } catch (const std::runtime_error &) {
                             return false;
                         }
-                        add_extra_memory(d);
+                        add_extra_memory(d, nullptr, nullptr, mid_decode);
                         return true;
                     };
                     dmds_t d_s;
+                    int64_t ctx_ub = 0; // context that keeps its full-n_ubatch size at run time, as in the small-device branch
                     if (measure_mid(size_ok, d_s)) {
-                        grow = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total());
+                        common_fit_place8_grow_of(int64_t(dmds_ok[0].mb.total()), int64_t(dmds_ok[0].mb.context),
+                            int64_t(d_s[0].mb.total()), int64_t(d_s[0].mb.context), grow, ctx_ub);
                     }
                     if (grow >= 256*MiB && double(grow) >= placemid_min_frac*double(size_ok)) {
-                        int64_t req = int64_t(size_ok) + grow;
-                        for (int it = 0; it < 3 && req >= int64_t(size_ok) + 128*MiB; it++) {
-                            dmds_t dm;
-                            if (!measure_mid(size_t(req), dm)) {
-                                break;
-                            }
-                            const int64_t sm = int64_t(dm[0].free) - int64_t(dm[0].mb.total()) - margins[0];
-                            LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
-                                " MiB over the margin\n", __func__, ub_rel, req/MiB, (size_t) (dm[0].mb.compute/MiB), sm/MiB);
-                            if (sm >= 0) {
-                                dmds_cpu_moe = dm;
-                                got = true;
-                                break;
-                            }
-                            req += sm - 16*MiB;
+                        dmds_t dm;
+                        const int64_t req = common_fit_place8_grow_size(int64_t(size_ok), size_cap, grow, ctx_ub,
+                            [&](int64_t r, int64_t & over) {
+                                if (!measure_mid(size_t(r), dm)) {
+                                    return false;
+                                }
+                                over = int64_t(dm[0].free) - int64_t(dm[0].mb.total()) - margins[0];
+                                LOG_TRC("%s: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
+                                    " MiB over the margin\n", __func__, ub_rel, r/MiB, (size_t) (dm[0].mb.compute/MiB), (over - ctx_ub)/MiB);
+                                return true;
+                            });
+                        if (req >= 0) {
+                            dm[0].mb.context += size_t(ctx_ub);
+                            dmds_cpu_moe = dm;
+                            got = true;
                         }
                     }
                     cparams->n_ubatch = ub_full;
                     if (got) {
+                        cap_gain();
                         common_fit_place8_env(ub_rel, true, grow/MiB, false, devs[0]);
                         LOG_INF("%s: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> %zu MiB; "
                             "ubatches of more than %u tokens run with the cache banks released, layer-major groups as before ("
                             "LLAMA_FIT_PLACEMID=0 off)\n", __func__, grow/MiB, (size_t) (size_ok/MiB), (size_t) (cparams->moe_cache_size/MiB), ub_rel);
+                        if (extra != nullptr && extra->lent) {
+                            LOG_INF("%s: the lent drafter beside that cache is counted with %s (LLAMA_FIT_PLACEMID_DECODE_SIZED=%d)\n", __func__,
+                                mid_decode ? "its device weights and compute buffers" : "its context only", mid_decode ? 1 : 0);
+                        }
                     } else {
                         common_fit_place8_env(0);
                         cparams->moe_cache_size = size_ok;
@@ -3015,14 +3075,16 @@ std::vector<size_t> common_fit_margin_steps_mib(const char * spec) {
     return steps;
 }
 
-std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size_t> & margins, const std::vector<size_t> & steps) {
+std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size_t> & margins, const std::vector<size_t> & steps,
+                                                           const std::vector<size_t> & reserve) {
     std::vector<std::vector<size_t>> trials;
     for (const size_t step : steps) {
         std::vector<size_t> mg = margins;
         bool lower = false;
-        for (auto & m : mg) {
-            if (m > step) {
-                m = step;
+        for (size_t i = 0; i < mg.size(); i++) {
+            const size_t r = i < reserve.size() ? std::min(reserve[i], mg[i]) : 0;
+            if (mg[i] - r > step) {
+                mg[i] = step + r;
                 lower = true;
             }
         }
@@ -3031,6 +3093,21 @@ std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size
         }
     }
     return trials;
+}
+
+std::vector<size_t> common_fit_margin_reserve(const std::vector<size_t> & margins, const std::vector<size_t> & defaults) {
+    std::vector<size_t> reserve(margins.size(), 0);
+    for (size_t i = 0; i < margins.size() && i < defaults.size(); i++) {
+        reserve[i] = margins[i] > defaults[i] ? margins[i] - defaults[i] : 0;
+    }
+    return reserve;
+}
+
+bool common_fit_plain_spill_proj_ok(bool proj_gpu, bool devices_given, const std::vector<size_t> & reserve) {
+    if (!proj_gpu) {
+        return true;
+    }
+    return !devices_given && std::any_of(reserve.begin(), reserve.end(), [](size_t r) { return r > 0; });
 }
 
 bool common_fit_plain_spill_gate(const std::vector<int> & headless, const char * force) {

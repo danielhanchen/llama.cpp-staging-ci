@@ -69,6 +69,34 @@
 
 static bool moe_cache_released_counts(); // (defined beside moe_cache_refill_from_ids)
 
+// whether every device of the model runs GGML_OP_KQ_MASK: a device without it (Metal, Vulkan, the meta device of -sm tensor) gets the
+// device KQ mask as a CPU split and a copy of the mask, where the host mask has the same values in an input; then the graphs keep the
+// host mask. LLAMA_KQ_MASK_DEVICE_CHECK=0: the device mask regardless, as before
+static bool model_devices_kq_mask(const llama_model & model) {
+    static const bool check = getenv("LLAMA_KQ_MASK_DEVICE_CHECK") == nullptr || atoi(getenv("LLAMA_KQ_MASK_DEVICE_CHECK")) != 0;
+    if (!check || model.devices.empty()) {
+        return true;
+    }
+    ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return true;
+    }
+    ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 5, 256, 1);
+    ggml_tensor * toks  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 8, 64, 1);
+    bool ok = true;
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        ggml_tensor * m = ggml_kq_mask(ctx, cells, toks, type);
+        for (const auto & d : model.devices) {
+            if (d.dev != nullptr && !ggml_backend_dev_supports_op(d.dev, m)) {
+                ok = false;
+            }
+        }
+    }
+    ggml_free(ctx);
+    return ok;
+}
+
 // the lowest compute capability (major*100 + minor*10) of the model's GPU devices, -1 if one is not a CUDA device or there is none
 static int model_gpu_min_cc(const llama_model & model) {
     int cc_min = -1;
@@ -500,6 +528,7 @@ llama_context::llama_context(
     cparams.exact_split             = 0;
     cparams.dsv41_far               = 0;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.kq_mask_dev             = model_devices_kq_mask(model);
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -629,6 +658,7 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.kv_f16     = params.type_k == GGML_TYPE_F16 && params.type_v == GGML_TYPE_F16;
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
@@ -650,6 +680,10 @@ llama_context::llama_context(
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+    // the rows of an exact verify ubatch with one attention per row: the outputs a caller allows per ubatch (the server sets
+    // n_outputs_max to its drafter's verify windows), else 64; decode splits a longer verify batch, whose rows are batch invariant
+    cparams.n_exact_rows = std::max<uint32_t>(1u, std::min({ cparams.n_ubatch,
+            params.n_outputs_max > 0 && !llama_model_has_encoder(&model) ? cparams.n_outputs_max : 64u }));
 
     // one top-k over all the verify rows of a sequence instead of one per row, where the output device's top-k returns
     // for each row of a multi-row input what that row alone returns (same set, same order): the CPU (std::partial_sort per row) and
@@ -1311,9 +1345,7 @@ llama_context::llama_context(
             place8_rel      = true;
             moe_cache->set_restore_soft(true);
             if (const char * el = getenv("LLAMA_MOE_PLACE8_LEND"); el != nullptr && atoi(el) != 0 && llama_mtp_draft_lend_on()) {
-                place8_lend = true;
-                std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
-                llama_place8_lend_tgts.push_back(this);
+                place8_lend = true; // registered at the end of the constructor (llama_place8_lend_tgts)
             }
             tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
             // (LLAMA_MOE_PLACE8_MID, set with it by the fit of a mid-size device): prompts keep their layer-major groups,
@@ -1931,6 +1963,12 @@ llama_context::llama_context(
         std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
         llama_mtp_ctxs.push_back(this);
     }
+    // a lending target too: a constructor that throws before here never runs the destructor that unregisters it, and the
+    // retry with a smaller MoE cache (common_init_from_params) would leave the drafter's restore reading the freed context
+    if (place8_lend) {
+        std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+        llama_place8_lend_tgts.push_back(this);
+    }
 }
 
 // the evictable weights a drafter lends exist only with mtp_borrow_io, which sets model_shared
@@ -1945,6 +1983,12 @@ void llama_context::small_plan_free(uint32_t i) {
     }
 }
 
+// the tensors of the largest commit graph: per cell and recurrent layer at most 11 for the delta-net replay and 6 for the conv
+// histories (rs_commit_build), with room to spare; at least the earlier fixed 16384, which many sequence slots outgrew
+static size_t rs_commit_max_nodes(const llama_memory_recurrent * mem, size_t n_cells) {
+    return std::max<size_t>(16384, n_cells * mem->s_l.size() * 20 + 64);
+}
+
 // the backend the commit graphs run on, and (one backend) a fallback allocation of the largest commit graph reserved at
 // load. T4, Qwen3.6 3-bit quant + MTP at a 4 GB tier, 32k: the device was full by the 2k request (CUDA graph instances
 // out of memory too) and the 2.05 MiB allocation of a new commit graph aborted the server in 8 of 8 launches. A commit now drops the
@@ -1954,7 +1998,7 @@ void llama_context::rs_replay_setup() {
     if (mem == nullptr || rs_mode != 0) {
         return;
     }
-    const size_t max_nodes = 16384;
+    const size_t max_nodes = rs_commit_max_nodes(mem, mem->size);
     const bool sched_only = getenv("LLAMA_RS_REPLAY_SCHED") != nullptr && atoi(getenv("LLAMA_RS_REPLAY_SCHED")) != 0;
     bool one = !sched_only;
     auto chk = [&](const ggml_tensor * t) {
@@ -2124,7 +2168,7 @@ void llama_context::rs_replay_commit(bool sync) {
         return;
     }
     const int64_t t0 = ggml_time_us();
-    const size_t max_nodes = 16384;
+    const size_t max_nodes = rs_commit_max_nodes(mem, mem->size);
     if (rs_mode == 0) {
         rs_replay_setup();
     }
@@ -2295,10 +2339,12 @@ void llama_context::rs_replay_commit(bool sync) {
         rs_graphs.clear();
         rs_ga_bytes = 0;
     }
-    ggml_init_params ip = { ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true };
+    // this commit's cells only (five key entries each)
+    const size_t max_nodes_g = rs_commit_max_nodes(mem, key.size()/5);
+    ggml_init_params ip = { ggml_tensor_overhead()*max_nodes_g + ggml_graph_overhead_custom(max_nodes_g, false), nullptr, true };
     ggml_context_ptr ctx_own { ggml_init(ip) };
     ggml_context * ctx = ctx_own.get();
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes_g, false);
     rs_commit_build(ctx, gf, /*worst =*/ false);
     if (ggml_graph_n_nodes(gf) > 0) {
         rs_graph e;
@@ -4698,8 +4744,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     // (cudaMallocHost, 320 MiB at n_batch 8192) ran beside the layer-major group but held the driver lock, so the request's own launches
     // waited on it: RTX PRO 6000 Flash-Next 4-bit quant + Q8_0 MTP drafter 48 GB, 42 ms of the first 8k / 30k request (cudaEventRecord blocked 42.6 ms).
     // The same store the first long prompt would make (it never shrinks); without a MoE cache the prompt rows go to the device sink
+    // (LLAMA_NEXTN_PREALLOC_NOCACHE=0: beside a MoE cache only, as before): without one the store is pinned at load as well, since
+    // the first prompt of a full ubatch still grows it to n_batch rows on its path: A100 80 GB full card, Flash-Next 4-bit + Q8_0 MTP
+    // drafter, n_batch 2048 (80 MiB), the first 8k request waited ~40 ms before its first kernel (sync, free, cudaMallocHost)
     static const bool prealloc = getenv("LLAMA_NEXTN_PREALLOC") == nullptr || atoi(getenv("LLAMA_NEXTN_PREALLOC")) != 0;
-    if (prealloc && value && !masked && moe_cache && (!buf_nextn || nextn_cap_rows < cparams.n_batch)) {
+    static const bool prealloc_nocache = getenv("LLAMA_NEXTN_PREALLOC_NOCACHE") == nullptr || atoi(getenv("LLAMA_NEXTN_PREALLOC_NOCACHE")) != 0;
+    if (prealloc && value && !masked && (moe_cache || prealloc_nocache) && (!buf_nextn || nextn_cap_rows < cparams.n_batch)) {
         static const bool nextn_lazy = getenv("LLAMA_NEXTN_LAZY") == nullptr || atoi(getenv("LLAMA_NEXTN_LAZY")) != 0;
         if (nextn_lazy) {
             const int64_t t0 = ggml_time_us();
@@ -5340,22 +5390,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // a kept small graph built for these parameters goes back into the scheduler: only its allocation is redone (the same
     // graph allocates to the same addresses, so its CUDA graph is replayed as captured)
     auto small_swap_in = [&]() -> bool {
+        const gf_small_modes & km = gf_res_small_modes[i_small];
         if (n_small == 0 || gf == nullptr || !gf_res_small_built[i_small] || gf_res_small_epoch[i_small] != gf_res_epoch ||
-                moe_cache_seed_graph != moe_cache_seed || moe_cache_hybrid_graph != moe_cache_hybrid || moe_cache_devseed_graph != moe_cache_devseed ||
-                moe_inplace_graph != moe_inplace_ok ||
+                km.seed != moe_cache_seed || km.hybrid != moe_cache_hybrid || km.devseed != moe_cache_devseed ||
+                km.inplace != moe_inplace_ok ||
                 !res->can_reuse(gparams)) {
             // debug (LLAMA_GRAPH_SMALL_WHY=N): the first condition that refused the kept graph, for up to N refusals
             static int why_left = getenv("LLAMA_GRAPH_SMALL_WHY") ? atoi(getenv("LLAMA_GRAPH_SMALL_WHY")) : 0;
             if (n_small > 0 && gf != nullptr && why_left > 0) {
                 why_left--;
                 const char * why = !gf_res_small_built[i_small] ? "not built" : gf_res_small_epoch[i_small] != gf_res_epoch ? "epoch" :
-                    moe_cache_seed_graph != moe_cache_seed ? "seed mode" : moe_cache_hybrid_graph != moe_cache_hybrid ? "hybrid mode" :
-                    moe_cache_devseed_graph != moe_cache_devseed ? "devseed mode" : moe_inplace_graph != moe_inplace_ok ? "inplace" : "can_reuse";
+                    km.seed != moe_cache_seed ? "seed mode" : km.hybrid != moe_cache_hybrid ? "hybrid mode" :
+                    km.devseed != moe_cache_devseed ? "devseed mode" : km.inplace != moe_inplace_ok ? "inplace" : "can_reuse";
                 LLAMA_LOG_INFO("%s: kept graph for %u tokens (way %u) not reused: %s (epoch %llu / %llu)\n", __func__, n_small, i_small % GF_SMALL_WAYS,
                     why, (unsigned long long) gf_res_small_epoch[i_small], (unsigned long long) gf_res_epoch);
             }
             return false;
         }
+        // the graph now in the scheduler is this one: the reuse check of the next ubatch compares against its modes
+        moe_cache_seed_graph    = km.seed;
+        moe_cache_hybrid_graph  = km.hybrid;
+        moe_cache_devseed_graph = km.devseed;
+        moe_inplace_graph       = km.inplace;
         gf_res_prev_active = nullptr; // (not an invalidation of the kept small graphs)
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -5576,6 +5632,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         moe_cache_hybrid_graph = moe_cache_hybrid;
         // the seed plans are enabled in the op params of the graph, a reused graph keeps them (and may be replayed as captured)
         moe_cache_devseed_graph = moe_cache_devseed;
+        if (n_small > 0) {
+            gf_res_small_modes[i_small] = { moe_cache_seed, moe_cache_hybrid, moe_cache_devseed, moe_inplace_ok };
+        }
     }
 
     if (t_tr0) {
@@ -5796,6 +5855,19 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     // TODO: this is a tmp solution until we have a proper way to support enc-dec models
     //       ref: upstream llama.cpp discussion of this case
     cparams.causal_attn = false;
+
+    // a model without a memory module runs its whole sequence here (decode() calls encode()): with the graphs reserved at the decode
+    // size (the fit's decode-sized placement), a longer sequence runs with the cache banks released and a shorter one gets them back,
+    // as the ubatches of decode() do. Before, the banks stayed and the compute buffers grew into the memory the fit gave them
+    if (tiny_rel_ub > 0 && moe_cache) {
+        if ((int64_t) n_tokens > tiny_rel_ub) {
+            if (!moe_cache->released()) {
+                tiny_rel_enter("encode");
+            }
+        } else if (tiny_rel_held) {
+            tiny_rel_leave();
+        }
+    }
 
     ggml_status status;
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
@@ -6358,8 +6430,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // 12 GB 391 -> 359 ms (base 361), decode unchanged or better (12 GB 137.2 -> 137.8, 16 GB 150.5 -> 162.6 tok/s, other texts)
     static const int64_t place8_chunk_env = getenv("LLAMA_MOE_PLACE8_CHUNK_MAX") ? std::max(0, atoi(getenv("LLAMA_MOE_PLACE8_CHUNK_MAX"))) : -1;
     const int64_t place8_chunk_max = place8_chunk_env >= 0 ? place8_chunk_env : (place8_grow > 0 && !place8_lean ? 64 : 0);
-    const uint32_t n_ubatch_split = place8_rel && place8_chunk_max > 0 && tiny_rel_ub > 0 && !cparams.verify && !embd_all &&
+    // (a recurrent memory keeps the last 1 + n_rs_seq tokens of a sequence in one ubatch, so the split needs ubatches longer than
+    // that: deeper speculative windows than the decode size can hold keep the one-ubatch prompt instead)
+    const bool place8_split_ok = cparams.n_rs_seq == 0 || (int64_t) tiny_rel_ub > (int64_t) cparams.n_rs_seq + 1;
+    uint32_t n_ubatch_split = place8_rel && place8_chunk_max > 0 && tiny_rel_ub > 0 && !cparams.verify && !embd_all && place8_split_ok &&
         (int64_t) n_tokens_all > tiny_rel_ub && (int64_t) n_tokens_all <= place8_chunk_max ? (uint32_t) tiny_rel_ub : cparams.n_ubatch;
+    // an exact verify batch with one attention per row runs as ubatches of at most the rows graph_max_nodes budgets (rows without
+    // outputs can exceed n_outputs_max); its rows are batch invariant, so the split leaves every row's bytes unchanged
+    if (exact_verify && exact_rows_per_query()) {
+        n_ubatch_split = std::min(n_ubatch_split, exact_rows_max());
+    }
 
     while (true) {
         mctx = memory->init_batch(*balloc, n_ubatch_split, embd_all);
@@ -6489,7 +6569,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     for (bool more = true; more; ) {
         // the state before the ubatch that starts at the capture index (a layer-major group captures inside its graph)
         for (int s = 0; s < cap_max; ++s) {
-            if (cap[s].idx >= 0 && !cap[s].done && n_tokens_prev == cap[s].idx) {
+            if (cap[s].idx >= 0 && !cap[s].done && n_tokens_prev == cap[s].idx && cap_starts(s, mctx->get_ubatch())) {
                 cap_now(s, mctx->get_ubatch().pos[0] - 1);
             }
         }
@@ -7239,7 +7319,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // Where the group will release the banks (a tiny cache, the member is not the first: the group has 2+ members), that lookup
         // aborted ("the MoE cache is too small": one slot is left). Such a member is built as a large ubatch, as the tail and a ubatch
         // under the tiny-ubatch release are: the narrowed layer reads the host experts. Groups that keep their banks are unchanged
-        const bool out_large = !tail && n_out > 0 && k >= 1 && lm_release_on() && lm_tiny_cache(moe_cache->cache_frac());
+        // Also with the graphs reserved at the decode size (place8_rel: the group releases the banks however large the cache), and
+        // while the banks are still released from a ubatch before the group (they have no memory to read; any member)
+        const bool out_large = !tail && n_out > 0 && lm_release_on() &&
+            ((k >= 1 && (lm_tiny_cache(moe_cache->cache_frac()) || place8_rel)) || moe_cache->released());
         if (tail || out_large) {
             moe_cache->set_force_large(true);
         }
@@ -7533,7 +7616,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         cap_k_group[c] = -1;
         if (cap[c].idx >= 0 && !cap[c].done) {
             for (size_t k = 1; k < group.size(); ++k) {
-                if (group[k].n_tokens_before == cap[c].idx) {
+                if (group[k].n_tokens_before == cap[c].idx && cap_starts(c, *group[k].ub)) {
                     cap_k_group[c] = (int) k;
                 }
             }
@@ -7715,6 +7798,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     }
     const bool lm_release_env = lm_release_on();
     bool lm_released = false;
+    // the banks were released before the group, by a large ubatch that ran alone before it (tiny_rel_enter; e.g. the first ubatch of
+    // a batch of two prompts holds both sequences and runs outside a group) and stay released through it: the release below finds
+    // nothing to release, and the group must not seed or replay into banks that have no memory (the seed copied into a bank without
+    // a buffer). It runs as the ubatches of a released window do: no seed, the banks come back after it
+    const bool lm_rel_before = moe_cache->released();
+    if (lm_rel_before) {
+        static int n_rel_before_log = 0;
+        if (n_rel_before_log++ < 4) {
+            LLAMA_LOG_INFO("%s: a layer-major group after released banks (%zu ubatches): it does not seed the cache\n", __func__, group.size());
+        }
+    }
     // the release also where the cache is above LLAMA_MOE_LM_RELEASE_FRAC but the group's merged graph does not allocate in
     // the free memory (it would be split): 3-bit 4 GB without MTP holds 5.1% of the host experts at ctx 16384 (699 MiB) and 4.5% at 20480;
     // at 5.1% the 16-ubatch group of an 8k prompt was split in halves down to single ubatches (T4 8k prompt 440 vs 830 tok/s, RTX PRO 6000 2063 vs
@@ -7931,7 +8025,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     static const bool lm_replay_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY")) != 0;
     size_t rp_k = 0; // members before the break (0: no replay)
     // merge: a group whose cache banks were released seeds nothing, so it replays nothing either
-    if (!lm_released && lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
+    if (!lm_released && !lm_rel_before && lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
         const auto & last = group.back();
         const int64_t b = last.n_tokens_before;
         const auto & brk = balloc->ubatch_breaks;
@@ -7941,7 +8035,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             rp_k = group.size() - 1;
         }
     }
-    if (!lm_released && lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
+    if (!lm_released && !lm_rel_before && lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
         // with the replay: the seed of the batch that ends at the break
         const int64_t n_seed_all = rp_k > 0 ? group[rp_k].n_tokens_before : n_tokens_all;
         for (size_t k = 0; k < (rp_k > 0 ? rp_k : group.size()); ++k) {
@@ -8396,6 +8490,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             srcs.emplace_back(node, arr);
         }
         lm_merged_active = true;
+        moe_cache->set_lm_merged(true);
         ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
         // (LLAMA_MOE_LM_LEND=0 off): a merged graph whose compute buffers would grow past the free memory borrows its allocation from the
         // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
@@ -8471,6 +8566,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
         lm_merged_active = false;
+        moe_cache->set_lm_merged(false);
         if (st != GGML_STATUS_ALLOC_FAILED) {
             n_sub++;
             if (st == GGML_STATUS_SUCCESS) {
@@ -9434,12 +9530,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     // LLAMA_EXACT_FA_GROUP=0 (kill switch of grouping) builds one attention per query of a batch invariant verify
     // batch: 4 views, the mask copy, the attention and the concat per query and layer. The 8 x n_tensors budget of a small dense model
     // ran out there (T4 Phi-4-mini Q4_K_M, kill-switch set, n-gram verify window: GGML_ASSERT(obj_new) in ggml_flash_attn_ext)
-    static const bool fa_group_off = [] {
-        const char * e = getenv("LLAMA_EXACT_FA_GROUP");
-        return e != nullptr && atoi(e) == 0;
-    }();
-    if (fa_group_off) {
-        res += 8u * model.hparams.n_layer() * std::min<uint32_t>(n_tokens, 64u);
+    // queries share one attention node only over F16 K and V, so a cache of another type (q8_0) builds one per query as well
+    // (RTX PRO 6000 Qwen3-1.7B Q4_K_M, -ctk q8_0 -ctv q8_0 -fa on, default n-gram verify window: GGML_ASSERT(obj_new) in build_attn_mha).
+    // The rows of such a ubatch are at most exact_rows_max() (the drafter's verify windows where the caller sets n_outputs_max), and
+    // decode splits a verify batch with more rows, so the budget follows the longest window instead of n_ubatch
+    if (exact_rows_per_query()) {
+        res += 8u * model.hparams.n_layer() * std::min<uint32_t>(n_tokens, exact_rows_max());
     }
 
     if (cparams.training) {
@@ -9447,6 +9543,18 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     }
 
     return res;
+}
+
+bool llama_context::exact_rows_per_query() const {
+    static const bool fa_group_off = [] {
+        const char * e = getenv("LLAMA_EXACT_FA_GROUP");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    return fa_group_off || (cparams.flash_attn && !cparams.kv_f16);
+}
+
+uint32_t llama_context::exact_rows_max() const {
+    return std::max<uint32_t>(1u, std::min(cparams.n_ctx, cparams.n_exact_rows));
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
@@ -13609,11 +13717,25 @@ bool llama_context::cap_prepare(int s) {
             return false;
         }
         r.view = ggml_view_1d(C.ctx.get(), r.t, (int64_t) (r.size/ggml_type_size(r.t->type)), r.off);
+        // the copy paths of backends without a view-aware async copy (CPU, Metal, SYCL) read the view's own buffer
+        if (ggml_backend_view_init(r.view) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
         off += r.size;
     }
     C.cell    = (uint32_t) cell;
     C.regions = std::move(rg);
     return true;
+}
+
+// the ubatch about to run starts at the batch row of capture s, a row of its sequence: with several sequences in a batch the
+// equal split interleaves their rows, and the count of the rows run before it alone does not place the capture (the
+// snapshot would hold another number of the sequence's tokens than its label says)
+bool llama_context::cap_starts(int s, const llama_ubatch & ub) const {
+    if (ub.n_tokens == 0 || ub.data == nullptr || ub.data->batch_idxs.empty()) {
+        return true; // no row map: as before
+    }
+    return ub.data->batch_idxs[0] == cap[s].idx && ub.n_seq_id[0] >= 1 && ub.seq_id[0][0] == cap[s].seq;
 }
 
 void llama_context::cap_now(int s, llama_pos pos) {

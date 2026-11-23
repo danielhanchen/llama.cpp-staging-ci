@@ -16,7 +16,11 @@ static __device__ __forceinline__ float gdn_gate_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 static __device__ __forceinline__ float gdn_gate_softplus(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+    if (x > 20.0f) {
+        return x;
+    }
+    const float e = expf(x);
+    return (e <= 5.9604644775390625e-8f) ? e : logf(1.0f + e);
 }
 
 // One token of the (non-KDA) recurrence for the state column a segment of lanes_per_col lanes owns. The AR kernel and the
@@ -95,7 +99,8 @@ gated_delta_net_cuda(const float * q,
                                      const float * ga,
                                      const float * ga_bias,
                                      const float * ga_scale,
-                                     const gdn_win_args wa) {
+                                     const gdn_win_args wa,
+                                     int64_t       n_tokens_dst) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
 
@@ -125,7 +130,7 @@ gated_delta_net_cuda(const float * q,
     if (s_ids == nullptr) {
         curr_state += state_in_offset + col * S_v;
     }
-    attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+    attn_data += (sequence * n_tokens_dst * H + h_idx) * S_v;
 
     float         s_shard[rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
@@ -436,7 +441,8 @@ gated_delta_net_tiled_cuda(const float * q,
     }
 }
 
-// GGML_CUDA_GDN_TILED: 0 = never, 1 = on every arch (tests / timing), unset = the per-arch default (RDNA3.5 at 1024+ tokens and 16+ heads)
+// GGML_CUDA_GDN_TILED: 0 = never, 1 = on every arch (tests / timing), unset = the per-arch default (RDNA3.5 and A100 at 1024+ tokens
+// and 16+ heads)
 static int ggml_cuda_gdn_tiled_env() {
     static const int value = []() {
         const char * env = getenv("GGML_CUDA_GDN_TILED");
@@ -467,8 +473,9 @@ static bool gdn_use_tiled(int device, int64_t S_v, int64_t n_heads, int64_t n_to
     if (env >= 0) {
         return env != 0;
     }
-    return GGML_CUDA_CC_IS_RDNA3_5(info.cc) && n_tokens >= gdn_tiled_rdna3_5_min_tokens &&
-        n_heads >= gdn_tiled_rdna3_5_min_heads;
+    // A100 (cc 8.0, no chunked mma kernel by default): the same thresholds; Flash-Next 4-bit 8k prompt -17..-19 ms on the full card
+    const bool arch = GGML_CUDA_CC_IS_RDNA3_5(info.cc) || (GGML_CUDA_CC_IS_NVIDIA(info.cc) && info.cc == GGML_CUDA_CC_AMPERE);
+    return arch && n_tokens >= gdn_tiled_rdna3_5_min_tokens && n_heads >= gdn_tiled_rdna3_5_min_heads;
 }
 
 template <int S_v, bool keep_rs_t, int num_warps>
@@ -531,7 +538,11 @@ static void launch_gated_delta_net(
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row_stride,
         const float * beta_raw, const float * ga, const float * ga_bias, const float * ga_scale, cudaStream_t stream,
-        const gdn_win_args wa = {}) {
+        const gdn_win_args wa = {}, int64_t n_tokens_dst = -1) {
+    // tokens per sequence of the output rows: a trailing part of the op's tokens writes into the rows of the whole op
+    if (n_tokens_dst < 0) {
+        n_tokens_dst = n_tokens;
+    }
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
@@ -552,7 +563,7 @@ static void launch_gated_delta_net(
     if constexpr (!KDA) {
         // the tiled kernel reads neither an in-place state (s_ids, commit 24dbe0fcacd) nor raw gates (commit 153a4696ebb): those run the
         // AR kernel, as they skip the chunked MMA kernel
-        if (!WIN && s_ids == nullptr && beta_raw == nullptr && ga == nullptr && gdn_use_tiled(ggml_cuda_get_device(), S_v, H*n_seqs, n_tokens)) {
+        if (!WIN && s_ids == nullptr && beta_raw == nullptr && ga == nullptr && n_tokens_dst == n_tokens && gdn_use_tiled(ggml_cuda_get_device(), S_v, H*n_seqs, n_tokens)) {
             // GGML_CUDA_GDN_TILED_LOG=1: every launch (test-gdn-tiled-exact counts them), else the first one
             static const bool log_all = getenv("GGML_CUDA_GDN_TILED_LOG") != nullptr && atoi(getenv("GGML_CUDA_GDN_TILED_LOG")) != 0;
             static std::atomic<bool> logged {false};
@@ -576,26 +587,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, WIN>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, wa);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, wa, n_tokens_dst);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, WIN>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, wa);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, wa, n_tokens_dst);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, WIN>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, wa);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, wa, n_tokens_dst);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, WIN>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, wa);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, wa, n_tokens_dst);
             break;
         }
         default:
@@ -604,6 +615,16 @@ static void launch_gated_delta_net(
 }
 
 static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tensor * dst);
+
+// GGML_CUDA_GDN_MMA_SNAP=0: an op with K > 1 snapshot slots runs the per-token kernel over all of its tokens (the chunked kernel
+// only takes K == 1). Default: the chunked kernel up to the last K - 1 tokens, the per-token kernel for those
+static bool ggml_cuda_gdn_mma_snap_split() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_GDN_MMA_SNAP");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
 
 // whether ggml_cuda_op_gated_delta_net may take the mma kernel for dst (the predicate of ggml_cuda_gdn_mma_args_from_tensor).
 // (GGML_CUDA_GDN_FUSE_PRED=0: the shape-only test as before): the dispatch itself, so that the fusions which make the op
@@ -647,6 +668,9 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
 
     const int64_t S_v = v->ne[0];
     const int64_t H   = v->ne[1];
+    // K > 1 snapshot slots: the chunked kernel runs the first n_tokens - (K - 1) tokens and writes its final state into slot
+    // K - 1; the per-token kernel continues from that state over the last K - 1 tokens and writes slots K - 2 .. 0
+    const int     K   = ggml_get_op_params_i32(dst, 0);
     return {
         (const float *) q->data,
         (const float *) k->data,
@@ -658,7 +682,7 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
         nullptr,
         H,
         q->ne[1],
-        v->ne[2],
+        v->ne[2] - (K > 1 ? K - 1 : 0),
         v->ne[3],
         v->ne[3] / q->ne[3],
         (int64_t) (q->nb[1] / sizeof(float)),
@@ -671,7 +695,8 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
         (int64_t) (beta->nb[2] / sizeof(float)),
         (int64_t) (beta->nb[3] / sizeof(float)),
         1.0f / sqrtf((float) S_v),
-        g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && S_v == 128 && q->ne[0] == 128,
+        g->ne[0] == 1 && K < v->ne[2] && (K == 1 || ggml_cuda_gdn_mma_snap_split()) && S_v == 128 && q->ne[0] == 128,
+        v->ne[2],
     };
 }
 
@@ -815,8 +840,19 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     if (s_ids == nullptr && beta_raw == nullptr && ga == nullptr) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
-        args.state_out = state_d;
+        float * mma_state = state_d + (keep_rs ? (int64_t) (K - 1) * state_slot_stride : 0);
+        args.state_out = mma_state;
         if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+            if (keep_rs) {
+                // the last K - 1 tokens from the state of the chunked part: snapshot slots K - 2 .. 0, the AR kernel's mapping
+                const int64_t t0 = args.n_tokens;
+                GGML_ASSERT(!kda && t0 + K - 1 == n_tokens);
+                launch_gated_delta_net<false, true>(q_d + t0 * sq2, k_d + t0 * sq2, v_d + t0 * sv2, g_d + t0 * sb2, b_d + t0 * sb2,
+                    mma_state, dst_d + t0 * S_v * H, state_d,
+                    S_v, H, K - 1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, nullptr, 0, nullptr, nullptr, nullptr, nullptr, stream,
+                    {}, n_tokens);
+            }
             return;
         }
     }

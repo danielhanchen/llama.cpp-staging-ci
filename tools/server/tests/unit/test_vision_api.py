@@ -204,3 +204,21 @@ def test_vision_embeddings_oai_content():
     # same prompt and image in both formats
     assert data[0]["embedding"] == data[1]["embedding"]
     assert data[0]["embedding"] != data[2]["embedding"]
+
+
+def test_vision_text_only_with_ngram_drafter():
+    # a text-only request on a multimodal server with the n-gram suffix drafter must not abort
+    global server
+    server.spec_type = "ngram-suffix"
+    server.n_slots = 1
+    server.start()
+    phrase = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen. "
+    res = server.make_request("POST", "/completion", data={
+        "prompt": phrase * 8 + "one two three four five",
+        "n_predict": 32,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200
+    assert res.body["tokens_predicted"] > 0
+    res = server.make_request("GET", "/health")
+    assert res.status_code == 200

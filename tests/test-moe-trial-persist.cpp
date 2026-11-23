@@ -95,6 +95,12 @@ int main() {
         std::vector<tp::rec> back;
         CHECK(tp::parse_line(line, tag12, back) && same(r, back), "round trip of %s", line.c_str());
         CHECK(!tp::parse_line(line, tag8, back), "another tag must not parse");
+        // LLAMA_MOE_CPU_MISS_MARGIN_TRUST=0 keeps a history of its own; the default tag is unchanged
+        const std::string tag12_nt = tp::tag_of(4241, 40, 32, false);
+        CHECK(tag12 == "trials|slots=4241|layers=40|max_batch=32", "default tag changed: %s", tag12.c_str());
+        CHECK(!tp::parse_line(line, tag12_nt, back), "a trust-off launch must not replay a trusted history");
+        CHECK(tp::parse_line(tp::format_line(tag12_nt, r), tag12_nt, back) && same(r, back), "round trip under the trust-off tag");
+        CHECK(!tp::parse_line(tp::format_line(tag12_nt, r), tag12, back), "a trusted launch must not read the trust-off history");
         CHECK(!tp::parse_line(tag12 + " 2 0:1:128:40:0.97", tag12, back), "a short line must not parse");
         CHECK(!tp::parse_line(tag12 + " 1 0:1:0:40:0.97", tag12, back), "gap 0 must not parse");
         CHECK(!tp::parse_line(tag12 + "x 0", tag12, back), "a tag prefix must not parse");

@@ -1116,6 +1116,14 @@ struct ggml_backend_sched {
     int * prev_node_backend_ids; // [graph_size]
     int * prev_leaf_backend_ids; // [graph_size]
 
+    // a restored plan (ggml_backend_sched_plan_restore) puts its own backend ids in place, while the graph allocator keeps the
+    // records of the graph it allocated last: the ids of that graph, compared with the next graph allocated normally
+    bool  plan_ids_restored;
+    int   alloc_n_nodes;
+    int   alloc_n_leafs;
+    int * alloc_node_backend_ids; // [graph_size]
+    int * alloc_leaf_backend_ids; // [graph_size]
+
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
 
@@ -2701,18 +2709,23 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
     sched->pf_check = false;
 
-    bool backend_ids_changed = false;
-    for (int i = 0; i < sched->graph.n_nodes; i++) {
-        if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
-            sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
+    // after a restored plan the graph allocator's records are those of the graph it allocated before the restore
+    const bool from_alloc = sched->plan_ids_restored;
+    const int * prev_node_ids = from_alloc ? sched->alloc_node_backend_ids : sched->prev_node_backend_ids;
+    const int * prev_leaf_ids = from_alloc ? sched->alloc_leaf_backend_ids : sched->prev_leaf_backend_ids;
+    sched->plan_ids_restored = false;
+    bool backend_ids_changed = from_alloc && (sched->alloc_n_nodes != sched->graph.n_nodes || sched->alloc_n_leafs != sched->graph.n_leafs);
+    for (int i = 0; !backend_ids_changed && i < sched->graph.n_nodes; i++) {
+        if (sched->node_backend_ids[i] != prev_node_ids[i] &&
+            sched->bufts[sched->node_backend_ids[i]] != sched->bufts[prev_node_ids[i]]) {
             backend_ids_changed = true;
             break;
         }
     }
     if (!backend_ids_changed) {
         for (int i = 0; i < sched->graph.n_leafs; i++) {
-            if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
-                sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
+            if (sched->leaf_backend_ids[i] != prev_leaf_ids[i] &&
+                sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[prev_leaf_ids[i]]) {
                 backend_ids_changed = true;
                 break;
             }
@@ -5105,6 +5118,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
     sched->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_leaf_backend_ids[0]));
+    sched->alloc_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->alloc_node_backend_ids[0]));
+    sched->alloc_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->alloc_leaf_backend_ids[0]));
 
     sched->graph_size      = 0;
     sched->prev_graph_size = 0;
@@ -5241,6 +5256,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
     free(sched->prev_leaf_backend_ids);
+    free(sched->alloc_node_backend_ids);
+    free(sched->alloc_leaf_backend_ids);
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
@@ -5395,6 +5412,7 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+    sched->plan_ids_restored = false; // the allocator's records are this graph's from here
 
     ggml_backend_sched_prefetch_bind(sched, /*dry =*/ true);
 
@@ -5470,6 +5488,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+    sched->plan_ids_restored = false; // the allocator's records are this graph's from here
 
     ggml_backend_sched_prefetch_reserve_check(sched);
 
@@ -5501,7 +5520,31 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
             }
         }
         // split and bind again from fresh tensor copies (the bound copies of this graph hold arena addresses); the depth is now the
-        // default, so this does not come back here
+        // default, so this does not come back here. The split pointed the sources of the graph's nodes at the input copies, which
+        // live in the scheduler's context that the next split reuses: point them back at the original tensors first
+        {
+            std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> orig;
+            for (int i = 0; i < sched->n_splits; i++) {
+                const struct ggml_backend_sched_split * split = &sched->splits[i];
+                for (int j = 0; j < split->n_inputs; j++) {
+                    for (int c = 0; c < sched->n_copies; c++) {
+                        struct ggml_tensor * cpy = tensor_copy(split->inputs[j], split->backend_id, c);
+                        if (cpy != NULL) {
+                            orig[cpy] = split->inputs[j];
+                        }
+                    }
+                }
+            }
+            for (int i = 0; i < measure_graph->n_nodes; i++) {
+                struct ggml_tensor * node = measure_graph->nodes[i];
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    auto it = node->src[j] != NULL ? orig.find(node->src[j]) : orig.end();
+                    if (it != orig.end()) {
+                        node->src[j] = it->second;
+                    }
+                }
+            }
+        }
         sched->pf_check = false;
         ggml_backend_sched_reset(sched);
         return ggml_backend_sched_reserve(sched, measure_graph);
@@ -5847,6 +5890,14 @@ bool ggml_backend_sched_plan_restore(ggml_backend_sched_t sched, ggml_backend_sc
         sched->hash_set.keys[i]          = p->h_key[k];
         sched->hv_tensor_backend_ids[i]  = p->h_bid[k];
         memcpy(sched->hv_tensor_copies + i*per, p->h_cpy.data() + k*per, per*sizeof(struct ggml_tensor *));
+    }
+    // the ids of the graph the allocator holds (the last one split and allocated), for the next normal allocation
+    if (!sched->plan_ids_restored) {
+        sched->alloc_n_nodes = sched->graph.n_nodes;
+        sched->alloc_n_leafs = sched->graph.n_leafs;
+        memcpy(sched->alloc_node_backend_ids, sched->node_backend_ids, sched->graph.n_nodes*sizeof(int));
+        memcpy(sched->alloc_leaf_backend_ids, sched->leaf_backend_ids, sched->graph.n_leafs*sizeof(int));
+        sched->plan_ids_restored = true;
     }
     sched->graph.n_nodes = p->n_nodes;
     sched->graph.n_leafs = p->n_leafs;

@@ -2850,13 +2850,15 @@ static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * pa
     // node of that query alone (the tiled kernel takes 8+ queries)
     if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
         struct ggml_tensor * q    = tensor->src[0];
-        struct ggml_tensor * mask = tensor->src[3];
+        struct ggml_tensor * mask  = tensor->src[3];
+        struct ggml_tensor * mask2 = tensor->src[8]; // the mask of the second KV source, one row per query like mask
         if (q->ne[1] < 2 || q->ne[3] != 1) {
             return false;
         }
         for (int64_t i = 0; i < q->ne[1]; ++i) {
             struct ggml_tensor q_i   = *q;
             struct ggml_tensor m_i;
+            struct ggml_tensor m2_i;
             struct ggml_tensor dst_i = *tensor;
             q_i.ne[1] = 1;
             q_i.data  = (char *) q->data + i*q->nb[1];
@@ -2865,10 +2867,16 @@ static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * pa
                 m_i.ne[1] = 1;
                 m_i.data  = (char *) mask->data + i*mask->nb[1];
             }
+            if (mask2) {
+                m2_i = *mask2;
+                m2_i.ne[1] = 1;
+                m2_i.data  = (char *) mask2->data + i*mask2->nb[1];
+            }
             dst_i.ne[2]  = 1;
             dst_i.data   = (char *) tensor->data + i*tensor->nb[2];
             dst_i.src[0] = &q_i;
             dst_i.src[3] = mask ? &m_i : NULL;
+            dst_i.src[8] = mask2 ? &m2_i : NULL;
             dst_i.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
             ggml_compute_forward(params, &dst_i);
             ggml_barrier(params->threadpool);
@@ -4498,6 +4506,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        // a node without elements writes nothing (e.g. the empty gather of the recurrent states that a decode reads in place, which
+        // keeps the graph of a prompt ubatch): skip it like a NOP instead of computing it and waiting on a barrier for every thread
+        // (custom ops may have side effects and are computed)
+        if (ggml_is_empty(node) && node->op != GGML_OP_CUSTOM && node->op != GGML_OP_MAP_CUSTOM1 && node->op != GGML_OP_MAP_CUSTOM2 &&
+                node->op != GGML_OP_MAP_CUSTOM3) {
+            continue;
+        }
+
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
@@ -5358,6 +5374,9 @@ void ggml_cpu_init(void) {
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
         ggml_cpu_iq_kernels_log();
+#endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        ggml_cpu_arm_kernels_log();
 #endif
         is_first_call = false;
     }

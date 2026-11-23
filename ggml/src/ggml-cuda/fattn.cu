@@ -137,6 +137,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 // the cells makes the lists ascending and duplicate free, so they equal the compacted ones element by element
 #define FATTN_SEL_THREADS 1024
 #define FATTN_SEL_UNROLL  4
+static_assert(FATTN_SEL_THREADS/32 == 32, "ggml_cuda_qsa_maskless_gather_ok counts 32 warp sums");
 template <int ncols1>
 __launch_bounds__(FATTN_SEL_THREADS, 1)
 static __global__ void flash_attn_sel_to_sparse_indices(
@@ -285,7 +286,9 @@ int ggml_cuda_qsa_maskless_mode() {
 }
 
 bool ggml_cuda_qsa_maskless_gather_ok(const ggml_cuda_qsa_maskless & qsa) {
-    return size_t(qsa.kq->ne[0] + 31)/32*sizeof(uint32_t) <= 48*1024;
+    // the bitmap (dynamic shared memory) and the list kernel's static warp sums (1024 threads: 32 ints) within the default 48 KiB
+    // per block (no opt-in above it)
+    return size_t(qsa.kq->ne[0] + 31)/32*sizeof(uint32_t) + 32*sizeof(int) <= 48*1024;
 }
 
 void ggml_cuda_qsa_maskless_compact(
@@ -837,6 +840,28 @@ int ggml_cuda_flash_attn_ext_src2_codes(const int device, const ggml_tensor * ds
     for (const ggml_tensor * t : {K2, V2}) {
         if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 4 != 0 || t->nb[2] % 4 != 0 || t->nb[3] % 4 != 0 ||
                 t->nb[1] > INT32_MAX || t->nb[2] > INT32_MAX || (uintptr_t) t->view_offs % 4 != 0) {
+            return 0;
+        }
+    }
+    // the two-source in-place kernels exist for tiles of up to 16 query columns: more than 16 rows with fewer than 4 query heads per
+    // tile (ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2 / _ncols1) is a wider tile, staged to f16
+    const ggml_tensor * Q = dst->src[0];
+    if (Q->ne[1] > 16) {
+        const ggml_tensor * K    = dst->src[1];
+        const ggml_tensor * V    = dst->src[2];
+        const ggml_tensor * mask = dst->src[3];
+        float max_bias = 0.0f;
+        memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+        bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+        for (const ggml_tensor * t : {Q, K, V, mask}) {
+            if (t == nullptr || ggml_is_quantized(t->type)) {
+                continue;
+            }
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                use_gqa_opt = use_gqa_opt && t->nb[i] % 16 == 0;
+            }
+        }
+        if (!use_gqa_opt || Q->ne[2] / K->ne[2] <= 2) {
             return 0;
         }
     }

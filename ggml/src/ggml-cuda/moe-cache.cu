@@ -412,6 +412,25 @@ static __global__ void moe_cache_assign(
         n_take = pf.max_fill;
         __syncthreads();
     }
+    // a prefetch admits at most the slots its hits leave unpinned (its top-n predictions may outnumber the slots, which a lookup's
+    // distinct ids never do); the rest stay uncached
+    if (pf.is_pf) {
+        int n_pin = n_hit;
+        for (int off = MOE_CACHE_LANES/2; off > 0; off >>= 1) {
+            n_pin += __shfl_xor_sync(full, n_pin, off, MOE_CACHE_LANES);
+        }
+        const int n_room = max(0, n_slots - lo - n_pin);
+        if (n_take > n_room) {
+            for (int j = n_room + lane; j < n_take; j += MOE_CACHE_LANES) {
+                row[take_e[j]] = -1;
+            }
+            if (lane == 0) {
+                pf.stat[MOE_PF_STAT_CAPPED] += (unsigned long long) (n_take - n_room);
+            }
+            n_take = n_room;
+            __syncthreads();
+        }
+    }
 
     // victims: CLOCK sweep, 32 slots at a time, the slots used by this lookup are skipped
     // there are enough unpinned slots because the number of distinct ids is at most the number of slots
@@ -1180,7 +1199,18 @@ int ggml_cuda_moe_refill_register(ggml_backend_cuda_context & ctx, const void * 
     std::lock_guard<std::mutex> lock(moe_rf_mutex);
     const auto it = moe_rf_regs.find(state_data);
     if (it != moe_rf_regs.end()) {
-        return it->second.idx;
+        // a cache registers each group once per lifetime: a known address is the state of a destroyed cache (it synchronized its
+        // streams) reused by a new one, whose epochs restart at 0, so the row starts at 0 again (nothing pending)
+        moe_rf_reg & r = it->second;
+        if (r.device != ctx.device) {
+            return -1;
+        }
+        ggml_cuda_set_device(ctx.device);
+        memset(r.h_need, 0, MOE_RF_ROW*sizeof(int32_t));
+        memset(r.h_done, 0, MOE_RF_ROW*sizeof(int32_t));
+        r.mirror.assign(MOE_RF_ROW, 0);
+        CUDA_CHECK(cudaMemcpyToSymbol(moe_rf_tab, r.h_need, MOE_RF_ROW*sizeof(int32_t), (size_t) r.idx*MOE_RF_ROW*sizeof(int32_t), cudaMemcpyHostToDevice));
+        return r.idx;
     }
     if (ctx.device < 0 || ctx.device >= GGML_CUDA_MAX_DEVICES || moe_rf_count[ctx.device] >= MOE_RF_GROUPS) {
         return -1;
@@ -1548,6 +1578,16 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
 }
 #endif
 
+// a fetch on the main stream can pick a victim slot whose deferred fill (an earlier layer of the graph, on the side stream, see
+// mode 2 below) is still running: the main stream waits for those copies first, else the late copy overwrites the slot after this
+// fetch and the slot holds another expert than its map entry. Only graphs that mix deferred and main-stream fetches wait
+static void moe_cache_wait_deferred(ggml_backend_cuda_context & ctx, cudaStream_t stream) {
+    if (ctx.moe_join_pending && ctx.moe_join != nullptr) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, ctx.moe_join, 0));
+        ctx.moe_join_pending = false;
+    }
+}
+
 void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 10);
 
@@ -1651,6 +1691,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         cudaStream_t stream = ctx.stream();
         if (ggml_get_op_params_i32(dst, 12) == 0) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, res->data, n_ids*sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+            moe_cache_wait_deferred(ctx, stream);
             moe_cache_fetch_launch(stream, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), (const int32_t *) res->data, n_ids, ne0);
             return;
         }
@@ -1672,6 +1713,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             }
             if (il < 0 || il >= GGML_CUDA_MOE_DEFER_LAYERS || n_info > GGML_CUDA_MOE_DEFER_STRIDE) {
                 // no entry for it: the copies run here in the stream (the host still computes the admitted experts: same output)
+                moe_cache_wait_deferred(ctx, stream);
                 moe_cache_fetch_launch(stream, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), (const int32_t *) res->data, n_ids, ne0);
                 return;
             }
@@ -1787,12 +1829,16 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         memcpy(&fetch, (const int32_t *) dst->op_params + 11, sizeof(float));
         const int fetch_q = (int) lrintf(fetch*65536.0f);
         GGML_ASSERT(ggml_is_contiguous(counts) && fetch_q >= 0 && fetch_q <= 65536);
+        // share 1 fetches every miss and its graph has no host path (the plain lookup stand-in, prompt ubatches), so the
+        // admission margin, which leaves rejected misses to the host, applies only below share 1
+        const int margin_q = n_expert >= 8 && fetch_q < 65536 ? admit_margin_q : 0;
         moe_cache_assign<<<1, MOE_CACHE_LANES, (3*n_ids + (scores != nullptr ? 2*MOE_CACHE_WINDOW : 0))*sizeof(int32_t), stream>>>(
             (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
             n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q,
             scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, ggml_get_op_params_i32(dst, 15),
-            tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
-            ggml_get_op_params_i32(dst, 9), n_expert >= 8 ? admit_margin_q : 0, admit_add_q, ggml_get_op_params_i32(dst, 8),
+            // the skip counter is words 4..5 of the statistics row: only a row of 6+ experts has them
+            tail_rank, tail_rank > 0 && counts->ne[0] >= 6 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
+            ggml_get_op_params_i32(dst, 9), margin_q, admit_add_q, ggml_get_op_params_i32(dst, 8),
             ggml_get_op_params_i32(dst, 7), moe_pf_real_args(state), moe_rf_real(state));
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -1810,5 +1856,6 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         moe_pf_real_args(state), moe_rf_real(state));
     CUDA_CHECK(cudaGetLastError());
 
+    moe_cache_wait_deferred(ctx, stream);
     moe_cache_fetch_launch(stream, dst, dst->src + 3, n_banks, (const int32_t *) dst->data, n_ids, ne0);
 }

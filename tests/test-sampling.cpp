@@ -1,6 +1,7 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "ggml.h"
 #include "llama.h"
+#include "sampling.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -9,8 +10,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 extern struct llama_sampler * llama_sampler_init_dry_testing(float dry_multiplier, float dry_base, int32_t dry_allowed_length, int32_t dry_penalty_last_n, const std::vector<std::vector<llama_token>>& seq_breakers);
@@ -395,6 +398,118 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+
+static float prob_scan(const std::vector<llama_token_data> & q, llama_token id) {
+    for (const auto & e : q) {
+        if (e.id == id) {
+            return e.p;
+        }
+    }
+    return 0.0f;
+}
+
+// the rejection residual max(0, p - q) and its draw, with q looked up by `lookup`; masked drops every 3rd candidate
+template <typename F>
+static llama_token residual_draw(const std::vector<llama_token_data> & p, bool masked, F lookup, std::mt19937 & rng, std::vector<llama_token_data> & residual) {
+    auto p_of = [&](size_t k) { return masked && k % 3 == 0 ? 0.0f : p[k].p; };
+    residual.clear();
+    float sum = 0.0f;
+    for (size_t k = 0; k < p.size(); ++k) {
+        const float r = p_of(k) - lookup(k);
+        if (r > 0.0f) {
+            residual.push_back({ p[k].id, 0.0f, r });
+            sum += r;
+        }
+    }
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    llama_token id = -1;
+    if (sum > 0.0f) {
+        float u = uni(rng) * sum;
+        id = residual.back().id;
+        for (const auto & e : residual) {
+            u -= e.p;
+            if (u <= 0.0f) {
+                id = e.id;
+                break;
+            }
+        }
+    }
+    return id;
+}
+
+// common_sampler_prob_lookup must give exactly what a first-match linear scan of q gives, for every candidate
+static void test_prob_lookup(size_t n_vocab, size_t n_p, size_t n_q, uint32_t seed) {
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<float> uf(0.0f, 1.0f);
+
+    std::vector<llama_token> perm(n_vocab);
+    for (size_t i = 0; i < n_vocab; ++i) {
+        perm[i] = (llama_token) i;
+    }
+    std::shuffle(perm.begin(), perm.end(), gen);
+
+    std::vector<llama_token_data> p(n_p);
+    for (size_t k = 0; k < n_p; ++k) {
+        p[k] = { perm[k], 0.0f, uf(gen) };
+    }
+    // q overlaps p partly, holds ids outside p, and repeats some ids (the first one counts)
+    std::vector<llama_token_data> q;
+    std::shuffle(perm.begin(), perm.end(), gen);
+    for (size_t k = 0; k < n_q; ++k) {
+        q.push_back({ perm[k], 0.0f, uf(gen) });
+        if (k % 7 == 3) {
+            q.push_back({ perm[k], 0.0f, uf(gen) });
+        }
+        if (k % 11 == 5 && k < n_p) {
+            q.push_back({ p[k].id, 0.0f, uf(gen) });
+        }
+    }
+
+    std::vector<int32_t> pos;
+    std::vector<float> out(p.size());
+    for (int rep = 0; rep < 2; ++rep) { // the scratch must come back all -1 and be reusable
+        common_sampler_prob_lookup(q.data(), q.size(), p.data(), p.size(), pos, out.data());
+        for (int32_t v : pos) {
+            GGML_ASSERT(v == -1);
+        }
+    }
+
+    // reference: a first-match scan where affordable, else a first-wins map plus a scan of a sample of the candidates
+    const bool full_scan = n_p * q.size() <= (size_t) 1 << 26;
+    std::unordered_map<llama_token, float> first;
+    for (const auto & e : q) {
+        first.emplace(e.id, e.p);
+    }
+    std::vector<float> ref(p.size());
+    size_t n_hit = 0;
+    for (size_t k = 0; k < p.size(); ++k) {
+        const auto it = first.find(p[k].id);
+        ref[k] = it == first.end() ? 0.0f : it->second;
+        n_hit += it != first.end();
+        if (full_scan || k % 997 == 0) {
+            GGML_ASSERT(ref[k] == prob_scan(q, p[k].id));
+        }
+        GGML_ASSERT(memcmp(&out[k], &ref[k], sizeof(float)) == 0);
+    }
+    GGML_ASSERT(n_hit > 0 && n_hit < p.size());
+
+    for (bool masked : { false, true }) {
+        std::mt19937 rng_a(seed ^ 0x9e3779b9u);
+        std::mt19937 rng_b(seed ^ 0x9e3779b9u);
+        std::vector<llama_token_data> res_a, res_b;
+        const llama_token id_a = residual_draw(p, masked, [&](size_t k) { return full_scan ? prob_scan(q, p[k].id) : ref[k]; }, rng_a, res_a);
+        const llama_token id_b = residual_draw(p, masked, [&](size_t k) { return out[k]; }, rng_b, res_b);
+        GGML_ASSERT(id_a == id_b);
+        GGML_ASSERT(res_a.size() == res_b.size());
+        for (size_t k = 0; k < res_a.size(); ++k) {
+            GGML_ASSERT(res_a[k].id == res_b[k].id && memcmp(&res_a[k].p, &res_b[k].p, sizeof(float)) == 0);
+        }
+        GGML_ASSERT(rng_a() == rng_b());
+    }
+
+    printf("prob_lookup n_vocab=%zu |p|=%zu |q|=%zu: OK\n", n_vocab, n_p, q.size());
+}
+
 int main(void) {
     ggml_time_init();
 
@@ -485,6 +600,13 @@ int main(void) {
     test_sampler_queue(10000, "pmk", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mkp", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mpk", 100, 0.8f, 0.1f);
+
+    test_prob_lookup(16, 10, 10, 1);
+    test_prob_lookup(1000, 256, 256, 2);
+    test_prob_lookup(1000, 256, 10, 3);
+    test_prob_lookup(248320, 10, 200000, 4);
+    test_prob_lookup(248320, 248320, 256, 5);
+    test_prob_lookup(248320, 248320, 240000, 6);
 
     printf("OK\n");
 

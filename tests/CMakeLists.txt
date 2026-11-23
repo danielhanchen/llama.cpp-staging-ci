@@ -183,7 +183,7 @@ llama_build(test-state-async.cpp)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp LINK llama)
-    llama_build_and_test(test-sampling.cpp LINK llama)
+    llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp LINK llama)
     llama_build_and_test(test-grammar-integration.cpp)
@@ -305,11 +305,55 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --rs-replay-sched -s 1
     )
+    # MTP draft contexts (qwen35, qwen35moe, deepseek4): a batch with no output row writes the cache bytes of the whole block
+    foreach(MKV_MODE "" "kill")
+        if (MKV_MODE STREQUAL "")
+            set(MKV_NAME test-mtp-kv-only)
+        else()
+            set(MKV_NAME test-mtp-kv-only-${MKV_MODE})
+        endif()
+        llama_test(test-llama-archs NAME ${MKV_NAME} LABEL main ARGS --mtp-kv-only -s 1)
+        if (MKV_MODE STREQUAL "kill")
+            set_tests_properties(${MKV_NAME} PROPERTIES ENVIRONMENT "LLAMA_MTP_KV_ONLY_QWEN35=0;LLAMA_MTP_KV_ONLY_DSV4=0")
+        endif()
+    endforeach()
     llama_test(
         test-llama-archs
         NAME test-small-backends
         LABEL main
         ARGS --small-backends -s 1
+    )
+    # a layer-major prompt group after a large two-sequence ubatch that released the MoE cache banks seeds nothing and gives the
+    # logits of a run without the cache (skipped without a CUDA / ROCm / MUSA device)
+    llama_test(
+        test-llama-archs
+        NAME test-moe-released-seed
+        LABEL main
+        ARGS --moe-released-seed -s 1
+    )
+    # an exact verify batch over a q8_0 KV cache with flash attention (one attention per row, windows of 32 and 128 rows) fits the
+    # graph and matches single decodes
+    llama_test(
+        test-llama-archs
+        NAME test-verify-quant-kv
+        LABEL main
+        ARGS --verify-quant-kv -s 1
+    )
+    # a layer-major group member with outputs beside released banks, or beside banks the group must release, reads the host experts
+    # (skipped without a CUDA / ROCm / MUSA device)
+    llama_test(
+        test-llama-archs
+        NAME test-moe-released-out
+        LABEL main
+        ARGS --moe-released-out -s 1
+    )
+    # a long sequence of a model without memory (diffusion) runs with the MoE cache banks released, a short one gets them back
+    # (skipped without a CUDA / ROCm / MUSA device)
+    llama_test(
+        test-llama-archs
+        NAME test-moe-encode-release
+        LABEL main
+        ARGS --moe-encode-release -s 1
     )
 
     # an exact verify row keeps every cell of its sequence when the cells do not follow the positions (two sequences in a unified KV)
@@ -374,6 +418,25 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-rs-snap-qwen35 PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # the recent-window ring: sinks-only, its off switch beside LLAMA_KV_WIN_SINKS, a two-stream sparse attention cache
+    llama_build(test-kv-win-guards.cpp)
+    llama_test(
+        test-kv-win-guards
+        LABEL main
+        ARGS "${MODEL_DIR}/llama-dense.gguf" "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-kv-win-guards PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # a partial seq_rm into a prompt ubatch restores the delta-net snapshot row of that position (fresh prefill = rollback);
+    # the chunked CUDA kernel needs 16 key heads x 128 (a model with that layout, not this one, exercises it on a GPU)
+    llama_build(test-gdn-snap-rollback.cpp)
+    llama_test(
+        test-gdn-snap-rollback
+        LABEL main
+        ARGS "${MODEL_DIR}/qwen35-dense.gguf" 200 2 2
+    )
+    set_tests_properties(test-gdn-snap-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
 
     # -sm tensor (Meta(CPU, CPU)) with LLAMA_RS_REPLAY=1: the delta-net rollback keeps the snapshot rows and matches the CPU decode
     llama_build(test-rs-replay-meta.cpp)
@@ -559,6 +622,12 @@ llama_build_and_test(test-fit-small-reserve.cpp)
 llama_build_and_test(test-fit-plain-spill.cpp)
 # --fit: the full margin beside a MoE cache without flash attention, and the flash attention the measure reads back (common/fit.h)
 llama_build_and_test(test-fit-faoff.cpp)
+# --fit: the MoE cache size of a decode-sized placement, at most the size requested (common/fit.h)
+llama_build_and_test(test-fit-place8-grow.cpp)
+# --fit: the mid-size placement prices a lent drafter decode-sized (common/fit.h)
+llama_build_and_test(test-fit-placemid-lent.cpp)
+# --fit: the K/V cells of an all-sliding DFlash drafter, with and without --swa-full (common_fit_dflash_draft_bytes)
+llama_build_and_test(test-fit-dflash-swa.cpp)
 # token-tiled gated delta-net vs the AR kernel, byte for byte on the GPU backend (SKIP without one)
 llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 # the ops added here (KQ_MASK, MOE_CACHE_LOOKUP, the GDN replay window) are refused by the meta backend (-sm tensor) and RPC and run on the CPU
@@ -583,6 +652,10 @@ llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)
 llama_build_and_test(test-moe-tc-exact.cpp LINK ggml)
 # ggml_dflash2_conv vs the add / mul / pad chain of the DFlash2 drafter's conv, byte for byte on every device (CPU always)
 llama_build_and_test(test-dflash2-conv-exact.cpp LINK ggml)
+# the MoE expert reduction (MUL, VIEWs, ADD chain) on Metal, fused or not, vs the CPU backend, byte for byte (SKIP without a Metal device)
+llama_build_and_test(test-moe-reduce-exact.cpp LINK ggml)
+# Metal asynchronous host <-> device copies at page and non-page offsets, round trip byte for byte (SKIP without a Metal device)
+llama_build_and_test(test-metal-async-copy.cpp LINK ggml)
 # the rows-per-block lever of the dense 2..8 column mat-vec vs the launch it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-mmvqcols-exact.cpp LINK ggml)
 # the ported few-row int8 MMQ (GGML_CUDA_MMQ_FEW) on dense K-quant / IQ4_XS / Q8_0 products at 2..8 columns vs mmvq + fp64 reference (NMSE gates,
@@ -603,9 +676,11 @@ llama_build_and_test(test-dsv41-cand-score-exact.cpp LINK ggml)
 llama_test(test-dsv41-cand-score-exact NAME test-dsv41-cand-score-gpu-exact ARGS --gpu)
 set_tests_properties(test-dsv41-cand-score-exact test-dsv41-cand-score-gpu-exact PROPERTIES SKIP_RETURN_CODE 77)
 llama_build_and_test(test-spec-type-gguf.cpp)
+llama_build_and_test(test-dflash-ev-auto.cpp)
 # the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
 llama_build_and_test(test-cal-build-id.cpp LINK ggml)
 llama_build_and_test(test-moe-trial-persist.cpp)   # CPU-miss trial verdicts in the calibration file
+llama_build_and_test(test-moe-overlap-reset.cpp)   # fetch overlap rule restarts with a fixed-share request
 if (NOT WIN32)
     target_link_libraries(test-cal-build-id PRIVATE ${CMAKE_DL_LIBS})
 endif()
@@ -621,13 +696,17 @@ if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-moe-cache-tail-skip.cpp)
 endif()
 
-# CPU work buffer: every node stays inside the size ggml_graph_plan() reserved (guard page after the buffer)
-if (NOT WIN32)
+# CPU work buffer: every node stays inside the size ggml_graph_plan() reserved (guard page after the buffer); it calls the CPU
+# backend's graph API directly, which a loadable CPU backend (GGML_BACKEND_DL) does not link
+if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-cpu-wsize-guard.cpp LINK ggml)
 endif()
 # the assign standing in for the plain lookup keeps the lookup's cache state (GPU backend, skipped without one)
 if (NOT WIN32)
     llama_build_and_test(test-moe-cache-plain-assign.cpp)
+    # with the hybrid admission margin set: the share 1 assign still fetches every miss, as the lookup does
+    llama_test(test-moe-cache-plain-assign NAME test-moe-cache-plain-assign-margin LABEL main)
+    set_tests_properties(test-moe-cache-plain-assign-margin PROPERTIES ENVIRONMENT "LLAMA_MOE_CACHE_ADMIT_MARGIN=1.25")
 endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately

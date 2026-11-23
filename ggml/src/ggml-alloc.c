@@ -519,6 +519,17 @@ struct ggml_gallocr {
         bool   last_free; // the last region does not limit the plan (only checked against it), see ggml_gallocr_set_external_last_free
     } * ext; // [n_buffers]
     bool ext_changed; // the next allocation must be planned again
+
+    // the topology of the graph the node_allocs were planned for (ggml_gallocr_topo_hash): a graph with the same counts and sizes
+    // but other sources or flags (other lifetimes) is logged (GGML_GALLOCR_TOPO_CHECK=1 or 2) or planned again (=3); off by default
+    uint64_t topo_hash;
+    struct ggml_hash_set topo_set;
+    int * topo_pos; // [topo_set.size]
+    // GGML_GALLOCR_TOPO_CHECK=1 or 2: the per-node hashes and names of the planned graph, to name the first node that differs
+    uint64_t * topo_node_hash; // [topo_n]
+    char (*topo_node_name)[GGML_MAX_NAME + 32]; // "name (op)"
+    int topo_n;
+    int64_t topo_mismatches;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -606,6 +617,10 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->ext);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    ggml_hash_set_free(&galloc->topo_set);
+    free(galloc->topo_pos);
+    free(galloc->topo_node_hash);
+    free(galloc->topo_node_name);
     free(galloc);
 }
 
@@ -980,6 +995,69 @@ static void ggml_gallocr_plan_ext(ggml_gallocr_t galloc, struct ggml_cgraph * gr
     }
 }
 
+// GGML_GALLOCR_TOPO_CHECK: unset or 0 (default) off, no hashing (only the counts and sizes are compared); 1 or 2 a plan reused for a
+// graph of another topology is logged and reused; 3 such a graph is planned again.
+// Internal modes: 0 off, 2 log only, 1 plan again
+static int ggml_gallocr_topo_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * e = getenv("GGML_GALLOCR_TOPO_CHECK");
+        const int v = e != NULL ? atoi(e) : 0;
+        mode = (v == 1 || v == 2) ? 2 : v == 3 ? 1 : 0;
+    }
+    return mode;
+}
+
+static int ggml_gallocr_topo_find(const ggml_gallocr_t galloc, const struct ggml_tensor * t) {
+    if (t == NULL) {
+        return -1;
+    }
+    const size_t slot = ggml_hash_find(&galloc->topo_set, t);
+    if (slot != GGML_HASHSET_FULL && ggml_bitset_get(galloc->topo_set.used, slot) && galloc->topo_set.keys[slot] == t) {
+        return galloc->topo_pos[slot];
+    }
+    return -2; // not a node or leaf of the graph (e.g. a weight)
+}
+
+// the graph's topology as the allocator sees it: per node its op, its input / output flags, and the graph positions of its sources
+// and view source (the lifetimes of the plan follow from them). node_hash: the hash after each node (NULL: not kept)
+static uint64_t ggml_gallocr_topo_hash(ggml_gallocr_t galloc, struct ggml_cgraph * graph, uint64_t * node_hash) {
+    const size_t n    = (size_t) graph->n_nodes + (size_t) graph->n_leafs;
+    const size_t want = n + n/4 + 1;
+    if (galloc->topo_set.size < want) {
+        ggml_hash_set_free(&galloc->topo_set);
+        galloc->topo_set = ggml_hash_set_new(want);
+        free(galloc->topo_pos);
+        galloc->topo_pos = (int *) malloc(galloc->topo_set.size * sizeof(int));
+        GGML_ASSERT(galloc->topo_set.keys != NULL && galloc->topo_pos != NULL);
+    } else {
+        ggml_hash_set_reset(&galloc->topo_set);
+    }
+    for (int i = 0; i < graph->n_nodes + graph->n_leafs; i++) {
+        struct ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+        const size_t slot = ggml_hash_insert(&galloc->topo_set, t);
+        if (slot != GGML_HASHSET_ALREADY_EXISTS) {
+            galloc->topo_pos[slot] = i;
+        }
+    }
+    uint64_t h = 1469598103934665603ULL;
+#define TOPO_MIX(v) do { h ^= (uint64_t) (int64_t) (v); h *= 1099511628211ULL; } while (0)
+    for (int i = 0; i < graph->n_nodes + graph->n_leafs; i++) {
+        const struct ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+        TOPO_MIX(t->op);
+        TOPO_MIX(t->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT));
+        TOPO_MIX(ggml_gallocr_topo_find(galloc, t->view_src));
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            TOPO_MIX(ggml_gallocr_topo_find(galloc, t->src[j]));
+        }
+        if (node_hash != NULL && i < graph->n_nodes) {
+            node_hash[i] = h;
+        }
+    }
+#undef TOPO_MIX
+    return h;
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     ggml_gallocr_plan_ext(galloc, graph, node_buffer_ids, leaf_buffer_ids, !no_alloc);
@@ -991,6 +1069,23 @@ static bool ggml_gallocr_reserve_n_impl(
         GGML_ASSERT(galloc->node_allocs != NULL);
     }
     galloc->n_nodes = graph->n_nodes;
+    if (ggml_gallocr_topo_mode() == 2) {
+        if (galloc->topo_n < graph->n_nodes) {
+            free(galloc->topo_node_hash);
+            free(galloc->topo_node_name);
+            galloc->topo_node_hash = (uint64_t *) malloc(graph->n_nodes * sizeof(uint64_t));
+            galloc->topo_node_name = malloc(graph->n_nodes * sizeof(galloc->topo_node_name[0]));
+            GGML_ASSERT(galloc->topo_node_hash != NULL && galloc->topo_node_name != NULL);
+            galloc->topo_n = graph->n_nodes;
+        }
+        for (int i = 0; i < graph->n_nodes; i++) {
+            snprintf(galloc->topo_node_name[i], sizeof(galloc->topo_node_name[i]), "%.63s (%.28s)", graph->nodes[i]->name,
+                ggml_op_desc(graph->nodes[i]));
+        }
+        galloc->topo_hash = ggml_gallocr_topo_hash(galloc, graph, galloc->topo_node_hash);
+    } else if (ggml_gallocr_topo_mode() != 0) {
+        galloc->topo_hash = ggml_gallocr_topo_hash(galloc, graph, NULL);
+    }
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
@@ -1285,6 +1380,36 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
     return talloc->size_max >= node_size;
 }
 
+// compares the graph's topology with the one the plan was made for and logs a mismatch (the first 8, then every power of two).
+// The per-node hashes that name the first differing node are only computed for a logged mismatch
+static bool ggml_gallocr_topo_differs(ggml_gallocr_t galloc, struct ggml_cgraph * graph, int topo) {
+    if (ggml_gallocr_topo_hash(galloc, graph, NULL) == galloc->topo_hash) {
+        return false;
+    }
+    const int64_t n = ++galloc->topo_mismatches;
+    if (n <= 8 || (n & (n - 1)) == 0) {
+        char diff[4*GGML_MAX_NAME] = "";
+        if (topo == 2 && galloc->topo_node_hash != NULL) {
+            uint64_t * nh = (uint64_t *) malloc(graph->n_nodes * sizeof(uint64_t));
+            GGML_ASSERT(nh != NULL);
+            ggml_gallocr_topo_hash(galloc, graph, nh);
+            int first = -1;
+            for (int i = 0; i < graph->n_nodes && i < galloc->n_nodes && first < 0; i++) {
+                first = nh[i] != galloc->topo_node_hash[i] ? i : -1;
+            }
+            free(nh);
+            if (first >= 0) {
+                snprintf(diff, sizeof(diff), ", first difference at node %d: %.63s (%.28s), planned %s", first,
+                    graph->nodes[first]->name, ggml_op_desc(graph->nodes[first]), galloc->topo_node_name[first]);
+            }
+        }
+        GGML_LOG_WARN("%s: graph of %d nodes and %d leafs has another topology than the planned one (%lld so far): %s%s\n",
+            __func__, graph->n_nodes, graph->n_leafs, (long long) n,
+            topo == 2 ? "reused (log only, GGML_GALLOCR_TOPO_CHECK=3 plans it again)" : "planned again", diff);
+    }
+    return true;
+}
+
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
     if (galloc->ext_changed) {
         return true;
@@ -1301,6 +1426,13 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
+        return true;
+    }
+
+    // the same counts do not make the same graph: a plan made for other sources or flags can place tensors whose lifetimes overlap
+    // in the same memory (compute nodes overwriting state or index copies they outlive)
+    const int topo = ggml_gallocr_topo_mode();
+    if (topo == 1 && ggml_gallocr_topo_differs(galloc, graph, topo)) {
         return true;
     }
 
@@ -1327,6 +1459,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 return true;
             }
         }
+    }
+
+    if (topo == 2) {
+        ggml_gallocr_topo_differs(galloc, graph, topo); // log only: the plan is reused either way
     }
 
     return false;

@@ -130,9 +130,140 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #endif
 }
 
-// placeholder implementation for Apple targets
-void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q8_K_ref(x, y, k);
+// The Q8_K activations of every K-quant / IQ vec_dot in NEON, the reference's bytes: the first element of the largest magnitude
+// sets the scale, each value is iscale*x rounded to the nearest integer, ties to even, at most 127, and the 16-value sums. A block
+// with a NaN or an infinity, and an all-zero block (the reference leaves its sums as they were), take the reference.
+// GGML_CPU_Q8K_SIMD=0: the reference.
+// The reference's rounding depends on how ggml-base was compiled: where the compiler contracts nearest_int(iscale*x) =
+// iscale*x + 1.5*2^23 into one fused multiply-add (GCC does by default on AArch64) the exact product is rounded once, otherwise
+// the product is rounded to float first, and the two differ next to half-integer ties. The first call quantizes probe blocks with
+// the reference and keeps the NEON path only for the rule the reference was seen to follow; a reference matching neither keeps
+// the reference.
+#if defined(__ARM_NEON) && defined(__aarch64__)
+enum { GGML_Q8K_REF = 0, GGML_Q8K_MUL = 1, GGML_Q8K_FMA = 2 };
+
+static void ggml_q8k_block_neon(const float * GGML_RESTRICT x, block_q8_K * GGML_RESTRICT y, int fused) {
+    float32x4_t vmax = vdupq_n_f32(0.0f);
+    uint32x4_t  bad  = vdupq_n_u32(0);
+    for (int j = 0; j < QK_K; j += 4) {
+        const float32x4_t v = vld1q_f32(x + j);
+        vmax = vmaxq_f32(vmax, vabsq_f32(v));
+        bad  = vorrq_u32(bad, vmvnq_u32(vceqq_f32(v, v)));
+    }
+    const float amax = vmaxvq_f32(vmax);
+    if (vmaxvq_u32(bad) != 0 || !isfinite(amax) || amax == 0.0f) {
+        quantize_row_q8_K_ref(x, y, QK_K);
+        return;
+    }
+    const float32x4_t va = vdupq_n_f32(amax);
+    int jm = 0;
+    for (int j = 0; j < QK_K; j += 4) {
+        const uint32x4_t eq = vceqq_f32(vabsq_f32(vld1q_f32(x + j)), va);
+        if (vmaxvq_u32(eq) != 0) {
+            int b = 0;
+            while (fabsf(x[j + b]) != amax) {
+                ++b;
+            }
+            jm = j + b;
+            break;
+        }
+    }
+    const float iscale = -127.f/x[jm];
+    const float32x4_t vs    = vdupq_n_f32(iscale);
+    const float32x4_t magic = vdupq_n_f32(12582912.f);
+    const int32x4_t   lowm  = vdupq_n_s32(0x007fffff);
+    const int32x4_t   bias  = vdupq_n_s32(0x00400000);
+    const int32x4_t   top   = vdupq_n_s32(127);
+    for (int j = 0; j < QK_K; j += 16) {
+        int32x4_t q[4];
+        for (int u = 0; u < 4; ++u) {
+            const float32x4_t v = vld1q_f32(x + j + 4*u);
+            int32x4_t r;
+            if (fused) {
+                // the reference's own trick on the fused value: one rounding of iscale*x + 1.5*2^23
+                r = vsubq_s32(vandq_s32(vreinterpretq_s32_f32(vfmaq_f32(magic, vs, v)), lowm), bias);
+            } else {
+                r = vcvtnq_s32_f32(vmulq_f32(vs, v));
+            }
+            q[u] = vminq_s32(r, top);
+        }
+        y->bsums[j/16] = (int16_t) vaddvq_s32(vaddq_s32(vaddq_s32(q[0], q[1]), vaddq_s32(q[2], q[3])));
+        const int16x8_t h0 = vcombine_s16(vqmovn_s32(q[0]), vqmovn_s32(q[1]));
+        const int16x8_t h1 = vcombine_s16(vqmovn_s32(q[2]), vqmovn_s32(q[3]));
+        vst1q_s8(y->qs + j, vcombine_s8(vqmovn_s16(h0), vqmovn_s16(h1)));
+    }
+    y->d = 1/iscale;
+}
+
+// Probe blocks of quarter-integer values (largest magnitude a few units, both signs tied): products of iscale*x land next to
+// half-integer ties often enough that the rounded-product and fused rules give different bytes in every probe block.
+static int ggml_q8k_probe(void) {
+    int seen_mul = 0, seen_fma = 0;
+    uint32_t st = 12345u;
+    for (int t = 0; t < 64; ++t) {
+        float x[QK_K];
+        for (int j = 0; j < QK_K; ++j) {
+            st = st*1664525u + 1013904223u;
+            x[j] = (float) ((int) ((st >> 9) % (uint32_t) (9 + 2*t)) - (4 + t)) * 0.25f;
+        }
+        block_q8_K r, m, f;
+        memset(&r, 0, sizeof(r)); memset(&m, 0, sizeof(m)); memset(&f, 0, sizeof(f));
+        quantize_row_q8_K_ref(x, &r, QK_K);
+        ggml_q8k_block_neon(x, &m, 0);
+        ggml_q8k_block_neon(x, &f, 1);
+        const int is_mul = memcmp(&r, &m, sizeof(r)) == 0;
+        const int is_fma = memcmp(&r, &f, sizeof(r)) == 0;
+        if (!is_mul && !is_fma) {
+            return GGML_Q8K_REF;
+        }
+        if (is_mul && !is_fma) {
+            seen_mul = 1;
+        } else if (is_fma && !is_mul) {
+            seen_fma = 1;
+        }
+    }
+    if (seen_mul && !seen_fma) {
+        return GGML_Q8K_MUL;
+    }
+    if (seen_fma && !seen_mul) {
+        return GGML_Q8K_FMA;
+    }
+    return GGML_Q8K_REF;
+}
+
+static int ggml_q8k_simd_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * e = getenv("GGML_CPU_Q8K_SIMD");
+        mode = (e == NULL || atoi(e) != 0) ? ggml_q8k_probe() : GGML_Q8K_REF;
+    }
+    return mode;
+}
+
+// once per process (ggml_cpu_init)
+void ggml_cpu_arm_kernels_log(void) {
+    const int q8k = ggml_q8k_simd_mode();
+    GGML_LOG_INFO("ggml-cpu: Q8_K quantization %s\n",
+        q8k == GGML_Q8K_MUL ? "in NEON, rounded products like the reference" :
+        q8k == GGML_Q8K_FMA ? "in NEON, fused multiply-adds like the reference" : "by the reference");
+}
+#endif
+
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    const int mode = ggml_q8k_simd_mode();
+    if (mode != GGML_Q8K_REF) {
+        assert(k % QK_K == 0);
+        block_q8_K * GGML_RESTRICT y = vy;
+        const int64_t nb = k / QK_K;
+        const int fused = mode == GGML_Q8K_FMA;
+        for (int64_t i = 0; i < nb; ++i) {
+            ggml_q8k_block_neon(x + i*QK_K, y + i, fused);
+        }
+        return;
+    }
+#endif
+    quantize_row_q8_K_ref(x, vy, k);
 }
 
 //===================================== Dot products =================================

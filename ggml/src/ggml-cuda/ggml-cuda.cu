@@ -1756,6 +1756,8 @@ static size_t ggml_backend_cuda_buffer_move(ggml_backend_buffer_t buffer, size_t
             return SIZE_MAX;
         }
         CUDA_CHECK(cudaMemcpy((void *) tmp, (const void *) at, ctx->lazy_gran, cudaMemcpyDeviceToDevice));
+        // a device-to-device cudaMemcpy may return before the copy has finished: wait for it before either mapping goes away
+        CUDA_CHECK(cudaDeviceSynchronize());
         CU_CHECK(cuMemUnmap(tmp, ctx->lazy_gran));
         CU_CHECK(cuMemUnmap(at, ctx->lazy_gran));
         CU_CHECK(cuMemRelease(ctx->chunks[i]));
@@ -2828,6 +2830,41 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+// On datacenter Blackwell, cuBLAS beats mmf for wide BF16 weights with few destination columns,
+// which is the batched decode shape. Measured on a B200 (cc 1000), Qwen3.8-27B BF16 decode:
+// 2 seqs 1.75x, 4 seqs 1.59x, 8 seqs 1.51x, 16 seqs 1.49x, and exactly neutral at 1 seq (mmvf
+// takes it) and at 24/32 seqs (already past the mmf cap). Prefill is unchanged.
+//
+// The bounds are deliberately narrow, each one covering only what was measured:
+//  - mul_mat_id is excluded because there cuBLAS is 2-4x SLOWER than mmf.
+//  - only the plain 2D cuBLAS entry point, so this cannot select the pointer-batched path.
+//  - only cc 1000..1099. Blackwell spans cc 1000/1100/1200 and only 1000 was measured.
+static bool ggml_cuda_mmf_loses_to_cublas(const ggml_tensor * src0, const ggml_tensor * src1,
+        const int cc, const int64_t ne11) {
+    // Off by default: cuBLAS converts the activations to BF16, so the output differs from mmf.
+    // GGML_CUDA_BF16_CUBLAS=1: on for cc 1000..1099, 2: on for every NVIDIA cc >= 1000 (cc 1100 / 1200 included)
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_BF16_CUBLAS");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    if (mode <= 0 || src0->type != GGML_TYPE_BF16 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < 1000 || (mode == 1 && cc >= 1100)) {
+        return false;
+    }
+    // ne11 == 1 belongs to mmvf, which is faster than both mmf and cuBLAS there.
+    if (ne11 < 2) {
+        return false;
+    }
+    if (src0->ne[2]*src0->ne[3] != 1 || src1->ne[2]*src1->ne[3] != 1) {
+        return false;
+    }
+    // Small weights cannot amortise the cuBLAS launch and the F32->BF16 activation conversion.
+    // 20 Mi elements. A sweep over 0, 1, 4, 16, 20 and 32 Mi on both models shows the dense win
+    // is flat from 4 to 20 Mi and drops about 5 percent at 32 Mi, so this is the largest floor
+    // that costs nothing. It also leaves the MoE model bit-identical, since its widest routed
+    // weight is 16.8 Mi.
+    return src0->ne[0]*src0->ne[1] >= 20*1024*1024;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -3099,6 +3136,39 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 
+    // A weight with one channel, broadcast over ne12 src1 channels with a single column each, is
+    // one GEMM with ne12 columns rather than ne12 separate GEMVs. Left as is, the weight crosses
+    // memory ne12 times. Fold the channel axis into the column axis so it is read once; the
+    // dispatch below then picks mmf or cuBLAS for the wider shape.
+    // Require both operands contiguous. The folded channel stride becomes the GEMM leading
+    // dimension, and a padded view could present ldb < K, which cuBLAS rejects, or a layout mmf
+    // does not accept. Contiguity makes the promoted strides exactly the packed ones.
+    // GGML_CUDA_MUL_MAT_FOLD=0: off
+    static const bool fold_on = [] {
+        const char * e = getenv("GGML_CUDA_MUL_MAT_FOLD");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (fold_on && ne11 == 1 && src1->ne[2] > 1 && src1->ne[3] == 1
+            && src0->ne[2] == 1 && src0->ne[3] == 1
+            && dst->ne[1] == 1
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        ggml_tensor src1_folded = *src1;
+        src1_folded.ne[1] = src1->ne[2];
+        src1_folded.ne[2] = 1;
+        src1_folded.nb[1] = src1->nb[2];
+        src1_folded.nb[2] = src1->nb[3];
+
+        ggml_tensor dst_folded = *dst;
+        dst_folded.ne[1] = dst->ne[2];
+        dst_folded.ne[2] = 1;
+        dst_folded.nb[1] = dst->nb[2];
+        dst_folded.nb[2] = dst->nb[3];
+        dst_folded.src[1] = &src1_folded;
+
+        ggml_cuda_mul_mat(ctx, src0, &src1_folded, &dst_folded);
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -3119,7 +3189,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    if (!ggml_cuda_mmf_loses_to_cublas(src0, src1, cc, ne11)
+            && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -4359,19 +4430,20 @@ static bool ggml_cuda_graph_drop_failed_instance(ggml_cuda_graph * graph, cudaEr
 // returns false when the exec could not be instantiated again (see ggml_cuda_graph_drop_failed_instance): the caller runs eagerly
 // one chunk of the graph, its exec and its newly captured graph (chunk 0: the graph's own graph / instance; the chunks after
 // it: chunk_graphs / chunk_instances)
-static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_t & instance, cudaGraph_t cgraph_chunk) {
+static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_t & instance, cudaGraph_t cgraph_chunk, bool reinstantiate = false) {
     // GGML_CUDA_GRAPH_UPDATE_DEBUG=1 (debug): the error pending before the update and whether the exec handle is still valid, logged
     // when the update fails with another error than an update failure (a sticky / earlier error vs a bad handle)
     static const bool update_debug = ggml_cuda_env_flag("GGML_CUDA_GRAPH_UPDATE_DEBUG");
     const cudaError_t pending = update_debug ? cudaPeekAtLastError() : cudaSuccess;
 
+    // reinstantiate: the exec is not updated, it is instantiated again from the new graph (see ggml_cuda_graph::cublas)
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
-    cudaError_t stat = cudaGraphExecUpdate(instance, cgraph_chunk, &result_info);
+    cudaError_t stat = reinstantiate ? cudaErrorGraphExecUpdateFailure : cudaGraphExecUpdate(instance, cgraph_chunk, &result_info);
 #else
     cudaGraphNode_t errorNode;
     cudaGraphExecUpdateResult result_info;
-    cudaError_t stat = cudaGraphExecUpdate(instance, cgraph_chunk, &errorNode, &result_info);
+    cudaError_t stat = reinstantiate ? cudaErrorGraphExecUpdateFailure : cudaGraphExecUpdate(instance, cgraph_chunk, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
     // GGML_CUDA_GRAPH_UPDATE_FAULT=N (debug) makes every Nth update fail as if the device were out of memory
@@ -4415,7 +4487,9 @@ static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_
 
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
-        (void)cudaGetLastError();
+        if (!reinstantiate) {
+            (void)cudaGetLastError();
+        }
         if (update_error) {
             // after another error than an update failure (seen after a launch stalled for minutes on a crowded GPU: the
             // update returned invalid argument and so did this destroy, which aborted) the exec is destroyed at most once and a
@@ -4464,9 +4538,27 @@ static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_
 // returns false when an exec could not be instantiated again (see ggml_cuda_graph_drop_failed_instance): the caller runs eagerly
 // every chunk of a newly captured graph: the execs of the chunks it kept are updated, a chunk new to it is instantiated, the
 // execs of chunks it no longer has (a shorter graph) are destroyed
-static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+// fresh: graph->instance was instantiated from this capture just before (only the chunks after it can be stale)
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key, bool fresh) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (!ggml_cuda_graph_update_chunk(graph, graph->instance, graph->graph)) {
+    // a capture with a cuBLAS call is instantiated again on Hopper and datacenter Blackwell (cc 9.0 up to 12.0), not updated (see
+    // ggml_cuda_graph::cublas); cc 12.x updated these graphs correctly and keeps the update. GGML_CUDA_GRAPH_CUBLAS_UPDATE=1: updated
+    // on every device, =0: instantiated again on every device
+    bool reinstantiate = false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const int cublas_update = getenv("GGML_CUDA_GRAPH_CUBLAS_UPDATE") != nullptr ? atoi(getenv("GGML_CUDA_GRAPH_CUBLAS_UPDATE")) != 0 : -1;
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    reinstantiate = graph->cublas && (cublas_update == 0 || (cublas_update < 0 && cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL));
+    if (reinstantiate && !(fresh && graph->chunk_instances.empty())) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: a CUDA graph with cuBLAS calls is instantiated again instead of updated (GGML_CUDA_GRAPH_CUBLAS_UPDATE=1: updated)\n",
+                __func__);
+        }
+    }
+#endif
+    if (!ggml_cuda_graph_update_chunk(graph, graph->instance, graph->graph, reinstantiate && !fresh)) {
         return false;
     }
     while (graph->chunk_instances.size() > graph->chunk_graphs.size()) {
@@ -4477,7 +4569,7 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     }
     for (size_t k = 0; k < graph->chunk_graphs.size(); ++k) {
         if (k < graph->chunk_instances.size() && graph->chunk_instances[k] != nullptr) {
-            if (!ggml_cuda_graph_update_chunk(graph, graph->chunk_instances[k], graph->chunk_graphs[k])) {
+            if (!ggml_cuda_graph_update_chunk(graph, graph->chunk_instances[k], graph->chunk_graphs[k], reinstantiate)) {
                 return false;
             }
             continue;
@@ -4948,7 +5040,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 
         args.norm = true;
         for (const ggml_op op : norm_ops) {
-            if (nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+            if (node_idx < n_nodes && nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
                 node_idx++;
             } else {
                 args.norm = false;
@@ -4957,14 +5049,14 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         }
 
         // DIV <- CLAMP, RESHAPE
-        if (nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
             nodes[node_idx]->src[0] != nodes[node_idx - 3]) {
             args.norm = false;
             return true;
         }
         node_idx++;
 
-        if (nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
             args.norm = false;
             return true;
         }
@@ -4972,7 +5064,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         node_idx++;
     }
 
-    if (nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+    if (node_idx < n_nodes && nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
         args.scale = true;
     }
 
@@ -7770,9 +7862,10 @@ static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const gg
 static bool ggml_cuda_gdn_sigmoid_deferred(const ggml_cgraph * cgraph, int i);
 
 // no node between i and j writes over the bytes of t (the allocator may reuse them once their last planned reader ran); a beta
-// sigmoid that its gated_delta_net applies itself (ggml_cuda_gdn_sigmoid_deferred) writes nothing
+// sigmoid that its gated_delta_net applies itself (ggml_cuda_gdn_sigmoid_deferred) writes nothing. The consumer j itself is checked
+// too: it reads t while it writes its own output, so its output may not have been placed over the freed bytes of t either
 static bool ggml_cuda_kept_until(const ggml_cgraph * cgraph, int i, int j, const ggml_tensor * t, bool skip_deferred = false) {
-    for (int m = i + 1; m < j; ++m) {
+    for (int m = i + 1; m <= j; ++m) {
         const ggml_tensor * n = cgraph->nodes[m];
         if (ggml_cuda_is_view_or_noop(n) || n->data == nullptr) {
             continue;
@@ -10461,6 +10554,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     cudaEvent_t join = cuda_ctx->side_mv_join[side_mv_n_events++];
                     CUDA_CHECK(cudaEventRecord(join, cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM)));
                     side_mv_pending.push_back({ side_chain_reader, join });
+                    cuda_ctx->q8_1_cache.invalidate_side();
+                    cuda_ctx->q8_1_cache.side_stream = false;
                     cuda_ctx->src1_memo.release();
                     cuda_ctx->src1_memo.share_next = false;
                     cuda_ctx->side_chain_active = false;
@@ -10495,6 +10590,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         cuda_ctx->src1_memo.share_next = false;
                         cuda_ctx->curr_stream_no    = GGML_CUDA_SIDE_MV_STREAM;
                         cuda_ctx->side_chain_active = true;
+                        cuda_ctx->q8_1_cache.side_stream = true;
                         cuda_ctx->side_chain_last   = it->second.first;
                         side_chain_reader  = it->second.second;
                         // the slot of x's q8_1 copy was handed out before the fork: counted from one claim earlier
@@ -10765,6 +10861,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 CUDA_CHECK(cudaEventRecord(cuda_ctx->side_mv_fork, cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM)));
                 CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(cuda_ctx->device, 0), cuda_ctx->side_mv_fork, 0));
                 cuda_ctx->side_chain_active = false;
+                cuda_ctx->q8_1_cache.invalidate_side();
+                cuda_ctx->q8_1_cache.side_stream = false;
                 cuda_ctx->side_chain_last   = -1;
                 cuda_ctx->curr_stream_no    = 0;
             }
@@ -10822,6 +10920,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             }
             chunks_captured.clear();
+            graph->cublas = cuda_ctx->cublas_in_capture;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
             // Debug (GGML_CUDA_GRAPH_CAPTURE_LOG=1): every capture, with the launches of the key's previous exec
             static const bool cap_log = getenv("GGML_CUDA_GRAPH_CAPTURE_LOG") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_CAPTURE_LOG")) != 0;
@@ -10903,14 +11002,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         bool graph_ok = true;
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
+        const bool fresh = graph->instance == nullptr;
+        if (fresh) { // Create executable graph from captured graph.
             const cudaError_t inst = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
             if (inst != cudaSuccess) {
                 graph_ok = ggml_cuda_graph_drop_failed_instance(graph, inst, "after its capture");
             }
         }
         if (graph_ok && cuda_graph_update_required) { // Update graph executable
-            graph_ok = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            graph_ok = ggml_cuda_graph_update_executable(cuda_ctx, graph_key, fresh);
         }
         if (!graph_ok) {
             // nothing of this evaluation ran (its nodes were only captured): run them now without the graph
@@ -11060,6 +11160,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        cuda_ctx->cublas_in_capture = false;
         // the copies of this capture only (here: only with the stats on, GGML_CUDA_GRAPH_NODE_STATS >= 3, the only writer
         // of the map: an unlocked global map lookup on every capture raced with a capture of another context on another thread)
         static const bool exec_stats_cap = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 3;
@@ -11188,7 +11289,8 @@ static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cg
 // with the same kernels (the q8_1 activation cache and the multi-matrix launch are used inside the branch as on the main stream; the
 // branch's cache slots cannot be handed out again before its join, see the claim guard in the evaluation): only the overlap changes.
 // Only graphs of 2..GGML_CUDA_SIDE_CHAIN_COLS (default 8) columns are planned (speculative verify windows): prompts and single-token
-// decodes keep their node order and kernels. GGML_CUDA_SIDE_CHAIN=0 turns it off.
+// decodes keep their node order and kernels. Off by default on cc 8.0 (see the gate in graph_optimize); GGML_CUDA_SIDE_CHAIN=0 / 1
+// turns it off / on.
 static int ggml_cuda_side_chain_cols() {
     static const int v = getenv("GGML_CUDA_SIDE_CHAIN_COLS") ? atoi(getenv("GGML_CUDA_SIDE_CHAIN_COLS")) : 8;
     return std::min(v, (int) MMVQ_MAX_BATCH_SIZE);
@@ -11710,7 +11812,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         if (!disable_fusion && !side_mv_disabled && side_mv_arch_ok && !(graph_opt != nullptr && atoi(graph_opt) == 1)) {
             ggml_cuda_side_mv_plan(cuda_ctx, cgraph, params);
         }
-        static const bool side_chain_on = getenv("GGML_CUDA_SIDE_CHAIN") == nullptr || atoi(getenv("GGML_CUDA_SIDE_CHAIN")) != 0;
+        // the side chain has its own default per compute capability: measured slower on cc 8.0 (A100: off was 1-5% cheaper per
+        // speculative verify pass) and faster on cc 12.0 (off 1-2.5% dearer), so it is off by default on cc 8.0 only.
+        // GGML_CUDA_SIDE_CHAIN=1 turns it on (Ampere and newer, as the side matvec), GGML_CUDA_SIDE_CHAIN=0 turns it off.
+        static const char * side_chain_env = getenv("GGML_CUDA_SIDE_CHAIN");
+        const bool side_chain_on = side_chain_env != nullptr ? atoi(side_chain_env) != 0 : side_mv_cc != GGML_CUDA_CC_AMPERE;
         if (!disable_fusion && side_chain_on && side_mv_arch_ok && !(graph_opt != nullptr && atoi(graph_opt) == 1)) {
             ggml_cuda_side_chain_plan(cuda_ctx, cgraph, params);
         }

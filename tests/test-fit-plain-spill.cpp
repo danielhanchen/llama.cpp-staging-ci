@@ -44,6 +44,43 @@ int main() {
         const auto tr4 = common_fit_margin_trials({1024*MiB}, common_fit_margin_steps_mib("512,512,256"));
         CHECK(tr4.size() == 2);
     }
+    // a reserve on top of the default margin (a 768 MiB projector loaded after the model) stays on top of every step
+    {
+        const std::vector<size_t> steps = common_fit_margin_steps_mib("512,448,256,192");
+        const auto tr = common_fit_margin_trials({(1024 + 768)*MiB}, steps, {768*MiB});
+        CHECK(tr.size() == 4);
+        CHECK(tr.size() == 4 && tr[0][0] == (512 + 768)*MiB && tr[1][0] == (448 + 768)*MiB && tr[2][0] == (256 + 768)*MiB &&
+              tr[3][0] == (192 + 768)*MiB);
+        // no reserve: the same trials as without the argument
+        const auto tr0 = common_fit_margin_trials({1024*MiB, 200*MiB}, steps, {0, 0});
+        CHECK(tr0 == common_fit_margin_trials({1024*MiB, 200*MiB}, steps));
+        // per device: only the device with the projector keeps it
+        const auto tr2 = common_fit_margin_trials({(1024 + 300)*MiB, 1024*MiB}, steps, {300*MiB, 0});
+        CHECK(tr2.size() == 4 && tr2[0][0] == (512 + 300)*MiB && tr2[0][1] == 512*MiB);
+    }
+    // the reserve is the part of each margin above the default; one step of the MTP drafter squeeze (512, then 448 MiB) keeps it
+    {
+        const std::vector<size_t> res = common_fit_margin_reserve({(1024 + 880)*MiB, 1024*MiB, 512*MiB}, {1024*MiB, 1024*MiB});
+        CHECK(res.size() == 3 && res[0] == 880*MiB && res[1] == 0 && res[2] == 0);
+        const auto sq = common_fit_margin_trials({(1024 + 880)*MiB}, {512*MiB}, common_fit_margin_reserve({(1024 + 880)*MiB}, {1024*MiB}));
+        CHECK(sq.size() == 1 && sq[0][0] == (512 + 880)*MiB);
+        const auto sq2 = common_fit_margin_trials({(1024 + 880)*MiB}, {448*MiB}, common_fit_margin_reserve({(1024 + 880)*MiB}, {1024*MiB}));
+        CHECK(sq2.size() == 1 && sq2[0][0] == (448 + 880)*MiB);
+        // without a projector the squeeze step is the plain cap, as before
+        const auto sq0 = common_fit_margin_trials({1024*MiB}, {512*MiB}, common_fit_margin_reserve({1024*MiB}, {1024*MiB}));
+        CHECK(sq0.size() == 1 && sq0[0][0] == 512*MiB);
+        // a margin already at or below the step (a --fit-target below it) is not a step
+        CHECK(common_fit_margin_trials({400*MiB}, {512*MiB}, common_fit_margin_reserve({400*MiB}, {1024*MiB})).empty());
+    }
+    // a GPU projector loaded after the fit: the step-down only where its reserve is in the margins (the server, default devices)
+    {
+        CHECK( common_fit_plain_spill_proj_ok(false, false, {}));          // no projector
+        CHECK( common_fit_plain_spill_proj_ok(false, true,  {0}));         // no projector, a device list
+        CHECK(!common_fit_plain_spill_proj_ok(true,  false, {0}));         // llama-mtmd-cli: nothing reserved
+        CHECK(!common_fit_plain_spill_proj_ok(true,  false, {}));
+        CHECK( common_fit_plain_spill_proj_ok(true,  false, {768*MiB}));   // the server: reserve on the fitted device
+        CHECK(!common_fit_plain_spill_proj_ok(true,  true,  {0, 768*MiB})); // --device: the reserve may sit in another slot
+    }
     // the display gate
     {
         CHECK( common_fit_plain_spill_gate({1}, nullptr));

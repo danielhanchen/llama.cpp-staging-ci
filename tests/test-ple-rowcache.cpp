@@ -12,7 +12,6 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 
 #include "../src/llama-row-cache.h"
 
@@ -46,8 +45,16 @@ struct gather_env {
 };
 
 static bool gather_init(gather_env & g, ggml_type type, int64_t ncols, int64_t nrows, int64_t nids, std::mt19937 & rng) {
-    g.be = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(g.be, 4);
+    // through the registry: the CPU backend can be a loadable module (GGML_BACKEND_DL), whose functions are not linked
+    g.be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    GGML_ASSERT(g.be != nullptr && "no CPU backend");
+    {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(g.be));
+        auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_n_threads != nullptr) {
+            set_n_threads(g.be, 4);
+        }
+    }
     ggml_init_params ip = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
     g.ctx = ggml_init(ip);
     g.tab = ggml_new_tensor_2d(g.ctx, type, ncols, nrows);

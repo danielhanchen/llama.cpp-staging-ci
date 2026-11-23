@@ -40,6 +40,13 @@ struct llama_kv_win_creating_scope {
 // t if the window mode is not creating, or t is not quantized; else the window type of K (is_k) or V
 ggml_type llama_kv_win_window_type(ggml_type t, bool is_k);
 
+// while alive, the KV caches created on this thread back every cell at load (no LLAMA_KV_LAZY), for caches whose rows are
+// written and read outside the prepare / apply_ubatch growth of a lazy cache (the DSV4 compressed caches)
+struct llama_kv_eager_scope {
+    llama_kv_eager_scope();
+    ~llama_kv_eager_scope();
+};
+
 //
 // llama_kv_cache
 //

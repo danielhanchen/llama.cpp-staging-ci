@@ -17,6 +17,7 @@ struct llama_cparams {
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
+    uint32_t n_exact_rows = 1; // rows of an exact verify ubatch with one attention per row (llama_context::exact_rows_max)
     // build_sampling may run the leading backend top-k of a sequence's chains once over all its rows of the ubatch (the
     // output device's top-k gives each row of a multi-row input the result of that row alone; LLAMA_DEV_TOPK_BATCH=0: off)
     bool     topk_batch = false;
@@ -49,8 +50,10 @@ struct llama_cparams {
     uint32_t dsv41_far = 0;       // leading rows of the current ubatch that stop before hparams.dsv41_far_layer (0 = none)
     bool causal_attn;
     bool offload_kqv;
+    bool kq_mask_dev = true;   // every device of the model runs GGML_OP_KQ_MASK (llm_graph's device KQ mask)
     bool flash_attn;
     bool auto_fa;
+    bool kv_f16 = false;     // K and V cache types are both F16
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;

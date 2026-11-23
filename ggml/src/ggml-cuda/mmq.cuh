@@ -1163,7 +1163,11 @@ static __device__ __forceinline__ int mmq_moe_tile_start(const int32_t * __restr
     return tile_prefix ? tile_prefix[e] : expert_bounds[e]/J + e;
 }
 
+// d == 0 (every routed slot of the product skipped: an empty tile range, the values are never used): zeros, no division by zero
 static __device__ __forceinline__ uint3 mmq_fastdiv_values_dev(const uint32_t d) {
+    if (d == 0) {
+        return make_uint3(0, 0, 0);
+    }
     uint32_t L = 0;
     while (L < 32 && (uint32_t{ 1 } << L) < d) {
         L++;
@@ -1825,7 +1829,8 @@ static constexpr bool mmq_pipe_instantiated() {
 // The IQ3_XXS gate / up and Q5_0 down experts (the 4-bit Flash-Next quant) on the pipe as well: same tiles, bit-identical; RTX PRO 6000,
 // J 40: IQ3_XXS 782 -> 686 us, Q5_0 925 -> 778 us per launch (IQ2_S experts measured slower on the pipe, 817 -> 1088 us: base kernel).
 // GGML_CUDA_MMQ_PIPE_EXT: unset = the policy below, 0 = these types keep the base kernel, N > 0 = the MMQ_PIPE_* bits N for them only.
-// On the A100 (sm 80) they keep the base kernel unless GGML_CUDA_MMQ_PIPE_EXT_SM80=1 (measured on the RTX PRO 6000 only).
+// On the A100 (sm 80) as well: Flash-Next 4-bit full card 8k prompt 3.22 -> 2.95 s, 48 GB cap 4.62 -> 4.51 s, same text.
+// GGML_CUDA_MMQ_PIPE_EXT_SM80=0 keeps the base kernel for these types on sm 80 (as before).
 static constexpr bool mmq_pipe_ext_type(const ggml_type type) {
     return type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_Q5_0;
 }
@@ -1837,7 +1842,7 @@ static int ggml_cuda_mmq_pipe_ext_env(const bool sm80) {
     }();
     static const bool on_sm80 = [] {
         const char * e = getenv("GGML_CUDA_MMQ_PIPE_EXT_SM80");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     return sm80 && !on_sm80 ? 0 : v;
 }

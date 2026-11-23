@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -227,6 +228,31 @@ class DeepseekV41Model(DeepseekV4Model):
         data = _StreamedBytes((len(pairs), rows, packed_cols * 2 // 32 * 17), chunks)
         self.gguf_writer.add_tensor(self.format_tensor_name(key, bid), data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
 
+    @contextlib.contextmanager
+    def _engram_row_readers(self, wn: str, sn: str, wpart: Path, spart: Path):
+        """(weight, scale) readers: rows [r0, r1) of the table and of its scales as uint8 tensors, from the local shards or,
+        with --remote, by byte range from the remote shards (both are one byte per element)."""
+        if self.remote_hf_model_id is not None:
+            if getattr(self, "_engram_remote", None) is None:
+                self._engram_remote = gguf.utility.SafetensorRemote.get_list_tensors_hf_model(self.remote_hf_model_id)
+            remote = self._engram_remote
+
+            def reader(t: gguf.utility.RemoteTensor):
+                row = t.size // t.shape[0]
+
+                def read(r0: int, r1: int) -> Tensor:
+                    r1 = min(r1, t.shape[0])
+                    start, size = t.offset_start + r0 * row, (r1 - r0) * row
+                    data = bytearray(gguf.utility.SafetensorRemote.get_data_by_range(t.url, start, size))
+                    return torch.frombuffer(data, dtype=torch.uint8).reshape(r1 - r0, row)
+                return read
+            yield reader(remote[wn]), reader(remote[sn])
+            return
+        from safetensors import safe_open
+        with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
+            ws, ss = fw.get_slice(wn), fs.get_slice(sn)
+            yield (lambda r0, r1: ws[r0:r1].view(torch.uint8)), (lambda r0, r1: ss[r0:r1].view(torch.uint8))
+
     def _write_engram_tables(self, layer_ids: list[int]) -> None:
         # official lookup e4m3 * 2^(e8m0 - 127): stored as the source MXFP8 blocks (bit-exact) or as exact BF16
         parts, dim = [], None
@@ -245,13 +271,11 @@ class DeepseekV41Model(DeepseekV4Model):
 
         if self._engram_mxfp8:
             def blocks() -> Iterable[np.ndarray]:
-                from safetensors import safe_open
                 for wn, sn, rows, wpart, spart in parts:
-                    with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
-                        ws, ss = fw.get_slice(wn), fs.get_slice(sn)
+                    with self._engram_row_readers(wn, sn, wpart, spart) as (ws, ss):
                         for r0 in range(0, rows, 1 << 18):
-                            q = ws[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 32).numpy()
-                            e = ss[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 1).numpy()
+                            q = ws(r0, r0 + (1 << 18)).reshape(-1, 32).numpy()
+                            e = ss(r0, r0 + (1 << 18)).reshape(-1, 1).numpy()
                             if (e == 0xFF).any() or ((q & 0x7F) == 0x7F).any():
                                 raise ValueError(f"{wn}: NaN E8M0 scale or E4M3 code")
                             yield np.concatenate([e, q], axis=1)
@@ -260,13 +284,11 @@ class DeepseekV41Model(DeepseekV4Model):
             return
 
         def chunks() -> Iterable[np.ndarray]:
-            from safetensors import safe_open
             for wn, sn, rows, wpart, spart in parts:
-                with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
-                    ws, ss = fw.get_slice(wn), fs.get_slice(sn)
+                with self._engram_row_readers(wn, sn, wpart, spart) as (ws, ss):
                     for r0 in range(0, rows, 1 << 18):
-                        q = ws[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 32)
-                        e = ss[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 1)
+                        q = ws(r0, r0 + (1 << 18)).reshape(-1, 32)
+                        e = ss(r0, r0 + (1 << 18)).reshape(-1, 1)
                         _e8m0_check(e.numpy(), sn)
                         v = (q.view(torch.float8_e4m3fn).float() * torch.exp2(e.float() - 127)).reshape(-1, dim)
                         yield (v if self._f32 else v.bfloat16()).view(torch.uint8).numpy()
