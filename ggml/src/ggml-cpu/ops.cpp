@@ -11,9 +11,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <thread>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 // ggml_compute_forward_dup
@@ -5402,6 +5407,139 @@ static ggml_cpu_row_source_entry ggml_cpu_row_source_of(const ggml_tensor * t) {
     return {};
 }
 
+// GET_ROWS results gathered ahead (ggml_backend_cpu_get_rows_ahead). The entries are never destroyed (a gather thread may still run
+// at exit); `use` is held shared by the gathers reading a result and exclusively by a call that replaces or drops it
+namespace {
+struct ggml_cpu_rows_ahead_entry {
+    std::atomic<const ggml_tensor *> t {nullptr};
+    int64_t                   nc = 0;
+    std::vector<int32_t>      ids;
+    std::unique_ptr<float[]>  out;     // not zero-filled: the gather threads write (and first touch) it
+    size_t                    out_cap = 0;
+    std::vector<std::thread>  thr;
+    std::shared_mutex         use;
+    std::mutex                m;
+    std::condition_variable   cv;
+    int                       running = 0;
+};
+std::mutex                  g_rows_ahead_mtx;
+ggml_cpu_rows_ahead_entry * g_rows_ahead = new ggml_cpu_rows_ahead_entry[4];
+std::atomic<int>            g_rows_ahead_n {0};
+std::atomic<int64_t>        g_rows_ahead_taken {0};
+}
+
+int64_t ggml_backend_cpu_get_rows_ahead_taken(void) {
+    return g_rows_ahead_taken.load(std::memory_order_relaxed);
+}
+
+// row i01 of the 2D-or-more src0 at (i11, i12) converted to floats, as the gather converts it
+static inline void ggml_cpu_get_row_q(const ggml_tensor * src0, ggml_to_float_t to_float, const ggml_cpu_row_source_entry & rs,
+        int64_t i01, int64_t i11, int64_t i12, float * y, uint8_t * tmp) {
+    const char * row = (const char *) src0->data + i01*src0->nb[1] + i11*src0->nb[2] + i12*src0->nb[3];
+    if (rs.fn) {
+        row = (const char *) rs.fn(rs.ud, src0, i01, tmp);
+    }
+    to_float((const void *) row, y, src0->ne[0]);
+}
+
+bool ggml_backend_cpu_get_rows_ahead(const ggml_tensor * t, const int32_t * ids, int64_t n, int n_threads) {
+    if (t == nullptr) {
+        return false;
+    }
+    const bool drop = n <= 0 || ids == nullptr;
+    const auto * tr = ggml_get_type_traits(t->type);
+    if (!drop && (!ggml_is_quantized(t->type) || tr->to_float == nullptr || t->data == nullptr || t->ne[2] != 1 || t->ne[3] != 1 ||
+            (t->buffer != nullptr && !ggml_backend_buffer_is_host(t->buffer)))) {
+        return false;
+    }
+    ggml_cpu_rows_ahead_entry * e = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_rows_ahead_mtx);
+        for (int k = 0; k < 4 && e == nullptr; ++k) {
+            if (g_rows_ahead[k].t == t) {
+                e = &g_rows_ahead[k];
+            }
+        }
+        if (e == nullptr) {
+            if (drop) {
+                return true;
+            }
+            for (int k = 0; k < 4 && e == nullptr; ++k) {
+                if (g_rows_ahead[k].t == nullptr && g_rows_ahead[k].thr.empty()) {
+                    e = &g_rows_ahead[k];
+                }
+            }
+            if (e == nullptr) {
+                return false;
+            }
+            e->t = t; // claimed (no result yet: ids is empty until the threads below are started)
+            g_rows_ahead_n.fetch_add(1, std::memory_order_release);
+        }
+    }
+    std::unique_lock<std::shared_mutex> excl(e->use);
+    for (auto & th : e->thr) {
+        th.join();
+    }
+    e->thr.clear();
+    e->running = 0;
+    if (drop) {
+        e->ids.clear();
+        e->out.reset();
+        e->out_cap = 0;
+        std::lock_guard<std::mutex> lock(g_rows_ahead_mtx);
+        e->t = nullptr;
+        g_rows_ahead_n.fetch_sub(1, std::memory_order_release);
+        return true;
+    }
+    const int64_t nc = t->ne[0];
+    const int64_t nr = t->ne[1];
+    e->nc = nc;
+    e->ids.assign(ids, ids + n);
+    for (auto & id : e->ids) {
+        if (id < 0 || id >= nr) {
+            id = -1; // never matches a gathered row
+        }
+    }
+    if (e->out_cap < (size_t) (n*nc)) {
+        e->out.reset(new float[(size_t) (n*nc)]);
+        e->out_cap = (size_t) (n*nc);
+    }
+    const int nth = (int) std::max<int64_t>(1, std::min<int64_t>(std::max(1, n_threads), n));
+    e->running = nth;
+    const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(t);
+    for (int ith = 0; ith < nth; ++ith) {
+        e->thr.emplace_back([e, t, tr, rs, n, nc, nth, ith]() {
+            alignas(64) uint8_t tmp[GGML_CPU_ROW_SOURCE_MAX_BYTES];
+            const int64_t dr = (n + nth - 1)/nth;
+            const int64_t i0 = dr*ith;
+            const int64_t i1 = std::min(i0 + dr, n);
+            for (int64_t i = i0; i < i1; ++i) {
+                if (e->ids[i] >= 0) {
+                    ggml_cpu_get_row_q(t, tr->to_float, rs, e->ids[i], 0, 0, e->out.get() + i*nc, tmp);
+                }
+            }
+            std::lock_guard<std::mutex> lock(e->m);
+            if (--e->running == 0) {
+                e->cv.notify_all();
+            }
+        });
+    }
+    return true;
+}
+
+static ggml_cpu_rows_ahead_entry * ggml_cpu_rows_ahead_of(const ggml_tensor * t) {
+    if (g_rows_ahead_n.load(std::memory_order_acquire) == 0) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_rows_ahead_mtx);
+    for (int k = 0; k < 4; ++k) {
+        if (g_rows_ahead[k].t == t) {
+            return &g_rows_ahead[k];
+        }
+    }
+    return nullptr;
+}
+
 static void ggml_compute_forward_get_rows_q(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -5436,6 +5574,23 @@ static void ggml_compute_forward_get_rows_q(
     const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(src0);
     alignas(64) uint8_t rs_tmp[GGML_CPU_ROW_SOURCE_MAX_BYTES];
 
+    // a result gathered ahead (ggml_backend_cpu_get_rows_ahead): row i of a 1D gather comes from it where it gathered the same row
+    ggml_cpu_rows_ahead_entry * ra = ne11 == 1 && ne12 == 1 && dst->type == GGML_TYPE_F32 && nb0 == sizeof(float) ?
+        ggml_cpu_rows_ahead_of(src0) : nullptr;
+    std::shared_lock<std::shared_mutex> ra_lock;
+    const int32_t * ra_ids = nullptr;
+    int64_t         ra_n   = 0;
+    int64_t         n_taken = 0;
+    if (ra != nullptr) {
+        ra_lock = std::shared_lock<std::shared_mutex>(ra->use);
+        if (ra->t == src0 && ra->nc == nc && !ra->ids.empty()) {
+            std::unique_lock<std::mutex> lock(ra->m);
+            ra->cv.wait(lock, [ra]() { return ra->running == 0; });
+            ra_ids = ra->ids.data();
+            ra_n   = (int64_t) ra->ids.size();
+        }
+    }
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -5443,6 +5598,12 @@ static void ggml_compute_forward_get_rows_q(
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        if (i10 < ra_n && ra_ids[i10] == i01) {
+            memcpy((char *) dst->data + i10*nb1, ra->out.get() + i10*nc, nc*sizeof(float));
+            n_taken++;
+            continue;
+        }
 
         const char * row = (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03;
         if (rs.fn) {
@@ -5452,6 +5613,9 @@ static void ggml_compute_forward_get_rows_q(
         dequantize_row_q(
                 (const void *) (row),
                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+    }
+    if (n_taken > 0) {
+        g_rows_ahead_taken.fetch_add(n_taken, std::memory_order_relaxed);
     }
 }
 

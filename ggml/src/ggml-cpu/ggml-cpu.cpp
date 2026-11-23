@@ -705,6 +705,13 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_row_source") == 0) {
         return (void *)ggml_backend_cpu_set_row_source;
     }
+    // GET_ROWS results gathered ahead of their graph (llama_context's next prompt batch)
+    if (strcmp(name, "ggml_backend_cpu_get_rows_ahead") == 0) {
+        return (void *)ggml_backend_cpu_get_rows_ahead;
+    }
+    if (strcmp(name, "ggml_backend_cpu_get_rows_ahead_taken") == 0) {
+        return (void *)ggml_backend_cpu_get_rows_ahead_taken;
+    }
     // the single-graph MoE mailbox host experts (llama_moe_cache)
     if (strcmp(name, "ggml_cpu_moe_host_ffn") == 0) {
         return (void *)ggml_cpu_moe_host_ffn;

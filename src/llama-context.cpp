@@ -2977,6 +2977,7 @@ void llama_context::gf_res_epoch_bump(int line) {
 
 llama_context::~llama_context() {
     nextn_join();
+    batch_ahead_drop();
     // the refill reads of the RAM tier that did not start are cancelled before the weight store goes (its destructor would
     // read every queued one)
     if (moe_cache) {
@@ -4437,6 +4438,28 @@ int64_t llama_context::nextn_rows_wait(int64_t n) {
 float * llama_context::nextn_rows_early() {
     nextn_join();
     return output_swaps.empty() ? embd_nextn.data : nullptr;
+}
+
+void * llama_context::nextn_rows_ready() {
+    static const bool env = getenv("LLAMA_MTP_PROMPT_ROWS_ASYNC") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_ROWS_ASYNC")) != 0;
+    nextn_join();
+    if (!env || nextn_host_be == nullptr || nextn_host_multi || mtp_dev_h_this || !output_swaps.empty() || !embd_nextn.data ||
+            cparams.embeddings_nextn_masked) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(nextn_host_be);
+    ggml_backend_event_t ev = dev ? ggml_backend_event_new(dev) : nullptr;
+    if (ev == nullptr) {
+        return nullptr;
+    }
+    // queued after the copies on the same stream: complete once they are
+    ggml_backend_event_record(ev, nextn_host_be);
+    static std::atomic<int> n_log{0};
+    if (n_log++ == 0) {
+        LLAMA_LOG_INFO("%s: the next-n rows of a prompt batch are waited for by their reader, not by the decoding thread "
+            "(LLAMA_MTP_PROMPT_ROWS_ASYNC=0 off)\n", __func__);
+    }
+    return ev;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
@@ -6205,6 +6228,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ~ubatch_breaks_reset() { b->ubatch_breaks.clear(); }
     } ubatch_breaks_reset_guard { balloc.get() };
     std::vector<int32_t> ub_breaks = std::move(ubatch_breaks_next);
+    // the next batch announced for after this decode (llama_set_batch_ahead): its gathers start when this decode's last ubatch is queued
+    const bool batch_ahead_now = batch_ahead.pending;
+    batch_ahead.pending = false;
+    nextn_host_be    = nullptr;
+    nextn_host_multi = false;
     ubatch_breaks_next.clear();
     // the captures asked for this decode (llama_set_state_capture); those of an earlier decode are dropped
     bool cap_active = false;
@@ -6805,6 +6833,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     float * embd_nextn_out = embd_nextn.data + offset*n_embd;
                     GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                     ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                    nextn_host_multi |= nextn_host_be != nullptr && nextn_host_be != backend_h;
+                    nextn_host_be = backend_h;
                 }
                 extract_all_idxs = extract_all_idxs || !masked;
             }
@@ -6831,6 +6861,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
         }
         more = mctx->next();
+    }
+
+    if (batch_ahead_now) {
+        batch_ahead_start(mctx.get());
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -8176,6 +8210,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     if (!(mtp_dev_h_this && mtp_dev_h_store(backend_h, t_h_nextn, ubatch, offset))) {
                         GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
+                        nextn_host_multi |= nextn_host_be != nullptr && nextn_host_be != backend_h;
+                        nextn_host_be = backend_h;
                     }
                     extract_all_idxs = extract_all_idxs || !masked;
                 }
@@ -13396,6 +13432,103 @@ void llama_context::set_ubatch_breaks(const int32_t * breaks, int32_t n) {
     ubatch_breaks_next.assign(breaks, breaks + std::max(0, n));
 }
 
+// llama_set_batch_ahead
+using llama_cpu_rows_ahead_fn_t = bool (*)(const ggml_tensor *, const int32_t *, int64_t, int);
+using llama_cpu_rows_taken_fn_t = int64_t (*)(void);
+
+static void * llama_cpu_proc(const char * name) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+bool llama_context::set_batch_ahead(const llama_token * tokens, int32_t n, llama_pos pos0, llama_seq_id seq_id) {
+    static const bool env = getenv("LLAMA_BATCH_GATHER_AHEAD") == nullptr || atoi(getenv("LLAMA_BATCH_GATHER_AHEAD")) != 0;
+    batch_ahead.pending = false;
+    if (!env || tokens == nullptr || n <= 0 || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+            llama_cpu_proc("ggml_backend_cpu_get_rows_ahead") == nullptr) {
+        return false;
+    }
+    // at most one ubatch: the gathers of a later ubatch of the same decode run beside the GPU already
+    n = std::min<int32_t>(n, (int32_t) cparams.n_ubatch);
+    batch_ahead.tok.assign(tokens, tokens + n);
+    batch_ahead.pos0    = pos0;
+    batch_ahead.seq_id  = seq_id;
+    batch_ahead.pending = true;
+    return true;
+}
+
+void llama_context::batch_ahead_start(const llama_memory_context_i * mctx) {
+    batch_ahead.pending = false;
+    const auto fn = (llama_cpu_rows_ahead_fn_t) llama_cpu_proc("ggml_backend_cpu_get_rows_ahead");
+    if (fn == nullptr || batch_ahead.tok.empty()) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    const uint32_t n = (uint32_t) batch_ahead.tok.size();
+    std::vector<llama_pos>      pos(n);
+    std::vector<int32_t>        n_seq_id(n, 1);
+    llama_seq_id                sid = batch_ahead.seq_id;
+    std::vector<llama_seq_id *> seq_ids(n, &sid);
+    for (uint32_t i = 0; i < n; ++i) {
+        pos[i] = batch_ahead.pos0 + (llama_pos) i;
+    }
+    llama_ubatch ub = {};
+    ub.b_equal_seqs = 1;
+    ub.n_tokens     = n;
+    ub.n_seq_tokens = n;
+    ub.n_seqs       = 1;
+    ub.n_seqs_unq   = 1;
+    ub.n_pos        = 1;
+    ub.token        = batch_ahead.tok.data();
+    ub.pos          = pos.data();
+    ub.n_seq_id     = n_seq_id.data();
+    ub.seq_id       = seq_ids.data();
+    ub.seq_id_unq   = &sid;
+
+    const int n_thr = std::max(1, (int) cparams.n_threads_batch);
+    auto start = [&](const ggml_tensor * t, const int32_t * ids, int64_t n_ids) {
+        if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer) || !ggml_is_quantized(t->type)) {
+            return;
+        }
+        if (fn(t, ids, n_ids, n_thr)) {
+            if (std::find(batch_ahead.started.begin(), batch_ahead.started.end(), t) == batch_ahead.started.end()) {
+                batch_ahead.started.push_back(t);
+            }
+            batch_ahead.n_rows += n_ids;
+        }
+    };
+    // the input embedding rows: the token ids themselves
+    static_assert(sizeof(llama_token) == sizeof(int32_t), "token ids are gathered as int32");
+    start(model.tok_embd, (const int32_t *) batch_ahead.tok.data(), n);
+    // the PLE rows: those the set_input of that ubatch computes from the cells this decode wrote (-1 where not known yet)
+    std::vector<int32_t> rows;
+    if (const ggml_tensor * t = model.ple_rows(ub, nullptr, mctx, false, rows)) {
+        start(t, rows.data(), (int64_t) rows.size());
+    }
+    batch_ahead.n_started++;
+    batch_ahead.t_us += ggml_time_us() - t0;
+    if (batch_ahead.n_started == 1) {
+        LLAMA_LOG_INFO("%s: the embedding rows of the next prompt batch (%u tokens) are gathered on %d host threads while this batch "
+            "computes (LLAMA_BATCH_GATHER_AHEAD=0 off)\n", __func__, n, n_thr);
+    }
+}
+
+void llama_context::batch_ahead_drop() {
+    const auto fn = (llama_cpu_rows_ahead_fn_t) llama_cpu_proc("ggml_backend_cpu_get_rows_ahead");
+    if (batch_ahead.n_started > 0) {
+        const auto taken = (llama_cpu_rows_taken_fn_t) llama_cpu_proc("ggml_backend_cpu_get_rows_ahead_taken");
+        LLAMA_LOG_INFO("%s: next-batch gathers: %" PRId64 " batches, %" PRId64 " rows converted ahead, %" PRId64 " rows taken by the "
+            "gathers, %.2f ms on the decode thread\n", __func__, batch_ahead.n_started, batch_ahead.n_rows, taken ? taken() : (int64_t) -1,
+            batch_ahead.t_us/1000.0);
+    }
+    for (const ggml_tensor * t : batch_ahead.started) {
+        if (fn) {
+            fn(t, nullptr, 0, 0);
+        }
+    }
+    batch_ahead.started.clear();
+}
+
 // llama_set_state_capture
 bool llama_context::state_capture_supported() const {
     static const bool env = getenv("LLAMA_STATE_CAPTURE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE")) != 0;
@@ -13740,6 +13873,10 @@ void llama_state_seq_async_wait(llama_context * ctx) {
 
 void llama_set_ubatch_breaks(llama_context * ctx, const int32_t * breaks, int32_t n) {
     ctx->set_ubatch_breaks(breaks, n);
+}
+
+bool llama_set_batch_ahead(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id) {
+    return ctx->set_batch_ahead(tokens, n_tokens, pos0, seq_id);
 }
 
 bool llama_state_capture_supported(const llama_context * ctx) {
@@ -14165,6 +14302,17 @@ bool llama_mtp_draft_weights_restore(llama_context * ctx) {
 
 float * llama_get_embeddings_nextn_early(llama_context * ctx) {
     return ctx->nextn_rows_early();
+}
+
+void * llama_nextn_rows_ready(llama_context * ctx) {
+    return ctx->nextn_rows_ready();
+}
+
+void llama_nextn_rows_ready_wait(void * handle) {
+    if (handle != nullptr) {
+        ggml_backend_event_synchronize((ggml_backend_event_t) handle);
+        ggml_backend_event_free((ggml_backend_event_t) handle);
+    }
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {

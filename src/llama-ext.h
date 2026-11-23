@@ -160,6 +160,11 @@ LLAMA_API void llama_set_verify(struct llama_context * ctx, bool value);
 // (LLAMA_LM_CKPT_MERGE): the next llama_decode() of a single sequence batch ends ubatches at these batch indices (each segment is split as
 // a batch of its own would be: the same ubatches as separate decode() calls, in one layer-major group); cleared by that call
 LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t * breaks, int32_t n);
+// the tokens of the prompt batch expected after the next llama_decode() (one sequence, positions pos0, pos0 + 1, ...): once that decode
+// has queued its last ubatch, the host gathers of these tokens' embedding rows run on host threads while the device computes, and the
+// decode after it takes every row that matches from them (the others are gathered as before; same bytes either way). A hint only:
+// nothing changes when the next batch differs. Cleared by the next decode. LLAMA_BATCH_GATHER_AHEAD=0: off (returns false)
+LLAMA_API bool llama_set_batch_ahead(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, llama_pos pos0, llama_seq_id seq_id);
 // the next llama_decode() keeps the partial state of seq_id (the recurrent rows) as it is before batch token i_batch, for a
 // checkpoint there that the decode does not stop at (the merged prompt checkpoint of llama-server, LLAMA_LM_CKPT_MERGE). After the
 // decode, llama_state_seq_captured() says whether it was taken, and llama_state_seq_get_size_ext / get_data_ext with
@@ -334,6 +339,12 @@ LLAMA_API int64_t llama_nextn_rows_wait(struct llama_context * ctx, int64_t n_ro
 // the nextn rows without a synchronization (unmasked: row i at i*n_embd); nullptr when outputs are to be reordered.
 // Valid for rows [0, llama_nextn_rows_wait(...)) until the next decode
 LLAMA_API float * llama_get_embeddings_nextn_early(struct llama_context * ctx);
+// a handle for the host copies of the last decode's nextn rows (unmasked, one backend): llama_nextn_rows_ready_wait(handle), from any
+// thread, returns once those rows are on the host and frees the handle (call it exactly once). nullptr when the last decode copied no
+// rows to the host this way (the caller synchronizes as before). The rows stay valid until the context writes them again (see
+// llama_set_nextn_hold). LLAMA_MTP_PROMPT_ROWS_ASYNC=0: always nullptr
+LLAMA_API void * llama_nextn_rows_ready(struct llama_context * ctx);
+LLAMA_API void   llama_nextn_rows_ready_wait(void * handle);
 // fn(user_data) is called once, on the calling thread of a later decode / encode / output read, before the context writes,
 // reorders or frees its next-n rows, or frees an MTP drafter's compute buffers (a reader of the rows outside the context, e.g. a drafter's
 // prompt pass on another thread, is waited for there). nullptr clears it. Not thread-safe: set it from the thread that decodes
