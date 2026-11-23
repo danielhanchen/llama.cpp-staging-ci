@@ -8949,7 +8949,19 @@ struct llama_moe_cache::impl {
             return false;
         }
         const bool mailbox = single_weigh() && single_usable(1);
-        const double trial_frac = trial_frac_env >= 0.0 ? trial_frac_env : (mailbox ? std::max(0.20, trial_frac_single) : 0.20);
+        // (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_TRUST, default 0.70; 0 = off): on a host whose marginal "on" is trusted (cmt_trust_marginal: a
+        // 12..31-CPU mailbox host) a cache below this share skips the warm phase and the trials from the first launch, as a launch does
+        // once its calibration file holds the firm "on" (the firm skip below): there the first trial timed "on" in every launch, so the
+        // trials only cost the launches that run them. L4 (12 vCPU), Qwen3.6-35B-A3B at 4 bits with its MTP head at 16 GB (60% cached):
+        // the launches that ran the trials decoded chat at 112 tok/s against 123 in the launches that skipped them, the same text as those.
+        // Above it the trials keep deciding: 20 GB (80%) timed "off" in 4 of 22 launches
+        static const double trial_frac_trust = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_TRUST");
+            return e != nullptr ? std::max(0.0, atof(e)) : 0.70;
+        }();
+        const bool trust = trial_frac_env < 0.0 && mailbox && trial_frac_trust > std::max(0.20, trial_frac_single) && cmt_trust_marginal();
+        const double trial_frac = trial_frac_env >= 0.0 ? trial_frac_env :
+            (mailbox ? std::max({ 0.20, trial_frac_single, trust ? trial_frac_trust : 0.0 }) : 0.20);
         // with LLAMA_MOE_CPU_MISS_PER_REQUEST no timing trials (the cost model only), so no verdict depends on which request
         // ran the first trial (RTX PRO 6000 LFM2.5 12 GB: chat / 8k / 16k other texts by request order); LLAMA_MOE_CPU_MISS_PER_REQUEST_TRIALS=1
         // keeps the first trial
@@ -8991,10 +9003,12 @@ struct llama_moe_cache::impl {
             cm_small_live = true;
             cm_gen++;
             if (!skip_firm) {
-                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (%s%.0f%%%s%s): small "
+                const bool by_trust = trust && !per_req_no_trials && cache_frac >= std::max(0.20, trial_frac_single);
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (%s%.0f%%%s%s%s): small "
                     "batches follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
                     tag, 100.0*cache_frac, per_req_no_trials ? "LLAMA_MOE_CPU_MISS_PER_REQUEST; trial share " : "below ", 100.0*trial_frac,
-                    mailbox ? ", single-graph mailbox" : "", late ? ", from now on" : "");
+                    mailbox ? ", single-graph mailbox" : "",
+                    by_trust ? ", trusted host: LLAMA_MOE_CPU_MISS_TRIAL_FRAC_TRUST=0 runs them" : "", late ? ", from now on" : "");
             }
         }
         return skip;
@@ -9305,6 +9319,12 @@ struct llama_moe_cache::impl {
             n_prompt_fetch++;
         }
         const group & g = groups[layers[il].ig];
+        if (il == g.layers[0] && n_ubatch <= max_batch && cm_batch_log_max() > 0 && n_bl_graph < cm_batch_log_max()) {
+            n_bl_graph++;
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU-miss graph %" PRId64 ": %" PRId64 " tokens, fetch share %.3f in the graph (host %d, plain %d, "
+                "prompt %d), rule share %.3f, graph key %d\n", tag, (int64_t) n_bl_graph, n_ubatch, share, (int) host, (int) plain, (int) prompt,
+                cm ? cm_share_of(n_ubatch) : 1.0f, hybrid_mode());
+        }
         if (plain && !slots_fit(g, n_ubatch)) {
             return nullptr; // the plain lookup refuses it too
         }
@@ -11484,6 +11504,50 @@ struct llama_moe_cache::impl {
     }
 
     // reads the device counters of the lookups: distinct hits, fetched misses, misses left to the host
+    // LLAMA_MOE_CPU_MISS_BATCH_LOG=N (diagnostic, default 0 = off): the first N small batches (at most max_batch tokens) log, before
+    // their graph, the fetch share the CPU-miss rule gives them and the device state the hybrid assign reads: the filled slots of each
+    // group with a device lookup (the assign admits every miss while that count is below the slots), the lent slots and the totals so
+    // far (hits, admitted misses, misses computed on the host, the fetch accumulator); the first N graph builds of small batches log the
+    // share their first layer was built with. Each batch line waits for the device; the outputs do not change
+    static int64_t cm_batch_log_max() {
+        static const int64_t n = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_BATCH_LOG");
+            return e != nullptr ? std::max<int64_t>(0, atoll(e)) : (int64_t) 0;
+        }();
+        return n;
+    }
+    int64_t n_bl_batch = 0;
+    mutable int64_t n_bl_graph = 0;
+    void cm_batch_log(int64_t n_tokens) {
+        if (cm_batch_log_max() == 0 || n_tokens > max_batch || n_bl_batch >= cm_batch_log_max()) {
+            return;
+        }
+        n_bl_batch++;
+        for (const group & g : groups) {
+            if (!g.dev_lookup || g.n_slots == 0 || g.state == nullptr || g.state->data == nullptr) {
+                continue;
+            }
+            ggml_backend_synchronize(devices[g.id].backend);
+            int32_t hdr[n_hdr] = { 0 };
+            ggml_backend_tensor_get(g.state, hdr, 0, sizeof(hdr));
+            int32_t st[3] = { 0, 0, 0 };
+            if (g.counts != nullptr && g.counts->data != nullptr) {
+                ggml_backend_tensor_get(g.counts, st, (size_t) g.counts->ne[0]*(g.counts->ne[1] - 1)*sizeof(int32_t), sizeof(st));
+            }
+            uint64_t hits = 0, adm = 0, n_host = 0;
+            memcpy(&hits, hdr + 2, sizeof(hits));
+            memcpy(&adm,  hdr + 4, sizeof(adm));
+            n_host = (uint64_t) (uint32_t) st[1] << 32 | (uint32_t) st[0];
+            const int64_t filled_host = std::count_if(g.lru.key_of.begin(), g.lru.key_of.end(), [](int32_t k) { return k >= 0; });
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU-miss batch %" PRId64 ": %" PRId64 " tokens, rule share %.3f (on %d, small live %d, gen %u), "
+                "group %d: device filled %d of %d slots (host %" PRId64 "%s), lent %d, hits %llu, admitted %llu, host %llu, acc %d\n",
+                tag, n_bl_batch, n_tokens, cm ? cm_share_of(n_tokens) : 1.0f, cm && n_tokens <= cm_max ? (int) cm_on[n_tokens] : 0,
+                (int) cm_small_live, cm_gen, (int) (&g - groups.data()), hdr[6], g.n_slots, filled_host,
+                g.dev_newer ? ", host stale" : "", g.lru.n_lent, (unsigned long long) hits, (unsigned long long) adm,
+                (unsigned long long) n_host, st[2]);
+        }
+    }
+
     void cm_counters(uint64_t c[3]) const {
         c[0] = c[1] = c[2] = 0;
         for (const group & g : groups) {
@@ -11999,6 +12063,7 @@ struct llama_moe_cache::impl {
                 download(g);
             }
         }
+        cm_batch_log(n_tokens);
         // diagnostic (LLAMA_MOE_CACHE_STATE_LOG=1): a hash of every group's slot map and state as the ubatch of n_tokens starts,
         // logged when it changed; verify windows and single token decodes must see the same sequence of states
         static const bool state_log = getenv("LLAMA_MOE_CACHE_STATE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_STATE_LOG")) != 0;
