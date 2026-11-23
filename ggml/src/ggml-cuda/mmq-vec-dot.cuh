@@ -139,7 +139,21 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout>
+// int32 -> fp32 of an MMA accumulator without the int-to-float conversion instruction (a quarter-rate unit on NVIDIA: 16 results
+// per clock per SM, so the conversions, not the tensor cores, bound the q8_0 MMQ kernels, 4 per m16n8k32 tile).
+// For |x| < 2^22 the bit pattern 0x4B400000 + x is the float 1.5 * 2^23 + x exactly (the same exponent, x in the mantissa).
+// With nd = -(1.5 * 2^23) * d exact, fmaf(bits, d, nd) rounds the exact value x * d once, i.e. it equals (float) x * d bit for bit.
+// nd is exact when 3 * d is: d with at most 22 significant bits (every scale of the types that set exact_cvt: an fp16 d, or an
+// fp16 d times a small integer / power of two), and no overflow (|d| < 2^103).
+static constexpr float GGML_CUDA_MMQ_CVT_BIAS = 12582912.0f; // 1.5 * 2^23 = __int_as_float(0x4B400000)
+
+static __device__ __forceinline__ float ggml_cuda_mmq_cvt_mul(const int x, const float d, const float nd) {
+    return __fmaf_rn(__int_as_float(x + 0x4B400000), d, nd);
+}
+
+// exact_cvt: C.x[l]*dA (int accumulator times x scale) as ggml_cuda_mmq_cvt_mul (NVIDIA mma path; the single-tile k32 accumulator
+// is at most 32*128*128 = 2^19 in magnitude). Same values as the conversion, so the same sums (bit-identical).
+template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout, bool exact_cvt = false>
 static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -217,6 +231,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
     tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
     float dA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
+    float nA[exact_cvt ? ntx : 1][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0]; // exact_cvt: -GGML_CUDA_MMQ_CVT_BIAS*dA
+    GGML_UNUSED(nA);
 
     const int i0 = (threadIdx.y/ntx)*rows_per_warp;
 
@@ -238,6 +254,9 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
                 const int k0 = k00 + k01;
 
                 dA[n][l][k01/QI8_0] = x_df[i*sram_stride + k0/QI8_0];
+                if constexpr (exact_cvt) {
+                    nA[n][l][k01/QI8_0] = -GGML_CUDA_MMQ_CVT_BIAS*dA[n][l][k01/QI8_0];
+                }
             }
         }
     }
@@ -269,7 +288,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA[n][l/2][k01/QI8_0]*dB[l%2];
+                    if constexpr (exact_cvt) {
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] +=
+                            ggml_cuda_mmq_cvt_mul(C.x[l], dA[n][l/2][k01/QI8_0], nA[n][l/2][k01/QI8_0])*dB[l%2];
+                    } else {
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA[n][l/2][k01/QI8_0]*dB[l%2];
+                    }
                 }
             }
         }
