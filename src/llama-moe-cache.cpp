@@ -23,7 +23,7 @@ extern "C" { GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int3
 extern "C" { GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_context * ctx, struct ggml_tensor * logits, struct ggml_tensor * map,
         struct ggml_tensor * state, struct ggml_tensor ** banks, const void ** host, int n_banks, int il, int n_top, int max_fill,
         int n_core, struct ggml_tensor * scores, struct ggml_tensor * dep); }
-extern "C" { GGML_API void ggml_moe_cache_prefetch_set_stage(struct ggml_tensor * op, int n_stg, int owner); }
+extern "C" { GGML_API void ggml_moe_cache_prefetch_set_stage(struct ggml_tensor * op, int n_stg, int owner, int min_score); }
 
 #include <algorithm>
 #include <array>
@@ -9620,6 +9620,7 @@ struct llama_moe_cache::impl {
         int max_fill = 0;
         int min_tok  = 1; // windows of fewer tokens do not prefetch
         int stage    = 0; // staging slots per group: the staged form through the copy engine (see prefetch_stage_cfg)
+        int min_score = 0; // staged form: votes a predicted expert needs (rank r of a token's top n adds n - r)
     };
     mutable bool     pf_resolved = false;
     mutable pf_cfg_t pf_cfg;
@@ -9707,6 +9708,8 @@ struct llama_moe_cache::impl {
                 c.max_fill = em != nullptr ? std::max(1, std::min(n_stg, atoi(em))) : std::min(2, n_stg);
                 c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
                 c.stage    = n_stg;
+                const char * ev = getenv("LLAMA_MOE_PREFETCH_STAGE_MIN_SCORE");
+                c.min_score = ev != nullptr ? std::max(0, std::min((1 << 21), atoi(ev))) : c.n;
                 pf_cfg = c;
                 pf_resolved = true;
                 return c;
@@ -9887,7 +9890,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * op = ggml_moe_cache_prefetch(ctx, logits, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il, n_top,
             max_fill, g.lru.n_core, g.scores, dep);
         if (cfg.stage > 0) {
-            ggml_moe_cache_prefetch_set_stage(op, cfg.stage, pf_owner);
+            ggml_moe_cache_prefetch_set_stage(op, cfg.stage, pf_owner, cfg.min_score);
         }
         if (n_prefetch_ops++ == 0) {
             if (cfg.stage > 0) {
