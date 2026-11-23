@@ -169,6 +169,9 @@ common_dflash_diag_t & common_dflash_diag();
 // LLAMA_DFLASH_EV_AUTO value to its mode: unset or 2 = the default (gated) mode 2, 0 = off, any other value = 1
 int common_speculative_dflash_ev_auto_mode(const char * env);
 
+// the default cumulative-probability cut of a DFlash2 draft beside this target (LLAMA_DFLASH_P_CUM unset), 0 = none
+float common_dflash_p_cum_default(const llama_context * ctx_tgt);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

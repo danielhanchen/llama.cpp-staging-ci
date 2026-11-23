@@ -150,6 +150,16 @@ static uint64_t tpp_host_input_bytes(const std::string & path) {
     return sum;
 }
 
+// the DFlash2 drafts' windows vary in width: the default cumulative-probability cut (common_dflash_p_cum_default) or a set
+// LLAMA_DFLASH_P_CUM above 0
+static bool server_spec_varied_widths(const common_params_speculative & sp, const llama_context * ctx_tgt) {
+    if (std::find(sp.types.begin(), sp.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) == sp.types.end()) {
+        return false;
+    }
+    const char * e = getenv("LLAMA_DFLASH_P_CUM");
+    return e != nullptr ? atof(e) > 0.0 : common_dflash_p_cum_default(ctx_tgt) > 0.0f;
+}
+
 // (LLAMA_SPEC_PREWARM=N: widths 1..N, opt-in): a target with a drafter and no MoE cache decodes, at load, a
 // dummy prompt of LLAMA_SPEC_PREWARM_POS (640) tokens, then windows of every width 1..N, LLAMA_SPEC_PREWARM_REPS (10) times each,
 // appended after it (a 1-row decode as a plain decode, wider ones as verify windows, as the server runs them), then forgets them: each
@@ -170,7 +180,7 @@ static uint64_t tpp_host_input_bytes(const std::string & path) {
 // (the graphs carry the slot's device sampler: each chain of `chains` is swapped in for its own windows, raw logits off as for a request
 // it serves; `restore` / `restore_raw` are put back after. No chain: the windows run once with the context's sampler state)
 static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max, const std::vector<llama_sampler *> & chains,
-        llama_sampler * restore, bool restore_raw) {
+        llama_sampler * restore, bool restore_raw, bool varied_widths) {
     const char * e = getenv("LLAMA_SPEC_PREWARM");
     int w_max = e != nullptr ? std::max(0, std::min(8, atoi(e))) : (gpu ? 8 : 0);
     if (n_out_max > 0) {
@@ -231,9 +241,12 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // tok/s with the all-fit prewarm vs 253.9 with the scored one, base without all-fit 265.8) and the scored form without one (full card:
     // chat 391.6 vs 382.8, 8k 236.1 vs 232.0: a request past 512 pools then replays them); 0 = scored only (commit 7f298b321bd), 1 =
     // all-fit only, 2 = both when the model selects QSA pools (twice the graphs: out of device memory at RTX PRO 6000 48 GB without the floor below,
-    // 245.2 tok/s with it)
+    // 245.2 tok/s with it). Without a cache, both where the drafts' windows vary in width (varied_widths: a DFlash2 cumulative-probability
+    // cut): a short request (below 512 tokens) runs the all-fit form, so with the scored form alone each width it met first was an eager
+    // pass plus a capture inside it (RTX PRO 6000 Flash-Next full card, DFlash2 with the cut at 0.35, chat: 348.4 -> 396.2 tok/s, rare
+    // widths 15-17 ms -> their fixed-width 8.3-11.0 ms; the same text)
     static const int pw_env  = getenv("LLAMA_SPEC_PREWARM_ALLFIT") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_ALLFIT")) : -1;
-    const int  pw_mode  = pw_env >= 0 ? pw_env : (llama_moe_cache_active(ctx) ? 1 : 0);
+    const int  pw_mode  = pw_env >= 0 ? pw_env : (llama_moe_cache_active(ctx) ? 1 : varied_widths ? 2 : 0);
     const bool pw_both  = pw_mode >= 2 && llama_qsa_allfit_capable(ctx);
     const int  n_forms  = pw_both ? 2 : 1;
     const int  n_end    = n_pre + n_forms*n_chain*reps*sum_w;
@@ -3269,7 +3282,7 @@ private:
             }
             server_spec_prewarm(ctx_tgt, llama_supports_gpu_offload() && params_base.n_gpu_layers != 0,
                 params_base.n_outputs_max_per_seq > 0 ? params_base.n_outputs_max_per_seq : params_base.n_outputs_max,
-                chains, s0.smpl_dev.get(), true);
+                chains, s0.smpl_dev.get(), true, server_spec_varied_widths(params_base.speculative, ctx_tgt));
         }
 
         // the load is over (target, drafter, warm-ups): read back the PLE table pages the page cache gave up since the

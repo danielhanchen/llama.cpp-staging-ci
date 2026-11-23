@@ -1088,6 +1088,46 @@ static int32_t common_dflash_n_max_sm80() {
     return n_max;
 }
 
+// every GPU is compute capability 12.x (RTX PRO 6000 class), false without a GPU
+static bool common_all_gpus_cc12() {
+    static const bool v = [] {
+        int n_gpu = 0;
+        for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(d);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+            const int cc = cc_fn != nullptr ? cc_fn(dev) : 0;
+            if (cc < 1200 || cc >= 1300) {
+                return false;
+            }
+            ++n_gpu;
+        }
+        return n_gpu > 0;
+    }();
+    return v;
+}
+
+// LLAMA_DFLASH_P_CUM unset: 0.35 for a DFlash2 draft beside a target without a MoE cache where every GPU is compute capability 12.x
+// and no other window rule is asked for (LLAMA_DFLASH_WINDOW, LLAMA_DFLASH_EV unset); there the walk stops where the product of the
+// steps' selector probabilities falls below 0.35, so the verify skips the unlikely tail of a draft. RTX PRO 6000 Flash-Next 4-bit
+// full card, DFlash2 n6, both prewarm forms (below), 3 launches each: chat 384.9 -> 396.2 tok/s (same text, 4.65 vs 4.83 tokens per
+// pass at 11.75 vs 12.55 ms), 8k 257.1 -> 274.6 (other text). The 48-prompt long-context KLD check against the -fa off band:
+// decode mean 0.0012 / p99 0.010 / max 0.037 vs 0.0030 / 0.023 / 0.095, paired per-prompt difference -0.0032 [-0.0040, -0.0024].
+// Not beside a MoE cache (each further row's misses decide there; no cut beat the default at 48 GB), nor on other GPUs (not measured).
+// LLAMA_DFLASH_P_CUM=0: off
+float common_dflash_p_cum_default(const llama_context * ctx_tgt) {
+    if (getenv("LLAMA_DFLASH_P_CUM") != nullptr || getenv("LLAMA_DFLASH_WINDOW") != nullptr || getenv("LLAMA_DFLASH_EV") != nullptr) {
+        return 0.0f;
+    }
+    if (ctx_tgt != nullptr && llama_moe_cache_active(ctx_tgt)) {
+        return 0.0f;
+    }
+    return common_all_gpus_cc12() ? 0.35f : 0.0f;
+}
+
 // every GPU is compute capability 8.0 (and there is at least one)
 static bool common_all_gpus_cc80() {
     static const bool v = [] {
@@ -1747,11 +1787,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // LLAMA_DFLASH_P_CUM=P (default 0 = off): the walk also stops where the product of the steps' probabilities falls below P,
                 // the chance that the whole draft so far is accepted if the selector were calibrated: a verify row costs about the same
                 // wherever it ends, so a long draft of unlikely tokens costs verify rows for few accepted ones
+                // (unset: common_dflash_p_cum_default, a user's --spec-draft-p-min keeps the default off)
                 static const float p_cum_min = [] {
                     const char * e = getenv("LLAMA_DFLASH_P_CUM");
-                    return e != nullptr ? std::max(0.0f, (float) atof(e)) : 0.0f;
+                    return e != nullptr ? std::max(0.0f, (float) atof(e)) : -1.0f;
                 }();
-                const float p_cum_thr = is_dflash2 ? p_cum_min : 0.0f;
+                const float p_cum_def = is_dflash2 && p_cum_min < 0.0f && params.p_min <= 0.0f ? common_dflash_p_cum_default(params.ctx_tgt) : 0.0f;
+                const float p_cum_thr = is_dflash2 ? (p_cum_min >= 0.0f ? p_cum_min : p_cum_def) : 0.0f;
+                if (p_cum_def > 0.0f) {
+                    static bool logged = false;
+                    if (!logged) {
+                        logged = true;
+                        LOG_INF("DFlash2 drafts end where the product of the steps' probabilities falls below %.2f (no MoE cache, "
+                                "compute capability 12.x; LLAMA_DFLASH_P_CUM=0 off)\n", p_cum_def);
+                    }
+                }
                 float p_cum = 1.0f;
                 // LLAMA_DFLASH_P_CUM_EXP=a (default 1): the product above is of p^a, a temperature for a selector whose
                 // probabilities are not calibrated (a < 1 trusts a low p less)
