@@ -2200,19 +2200,27 @@ private:
                 }
             }
             dev_free += igpu_free;
-            // (opt-in, LLAMA_SPEC_TPP_NEED_PLE=0): without tensor overrides the per-layer embedding table never takes device
-            // memory, so it can be left out of the need. A100 80 GB, Qwen3.8-Flash-Next at 4 bits + MTP drafter: need 94815 MiB with
-            // its 26.8 GiB table against 80725 MiB free keeps the windows at 2 drafts although the fit places every expert on the card and
-            // runs no MoE cache. Left out, the rule above + the earlier rule's 4-draft windows there: chat 156.1 -> 159.7 tok/s (+2.3%) but 8k
-            // 148.2 -> 120.6 (-18.6%: each verify row costs ~2.9 ms on that card, 4.06 / 3.05 tokens per pass at 25.5 / 25.3 ms). So the
-            // default (unset / 1) still counts the whole file until the deep windows are priced per device
+            // LLAMA_SPEC_TPP_NEED_PLE: without tensor overrides the per-layer embedding table never takes device memory. Unset: it is
+            // left out of the need only where the rest then fits on the devices, so a model whose experts all fit beside its host-side
+            // table takes the full-card windows (no MoE cache runs there); where the rest does not fit either, the cached-tier rules below
+            // keep reading the whole file. A100 80 GB, Qwen3.8-Flash-Next at 4 bits + its MTP drafter, Studio argv, full card: need 94815
+            // MiB with the 26.8 GiB table against 80725 MiB free kept the windows at 2 drafts + a priced 3rd although the fit places every
+            // expert on the card; left out, 4 drafts below position 12288: 3 launches, chat 181.0 -> 182.2 tok/s, 8k 136.3 -> 158.1
+            // (+16%, 2.98 -> 3.76 tokens per pass), the text of the DFlash2 drafter and of the window-independent verify (4-row windows
+            // sum their head rows in another order than 5-row ones). Leaving it out everywhere (=0) moved the cached tiers' rules:
+            // RTX PRO 6000 at 48 / 16 GB chat -2.4% / -1.8%, 16 GB 8k -16%. =0: always left out, =1: always counted
             const uint64_t tgt_bytes = mtp_shape ? tpp_gguf_bytes(params.model.path) : 0;
-            const uint64_t ple_bytes = mtp_shape && tgt_bytes > 0 && !tpp_host_experts(params.tensor_buft_overrides, params.moe_cache_size, params.moe_cache_auto) &&
-                getenv("LLAMA_SPEC_TPP_NEED_PLE") != nullptr && atoi(getenv("LLAMA_SPEC_TPP_NEED_PLE")) == 0 ? tpp_host_input_bytes(params.model.path) : 0;
-            const uint64_t need = mtp_shape ? tgt_bytes - std::min(ple_bytes, tgt_bytes) + tpp_gguf_bytes(sp.draft.mparams.path) + (1536ull << 20) : 0;
+            const char * np_env = getenv("LLAMA_SPEC_TPP_NEED_PLE");
+            const int np_mode = np_env != nullptr ? (atoi(np_env) == 0 ? 0 : 1) : -1;
+            const uint64_t ple_all = mtp_shape && tgt_bytes > 0 && np_mode != 1 &&
+                !tpp_host_experts(params.tensor_buft_overrides, params.moe_cache_size, params.moe_cache_auto) ? tpp_host_input_bytes(params.model.path) : 0;
+            const uint64_t need_all = mtp_shape ? tgt_bytes + tpp_gguf_bytes(sp.draft.mparams.path) + (1536ull << 20) : 0;
+            const uint64_t ple_bytes = np_mode == 0 || (ple_all > 0 && need_all - std::min(ple_all, need_all) <= dev_free) ? ple_all : 0;
+            const uint64_t need = need_all - std::min(ple_bytes, need_all);
             if (ple_bytes > 0) {
                 SRV_INF("the per-layer embedding table (%.0f MiB) stays in host memory: not counted in the device need of the "
-                    "draft window rule (LLAMA_SPEC_TPP_NEED_PLE=0; unset: counted)\n", ple_bytes/1048576.0);
+                    "draft window rule (%s; LLAMA_SPEC_TPP_NEED_PLE=1: counted)\n", ple_bytes/1048576.0,
+                    np_mode == 0 ? "LLAMA_SPEC_TPP_NEED_PLE=0" : "the rest fits on the devices");
             }
             // (no GPU: no MoE cache. LLAMA_SPEC_TPP_FORCE_CACHED=1, a test hook: as if the experts did not fit)
             const char * ce = getenv("LLAMA_SPEC_TPP_CACHED");

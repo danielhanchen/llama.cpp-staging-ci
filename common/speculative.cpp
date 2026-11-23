@@ -1061,6 +1061,33 @@ common_dflash_diag_t & common_dflash_diag() {
     return d;
 }
 
+// LLAMA_DFLASH_N_MAX_SM80 (default 4, 0 = off): the most steps a DFlash2 draft walks where every GPU is compute capability 8.0,
+// 0 where the cap does not apply (see the walk in draft())
+static int32_t common_dflash_n_max_sm80() {
+    static const int32_t n_max = [] {
+        const char * e = getenv("LLAMA_DFLASH_N_MAX_SM80");
+        const int32_t n = e != nullptr ? atoi(e) : 4;
+        if (n <= 0) {
+            return 0;
+        }
+        int n_gpu = 0;
+        for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(d);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+            if (cc_fn == nullptr || cc_fn(dev) != 800) {
+                return 0;
+            }
+            ++n_gpu;
+        }
+        return n_gpu > 0 ? n : 0;
+    }();
+    return n_max;
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // process() reads the target's layer inputs at the segment's rows of the decode (nextn_row_offset), so a merged prompt
@@ -1573,8 +1600,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // LLAMA_DFLASH_FULL_BLOCK=1: a DFlash2 draft decodes the whole trained block (the anchor + block_size - 1 masks)
         // and walks only its first n_max rows. The attention over the block is not causal, so a block cut to n_max + 1 rows changes
         // every row's draft against the block the drafter was trained on. The blocks of one decode share one width (the selector
-        // splits the rows into equal blocks), so the whole block is used only when it fits for every drafting sequence
-        static const bool full_block = getenv("LLAMA_DFLASH_FULL_BLOCK") != nullptr && atoi(getenv("LLAMA_DFLASH_FULL_BLOCK")) != 0;
+        // splits the rows into equal blocks), so the whole block is used only when it fits for every drafting sequence.
+        // Unset: on where no MoE cache runs and the walk takes the whole draft. There the window is the whole walk, so only the drafts
+        // change and the verify keeps the text: RTX PRO 6000 Flash-Next 4-bit full card, n_max 6, 3 launches: chat 378.0 -> 385.4 tok/s
+        // (+2.0%), 8k 246.8 -> 256.7 (+4.0%), the same text. Not under the compute capability 8.0 cap (LLAMA_DFLASH_N_MAX_SM80): a walk
+        // of 4 steps over the whole block drafted worse at 8k (A100 80 GB full card, 3 launches: 8k 153.0 -> 150.9, chat level). Beside a
+        // cache the window rules read the steps' probabilities, so the windows and the text move (RTX PRO 6000 16 GB 8k 133.8 -> 115.5,
+        // A100 80 GB at a 48 GB cap 8k 102.8 -> 67.7): off there. =1: on everywhere, =0: off
+        static const int full_block_env = getenv("LLAMA_DFLASH_FULL_BLOCK") != nullptr ? atoi(getenv("LLAMA_DFLASH_FULL_BLOCK")) : -1;
+        const bool full_block = full_block_env > 0 || (full_block_env < 0 && is_dflash2 &&
+            (params.ctx_tgt == nullptr || !llama_moe_cache_active(params.ctx_tgt)) &&
+            (common_dflash_n_max_sm80() == 0 || common_dflash_n_max_sm80() >= params.n_max));
+        if (is_dflash2 && full_block && full_block_env < 0) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LOG_INF("DFlash2 drafts decode the whole trained block of %d rows (no MoE cache, the whole draft walked; "
+                        "LLAMA_DFLASH_FULL_BLOCK=0 off)\n", block_size);
+            }
+        }
         bool full_block_fits = is_dflash2 && full_block;
         for (llama_seq_id seq_id = 0; full_block_fits && seq_id < (llama_seq_id) n_seq; ++seq_id) {
             const auto & dp = dparams[seq_id];
@@ -1871,27 +1915,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // too): there the measured EV window (eva_t) already picks the width, and the route tail skip makes the text follow the
                 // window: A100 80 GB at a 48 GB cap, chat 119.5 vs 115.0 tok/s (same text), 8k 84.0 vs 93.9 (other text, 2.98 vs 3.41
                 // tokens per pass at about the same pass time)
-                static const int32_t df2_n_max_sm80 = [] {
-                    const char * e = getenv("LLAMA_DFLASH_N_MAX_SM80");
-                    const int32_t n = e != nullptr ? atoi(e) : 4;
-                    if (n <= 0) {
-                        return 0;
-                    }
-                    int n_gpu = 0;
-                    for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
-                        ggml_backend_dev_t dev = ggml_backend_dev_get(d);
-                        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-                            continue;
-                        }
-                        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                        auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
-                        if (cc_fn == nullptr || cc_fn(dev) != 800) {
-                            return 0;
-                        }
-                        ++n_gpu;
-                    }
-                    return n_gpu > 0 ? n : 0;
-                }();
+                const int32_t df2_n_max_sm80 = common_dflash_n_max_sm80();
                 static const bool df2_n_max_sm80_cached = [] {
                     const char * e = getenv("LLAMA_DFLASH_N_MAX_SM80_CACHED");
                     return e != nullptr && atoi(e) != 0;
