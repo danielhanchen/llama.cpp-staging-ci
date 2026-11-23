@@ -11883,13 +11883,15 @@ struct llama_moe_cache::impl {
         // the slots after the hand: from slot 0 it evicted cached experts and left the empty ones (the end of the banks, where lent
         // slots came back short of their refill) unfilled for most of a decode, so the host path computed nothing there. L4 (12 vCPU)
         // Qwen3.6-35B-A3B at 4 bits with its MTP head at 16 GB: after an 8k prompt 13 of 5726 slots stayed empty for 250 of 256
-        // tokens, 2600 misses uploaded and 276 computed on the host (chat, cache full: 1660 and 4680)
+        // tokens, 2600 misses uploaded and 276 computed on the host (chat, cache full: 1660 and 4680).
+        // Not with the decode extension on: its grown slots join empty, and starting the hand on them changed the text and cost
+        // the 8k decode (T4 8 GB, same model: 8k 61.5 vs 66.0 tok/s), so that cache keeps slot 0 as before
         static const bool hand_empty = [] {
             const char * e = getenv("LLAMA_MOE_CACHE_HAND_EMPTY");
             return e == nullptr || atoi(e) != 0;
         }();
         int32_t hand = 0;
-        if (hand_empty && g.counts != nullptr) {
+        if (hand_empty && g.counts != nullptr && !ext_on) {
             for (int32_t s = g.lru.n_core; s < g.n_slots; ++s) {
                 if (g.lru.key_of[s] < 0) {
                     hand = s;
