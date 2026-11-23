@@ -90,4 +90,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // a draft context whose target (params.ctx_other) runs with a MoE cache
+    bool other_moe_cache = false;
 };
