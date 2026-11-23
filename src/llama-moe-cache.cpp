@@ -8937,6 +8937,21 @@ struct llama_moe_cache::impl {
     // without its trials, so it keeps them. An explicit LLAMA_MOE_CPU_MISS_TRIAL_FRAC sets both. The mailbox form is known from the
     // first graph with the hybrid path, usually after the calibration: single_note_form calls this again (late) then, once, if no
     // trial has completed
+    // a group's banks hold i-quant experts (see the trust share in cm_skip_trials)
+    bool host_iq() const {
+        for (const group & g : groups) {
+            for (const ggml_tensor * bank : g.banks) {
+                switch (bank->type) {
+                    case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+                    case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
+                        return true;
+                    default:
+                        break;
+                }
+            }
+        }
+        return false;
+    }
     bool cm_trials_late_done = false;
     bool cm_trials_skipped   = false;
     bool cm_skip_trials(bool late) {
@@ -8960,7 +8975,17 @@ struct llama_moe_cache::impl {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_TRUST");
             return e != nullptr ? std::max(0.0, atof(e)) : 0.70;
         }();
-        const bool trust = trial_frac_env < 0.0 && mailbox && trial_frac_trust > std::max(0.20, trial_frac_single) && cmt_trust_marginal();
+        // Not for a cache with i-quant host experts (LLAMA_MOE_CPU_MISS_TRUST_IQ=1: those too): their host products cost more per byte
+        // than the calibration assumes, so the cost model's "on" does not hold there. A100 40 GB (12 vCPU), Qwen3.8-Flash-Next at 4 bits
+        // (IQ2_S / IQ3_XXS / IQ4_XS experts) with its MTP head, whole card (51.6% cached): 177 us per host row against 70 for
+        // Qwen3.6-35B-A3B at 4 bits (K-quants); its trials time "off" (t_on 39.4 / 29.9 ms, t_off 36.7 / 23.3), and skipping them cost
+        // chat 69.7 -> 61.8 tok/s and 8k 76.0 -> 66.7
+        static const bool trust_iq = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRUST_IQ");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        const bool trust = trial_frac_env < 0.0 && mailbox && trial_frac_trust > std::max(0.20, trial_frac_single) && cmt_trust_marginal() &&
+            (trust_iq || !host_iq());
         const double trial_frac = trial_frac_env >= 0.0 ? trial_frac_env :
             (mailbox ? std::max({ 0.20, trial_frac_single, trust ? trial_frac_trust : 0.0 }) : 0.20);
         // with LLAMA_MOE_CPU_MISS_PER_REQUEST no timing trials (the cost model only), so no verdict depends on which request
