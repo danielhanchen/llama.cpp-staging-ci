@@ -2698,13 +2698,21 @@ static int ggml_cuda_dense_tc_acc() {
     return acc;
 }
 
-static int ggml_cuda_dense_tc_min() {
-    static const int n = getenv("GGML_CUDA_DENSE_CUBLAS_MIN") ? atoi(getenv("GGML_CUDA_DENSE_CUBLAS_MIN")) : 0;
-    return n;
+// GGML_CUDA_DENSE_CUBLAS_MIN=N: the route for products of at least N columns, 0 = off everywhere. Unset: the per-architecture
+// default, ggml_cuda_dense_tc_min_default_cc8 (1024) on compute capability 8.0 (A100 / A30), off elsewhere (L4 / G4 lose with it).
+// Keep in sync with common_fit_dense_tc_bytes (common/fit.cpp), which keeps the route's pool scratch free on those devices.
+static constexpr int ggml_cuda_dense_tc_min_default_cc8 = 1024;
+
+static int ggml_cuda_dense_tc_min(const int cc) {
+    static const int n_env = getenv("GGML_CUDA_DENSE_CUBLAS_MIN") ? atoi(getenv("GGML_CUDA_DENSE_CUBLAS_MIN")) : -1;
+    if (n_env >= 0) {
+        return n_env;
+    }
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE ? ggml_cuda_dense_tc_min_default_cc8 : 0;
 }
 
 static bool ggml_cuda_dense_tc_route(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
-    const int n_min = ggml_cuda_dense_tc_min();
+    const int n_min = ggml_cuda_dense_tc_min(cc);
     if (n_min <= 0 || !ggml_is_quantized(src0->type) || src1->ne[1] < n_min || !GGML_CUDA_CC_IS_NVIDIA(cc)) {
         return false;
     }
@@ -2723,6 +2731,11 @@ static bool ggml_cuda_dense_tc_route(const ggml_tensor * src0, const ggml_tensor
 }
 
 static void ggml_cuda_mul_mat_dense_tc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        GGML_LOG_INFO("%s: dense prompt products on tensor cores (%s x %" PRId64 " columns; GGML_CUDA_DENSE_CUBLAS_MIN=0 off)\n",
+            __func__, ggml_type_name(src0->type), src1->ne[1]);
+    }
     switch (ggml_cuda_dense_tc_acc()) {
         case 1:
             ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);

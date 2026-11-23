@@ -777,6 +777,107 @@ static int64_t common_fit_dflash_head_bytes(const char * path) {
     return b;
 }
 
+// (LLAMA_FIT_DENSE_TC=0 off): the CUDA backend routes quantized dense products of at least GGML_CUDA_DENSE_CUBLAS_MIN columns
+// (default 1024 on compute capability 8.0, off elsewhere: ggml_cuda_dense_tc_min) through a dequantize-to-F16 + cuBLAS GEMM. Its
+// scratch comes from the context's CUDA pool at run time, outside the measured compute buffer: the whole weight as F16 plus src1 as
+// F16 (one ubatch). The pool peak is the largest single product's need, so what the route adds is its largest need beyond the pool
+// peak the context reaches anyway; for a MoE model that is the q8_1 copy of the routed src1 rows (n_ubatch x experts used x n_embd)
+// of the expert products. Per model (a separate draft model has a context and a pool of its own), A100 measures (ubatch 2048, MTP):
+//   Qwen3.8-27B at 4 bits + its MTP head (dense, FFN 5120 x 17408): +412 MiB of device memory against MMQ; here 238 + the head's 238 MiB
+//   Qwen3.6-35B-A3B at 4 bits +8 MiB, Flash-Next at 4 bits +16 MiB (largest need 70 MiB, expert src1 56 MiB: 14 MiB here)
+// A margin above that costs the MoE cache for nothing: Flash-Next on the A100 80 GB at 48 GB with a flat 262 MiB margin had 46 fewer cache
+// slots (of 6840) and chat decode -9.5% (3 launches each, same text). LLAMA_FIT_DENSE_TC_SLACK_MIB (0) adds to a nonzero need.
+// The embedding tables (row gathers) and the output head (prompt ubatches compute only the requested rows) are left out.
+static int64_t common_fit_dense_tc_min_cols() {
+    const char * e = getenv("GGML_CUDA_DENSE_CUBLAS_MIN");
+    return e != nullptr ? std::max(0, atoi(e)) : 1024;
+}
+
+static int64_t common_fit_dense_tc_model_bytes(const char * path, int64_t n_ubatch) {
+    static std::string last_path;
+    static int64_t     last_ub = -1;
+    static int64_t     last_b  = 0;
+    const int64_t n_min = common_fit_dense_tc_min_cols();
+    if (path == nullptr || n_min <= 0 || n_ubatch < n_min) {
+        return 0;
+    }
+    if (last_path == path && last_ub == n_ubatch) {
+        return last_b;
+    }
+    int64_t b   = 0;
+    int64_t moe = 0; // bytes of the q8_1 src1 copy of one ubatch's expert rows
+    std::string fname = path;
+    int n_split = 1;
+    for (int i = 0; i < n_split; ++i) {
+        ggml_context * meta = nullptr;
+        gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+        gguf_context_ptr gctx(gguf_init_from_file(fname.c_str(), gp));
+        if (!gctx) {
+            break;
+        }
+        ggml_context_ptr meta_ptr(meta);
+        if (i == 0) {
+            const int64_t kid = gguf_find_key(gctx.get(), "split.count");
+            n_split = kid >= 0 ? (int) gguf_get_val_u16(gctx.get(), kid) : 1;
+            const int64_t aid = gguf_find_key(gctx.get(), "general.architecture");
+            if (aid >= 0 && gguf_get_kv_type(gctx.get(), aid) == GGUF_TYPE_STRING) {
+                const std::string arch = gguf_get_val_str(gctx.get(), aid);
+                const int64_t uid = gguf_find_key(gctx.get(), (arch + ".expert_used_count").c_str());
+                const int64_t eid = gguf_find_key(gctx.get(), (arch + ".embedding_length").c_str());
+                if (uid >= 0 && eid >= 0 && gguf_get_kv_type(gctx.get(), uid) == GGUF_TYPE_UINT32 &&
+                        gguf_get_kv_type(gctx.get(), eid) == GGUF_TYPE_UINT32) {
+                    moe = n_ubatch*(int64_t) gguf_get_val_u32(gctx.get(), uid)*(int64_t) gguf_get_val_u32(gctx.get(), eid)*36/32;
+                }
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(meta); t != nullptr; t = ggml_get_next_tensor(meta, t)) {
+            if (!ggml_is_quantized(t->type) || t->ne[1] <= 1 || t->ne[2] != 1 || t->ne[3] != 1 ||
+                    strstr(t->name, "token_embd") != nullptr || strstr(t->name, "per_layer_") != nullptr ||
+                    strcmp(t->name, "output.weight") == 0) {
+                continue;
+            }
+            b = std::max(b, 2*t->ne[0]*t->ne[1] + 2*t->ne[0]*n_ubatch);
+        }
+        if (i + 1 < n_split) {
+            char prefix[4096];
+            char next[4096];
+            if (llama_split_prefix(prefix, sizeof(prefix), path, 0, n_split) <= 0) {
+                break;
+            }
+            llama_split_path(next, sizeof(next), prefix, i + 1, n_split);
+            fname = next;
+        }
+    }
+    b = std::max<int64_t>(0, b - moe);
+    if (b > 0) {
+        const char * es = getenv("LLAMA_FIT_DENSE_TC_SLACK_MIB");
+        b += (es != nullptr ? std::max<int64_t>(0, atoll(es)) : 0)*1024*1024;
+    }
+    last_path = path;
+    last_ub   = n_ubatch;
+    last_b    = b;
+    return b;
+}
+
+// whether the dense route is on for this device (as ggml_cuda_dense_tc_min decides it): an explicit GGML_CUDA_DENSE_CUBLAS_MIN on
+// any NVIDIA GPU, else compute capability 8.0 only
+static bool common_fit_dense_tc_dev(ggml_backend_dev_t dev) {
+    const char * ef = getenv("LLAMA_FIT_DENSE_TC");
+    if ((ef != nullptr && atoi(ef) == 0) || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        return false;
+    }
+    auto cc_fn = (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability");
+    const int cc = cc_fn != nullptr ? cc_fn(dev) : -1;
+    if (cc < 0 || cc >= 0x1000000) {
+        return false; // not NVIDIA (the HIP / MUSA builds report offset values)
+    }
+    return getenv("GGML_CUDA_DENSE_CUBLAS_MIN") != nullptr || cc == 800;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -1083,6 +1184,29 @@ static void common_params_fit_impl(
         }
         LOG_INF("%s: flash attention off: each GPU keeps %" PRId64 " MiB more free for the F16 copies of the KQ matrix (n_head x n_ubatch x "
             "n_ctx; LLAMA_FIT_FAOFF_MARGIN=0 off)\n", __func__, g_fit_faoff_kq/(1024*1024));
+    }
+
+    // the dense tensor-core route's pool scratch (common_fit_dense_tc_model_bytes): the main model's, plus the draft context's (a context
+    // has a pool of its own on the same device; an MTP context that shares the model runs its prompt rows through the same matrix shapes)
+    {
+        int64_t tc = common_fit_dense_tc_model_bytes(path_model, cparams->n_ubatch);
+        if (extra != nullptr && extra->path_model != nullptr && extra->cparams != nullptr) {
+            tc += common_fit_dense_tc_model_bytes(extra->path_model, extra->cparams->n_ubatch);
+        }
+        // the scratch is charged to the run-time half of the device's margin first (the margin exists for such run-time buffers); only
+        // what does not fit there widens it (LLAMA_FIT_DENSE_TC=2: the whole scratch on top). Qwen3.8-27B at 4 bits + MTP, A100 at 16 GB
+        // (238 MiB of scratch, 1024 MiB margin): on top, the fit put 48 instead of 49 of 66 layers on the GPU and decode lost 5%;
+        // charged to the margin, 49 layers, base decode, the 8k prompt 8.93 -> 6.66 s, no allocation failure (2 launches, chat + 8k)
+        const char * ef  = getenv("LLAMA_FIT_DENSE_TC");
+        const bool   top = ef != nullptr && atoi(ef) == 2;
+        for (size_t id = 0; tc > 0 && id < nd; id++) {
+            if (common_fit_dense_tc_dev(devs[id])) {
+                const int64_t add = top ? tc : std::max<int64_t>(0, tc - margins[id]/2);
+                margins[id] += add;
+                LOG_INF("%s: dense prompt products on tensor cores: %" PRId64 " MiB of scratch on device %zu, the margin grows by %" PRId64 " MiB "
+                    "(LLAMA_FIT_DENSE_TC=0 off, =2 all on top)\n", __func__, tc/(1024*1024), id, add/(1024*1024));
+            }
+        }
     }
 
     std::vector<std::string> dev_names;
