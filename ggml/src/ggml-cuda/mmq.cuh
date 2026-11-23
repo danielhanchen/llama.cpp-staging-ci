@@ -531,11 +531,28 @@ struct ggml_cuda_mmq_util_funcs {
     ggml_cuda_mmq_load_tiles_t load_tiles;
     ggml_cuda_mmq_vec_dot_t    vec_dot;
     ggml_cuda_mmq_write_back_t write_back;
+    ggml_cuda_mmq_vec_dot_t    vec_dot_cvt; // vec_dot with the int-to-float conversion instruction (GGML_CUDA_MMQ_EXACT_CVT=0); = vec_dot if none
 
     constexpr __host__ __device__ ggml_cuda_mmq_util_funcs(
-            int vdr, ggml_cuda_mmq_load_tiles_t load_tiles, ggml_cuda_mmq_vec_dot_t vec_dot, ggml_cuda_mmq_write_back_t write_back) :
-        vdr(vdr), load_tiles(load_tiles), vec_dot(vec_dot), write_back(write_back) {}
+            int vdr, ggml_cuda_mmq_load_tiles_t load_tiles, ggml_cuda_mmq_vec_dot_t vec_dot, ggml_cuda_mmq_write_back_t write_back,
+            ggml_cuda_mmq_vec_dot_t vec_dot_cvt = nullptr) :
+        vdr(vdr), load_tiles(load_tiles), vec_dot(vec_dot), write_back(write_back), vec_dot_cvt(vec_dot_cvt ? vec_dot_cvt : vec_dot) {}
 };
+
+// NVIDIA builds: the exact int-to-float product below (the AMD mma paths keep their conversion; no second vec_dot there)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static constexpr bool ggml_cuda_mmq_exact_cvt_build = true;
+#else
+static constexpr bool ggml_cuda_mmq_exact_cvt_build = false;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+// the types whose mma q8_0 vec_dot runs the exact int-to-float product (ggml_cuda_mmq_cvt_mul): their x scales are an fp16 d or
+// an fp16 d times a small integer or power of two (at most 17 significant bits, see the load_tiles functions)
+static constexpr __host__ __device__ bool ggml_cuda_mmq_exact_cvt_type(const ggml_type type) {
+    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
+        type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S ||
+        type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL;
+}
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_funcs() {
@@ -715,20 +732,23 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_q1_0<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, ggml_cuda_mmq_exact_cvt_build>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_exact_cvt_build ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, false> : nullptr);
         case GGML_TYPE_Q2_0:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_q2_0<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, ggml_cuda_mmq_exact_cvt_build>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_exact_cvt_build ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, false> : nullptr);
         case GGML_TYPE_Q4_0:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_q4_0<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_DS4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_DS4, ggml_cuda_mmq_exact_cvt_build>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_exact_cvt_build ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_DS4, false> : nullptr);
         case GGML_TYPE_Q4_1:
             return ggml_cuda_mmq_util_funcs(
                 -1,
@@ -739,8 +759,9 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_q5_0<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, ggml_cuda_mmq_exact_cvt_build>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_exact_cvt_build ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, false> : nullptr);
         case GGML_TYPE_Q5_1:
             return ggml_cuda_mmq_util_funcs(
                 -1,
@@ -751,8 +772,9 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_q8_0<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, ggml_cuda_mmq_exact_cvt_build>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_exact_cvt_build ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, false> : nullptr);
 // ---------------------------------------------------------------------------------------------
         case GGML_TYPE_Q2_K:
             return ggml_cuda_mmq_util_funcs(
@@ -795,8 +817,9 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_iq2_xxs<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, ggml_cuda_mmq_exact_cvt_build>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_exact_cvt_build ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, false> : nullptr);
         case GGML_TYPE_IQ2_XS:
             return ggml_cuda_mmq_util_funcs(
                 -1,
@@ -813,26 +836,30 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_iq3_xxs<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, ggml_cuda_mmq_exact_cvt_build>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_exact_cvt_build ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, false> : nullptr);
         case GGML_TYPE_IQ3_S:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_iq3_s<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, ggml_cuda_mmq_exact_cvt_build>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_exact_cvt_build ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, false> : nullptr);
         case GGML_TYPE_IQ4_XS:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_iq4_xs<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, ggml_cuda_mmq_exact_cvt_build>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_exact_cvt_build ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, false> : nullptr);
         case GGML_TYPE_IQ4_NL:
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_iq4_nl<type, J, fallback>,
-                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, ggml_cuda_mmq_exact_cvt_build>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>,
+                ggml_cuda_mmq_exact_cvt_build ? ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, false> : nullptr);
 // ---------------------------------------------------------------------------------------------
         case GGML_TYPE_MXFP4:
             return ggml_cuda_mmq_util_funcs(
@@ -867,11 +894,32 @@ static constexpr __device__ ggml_cuda_mmq_vec_dot_t ggml_cuda_mmq_get_vec_dot() 
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+static constexpr __device__ ggml_cuda_mmq_vec_dot_t ggml_cuda_mmq_get_vec_dot_cvt() {
+    return ggml_cuda_mmq_get_util_funcs<type, J, fallback, prec_src1>().vec_dot_cvt;
+}
+
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_back() {
     return ggml_cuda_mmq_get_util_funcs<type, J, fallback, prec_src1>().write_back;
 }
 
 // ---------------------------------------------------------------------------------------------
+
+// cvt (GGML_CUDA_MMQ_EXACT_CVT=0): the vec_dot with the int-to-float conversion instruction where the type has the exact product
+// form (same values either way); a uniform branch per call
+#define MMQ_VEC_DOT(k00_)                                       \
+    do {                                                        \
+        if constexpr (vec_dot_cvt != vec_dot) {                 \
+            if (cvt) {                                          \
+                vec_dot_cvt(tile_x, tile_y, sum, (k00_));       \
+            } else {                                            \
+                vec_dot(tile_x, tile_y, sum, (k00_));           \
+            }                                                   \
+        } else {                                                \
+            GGML_UNUSED(cvt);                                   \
+            vec_dot(tile_x, tile_y, sum, (k00_));               \
+        }                                                       \
+    } while (0)
 
 template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
@@ -879,7 +927,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const bool cvt) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
@@ -887,6 +935,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int              I          = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
     constexpr ggml_cuda_mmq_load_tiles_t load_tiles = ggml_cuda_mmq_get_load_tiles<type, J, fallback, prec_src1>();
     constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback, prec_src1>();
+    constexpr ggml_cuda_mmq_vec_dot_t    vec_dot_cvt = ggml_cuda_mmq_get_vec_dot_cvt<type, J, fallback, prec_src1>();
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback, prec_src1>();
 
     extern __shared__ int data_mul_mat_q[];
@@ -923,7 +972,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, 0);
+        MMQ_VEC_DOT(0);
 
         __syncthreads();
 
@@ -939,7 +988,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        MMQ_VEC_DOT(MMQ_TILE_NE_K);
 
         __syncthreads();
     }
@@ -962,6 +1011,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 //   MMQ_PIPE_TAB:  IQ3_S only: the 2 KiB grid table is read from a copy in shared memory instead of through L1 (at 2 blocks per SM the
 //                  L1 left beside the tiles does not hold it).
 // The stream-k decomposition, the tile shapes and the grid are those of the base launch.
+// mul_mat_q / mul_mat_q_pipe flags argument: MMQ_FLAG_CVT = the int-to-float conversion instruction in the q8_0 vec_dot
+// (GGML_CUDA_MMQ_EXACT_CVT=0)
+#define MMQ_FLAG_CVT 1
+
 #define MMQ_PIPE_YREG 1
 #define MMQ_PIPE_L2X  2
 #define MMQ_PIPE_OCC2 4
@@ -981,7 +1034,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_pipe(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const bool cvt) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nthreads   = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1);
@@ -990,6 +1043,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_pipe(
     constexpr int              I          = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
     constexpr ggml_cuda_mmq_load_tiles_t load_tiles = ggml_cuda_mmq_get_load_tiles<type, J, fallback, prec_src1>();
     constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback, prec_src1>();
+    constexpr ggml_cuda_mmq_vec_dot_t    vec_dot_cvt = ggml_cuda_mmq_get_vec_dot_cvt<type, J, fallback, prec_src1>();
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback, prec_src1>();
 
     extern __shared__ int data_mul_mat_q[];
@@ -1106,7 +1160,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_pipe(
         if constexpr (pipe & MMQ_PIPE_YREG) {
             y_load(y_src(kb0, 1));
         }
-        vec_dot(tile_x, tile_y, sum, 0);
+        MMQ_VEC_DOT(0);
 
         __syncthreads();
 
@@ -1123,7 +1177,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_pipe(
                 y_load(y_src(kb0 + blocks_per_iter, 0));
             }
         }
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        MMQ_VEC_DOT(MMQ_TILE_NE_K);
 
         __syncthreads();
     }
@@ -1141,15 +1195,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_sel(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const bool cvt) {
     if constexpr (pipe == 0) {
         mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1>
             (x, offset_x, y, ids_dst, dst, tmp_fixup, y_scale, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, cvt);
     } else {
         mul_mat_q_process_tile_pipe<type, J, fallback, fixup, prec_src1, pipe>
             (x, offset_x, y, ids_dst, dst, tmp_fixup, y_scale, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, cvt);
     }
 }
 
@@ -1210,7 +1264,7 @@ static __device__ __forceinline__ void mul_mat_q_body(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix, const int exact_nsm) {
+        const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix, const int exact_nsm, const bool cvt) {
     // tile_prefix: the column tile count is known on the device only (mmq_moe_tile_prefix), the stream-k split is over it.
     // exact_nsm > 0 (stream-k kernel, skip_empty): the prefix kernel also wrote the exact prefix and chose the form (see
     // mmq_moe_tile_prefix): one block per non-empty tile over the exact prefix, or the stream-k split over exact_nsm blocks as before
@@ -1316,7 +1370,7 @@ static __device__ __forceinline__ void mul_mat_q_body(
         mul_mat_q_process_tile_sel<type, J, fallback, fixup, prec_src1, pipe>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, cvt);
         return;
     }
 
@@ -1420,7 +1474,7 @@ static __device__ __forceinline__ void mul_mat_q_body(
         mul_mat_q_process_tile_sel<type, J, fallback, fixup, prec_src1, pipe>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, cvt);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1507,7 +1561,7 @@ static __device__ __forceinline__ void mul_mat_q_body(
     mul_mat_q_process_tile_sel<type, J, fallback, fixup, prec_src1, pipe>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, cvt);
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
@@ -1519,13 +1573,13 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix, const int exact_nsm) {
+        const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix, const int exact_nsm, const int flags) {
     mul_mat_q_body<type, J, fallback, prec_src1, 0>(
         x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale,
         blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst,
         channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, nsamples_y, stride_sample_x, stride_sample_y, stride_sample_dst,
-        ntx_host, nexperts_compact, tile_prefix, exact_nsm);
+        ntx_host, nexperts_compact, tile_prefix, exact_nsm, (flags & MMQ_FLAG_CVT) != 0);
 }
 
 // compiled for sm 120 (consumer Blackwell) and sm 80 (A100) and sm 75 (T4); the host launches it
@@ -1539,7 +1593,7 @@ static __global__ void mul_mat_q_pipe(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix, const int exact_nsm) {
+        const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix, const int exact_nsm, const int flags) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && \
     ((__CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN) || __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE || \
      __CUDA_ARCH__ == GGML_CUDA_CC_TURING)
@@ -1548,9 +1602,9 @@ static __global__ void mul_mat_q_pipe(
         blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst,
         channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, nsamples_y, stride_sample_x, stride_sample_y, stride_sample_dst,
-        ntx_host, nexperts_compact, tile_prefix, exact_nsm);
+        ntx_host, nexperts_compact, tile_prefix, exact_nsm, (flags & MMQ_FLAG_CVT) != 0);
 #else
-    GGML_UNUSED_VARS(x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale, blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, nsamples_y, stride_sample_x, stride_sample_y, stride_sample_dst, ntx_host, nexperts_compact, tile_prefix, exact_nsm);
+    GGML_UNUSED_VARS(x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale, blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, nsamples_y, stride_sample_x, stride_sample_y, stride_sample_dst, ntx_host, nexperts_compact, tile_prefix, exact_nsm, flags);
     NO_DEVICE_CODE;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (sm 12x || sm 80 || sm 75)
 }
@@ -1872,7 +1926,7 @@ typedef void (*mmq_kernel_t)(
         const uint3, const int, const int, const int, const int, const int,
         const uint3, const uint3, const int, const int, const int,
         const uint3, const uint3, const int, const int, const int,
-        const uint3, const int, const int32_t *, const int);
+        const uint3, const int, const int32_t *, const int, const int);
 
 // the pipe kernel for code, with its shared memory limit raised; nullptr if its occupancy is not met (MMQ_PIPE_OCC2 needs 2 blocks per SM)
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, int code>
@@ -2018,6 +2072,35 @@ static void mmq_exact_tiles_stats(const bool exact, const int32_t * tile_prefix,
     mmq_log_decades(v[1] ? n_tiles : n_split, v[1] ? "device form: one block per tile" : "device form: stream-k split");
 }
 
+// GGML_CUDA_MMQ_EXACT_CVT: the exact int-to-float product in the q8_0 mma vec_dot (ggml_cuda_mmq_cvt_mul: no conversion instruction,
+// the same values). Unset = on for the A100 (cc 8.0: separate integer and FP32 pipes, the conversion unit at a quarter of the FP32
+// rate) only, 0 = the conversion instruction everywhere (as before), 1 = the exact product on every NVIDIA arch (tests / timing).
+// RTX PRO 6000 (sm 120) measured 1-5% slower with it (test-mmq-pipe): its integer adds share the FP32 lanes.
+// Engagement: MMQ launches of these types on the mma path with the exact product, logged at 1, 10, 100, ...
+static bool ggml_cuda_mmq_exact_cvt_env(const int cc) {
+    static const int env = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_EXACT_CVT");
+        return e == nullptr || *e == '\0' ? -1 : atoi(e);
+    }();
+    if (env >= 0) {
+        return env != 0;
+    }
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE;
+}
+
+static void mmq_exact_cvt_count(const ggml_type type) {
+    static std::atomic<int64_t> n{0};
+    const int64_t c = n.fetch_add(1) + 1;
+    int64_t p = 1;
+    while (p < c) {
+        p *= 10;
+    }
+    if (p == c) {
+        GGML_LOG_INFO("ggml_cuda: MMQ exact int-to-float product: %" PRId64 " launches (last %s; GGML_CUDA_MMQ_EXACT_CVT=0 off)\n",
+            c, ggml_type_name(type));
+    }
+}
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -2031,6 +2114,15 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
 
     const dim3 block_dims(warp_size, nwarps, 1);
+
+    int flags = 0;
+    if (ggml_cuda_mmq_exact_cvt_build && ggml_cuda_mmq_exact_cvt_type(type) && config.use_mma_data_layout(cc)) {
+        if (ggml_cuda_mmq_exact_cvt_env(cc)) {
+            mmq_exact_cvt_count(type);
+        } else {
+            flags |= MMQ_FLAG_CVT;
+        }
+    }
 
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, prec_src1>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, prec_src1>), nbytes_shared);
@@ -2126,7 +2218,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, nexperts_compact, tile_prefix_p, 0);
+             ntx_fd, nexperts_compact, tile_prefix_p, 0, flags);
         return;
     }
 
@@ -2148,7 +2240,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd, nexperts_compact, tile_prefix_p, exact_nsm);
+         ntx_fd, nexperts_compact, tile_prefix_p, exact_nsm, flags);
 #undef MMQ_LAUNCH_KERNEL
 
     if (!fixup_needed) {

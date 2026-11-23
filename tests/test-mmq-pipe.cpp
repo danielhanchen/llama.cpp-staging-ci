@@ -1,7 +1,9 @@
-// MoE expert GEMM (MUL_MAT_ID, MMQ) exactness + timing at the Flash-Next / Qwen3.6 MoE prompt shapes.
-// For each case one MUL_MAT_ID runs on the first GPU backend; prints
+// MoE expert GEMM (MUL_MAT_ID, MMQ) exactness + timing at the Flash-Next / Qwen3.6 MoE prompt shapes, and the dense
+// products (MUL_MAT, cases with topk 0) of the Flash-Next prompt.
+// For each case one MUL_MAT_ID (or MUL_MAT) runs on the first GPU backend; prints
 //   case <name> md5 <md5 of the output> us <median microseconds per graph compute over the timed reps>
-// Run it once per GGML_CUDA_MMQ_PIPE value: the md5 of every case must equal the GGML_CUDA_MMQ_PIPE=0 run (byte-identical output).
+// Run it once per GGML_CUDA_MMQ_PIPE / GGML_CUDA_MMQ_EXACT_CVT value: the md5 of every case must equal the
+// GGML_CUDA_MMQ_PIPE=0 GGML_CUDA_MMQ_EXACT_CVT=0 run (byte-identical output).
 // argv[1] (optional): run only cases whose name contains it. TEST_MMQ_PIPE_REPS (default 30) timed reps, 5 untimed warm-up reps.
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -101,7 +103,7 @@ static std::string md5_hex(md5_ctx m) {
 struct mm_case {
     std::string name;
     ggml_type   type;
-    int64_t     K, N, E, topk;
+    int64_t     K, N, E, topk; // topk 0: a dense MUL_MAT of [K, N] by [K, tokens] (E 1)
     bool        bcast;     // src1 [K, 1, T] (gate / up) instead of [K, topk, T] (down)
     int64_t     tokens;
     int32_t     op2;       // op param 2 (> 0: an in-place MoE cache bank, the skip_empty / stream-k launch)
@@ -116,11 +118,15 @@ static void run_case(ggml_backend_t backend, const mm_case & c, const int reps) 
 
     ggml_init_params ip = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
+    const bool dense = c.topk == 0;
     ggml_tensor * w   = ggml_new_tensor_3d(ctx, c.type, c.K, c.N, c.E);
-    ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.K, c.bcast ? 1 : c.topk, c.tokens);
-    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.topk, c.tokens);
-    ggml_tensor * out = ggml_mul_mat_id(ctx, w, x, ids);
-    ((int32_t *) out->op_params)[2] = c.op2;
+    ggml_tensor * x   = dense ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.K, c.tokens) :
+                                ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.K, c.bcast ? 1 : c.topk, c.tokens);
+    ggml_tensor * ids = dense ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.topk, c.tokens);
+    ggml_tensor * out = dense ? ggml_mul_mat(ctx, w, x) : ggml_mul_mat_id(ctx, w, x, ids);
+    if (!dense) {
+        ((int32_t *) out->op_params)[2] = c.op2;
+    }
     ggml_cgraph * g = ggml_new_graph(ctx);
     ggml_build_forward_expand(g, out);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -134,7 +140,8 @@ static void run_case(ggml_backend_t backend, const mm_case & c, const int reps) 
             v = ud(rng);
         }
         std::vector<uint8_t> pool(rs*npool);
-        ggml_quantize_chunk(c.type, f.data(), pool.data(), 0, npool, c.K, nullptr);
+        std::vector<float> imat(c.K, 1.0f); // the types that need an importance matrix get a flat one
+        ggml_quantize_chunk(c.type, f.data(), pool.data(), 0, npool, c.K, ggml_quantize_requires_imatrix(c.type) ? imat.data() : nullptr);
         std::vector<uint8_t> q(rs*nrow);
         std::uniform_int_distribution<int64_t> pick(0, npool - 1);
         for (int64_t r = 0; r < nrow; ++r) {
@@ -148,6 +155,8 @@ static void run_case(ggml_backend_t backend, const mm_case & c, const int reps) 
             v = ud(rng);
         }
         ggml_backend_tensor_set(x, f.data(), 0, f.size()*sizeof(float));
+    }
+    if (!dense) {
         std::vector<int32_t> id(c.topk*c.tokens);
         std::uniform_real_distribution<float> u01(0.0f, 1.0f);
         for (int64_t t = 0; t < c.tokens; ++t) {
@@ -208,7 +217,8 @@ int main(int argc, char ** argv) {
         return 2;
     }
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-    printf("device %s pipe %s\n", ggml_backend_dev_description(dev), getenv("GGML_CUDA_MMQ_PIPE") ? getenv("GGML_CUDA_MMQ_PIPE") : "(default)");
+    printf("device %s pipe %s exact_cvt %s\n", ggml_backend_dev_description(dev), getenv("GGML_CUDA_MMQ_PIPE") ? getenv("GGML_CUDA_MMQ_PIPE") : "(default)",
+        getenv("GGML_CUDA_MMQ_EXACT_CVT") ? getenv("GGML_CUDA_MMQ_EXACT_CVT") : "(default)");
     const char * only = argc > 1 ? argv[1] : nullptr;
     const int reps = getenv("TEST_MMQ_PIPE_REPS") ? std::max(1, atoi(getenv("TEST_MMQ_PIPE_REPS"))) : 30;
 
@@ -246,6 +256,18 @@ int main(int argc, char ** argv) {
     // a 4096-token ubatch (J 128 at Qwen3.6: 128 columns per expert)
     cs.push_back({ "q36_gate_q4k_4096",      GGML_TYPE_Q4_K,   2048,  512, 256,  8, true,  4096, 0,   0.0f,  0.0f, 1 });
     cs.push_back({ "fn_gate_iq3s_6554",      GGML_TYPE_IQ3_S,  2560,  640, 512, 10, true,  6554, 0,   0.0f,  0.0f, 1 }); // J 128
+    // Flash-Next dense products of a 2048-token ubatch (J 128): hyper-connection up / down (Q8_0), delta-net output and shared
+    // expert down (Q8_0), delta-net qkv and attention output (Q6_K), and a 2044-token tail
+    cs.push_back({ "fn_dense_hcup_q8_0",     GGML_TYPE_Q8_0,    320, 10240, 1, 0, false, 2048, 0,  0.0f,  0.0f, 7 });
+    cs.push_back({ "fn_dense_hcdown_q8_0",   GGML_TYPE_Q8_0,  10240,   320, 1, 0, false, 2048, 0,  0.0f,  0.0f, 8 }); // fallback, stream-k
+    cs.push_back({ "fn_dense_ssmout_q8_0",   GGML_TYPE_Q8_0,   6144,  2560, 1, 0, false, 2048, 0,  0.0f,  0.0f, 9 });
+    cs.push_back({ "fn_dense_shdown_q8_0",   GGML_TYPE_Q8_0,    640,  2560, 1, 0, false, 2048, 0,  0.0f,  0.0f, 10 });
+    cs.push_back({ "fn_dense_ssmout_q8_0_t", GGML_TYPE_Q8_0,   6144,  2560, 1, 0, false, 2044, 0,  0.0f,  0.0f, 11 });
+    cs.push_back({ "fn_dense_qkv_q6k",       GGML_TYPE_Q6_K,   2560, 10240, 1, 0, false, 2048, 0,  0.0f,  0.0f, 12 });
+    cs.push_back({ "fn_dense_attnout_q6k",   GGML_TYPE_Q6_K,   6144,  2560, 1, 0, false, 2048, 0,  0.0f,  0.0f, 13 });
+    cs.push_back({ "fn_dense_q4_0",          GGML_TYPE_Q4_0,   2560, 10240, 1, 0, false, 2048, 0,  0.0f,  0.0f, 14 });
+    cs.push_back({ "fn_dense_iq4nl",         GGML_TYPE_IQ4_NL, 2560, 10240, 1, 0, false, 2048, 0,  0.0f,  0.0f, 15 });
+    cs.push_back({ "fn_gate_iq2xxs_2048",    GGML_TYPE_IQ2_XXS, 2560, 640, 512, 10, true,  2048, 0,   0.0f,  0.0f, 16 });
 
     for (const auto & c : cs) {
         if (only && c.name.find(only) == std::string::npos) {
