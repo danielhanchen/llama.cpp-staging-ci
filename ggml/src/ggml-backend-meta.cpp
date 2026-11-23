@@ -2108,6 +2108,20 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     }
 }
 
+// whether ggml_backend_meta_set_tensor_async takes a whole-tensor upload of this tensor (one segment, no repeat, split along one
+// axis or mirrored, contiguous)
+bool ggml_backend_meta_set_async_ok(const ggml_tensor * tensor) {
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer) || !ggml_is_contiguous(tensor)) {
+        return false;
+    }
+    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    if (ss.n_segments != 1 || ss.nr[0] != 1) {
+        return false;
+    }
+    return ss.axis == GGML_BACKEND_SPLIT_AXIS_0 || ss.axis == GGML_BACKEND_SPLIT_AXIS_1 || ss.axis == GGML_BACKEND_SPLIT_AXIS_2 ||
+        ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+}
+
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(offset == 0);

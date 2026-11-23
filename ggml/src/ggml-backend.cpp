@@ -4428,7 +4428,13 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
         return false;
     }
     if (async_upload < 0) {
-        ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
+        // a meta (tensor parallel) backend uploads through its simple backends: the family is theirs
+        ggml_backend_t fam_backend = split_backend;
+        static const bool meta_async_fam = getenv("GGML_SCHED_META_ASYNC_UPLOAD") == NULL || atoi(getenv("GGML_SCHED_META_ASYNC_UPLOAD")) != 0;
+        if (meta_async_fam && ggml_backend_is_meta(split_backend) && ggml_backend_meta_n_backends(split_backend) > 0) {
+            fam_backend = ggml_backend_meta_simple_backend(split_backend, 0);
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(fam_backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
         const char * reg_name = reg ? ggml_backend_reg_name(reg) : "";
         if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
@@ -4445,9 +4451,19 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
     if (input_cpy->buffer == NULL || ggml_backend_buffer_is_host(input_cpy->buffer)) {
         return false;
     }
-    // a meta (tensor parallel) buffer splits the copy by its split state, its async set only handles some of them: the sync copy below
+    // a meta (tensor parallel) buffer splits the copy by its split state, its async set only handles some of them (one segment along
+    // one axis, or mirrored): those are queued on every device's stream like any async upload, the others take the sync copy below
+    // (GGML_SCHED_META_ASYNC_UPLOAD=0: every meta input takes the sync copy, as before)
     if (ggml_backend_buffer_is_meta(input_cpy->buffer)) {
-        return false;
+        static const bool meta_async = getenv("GGML_SCHED_META_ASYNC_UPLOAD") == NULL || atoi(getenv("GGML_SCHED_META_ASYNC_UPLOAD")) != 0;
+        if (!meta_async || !ggml_backend_meta_set_async_ok(input_cpy)) {
+            return false;
+        }
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: tensor-parallel inputs uploaded asynchronously on every device (GGML_SCHED_META_ASYNC_UPLOAD=0: sync copy)\n", __func__);
+        }
     }
 
     // graph inputs (leaves set by the caller before the compute, e.g. positions, masks, token ids) take the same relaxed
