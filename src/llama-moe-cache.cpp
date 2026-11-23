@@ -8951,10 +8951,11 @@ struct llama_moe_cache::impl {
         const bool mailbox = single_weigh() && single_usable(1);
         // (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_TRUST, default 0.70; 0 = off): on a host whose marginal "on" is trusted (cmt_trust_marginal: a
         // 12..31-CPU mailbox host) a cache below this share skips the warm phase and the trials from the first launch, as a launch does
-        // once its calibration file holds the firm "on" (the firm skip below): there the first trial timed "on" in every launch, so the
-        // trials only cost the launches that run them. L4 (12 vCPU), Qwen3.6-35B-A3B at 4 bits with its MTP head at 16 GB (60% cached):
-        // the launches that ran the trials decoded chat at 112 tok/s against 123 in the launches that skipped them, the same text as those.
-        // Above it the trials keep deciding: 20 GB (80%) timed "off" in 4 of 22 launches
+        // once its calibration file holds the firm "on" (the firm skip below): there the target cache's first trial timed "on" in every
+        // launch, so the trials only cost the launches that run them. L4 (12 vCPU), Qwen3.6-35B-A3B at 4 bits with its MTP head at 16 GB
+        // (60% cached): the launches that ran the trials decoded chat at 98-111 tok/s against 120-122 in the launches that skipped them,
+        // the same text as those. The drafter's own cache (153 slots) skips them too: its trials time "off", but its host path computes
+        // a few experts per launch either way (same text). Above it the trials keep deciding: 20 GB (80%) timed "off" in 4 of 22 launches
         static const double trial_frac_trust = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_TRUST");
             return e != nullptr ? std::max(0.0, atof(e)) : 0.70;
@@ -11877,7 +11878,26 @@ struct llama_moe_cache::impl {
             ggml_backend_tensor_set(g.map, g.lru.slot_map[il], il*n_expert*sizeof(int32_t), n_expert*sizeof(int32_t));
         }
         // hand and epoch, the counters are kept
-        const int32_t hdr[2] = { 0, 0 };
+        // (LLAMA_MOE_CACHE_HAND_EMPTY, default 1; 0 = slot 0 always): a group with empty slots starts the hand at the first empty
+        // slot outside the core. The hybrid assign admits every miss while the group has an empty slot, but takes its victims from
+        // the slots after the hand: from slot 0 it evicted cached experts and left the empty ones (the end of the banks, where lent
+        // slots came back short of their refill) unfilled for most of a decode, so the host path computed nothing there. L4 (12 vCPU)
+        // Qwen3.6-35B-A3B at 4 bits with its MTP head at 16 GB: after an 8k prompt 13 of 5726 slots stayed empty for 250 of 256
+        // tokens, 2600 misses uploaded and 276 computed on the host (chat, cache full: 1660 and 4680)
+        static const bool hand_empty = [] {
+            const char * e = getenv("LLAMA_MOE_CACHE_HAND_EMPTY");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        int32_t hand = 0;
+        if (hand_empty && g.counts != nullptr) {
+            for (int32_t s = g.lru.n_core; s < g.n_slots; ++s) {
+                if (g.lru.key_of[s] < 0) {
+                    hand = s;
+                    break;
+                }
+            }
+        }
+        const int32_t hdr[2] = { hand, 0 };
         ggml_backend_tensor_set(g.state, hdr, 0, sizeof(hdr));
         if (g.counts != nullptr) {
             // the number of filled slots, see ggml_moe_cache_assign
