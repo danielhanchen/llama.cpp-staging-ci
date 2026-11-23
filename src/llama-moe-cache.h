@@ -326,6 +326,8 @@ public:
 
     // the largest ubatch (at most n_small_max tokens) whose experts every cached layer reads from the cache without copying them
     int64_t n_tokens_cached() const;
+    // small batches run inside a CPU-miss timing trial so far (see llama_moe_cache_trial_batches)
+    int64_t trial_batches() const;
     // share of the host experts' bytes the cache holds (-1 before the slots are sized)
     double cached_frac() const;
     // bytes of the host experts the cache cannot hold (0 before the slots are sized)

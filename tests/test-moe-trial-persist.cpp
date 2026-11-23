@@ -367,6 +367,34 @@ int main() {
         CHECK(tp::env_on(nullptr) && !tp::env_on("0") && tp::env_on("1"), "the switch is on unless set to 0");
     }
 
+    {
+        // the trial ratio by width: narrow "on" batches against wide "off" ones must not look faster (A100 80 GB DFlash2 8k)
+        std::vector<int64_t> t[2], n[2];
+        // off: 5 batches at 7 rows (55 ms) and 5 at 2 rows (21 ms); on: the same widths 10% slower, but 8 of 10 at 2 rows
+        for (int i = 0; i < 5; ++i) { t[0].push_back(55000); n[0].push_back(7); }
+        for (int i = 0; i < 5; ++i) { t[0].push_back(21000); n[0].push_back(2); }
+        for (int i = 0; i < 2; ++i) { t[1].push_back(60500); n[1].push_back(7); }
+        for (int i = 0; i < 8; ++i) { t[1].push_back(23100); n[1].push_back(2); }
+        int m = -1;
+        const double r = tp::width_ratio(t, n, 3, &m);
+        CHECK(std::fabs(r - 1.10) < 1e-6 && m == 7, "per-width ratio %.4f (matched %d), expected 1.10 over 7 matched", r, m);
+        // the plain medians would have called it a gain: 23.1 / 55 ms
+        // no width in common: the per-token medians (on 2 rows at 12 ms per token vs off 7 rows at 7.86): slower
+        std::vector<int64_t> u[2], k[2];
+        for (int i = 0; i < 5; ++i) { u[0].push_back(55000); k[0].push_back(7); u[1].push_back(24000); k[1].push_back(2); }
+        const double r2 = tp::width_ratio(u, k, 3, &m);
+        CHECK(m == 0 && std::fabs(r2 - (12000.0/(55000.0/7.0))) < 1e-6, "per-token fallback %.4f (matched %d)", r2, m);
+        // one width: the ratio of the two medians
+        std::vector<int64_t> v[2], q[2];
+        for (int i = 0; i < 5; ++i) { v[0].push_back(30000 + 100*i); q[0].push_back(5); v[1].push_back(27000 + 100*i); q[1].push_back(5); }
+        const double r3 = tp::width_ratio(v, q, 3, &m);
+        CHECK(std::fabs(r3 - 27200.0/30200.0) < 1e-9 && m == 5, "one width %.6f", r3);
+        // an empty arm
+        std::vector<int64_t> e[2], f[2];
+        e[0] = { 1000 }; f[0] = { 1 };
+        CHECK(tp::width_ratio(e, f, 3, &m) == 0.0, "an empty arm gives 0");
+    }
+
     if (fails == 0) {
         printf("test-moe-trial-persist: OK\n");
     }

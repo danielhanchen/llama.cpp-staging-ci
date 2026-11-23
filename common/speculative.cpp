@@ -1135,8 +1135,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int64_t> t_end;                  // per seq: end of the last draft call (0 = nothing pending)
         std::vector<int32_t> w_last;                 // per seq: verify rows of that draft
         std::vector<std::vector<float>> p_last;      // per seq: its steps' selector probabilities
+        std::vector<int64_t> trial0;                 // per seq: the target MoE cache's trial batches at that draft's end
+        int64_t n_trial_skip = 0;                    // passes left out of the verify ms: they ran a CPU-miss timing trial batch
         bool init = false;
     } eva;
+
+    // LLAMA_DFLASH_EV_AUTO_SKIP_TRIAL (default 1; 0 = timed as any other pass): a pass whose verify ran a batch of the target MoE
+    // cache's CPU-miss timing trial (synchronized, and in two of its blocks on the other path) is left out of the verify ms of its
+    // width: the trial's batches with the host path on cost up to 3x a steady pass, and they fall on the widths the drafter used then,
+    // so the windows came out narrower in the launches that ran a trial (A100 80 GB, Qwen3.8-Flash-Next at 4 bits, DFlash2, 48 GB:
+    // 2.98-3.08 vs 3.66 tokens per pass at 8k)
+    static bool eva_skip_trial() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_DFLASH_EV_AUTO_SKIP_TRIAL");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
+    }
 
     // the small-share band's passes, measured against the band's priced cost of their width (see df2_low_lng_ratio)
     struct lowg_t {
@@ -1202,6 +1217,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         eva.t_end.assign(n_seq, 0);
         eva.w_last.assign(n_seq, 0);
         eva.p_last.assign(n_seq, {});
+        eva.trial0.assign(n_seq, -1);
     }
 
     void eva_log(const char * when) const {
@@ -1213,8 +1229,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 s += b;
             }
         }
-        LOG_INF("DFlash2 EV-auto %s: %" PRId64 " passes measured, draft %.2f ms, %" PRId64 " drafts cut by %" PRId64 " rows, %" PRId64 " probes; verify ms (decayed n, picks):%s\n",
-                when, eva.n_meas, eva.d_n > 0.0 ? eva.d_ms / eva.d_n : 0.0, eva.n_cut, eva.n_rows_cut, eva.n_probe, s.c_str());
+        LOG_INF("DFlash2 EV-auto %s: %" PRId64 " passes measured, %" PRId64 " left out (CPU-miss trial batches), draft %.2f ms, %" PRId64 " drafts cut by %" PRId64 " rows, %" PRId64 " probes; verify ms (decayed n, picks):%s\n",
+                when, eva.n_meas, eva.n_trial_skip, eva.d_n > 0.0 ? eva.d_ms / eva.d_n : 0.0, eva.n_cut, eva.n_rows_cut, eva.n_probe, s.c_str());
     }
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
@@ -2115,6 +2131,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     eva.t_end [seq_id] = n_ver > 0 ? now : 0;
                     eva.w_last[seq_id] = (int32_t) n_ver + 1;
+                    eva.trial0[seq_id] = eva_skip_trial() ? llama_moe_cache_trial_batches(params.ctx_tgt) : -1;
                     eva.p_last[seq_id].assign(step_p.begin(), step_p.begin() + std::min(step_p.size(), n_ver));
                     if (n_ver + 1 < (size_t) eva_t::W) {
                         eva.picks[n_ver + 1]++;
@@ -2221,7 +2238,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // beside a small cache the first pass of a width also builds its graphs: counted as a probe, not timed
                 const bool first = eva.small && eva.cnt[w] == 0;
                 eva.cnt[w]++;
-                if (!first && ms > 0.0 && ms < 2000.0 && (m == 0.0 || ms < 3.0 * m)) {
+                const int64_t tr0   = eva.trial0[seq_id];
+                const bool    trial = tr0 >= 0 && llama_moe_cache_trial_batches(params.ctx_tgt) != tr0;
+                eva.n_trial_skip += trial ? 1 : 0;
+                if (!first && !trial && ms > 0.0 && ms < 2000.0 && (m == 0.0 || ms < 3.0 * m)) {
                     eva.v_sum[w] = 0.97 * eva.v_sum[w] + ms;
                     eva.v_n[w]   = 0.97 * eva.v_n[w]   + 1.0;
                     eva.n_meas++;

@@ -1341,7 +1341,12 @@ struct llama_moe_cache::impl {
     int      cmt_arm    = 0;
     int      cmt_skipn  = 0;
     int64_t  cmt_t_prev = -1;
+    int64_t  cmt_n_prev = 0;
     std::vector<int64_t> cmt_t[2];
+    std::vector<int64_t> cmt_tn[2];   // the token count of each timed small batch (see cmt_ratio)
+    // small batches run inside a timing trial so far (any block: synchronized, and two blocks take the other path), read by the
+    // draft window rules that time passes (llama_moe_cache_trial_batches), so they leave those passes out
+    std::atomic<int64_t> cmt_trial_batches { 0 };
     // the host is not as fast as calibrated (a busy host: the last trial found the host path cmt_host_bad times slower or worse): the
     // short prompts do not take it either
     static constexpr double cmt_host_bad = 1.25;
@@ -11343,7 +11348,41 @@ struct llama_moe_cache::impl {
     void cmt_end() {
         if (cmt_t_prev >= 0) {
             cmt_t[cmt_arm].push_back(ggml_time_us() - cmt_t_prev);
+            cmt_tn[cmt_arm].push_back(cmt_n_prev);
             cmt_t_prev = -1;
+        }
+    }
+    // LLAMA_MOE_CPU_MISS_TRIAL_PER_WIDTH (default 1; 0 = the medians of all counted batches of each arm, as before): a trial compares
+    // the two paths width by width (llama_moe_tp::width_ratio). A DFlash2 draft verifies windows of 2..7 rows whose widths follow the
+    // drafter, so the 8 batches of a block can be mostly narrow in one arm and wide in the other: A100 80 GB (12 vCPU), Qwen3.8-Flash-Next
+    // at 4 bits with its DFlash2 drafter capped at 48 GB (70.5% cached), 21 ms per batch at 2 rows vs 55 ms at 7, the verdict followed the
+    // widths (t_on / t_off 0.73 in one launch, 1.67 in the next, same host)
+    static bool cmt_per_width_on() {
+        static const bool on = llama_moe_tp::env_on(getenv("LLAMA_MOE_CPU_MISS_TRIAL_PER_WIDTH"));
+        return on;
+    }
+    // the medians the verdict compares: t_off as measured, t_on = t_off times the width-matched ratio (with the switch off, or all
+    // batches of one width: the two medians as before)
+    void cmt_ratio(double & t_off, double & t_on, int & matched) const {
+        auto median = [](std::vector<int64_t> v) {
+            std::sort(v.begin(), v.end());
+            return v.empty() ? 0.0 : (double) v[v.size()/2];
+        };
+        t_off   = median(cmt_t[0]);
+        t_on    = median(cmt_t[1]);
+        matched = -1;
+        if (!cmt_per_width_on() || cmt_t[0].empty() || cmt_t[1].empty()) {
+            return;
+        }
+        const int64_t w0 = cmt_tn[0].front();
+        const bool one_width = std::all_of(cmt_tn[0].begin(), cmt_tn[0].end(), [w0](int64_t w) { return w == w0; }) &&
+                               std::all_of(cmt_tn[1].begin(), cmt_tn[1].end(), [w0](int64_t w) { return w == w0; });
+        if (one_width) {
+            return;
+        }
+        const double r = llama_moe_tp::width_ratio(cmt_t, cmt_tn, 3, &matched);
+        if (r > 0.0) {
+            t_on = r*t_off;
         }
     }
 
@@ -11440,15 +11479,26 @@ struct llama_moe_cache::impl {
         const bool retime   = have_rec && !replay;
         const int  end_at = replay ? std::min(cmt_rec[cmt_n].len, 5*cmt_block) : 5*cmt_block;
         cmt_len_now = cmt_done;
-        // the host path much slower than without it ends the trial early
-        if (!replay && cmt_t[0].size() >= 4 && cmt_t[1].size() >= 4 &&
-                *std::min_element(cmt_t[1].begin(), cmt_t[1].end()) > (1.0 + 8*cmt_margin)*median(cmt_t[0])) {
-            cmt_done = 5*cmt_block;
+        // the host path much slower than without it ends the trial early (by width, see cmt_ratio: the width-matched ratio)
+        if (!replay && cmt_t[0].size() >= 4 && cmt_t[1].size() >= 4) {
+            bool slow;
+            if (cmt_per_width_on()) {
+                double a, b;
+                int    m;
+                cmt_ratio(a, b, m);
+                slow = m != 0 && b > (1.0 + 8*cmt_margin)*a;
+            } else {
+                slow = *std::min_element(cmt_t[1].begin(), cmt_t[1].end()) > (1.0 + 8*cmt_margin)*median(cmt_t[0]);
+            }
+            if (slow) {
+                cmt_done = 5*cmt_block;
+            }
         }
         if (cmt_done >= end_at) {
             cmt_done = -1;
-            const double t_off = median(cmt_t[0]);
-            const double t_on  = median(cmt_t[1]);
+            double t_off, t_on;
+            int    matched;
+            cmt_ratio(t_off, t_on, matched);
             bool on, host_ok;
             int  gap_next;
             if (replay) {
@@ -11510,14 +11560,18 @@ struct llama_moe_cache::impl {
                         "(recorded t_on / t_off %.3f; this launch %.3f / %.3f ms, medians of %zu and %zu)\n",
                         tag, cmt_n, on ? "on" : "off", cmt_rec[cmt_n - 1].ratio, t_off/1e3, t_on/1e3, cmt_t[0].size(), cmt_t[1].size());
                 } else {
-                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: %.3f ms per small batch without the host path, %.3f ms with it (medians of %zu and %zu) -> %s for small batches%s%s\n",
-                        tag, cmt_n, t_off/1e3, t_on/1e3, cmt_t[0].size(), cmt_t[1].size(), on ? "on" : "off",
+                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: %.3f ms per small batch without the host path, %.3f ms with it (medians of %zu and %zu%s) -> %s for small batches%s%s\n",
+                        tag, cmt_n, t_off/1e3, t_on/1e3, cmt_t[0].size(), cmt_t[1].size(),
+                        matched > 0 ? "; with it: the off median times the ratio per width" : matched == 0 ? "; with it: the off median times the ratio per token" : "",
+                        on ? "on" : "off",
                         !host_ok ? ", off for short prompts (the host is slower than calibrated)" : "",
                         cmt_n > 1 && cmt_hyst() > 0.0 ? " (hysteresis, LLAMA_MOE_CPU_MISS_TRIAL_HYST)" : "");
                 }
             }
             cmt_t[0].clear();
             cmt_t[1].clear();
+            cmt_tn[0].clear();
+            cmt_tn[1].clear();
             cm_gen++; // the small batches and the short prompts (cm_prompt_ok) may change
             cm_small_ok   = on;
             cm_small_live = on;
@@ -11547,9 +11601,11 @@ struct llama_moe_cache::impl {
         cm_small_live = arm != 0;
         if (blk > 0 && cmt_skipn == 0) {
             cmt_t_prev = now;
+            cmt_n_prev = n_tokens;
         }
         cmt_skipn = std::max(0, cmt_skipn - 1);
         cmt_done++;
+        cmt_trial_batches.fetch_add(1, std::memory_order_relaxed);
     }
 
     // reads the device counters of the lookups: distinct hits, fetched misses, misses left to the host
@@ -16285,6 +16341,10 @@ double llama_moe_cache::cached_frac() const {
 
 double llama_moe_cache::host_uncached_bytes() const {
     return pimpl->host_uncached;
+}
+
+int64_t llama_moe_cache::trial_batches() const {
+    return pimpl->cmt_trial_batches.load(std::memory_order_relaxed);
 }
 
 int64_t llama_moe_cache::n_tokens_cached() const {
