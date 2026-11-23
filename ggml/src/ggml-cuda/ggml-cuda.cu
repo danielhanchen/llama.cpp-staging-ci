@@ -11121,8 +11121,8 @@ static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cg
 // with the same kernels (the q8_1 activation cache and the multi-matrix launch are used inside the branch as on the main stream; the
 // branch's cache slots cannot be handed out again before its join, see the claim guard in the evaluation): only the overlap changes.
 // Only graphs of 2..GGML_CUDA_SIDE_CHAIN_COLS (default 8) columns are planned (speculative verify windows): prompts and single-token
-// decodes keep their node order and kernels. Off by default on cc 8.0 (see the gate in graph_optimize); GGML_CUDA_SIDE_CHAIN=0 / 1
-// turns it off / on.
+// decodes keep their node order and kernels. Off by default on cc 8.0 where the device runs a MoE cache (see the gate in
+// graph_optimize); GGML_CUDA_SIDE_CHAIN=0 / 1 turns it off / on.
 static int ggml_cuda_side_chain_cols() {
     static const int v = getenv("GGML_CUDA_SIDE_CHAIN_COLS") ? atoi(getenv("GGML_CUDA_SIDE_CHAIN_COLS")) : 8;
     return std::min(v, (int) MMVQ_MAX_BATCH_SIZE);
@@ -11644,11 +11644,28 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         if (!disable_fusion && !side_mv_disabled && side_mv_arch_ok && !(graph_opt != nullptr && atoi(graph_opt) == 1)) {
             ggml_cuda_side_mv_plan(cuda_ctx, cgraph, params);
         }
-        // the side chain has its own default per compute capability: measured slower on cc 8.0 (A100: off was 1-5% cheaper per
-        // speculative verify pass) and faster on cc 12.0 (off 1-2.5% dearer), so it is off by default on cc 8.0 only.
-        // GGML_CUDA_SIDE_CHAIN=1 turns it on (Ampere and newer, as the side matvec), GGML_CUDA_SIDE_CHAIN=0 turns it off.
+        // the side chain has its own default per compute capability and residency: on cc 8.0 (A100) it was slower where the device
+        // runs a MoE cache (off 1-5% cheaper per speculative verify pass with host experts) but faster with the whole model on the
+        // device (off 0.8-4% dearer), and on cc 12.0 it is faster either way (off 1-2.5% dearer). So on cc 8.0 it is off once a
+        // graph of this device has held a MoE cache lookup (a reserve graph included, so before the first decode), else on; other
+        // compute capabilities keep it on. GGML_CUDA_SIDE_CHAIN=1 turns it on (Ampere and newer, as the side matvec),
+        // GGML_CUDA_SIDE_CHAIN=0 turns it off, GGML_CUDA_SIDE_CHAIN_RESIDENT=0 keeps it off on every cc 8.0 graph.
         static const char * side_chain_env = getenv("GGML_CUDA_SIDE_CHAIN");
-        const bool side_chain_on = side_chain_env != nullptr ? atoi(side_chain_env) != 0 : side_mv_cc != GGML_CUDA_CC_AMPERE;
+        static const bool side_chain_resident = ggml_cuda_env_int("GGML_CUDA_SIDE_CHAIN_RESIDENT", 1) != 0;
+        static std::atomic<bool> side_chain_moe_cache[GGML_CUDA_MAX_DEVICES] = {};
+        bool side_chain_default = side_mv_cc != GGML_CUDA_CC_AMPERE;
+        if (!side_chain_default && side_chain_env == nullptr && side_chain_resident) {
+            if (!side_chain_moe_cache[cuda_ctx->device].load(std::memory_order_relaxed)) {
+                for (int i = 0; i < cgraph->n_nodes; ++i) {
+                    if (cgraph->nodes[i]->op == GGML_OP_MOE_CACHE_LOOKUP) {
+                        side_chain_moe_cache[cuda_ctx->device].store(true, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+            }
+            side_chain_default = !side_chain_moe_cache[cuda_ctx->device].load(std::memory_order_relaxed);
+        }
+        const bool side_chain_on = side_chain_env != nullptr ? atoi(side_chain_env) != 0 : side_chain_default;
         if (!disable_fusion && side_chain_on && side_mv_arch_ok && !(graph_opt != nullptr && atoi(graph_opt) == 1)) {
             ggml_cuda_side_chain_plan(cuda_ctx, cgraph, params);
         }
