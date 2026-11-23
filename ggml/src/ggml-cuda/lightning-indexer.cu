@@ -1,5 +1,6 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "common.cuh"
+#include "preload.cuh"
 #include "lightning-indexer.cuh"
 #include "fattn-common.cuh"
 #include "convert.cuh"
@@ -594,6 +595,10 @@ static __global__ void lightning_indexer_kernel_tile(
 }
 
 #define LIGHTNING_INDEXER_LAUNCH(lightning_indexer_kernel, n_embd, n_head, type_K, cand_t, grid_l) \
+    if (ggml_cuda_preload_on()) {                                                                 \
+        ggml_cuda_preload_func((const void *)                                                     \
+            lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K, cand_t>); \
+    } else                                                                                        \
         lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K, cand_t>  \
             <<<grid_l, block, 0, ctx.stream()>>>(                                                 \
             q_d, k_d, w_d, m_d, dst_d,                                                            \
@@ -716,14 +721,18 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         GGML_ASSERT(c->ne[1] == n_batch && c->ne[2] == 1 && c->ne[3] == n_stream);
         const int bs = ggml_get_op_params_i32(dst, 0);
         GGML_ASSERT(bs > 0 && c->ne[0]*bs <= INT_MAX);
-        cand = { (const char *) c->data, (int) (c->ne[0]*bs), bs, c->nb[1], c->nb[3] };
+        cand = { (const char *) ggml_cuda_preload_ptr(c), (int) (c->ne[0]*bs), bs, c->nb[1], c->nb[3] };
     }
     const bool tile = n_embd == 128 && n_head == 4 && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS &&
         !(dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT);
     if (cand.C && !tile) {
         // the per token kernels write only the candidate rows
         const dim3 grid_f(std::min<int64_t>((n_kv + 255)/256, 64), n_batch, n_stream);
-        lightning_indexer_fill_ninf<<<grid_f, 256, 0, ctx.stream()>>>(dst_d, n_kv, nb1, nb3);
+        if (ggml_cuda_preload_on()) {
+            ggml_cuda_preload_func((const void *) lightning_indexer_fill_ninf);
+        } else {
+            lightning_indexer_fill_ninf<<<grid_f, 256, 0, ctx.stream()>>>(dst_d, n_kv, nb1, nb3);
+        }
     }
 
     if (n_embd == 128 && n_head == 64) {
@@ -828,7 +837,10 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         LIGHTNING_INDEXER_CASE_ALL(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_F32)
         GGML_ABORT("fatal error");
 
-        if (cand.C) {
+        if (cand.C && ggml_cuda_preload_on()) {
+            ggml_cuda_preload_func((const void *) lightning_indexer_cand_flags);
+            ggml_cuda_preload_func((const void *) lightning_indexer_cand_apply);
+        } else if (cand.C) {
             // every row was scored: rows outside the token's candidate blocks -> -inf
             const int64_t n_blk = (n_kv + cand.bs - 1)/cand.bs;
             ggml_cuda_pool_alloc<uint8_t> flags(ctx.pool(), n_blk*n_batch*n_stream);

@@ -2,6 +2,7 @@
 #include "ggml.h"
 #include "p1fuse-stats.cuh"
 #include "common.cuh"
+#include "preload.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
 #include "mmvf-splitk.cuh"
@@ -517,7 +518,7 @@ static void mul_mat_vec_f_switch_fusion(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
-            ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
+            ggml_cuda_kernel_launch_pl(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ggml_cuda_mmvf_one_bar());
@@ -527,7 +528,7 @@ static void mul_mat_vec_f_switch_fusion(
 
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
-    ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
+    ggml_cuda_kernel_launch_pl(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ggml_cuda_mmvf_one_bar());
@@ -798,7 +799,7 @@ static void mul_mat_vec_f_multi_launch(const ggml_cuda_mm_fusion_args_device & f
     const bool one_bar = ggml_cuda_mmvf_one_bar();
     ggml_cuda_p1_stat(one_bar ? GGML_CUDA_P1_MMVF_ONEBAR : GGML_CUDA_P1_MMVF_TWOBAR);
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, (int) ((one_bar ? ncols_dst : 1)*32*sizeof(float)), stream};
-#define MMVF_MULTI_LAUNCH(NC) case NC: ggml_cuda_kernel_launch(mul_mat_vec_f<T, float, NC, 256, false, false, true>, launch_params, \
+#define MMVF_MULTI_LAUNCH(NC) case NC: ggml_cuda_kernel_launch_pl(mul_mat_vec_f<T, float, NC, 256, false, false, true>, launch_params, \
         (const T *) nullptr, y, (const int32_t *) nullptr, fusion, (float *) nullptr, (int) (ncols/2), make_uint3(0, 0, 0), (int) stride_row, \
         (int) (stride_col_y/2), 0, one, 0, 0, 0, one, 0, 0, 0, 0, one_bar); break;
     switch (ncols_dst) {
@@ -876,7 +877,8 @@ static bool mul_mat_vec_f_splitk_plan(ggml_backend_cuda_context & ctx, const flo
         return false;
     }
     const size_t part_per_stream = (size_t) MMVF_SPLITK_MAX_ROWS*MMVF_SPLITK_MAX_SPLIT*MMVF_MAX_BATCH_SIZE;
-    if (ctx.mmvf_splitk_part == nullptr) {
+    if (ctx.mmvf_splitk_part == nullptr && !(alloc && ggml_cuda_preload_on())) {
+        // (a kernel preload takes the launch the product would take, without the buffers)
         if (!alloc) {
             return false;
         }
@@ -921,7 +923,7 @@ static bool mul_mat_vec_f_splitk_try(ggml_backend_cuda_context & ctx, const floa
     const dim3 block_nums(a.nrows, a.nsplit, 1);
     const dim3 block_dims(MMVF_SPLITK_BLOCK, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, ctx.stream()};
-#define MMVF_SPLITK_LAUNCH(NC) case NC: ggml_cuda_kernel_launch(mul_mat_vec_f_splitk<NC>, launch_params, a.x, a.y, a.dst, a.part, a.cnt, \
+#define MMVF_SPLITK_LAUNCH(NC) case NC: ggml_cuda_kernel_launch_pl(mul_mat_vec_f_splitk<NC>, launch_params, a.x, a.y, a.dst, a.part, a.cnt, \
         a.ncols2, a.chunk2, a.stride_row, a.stride_col_y2, a.stride_col_dst); break;
     switch (ncols_dst) {
         MMVF_SPLITK_LAUNCH(1)

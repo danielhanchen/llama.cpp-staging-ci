@@ -104,6 +104,9 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // the CUDA kernels of the tail of a long prompt loaded at load, while the device is idle (see tail_preload in llama-context.cpp)
+    void tail_preload();
+
     // read back the PLE table pages the page cache gave up after the load's part read (see llama_ple_topup)
     size_t ple_topup();
 
