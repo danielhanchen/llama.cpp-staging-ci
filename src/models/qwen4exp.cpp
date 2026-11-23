@@ -643,7 +643,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)); // [n_embd, hc, n_tokens]
+    // a batch of prompt rows multiplies eh_proj as one 2-D product over its hc * n_tokens columns: as a 3-D [2*n_embd, hc, n_tokens]
+    // input the CUDA backend took the hc columns of each token as their own mat-vec channel and read the whole weight once per token
+    // (RTX PRO 6000, Qwen3.8-Flash-Next Q8_0 drafter: ~9 ms per 2048-row prompt ubatch, beside the target's next ubatch). Below
+    // LLAMA_MTP_EH_PROJ_FLAT_MIN rows (64; the draft steps and the catch-up batches after a verify) the product keeps its 3-D form and
+    // its kernels; LLAMA_MTP_EH_PROJ_FLAT=0 keeps it everywhere. Same weights and inputs; the drafter's prompt-row K / V come from
+    // the matrix-matrix kernel there, the target's computation is unchanged
+    static const bool eh_flat_on = getenv("LLAMA_MTP_EH_PROJ_FLAT") == nullptr || atoi(getenv("LLAMA_MTP_EH_PROJ_FLAT")) != 0;
+    static const int64_t eh_flat_min = getenv("LLAMA_MTP_EH_PROJ_FLAT_MIN") ? std::max(1, atoi(getenv("LLAMA_MTP_EH_PROJ_FLAT_MIN"))) : 64;
+    ggml_tensor * eh_in  = ggml_concat(ctx0, e_norm, h_norm, 0); // [2*n_embd, hc, n_tokens]
+    ggml_tensor * res_hc = nullptr;
+    if (eh_flat_on && n_tokens >= eh_flat_min) {
+        res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_reshape_2d(ctx0, eh_in, eh_in->ne[0], eh_in->ne[1]*eh_in->ne[2]));
+        res_hc = ggml_reshape_3d(ctx0, res_hc, res_hc->ne[0], eh_in->ne[1], eh_in->ne[2]); // [n_embd, hc, n_tokens]
+    } else {
+        res_hc = build_lora_mm(layer.nextn.eh_proj, eh_in); // [n_embd, hc, n_tokens]
+    }
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
