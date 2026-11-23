@@ -273,6 +273,9 @@ LLAMA_API bool llama_verify_exact_placement(const struct llama_context * ctx);
 LLAMA_API int32_t llama_verify_device_max_tokens(const struct llama_context * ctx);
 // the tokens whose experts the MoE cache's device slots hold at once (llama_moe_cache::n_tokens_cached, at most 32), -1 without a cache
 LLAMA_API int32_t llama_moe_cache_tokens(const struct llama_context * ctx);
+// small batches the MoE cache has run inside its CPU-miss timing trials so far (their blocks are synchronized and two of them take
+// the other path, so a pass that ran one is not the steady cost of its width), -1 without a cache
+LLAMA_API int64_t llama_moe_cache_trial_batches(const struct llama_context * ctx);
 // the cached share of the MoE cache's host expert bytes (0..1), -1 without a cache or before its slots are sized
 LLAMA_API double llama_moe_cache_frac(const struct llama_context * ctx);
 // a MoE cache that holds at least LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC (0.6; 0 = off, as before) of its host expert bytes

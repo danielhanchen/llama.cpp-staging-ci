@@ -23,6 +23,7 @@ extern "C" { GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int3
 extern "C" { GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_context * ctx, struct ggml_tensor * logits, struct ggml_tensor * map,
         struct ggml_tensor * state, struct ggml_tensor ** banks, const void ** host, int n_banks, int il, int n_top, int max_fill,
         int n_core, struct ggml_tensor * scores, struct ggml_tensor * dep); }
+extern "C" { GGML_API void ggml_moe_cache_prefetch_set_stage(struct ggml_tensor * op, int n_stg, int owner); }
 
 #include <algorithm>
 #include <array>
@@ -1340,7 +1341,12 @@ struct llama_moe_cache::impl {
     int      cmt_arm    = 0;
     int      cmt_skipn  = 0;
     int64_t  cmt_t_prev = -1;
+    int64_t  cmt_n_prev = 0;
     std::vector<int64_t> cmt_t[2];
+    std::vector<int64_t> cmt_tn[2];   // the token count of each timed small batch (see cmt_ratio)
+    // small batches run inside a timing trial so far (any block: synchronized, and two blocks take the other path), read by the
+    // draft window rules that time passes (llama_moe_cache_trial_batches), so they leave those passes out
+    std::atomic<int64_t> cmt_trial_batches { 0 };
     // the host is not as fast as calibrated (a busy host: the last trial found the host path cmt_host_bad times slower or worse): the
     // short prompts do not take it either
     static constexpr double cmt_host_bad = 1.25;
@@ -9009,9 +9015,37 @@ struct llama_moe_cache::impl {
                 return cmt_ps_state == 1 && cmt_rec_file > 0 ? &cmt_rec[0] : nullptr;
             }, cmt_trust_tries(), cmt_ps_min_gain());
         }
-        const bool skip = skip_share || skip_firm;
+        // A first trial recorded as firm "off" by a launch that found the host clearly slower than calibrated (host_ok 0: t_on at least
+        // cmt_host_bad x t_off, the record a replay runs with the host path off in every block, llama_moe_tp::replay_off_fetch) runs no
+        // warm phase and no trials either: small batches and short prompts stay on the plain cache, as that replay does, without its
+        // synchronized, timed blocks (LLAMA_MOE_CPU_MISS_FIRM_OFF_SKIP=0: replayed). A100 80 GB (12 vCPU), Qwen3.8-Flash-Next at 4 bits with
+        // its DFlash2 drafter capped at 48 GB (70.5% cached, recorded t_on / t_off 1.55): the replayed trial fell in the chat request,
+        // 115 tok/s against 124 with LLAMA_MOE_CPU_MISS=0, same text, no expert computed on the host in either
+        bool skip_off = false;
+        if (!skip_share && !skip_firm && cm_trial && !cm_force && cmt_n == 0 && cmt_done < 0 && cmt_firm_off_skip_on() && cmt_replay_off_fetch_on()) {
+            cmt_ps_setup();
+            skip_off = cmt_ps_state == 1 && cmt_rec_file > 0 && llama_moe_tp::replay_off_fetch(true, cmt_rec[0]);
+        }
+        const bool skip = skip_share || skip_firm || skip_off;
         if (late) {
             cm_trials_late_done = true;
+        }
+        if (skip_off) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no warm phase or timing trials at %.1f%% of the host experts cached: the first trial is "
+                "firm off with the host slower than calibrated (t_on / t_off %.3f) in %s, small batches and short prompts stay on the plain "
+                "cache%s (LLAMA_MOE_CPU_MISS_FIRM_OFF_SKIP=0: replayed)\n", tag, 100.0*cache_frac, cmt_rec[0].ratio, cmt_ps_path.c_str(),
+                late ? ", from now on" : "");
+            cm_trials_skipped = true;
+            cmt_done      = -1;
+            cmt_wait      = -1;
+            cmt_t_prev    = -1;
+            cmw_on        = false;
+            cmt_n         = (int) cmt_rec_file;
+            cm_small_ok   = false;
+            cm_small_live = false;
+            cmt_host_ok   = false;
+            cm_gen++;
+            return true;
         }
         if (skip_firm) {
             LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no warm phase or timing trials at %.1f%% of the host experts cached: the first trial is "
@@ -9687,9 +9721,16 @@ struct llama_moe_cache::impl {
         int n        = 0;
         int max_fill = 0;
         int min_tok  = 1; // windows of fewer tokens do not prefetch
+        int stage    = 0; // staging slots per group: the staged form through the copy engine (see prefetch_stage_cfg)
     };
     mutable bool     pf_resolved = false;
     mutable pf_cfg_t pf_cfg;
+    // a number of this cache instance for the staged prefetch (the backend resets a group's staging when its banks reuse the address
+    // of an earlier cache's)
+    int              pf_owner = [] {
+        static std::atomic<int> n{0};
+        return ++n;
+    }();
     bool             pf_quiet    = false; // a no_alloc (fit) instance: no log
 
     // the compute capability of the CUDA device of a backend (major*100 + minor*10), -1 if it is not one
@@ -9700,6 +9741,26 @@ struct llama_moe_cache::impl {
         return cc_fn != nullptr ? cc_fn(dev) : -1;
     }
 
+    // staged prefetch (the CUDA backend's copy engine, see moe_stg_view in moe-cache.cu): the same predicted experts (top N of the next
+    // layer's router on this layer's MoE input) are copied by the DMA engine into a few staging slots per cache group instead of being
+    // admitted into the cache by SM copies; the next layer's lookup decides exactly as without it, and its fetch copies a staged expert
+    // from device memory instead of reading it over the link. The cache holds the same experts and every product reads the same bytes,
+    // so the text is the one without it. On an A100 80 GB at 48 GB (70.5% of the host experts cached, ~12 GB/s link) the misses' copies
+    // are the critical path of every MoE layer of a verify window (DFlash2 n6 chat: 39 ms per pass, of it ~21 ms with a miss copy in
+    // flight), while the SM form of the prefetch slowed the attention beside its copies (chat -7%).
+    // Opt-in: LLAMA_MOE_PREFETCH_STAGE=N on with N slots per group (1..16; 4 measured), unset or 0 off. Top LLAMA_MOE_PREFETCH (10)
+    // predicted experts per token, at most LLAMA_MOE_PREFETCH_MAX (1) staged per layer and window: fewer than a third of the staged
+    // experts turn out to be fills, and every copy shares the link with the fills. Not on by default: the bytes are exact, but the
+    // timed rules around it see the faster fetches. A100 80 GB at 48 GB, 3 launches each: MTP chat +2.7% and 8k +14%, DFlash2 chat
+    // +4.1%, but DFlash2 8k -10..-32%: its window widths, chosen from timed verify costs, came out narrower for fewer tokens per pass,
+    // and the CPU-miss timing trial ran in another request and kept the host path. Not tied to LLAMA_MOE_PREFETCH_AUTO (the cache is
+    // unchanged); LLAMA_MOE_PREFETCH=0 turns both forms off
+    // returns the slots per group (0: off)
+    static int prefetch_stage_cfg() {
+        const char * es = getenv("LLAMA_MOE_PREFETCH_STAGE");
+        return es != nullptr ? std::max(0, std::min(16, atoi(es))) : 0;
+    }
+
     pf_cfg_t prefetch_cfg() const {
         if (pf_resolved) {
             return pf_cfg;
@@ -9708,6 +9769,18 @@ struct llama_moe_cache::impl {
         const char * em = getenv("LLAMA_MOE_PREFETCH_MAX");
         const char * et = getenv("LLAMA_MOE_PREFETCH_MIN_TOKENS");
         pf_cfg_t c;
+        if (e == nullptr || atoi(e) != 0) {
+            const int n_stg = prefetch_stage_cfg();
+            if (n_stg > 0) {
+                c.n        = e != nullptr ? std::max(1, std::min(32, atoi(e))) : 10;
+                c.max_fill = em != nullptr ? std::max(1, std::min(n_stg, atoi(em))) : 1;
+                c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
+                c.stage    = n_stg;
+                pf_cfg = c;
+                pf_resolved = true;
+                return c;
+            }
+        }
         if (e != nullptr) {
             c.n        = std::max(0, std::min(32, atoi(e)));
             c.max_fill = em != nullptr ? std::max(0, atoi(em)) : 0;
@@ -9882,9 +9955,17 @@ struct llama_moe_cache::impl {
         std::vector<const void *>  host  = l.host_dev;
         ggml_tensor * op = ggml_moe_cache_prefetch(ctx, logits, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il, n_top,
             max_fill, g.lru.n_core, g.scores, dep);
+        if (cfg.stage > 0) {
+            ggml_moe_cache_prefetch_set_stage(op, cfg.stage, pf_owner);
+        }
         if (n_prefetch_ops++ == 0) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch of the top %d predicted experts per token (max %d per layer, "
-                "0 = no cap; LLAMA_MOE_PREFETCH=0 off)\n", tag, n_top, max_fill);
+            if (cfg.stage > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch of the top %d predicted experts per token, staged through the "
+                    "copy engine (%d slots per group, at most %d per layer; LLAMA_MOE_PREFETCH_STAGE=0 off)\n", tag, n_top, cfg.stage, max_fill);
+            } else {
+                LLAMA_LOG_INFO("llama_moe_cache%s: cross-layer prefetch of the top %d predicted experts per token (max %d per layer, "
+                    "0 = no cap; LLAMA_MOE_PREFETCH=0 off)\n", tag, n_top, max_fill);
+            }
         }
         return op;
     }
@@ -11202,6 +11283,11 @@ struct llama_moe_cache::impl {
         static const bool on = llama_moe_tp::env_on(getenv("LLAMA_MOE_CPU_MISS_REPLAY_OFF_FETCH"));
         return on;
     }
+    // LLAMA_MOE_CPU_MISS_FIRM_OFF_SKIP=0: a first trial recorded firm "off" with the host slower than calibrated replays its blocks (see cm_skip_trials)
+    static bool cmt_firm_off_skip_on() {
+        static const bool on = llama_moe_tp::env_on(getenv("LLAMA_MOE_CPU_MISS_FIRM_OFF_SKIP"));
+        return on;
+    }
     // LLAMA_MOE_CPU_MISS_FIRM_SKIP=0: a first trial made firm "on" by agreeing marginal timings replays its blocks (see cm_skip_trials)
     static bool cmt_firm_skip_on() {
         static const bool on = llama_moe_tp::env_on(getenv("LLAMA_MOE_CPU_MISS_FIRM_SKIP"));
@@ -11320,7 +11406,41 @@ struct llama_moe_cache::impl {
     void cmt_end() {
         if (cmt_t_prev >= 0) {
             cmt_t[cmt_arm].push_back(ggml_time_us() - cmt_t_prev);
+            cmt_tn[cmt_arm].push_back(cmt_n_prev);
             cmt_t_prev = -1;
+        }
+    }
+    // LLAMA_MOE_CPU_MISS_TRIAL_PER_WIDTH (default 1; 0 = the medians of all counted batches of each arm, as before): a trial compares
+    // the two paths width by width (llama_moe_tp::width_ratio). A DFlash2 draft verifies windows of 2..7 rows whose widths follow the
+    // drafter, so the 8 batches of a block can be mostly narrow in one arm and wide in the other: A100 80 GB (12 vCPU), Qwen3.8-Flash-Next
+    // at 4 bits with its DFlash2 drafter capped at 48 GB (70.5% cached), 21 ms per batch at 2 rows vs 55 ms at 7, the verdict followed the
+    // widths (t_on / t_off 0.73 in one launch, 1.67 in the next, same host)
+    static bool cmt_per_width_on() {
+        static const bool on = llama_moe_tp::env_on(getenv("LLAMA_MOE_CPU_MISS_TRIAL_PER_WIDTH"));
+        return on;
+    }
+    // the medians the verdict compares: t_off as measured, t_on = t_off times the width-matched ratio (with the switch off, or all
+    // batches of one width: the two medians as before)
+    void cmt_ratio(double & t_off, double & t_on, int & matched) const {
+        auto median = [](std::vector<int64_t> v) {
+            std::sort(v.begin(), v.end());
+            return v.empty() ? 0.0 : (double) v[v.size()/2];
+        };
+        t_off   = median(cmt_t[0]);
+        t_on    = median(cmt_t[1]);
+        matched = -1;
+        if (!cmt_per_width_on() || cmt_t[0].empty() || cmt_t[1].empty()) {
+            return;
+        }
+        const int64_t w0 = cmt_tn[0].front();
+        const bool one_width = std::all_of(cmt_tn[0].begin(), cmt_tn[0].end(), [w0](int64_t w) { return w == w0; }) &&
+                               std::all_of(cmt_tn[1].begin(), cmt_tn[1].end(), [w0](int64_t w) { return w == w0; });
+        if (one_width) {
+            return;
+        }
+        const double r = llama_moe_tp::width_ratio(cmt_t, cmt_tn, 3, &matched);
+        if (r > 0.0) {
+            t_on = r*t_off;
         }
     }
 
@@ -11417,15 +11537,26 @@ struct llama_moe_cache::impl {
         const bool retime   = have_rec && !replay;
         const int  end_at = replay ? std::min(cmt_rec[cmt_n].len, 5*cmt_block) : 5*cmt_block;
         cmt_len_now = cmt_done;
-        // the host path much slower than without it ends the trial early
-        if (!replay && cmt_t[0].size() >= 4 && cmt_t[1].size() >= 4 &&
-                *std::min_element(cmt_t[1].begin(), cmt_t[1].end()) > (1.0 + 8*cmt_margin)*median(cmt_t[0])) {
-            cmt_done = 5*cmt_block;
+        // the host path much slower than without it ends the trial early (by width, see cmt_ratio: the width-matched ratio)
+        if (!replay && cmt_t[0].size() >= 4 && cmt_t[1].size() >= 4) {
+            bool slow;
+            if (cmt_per_width_on()) {
+                double a, b;
+                int    m;
+                cmt_ratio(a, b, m);
+                slow = m != 0 && b > (1.0 + 8*cmt_margin)*a;
+            } else {
+                slow = *std::min_element(cmt_t[1].begin(), cmt_t[1].end()) > (1.0 + 8*cmt_margin)*median(cmt_t[0]);
+            }
+            if (slow) {
+                cmt_done = 5*cmt_block;
+            }
         }
         if (cmt_done >= end_at) {
             cmt_done = -1;
-            const double t_off = median(cmt_t[0]);
-            const double t_on  = median(cmt_t[1]);
+            double t_off, t_on;
+            int    matched;
+            cmt_ratio(t_off, t_on, matched);
             bool on, host_ok;
             int  gap_next;
             if (replay) {
@@ -11487,14 +11618,18 @@ struct llama_moe_cache::impl {
                         "(recorded t_on / t_off %.3f; this launch %.3f / %.3f ms, medians of %zu and %zu)\n",
                         tag, cmt_n, on ? "on" : "off", cmt_rec[cmt_n - 1].ratio, t_off/1e3, t_on/1e3, cmt_t[0].size(), cmt_t[1].size());
                 } else {
-                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: %.3f ms per small batch without the host path, %.3f ms with it (medians of %zu and %zu) -> %s for small batches%s%s\n",
-                        tag, cmt_n, t_off/1e3, t_on/1e3, cmt_t[0].size(), cmt_t[1].size(), on ? "on" : "off",
+                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: %.3f ms per small batch without the host path, %.3f ms with it (medians of %zu and %zu%s) -> %s for small batches%s%s\n",
+                        tag, cmt_n, t_off/1e3, t_on/1e3, cmt_t[0].size(), cmt_t[1].size(),
+                        matched > 0 ? "; with it: the off median times the ratio per width" : matched == 0 ? "; with it: the off median times the ratio per token" : "",
+                        on ? "on" : "off",
                         !host_ok ? ", off for short prompts (the host is slower than calibrated)" : "",
                         cmt_n > 1 && cmt_hyst() > 0.0 ? " (hysteresis, LLAMA_MOE_CPU_MISS_TRIAL_HYST)" : "");
                 }
             }
             cmt_t[0].clear();
             cmt_t[1].clear();
+            cmt_tn[0].clear();
+            cmt_tn[1].clear();
             cm_gen++; // the small batches and the short prompts (cm_prompt_ok) may change
             cm_small_ok   = on;
             cm_small_live = on;
@@ -11524,9 +11659,11 @@ struct llama_moe_cache::impl {
         cm_small_live = arm != 0;
         if (blk > 0 && cmt_skipn == 0) {
             cmt_t_prev = now;
+            cmt_n_prev = n_tokens;
         }
         cmt_skipn = std::max(0, cmt_skipn - 1);
         cmt_done++;
+        cmt_trial_batches.fetch_add(1, std::memory_order_relaxed);
     }
 
     // reads the device counters of the lookups: distinct hits, fetched misses, misses left to the host
@@ -16264,6 +16401,10 @@ double llama_moe_cache::cached_frac() const {
 
 double llama_moe_cache::host_uncached_bytes() const {
     return pimpl->host_uncached;
+}
+
+int64_t llama_moe_cache::trial_batches() const {
+    return pimpl->cmt_trial_batches.load(std::memory_order_relaxed);
 }
 
 int64_t llama_moe_cache::n_tokens_cached() const {

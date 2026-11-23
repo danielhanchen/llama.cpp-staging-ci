@@ -1088,6 +1088,27 @@ static int32_t common_dflash_n_max_sm80() {
     return n_max;
 }
 
+// every GPU is compute capability 8.0 (and there is at least one)
+static bool common_all_gpus_cc80() {
+    static const bool v = [] {
+        int n_gpu = 0;
+        for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(d);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+            if (cc_fn == nullptr || cc_fn(dev) != 800) {
+                return false;
+            }
+            ++n_gpu;
+        }
+        return n_gpu > 0;
+    }();
+    return v;
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // process() reads the target's layer inputs at the segment's rows of the decode (nextn_row_offset), so a merged prompt
@@ -1162,8 +1183,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int64_t> t_end;                  // per seq: end of the last draft call (0 = nothing pending)
         std::vector<int32_t> w_last;                 // per seq: verify rows of that draft
         std::vector<std::vector<float>> p_last;      // per seq: its steps' selector probabilities
+        std::vector<int64_t> trial0;                 // per seq: the target MoE cache's trial batches at that draft's end
+        int64_t n_trial_skip = 0;                    // passes left out of the verify ms: they ran a CPU-miss timing trial batch
         bool init = false;
     } eva;
+
+    // LLAMA_DFLASH_EV_AUTO_SKIP_TRIAL (default 1; 0 = timed as any other pass): a pass whose verify ran a batch of the target MoE
+    // cache's CPU-miss timing trial (synchronized, and in two of its blocks on the other path) is left out of the verify ms of its
+    // width: the trial's batches with the host path on cost up to 3x a steady pass, and they fall on the widths the drafter used then,
+    // so the windows came out narrower in the launches that ran a trial (A100 80 GB, Qwen3.8-Flash-Next at 4 bits, DFlash2, 48 GB:
+    // 2.98-3.08 vs 3.66 tokens per pass at 8k)
+    static double eva_stale() {
+        static const double d = [] {
+            const char * e = getenv("LLAMA_DFLASH_EV_AUTO_STALE");
+            return e != nullptr ? std::min(1.0, std::max(0.0, atof(e))) : 0.99;
+        }();
+        return d;
+    }
+    static bool eva_skip_trial() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_DFLASH_EV_AUTO_SKIP_TRIAL");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
+    }
 
     // the small-share band's passes, measured against the band's priced cost of their width (see df2_low_lng_ratio)
     struct lowg_t {
@@ -1205,7 +1248,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const double m_ref = eva.v_sum[wr] / eva.v_n[wr];
         const double prior = m_ref * (0.3 + 0.1 * w) / (0.3 + 0.1 * wr);
         const double k     = 4.0;
-        const double n     = w < eva_t::W ? eva.v_n[w] : 0.0;
+        // a width's mean decays only when that width is verified again, so one verified mostly in a slow stretch (the warm passes keep
+        // the whole draft in the first, cold request; a long prompt's refill) kept that cost and was rarely picked again: A100 80 GB,
+        // Qwen3.8-Flash-Next at 4 bits, DFlash2, 48 GB, 8k: w7 46.7 ms against ~36 ms in the fixed-width run, 2.98 vs 4.13 tokens per pass.
+        // Its weight against the shape prior shrinks by LLAMA_DFLASH_EV_AUTO_STALE (0.99; 1 = off) per pass measured at other widths
+        const double age   = w < eva_t::W ? (double) std::max<int64_t>(0, eva.n_meas - eva.last_meas[w]) : 0.0;
+        const double n     = w < eva_t::W ? eva.v_n[w] * (eva_stale() < 1.0 ? std::pow(eva_stale(), age) : 1.0) : 0.0;
         const double m     = n > 0.0 ? eva.v_sum[w] / n : prior;
         return (n * m + k * prior) / (n + k);
     }
@@ -1229,6 +1277,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         eva.t_end.assign(n_seq, 0);
         eva.w_last.assign(n_seq, 0);
         eva.p_last.assign(n_seq, {});
+        eva.trial0.assign(n_seq, -1);
     }
 
     void eva_log(const char * when) const {
@@ -1240,8 +1289,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 s += b;
             }
         }
-        LOG_INF("DFlash2 EV-auto %s: %" PRId64 " passes measured, draft %.2f ms, %" PRId64 " drafts cut by %" PRId64 " rows, %" PRId64 " probes; verify ms (decayed n, picks):%s\n",
-                when, eva.n_meas, eva.d_n > 0.0 ? eva.d_ms / eva.d_n : 0.0, eva.n_cut, eva.n_rows_cut, eva.n_probe, s.c_str());
+        LOG_INF("DFlash2 EV-auto %s: %" PRId64 " passes measured, %" PRId64 " left out (CPU-miss trial batches), draft %.2f ms, %" PRId64 " drafts cut by %" PRId64 " rows, %" PRId64 " probes; verify ms (decayed n, picks):%s\n",
+                when, eva.n_meas, eva.n_trial_skip, eva.d_n > 0.0 ? eva.d_ms / eva.d_n : 0.0, eva.n_cut, eva.n_rows_cut, eva.n_probe, s.c_str());
     }
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
@@ -1887,8 +1936,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
                 // the measured EV window (see eva_t), where neither LLAMA_DFLASH_EV nor a two-width window runs
+                // LLAMA_DFLASH_EV_AUTO_SM80 (default 0; 1 = as before): the default mode 2 does not run where every GPU is compute
+                // capability 8.0. A100 80 GB (12 vCPU), Qwen3.8-Flash-Next at 4 bits with its DFlash2 drafter at 48 GB (70.5% cached), the
+                // same VM, 3 launches each: the windows of the other rules (no measured window) gave chat 119.9-123.6 tok/s against 114.6-115.0
+                // and 8k 108.8-110.2 against 103.9-104.8; its measured costs of the wide windows came from the cold first passes and
+                // the timing trial's blocks, so the window settled 1-2 rows narrower than the passes paid for. LLAMA_DFLASH_EV_AUTO=1 forces it
+                static const bool eva_sm80 = [] {
+                    const char * e = getenv("LLAMA_DFLASH_EV_AUTO_SM80");
+                    return e != nullptr && atoi(e) != 0;
+                }();
                 const bool use_eva = is_dflash2 && !use_ev && !use_df2w && eva_mode() != 0 && (df2_meas ||
-                    eva_mode() == 1 || (n_seq == 1 && df2_cache_on && !df2_cached && df2_frac >= df2_mid_hi && !llama_exact_verify_enabled()));
+                    eva_mode() == 1 || (n_seq == 1 && df2_cache_on && !df2_cached && df2_frac >= df2_mid_hi && !llama_exact_verify_enabled() &&
+                        (eva_sm80 || !common_all_gpus_cc80())));
                 if (use_eva) {
                     eva_init();
                     eva.small = eva.small || df2_meas;
@@ -2139,6 +2198,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     eva.t_end [seq_id] = n_ver > 0 ? now : 0;
                     eva.w_last[seq_id] = (int32_t) n_ver + 1;
+                    eva.trial0[seq_id] = eva_skip_trial() ? llama_moe_cache_trial_batches(params.ctx_tgt) : -1;
                     eva.p_last[seq_id].assign(step_p.begin(), step_p.begin() + std::min(step_p.size(), n_ver));
                     if (n_ver + 1 < (size_t) eva_t::W) {
                         eva.picks[n_ver + 1]++;
@@ -2245,7 +2305,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // beside a small cache the first pass of a width also builds its graphs: counted as a probe, not timed
                 const bool first = eva.small && eva.cnt[w] == 0;
                 eva.cnt[w]++;
-                if (!first && ms > 0.0 && ms < 2000.0 && (m == 0.0 || ms < 3.0 * m)) {
+                const int64_t tr0   = eva.trial0[seq_id];
+                const bool    trial = tr0 >= 0 && llama_moe_cache_trial_batches(params.ctx_tgt) != tr0;
+                eva.n_trial_skip += trial ? 1 : 0;
+                if (!first && !trial && ms > 0.0 && ms < 2000.0 && (m == 0.0 || ms < 3.0 * m)) {
                     eva.v_sum[w] = 0.97 * eva.v_sum[w] + ms;
                     eva.v_n[w]   = 0.97 * eva.v_n[w]   + 1.0;
                     eva.n_meas++;

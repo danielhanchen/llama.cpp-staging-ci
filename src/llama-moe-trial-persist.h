@@ -282,4 +282,64 @@ inline bool firm_skip(bool skip_on, bool trust_scope, F && first_rec, int max_tr
     return r0 != nullptr && firm_marginal_on(*r0, max_tries, min_gain);
 }
 
+// the host path's time ratio t_on / t_off of a trial whose counted small batches have different widths (a draft verify window of 2..7
+// rows costs 2-3x as much at 7 rows as at 2): t[a] / n[a] are the times and the token counts of the batches of arm a (0 = host path off,
+// 1 = on). A median over all batches of an arm follows which widths fell in the arm's blocks, not the path, so the ratio is the
+// geometric mean of the per-width median ratios over the widths both arms ran, each weighted by the fewer batches of the two arms;
+// with fewer than min_matched matched batches, the ratio of the per-token medians (time / tokens). With one width (single token
+// decode, a fixed draft width) this is the ratio of the two medians, as before. Returns 0 if an arm has no batch; *matched gets the
+// matched weight (0 = the per-token fallback)
+inline double width_ratio(const std::vector<int64_t> t[2], const std::vector<int64_t> n[2], int min_matched, int * matched = nullptr) {
+    if (matched != nullptr) {
+        *matched = 0;
+    }
+    if (t[0].empty() || t[1].empty() || t[0].size() != n[0].size() || t[1].size() != n[1].size()) {
+        return 0.0;
+    }
+    auto med = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size()/2];
+    };
+    std::vector<int64_t> ws(n[0].begin(), n[0].end());
+    std::sort(ws.begin(), ws.end());
+    ws.erase(std::unique(ws.begin(), ws.end()), ws.end());
+    double lsum = 0.0;
+    int    wsum = 0;
+    for (const int64_t w : ws) {
+        std::vector<double> a[2];
+        for (int k = 0; k < 2; ++k) {
+            for (size_t i = 0; i < t[k].size(); ++i) {
+                if (n[k][i] == w) {
+                    a[k].push_back((double) t[k][i]);
+                }
+            }
+        }
+        if (a[1].empty()) {
+            continue;
+        }
+        const double m0 = med(a[0]);
+        const double m1 = med(a[1]);
+        if (m0 <= 0.0 || m1 <= 0.0) {
+            continue;
+        }
+        const int wt = (int) std::min(a[0].size(), a[1].size());
+        lsum += wt*std::log(m1/m0);
+        wsum += wt;
+    }
+    if (wsum >= std::max(1, min_matched)) {
+        if (matched != nullptr) {
+            *matched = wsum;
+        }
+        return std::exp(lsum/wsum);
+    }
+    std::vector<double> p[2];
+    for (int k = 0; k < 2; ++k) {
+        for (size_t i = 0; i < t[k].size(); ++i) {
+            p[k].push_back((double) t[k][i]/(double) std::max<int64_t>(1, n[k][i]));
+        }
+    }
+    const double m0 = med(p[0]);
+    return m0 > 0.0 ? med(p[1])/m0 : 0.0;
+}
+
 } // namespace llama_moe_tp
