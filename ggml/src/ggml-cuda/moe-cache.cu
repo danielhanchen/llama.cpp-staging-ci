@@ -5,17 +5,22 @@
 #include "ggml-moe-mailbox.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #define MOE_MAILBOX_OK 1 // single-graph host misses (ggml_moe_mailbox_publish)
+#define MOE_STG_OK     1 // staged prefetch through the copy engine (see moe_stg_pick)
 #endif
 
 // device-side lookup of the MoE expert cache, see ggml_moe_cache_lookup and llama-moe-cache.cpp
@@ -707,10 +712,148 @@ static __global__ void moe_cache_assign(
     }
 }
 
+// staged prefetch through the copy engine (ggml_moe_cache_prefetch_set_stage: op mode 8 with op param 14 = staging slots per group).
+// The SM copies of the prefetch below (moe_pf_run) read host memory while the next layer's attention and dense products run, and
+// on an A100 behind a ~12 GB/s link such reads slow the kernels beside them about 2.3x (the expert products beside a fetch: 112 us
+// against 49 us alone; the DMA engine leaves them at full speed), which ate the gain there. The staged form leaves the cache alone:
+// - moe_stg_pick (main stream, after the layer's FFN output): of the next layer's predicted experts (moe_pf_topn), up to max_fill
+//   that the cache does not hold go to staging slots of the group (device memory outside the banks, round robin) as requests in a
+//   ring of mapped host memory;
+// - a host thread per device (moe_stg_thread) queues the copies of each request on its own stream (the DMA engine), then a kernel
+//   that writes the request's number to the slot's done word, and acknowledges the request in mapped host memory;
+// - the next layer's lookup / assign decides hits, misses, victims and host experts exactly as without it; its fetch kernel takes a
+//   fill whose expert is staged from the staging slot (a device copy) when the request was acknowledged, waiting for the done word,
+//   and from host memory otherwise (or after MOE_STG_WAIT_NS). The cache holds the same experts in the same slots and every product
+//   reads the same bytes, so the output is the same with and without it.
+// A slot is given to a new request only after the fetches of the layer it was staged for (stream order: the pick of a later layer of
+// the group runs after that layer's join); the copies of one device run in request order, so a new request into a slot whose old copies
+// are still queued lands after them, and its done word is written after its own copies.
+#define MOE_STG_MAX_SLOTS  16
+#define MOE_STG_MAX_GROUPS 64
+#define MOE_STG_RING       4096
+#define MOE_STG_WAIT_NS    4000000ull // a fetch waits at most this long for an acknowledged staged copy, then reads host memory
+enum {
+    MOE_STG_STAT_REQ = 0,  // experts staged (requests)
+    MOE_STG_STAT_FILLS,    // fills of fetch kernels with staging
+    MOE_STG_STAT_USED,     // fills copied from a staging slot
+    MOE_STG_STAT_WAITED,   // of them: the staged copy was not done when the fetch looked
+    MOE_STG_STAT_NOACK,    // fills staged but not acknowledged yet: read from host memory
+    MOE_STG_STAT_TIMEOUT,  // fills whose acknowledged copy took longer than MOE_STG_WAIT_NS: read from host memory
+    MOE_STG_STAT_N
+};
+struct moe_stg_req {   // written by moe_stg_pick, read by the copy thread
+    int32_t reg;       // registered group
+    int32_t s;         // staging slot
+    int32_t key;       // il << 16 | expert
+    int32_t seq;       // written last: the request is complete once seq is the number the thread expects
+};
+struct moe_stg_host {  // mapped host memory, one per device
+    moe_stg_req req[MOE_STG_RING];
+    int32_t     ack[MOE_STG_MAX_GROUPS][MOE_STG_MAX_SLOTS]; // the copy thread: number of the request whose copies are queued
+};
+// what a fetch kernel reads of the staging of its group (null key: no staging)
+struct moe_stg_view {
+    const int32_t * key;   // [n] il << 16 | expert, -1 empty
+    const int32_t * seq;   // [n] number of the slot's last request
+    const int32_t * done;  // [n] written on the copy stream after the copies of a request
+    const int32_t * ack;   // [n] mapped host memory, see moe_stg_host
+    const char    * buf[4];
+    unsigned long long * stat;
+    int             n;
+    int             il;
+};
+
+static __device__ __forceinline__ int32_t moe_stg_load_acquire_sys(const int32_t * p) {
+    int32_t v;
+#if defined(MOE_STG_OK) && __CUDA_ARCH__ >= 700
+    asm volatile("ld.acquire.sys.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+#else
+    v = *(const volatile int32_t *) p;
+    __threadfence_system();
+#endif
+    return v;
+}
+
+static __device__ __forceinline__ uint64_t moe_stg_ns() {
+#if defined(MOE_STG_OK)
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+#else
+    return 0;
+#endif
+}
+
+// the staging slot to copy fill j from (-1: host memory) and the request number it holds (*q); thread 0 of the block, before the copy.
+// The pick of another layer may rewrite a slot while this runs (its op is not ordered against this fetch where the graph runs branches
+// on several streams): key and request number are read as a pair (the pick empties the key first, writes the number, then the key)
+// and checked again after the copy (see moe_cache_fetch)
+static __device__ int moe_stg_source(const moe_stg_view & stg, const int32_t e, const bool count, int32_t * q) {
+#if !defined(MOE_STG_OK)
+    GGML_UNUSED(stg);
+    GGML_UNUSED(e);
+    GGML_UNUSED(count);
+    return -1;
+#else
+    if (stg.key == nullptr || stg.n <= 0) {
+        return -1;
+    }
+    if (count) {
+        atomicAdd(stg.stat + MOE_STG_STAT_FILLS, 1ull);
+    }
+    const int32_t k = (stg.il << 16) | e;
+    const volatile int32_t * vkey = stg.key;
+    const volatile int32_t * vseq = stg.seq;
+    for (int s = 0; s < stg.n; ++s) {
+        if (vkey[s] != k) {
+            continue;
+        }
+        __threadfence();
+        const int32_t want = vseq[s];
+        __threadfence();
+        if (vkey[s] != k) {
+            return -1; // rewritten meanwhile
+        }
+        *q = want;
+        if (moe_stg_load_acquire_sys(stg.ack + s) != want) {
+            if (count) {
+                atomicAdd(stg.stat + MOE_STG_STAT_NOACK, 1ull);
+            }
+            return -1;
+        }
+        const volatile int32_t * done = stg.done + s;
+        if (*done != want) {
+            if (count) {
+                atomicAdd(stg.stat + MOE_STG_STAT_WAITED, 1ull);
+            }
+            const uint64_t t0 = moe_stg_ns();
+            while (*done != want) {
+                if (moe_stg_ns() - t0 > MOE_STG_WAIT_NS) {
+                    if (count) {
+                        atomicAdd(stg.stat + MOE_STG_STAT_TIMEOUT, 1ull);
+                    }
+                    return -1;
+                }
+#if __CUDA_ARCH__ >= 700
+                __nanosleep(256);
+#endif
+            }
+        }
+        __threadfence();
+        if (count) {
+            atomicAdd(stg.stat + MOE_STG_STAT_USED, 1ull);
+        }
+        return s;
+    }
+    return -1;
+#endif // !defined(MOE_STG_OK)
+}
+
 struct moe_cache_fetch_args {
     const char * src[4];
     char       * dst[4];
     int64_t      nb[4];
+    moe_stg_view stg;
 };
 
 // copy the missing experts from (mapped) host memory to their slots, block z copies the chunks z, z + gridDim.z, ...
@@ -735,6 +878,40 @@ static __global__ void moe_cache_fetch(const int32_t * __restrict__ info, const 
     }
     const int     b   = blockIdx.y;
     const int64_t nb  = args.nb[b];
+
+    // a staged copy of the expert (see moe_stg_pick): the same bytes, from device memory
+    __shared__ int     stg_s;
+    __shared__ int32_t stg_q;
+    if (args.stg.key != nullptr) {
+        if (threadIdx.x == 0) {
+            stg_s = moe_stg_source(args.stg, fill_e[j], b == 0 && blockIdx.z == 0, &stg_q);
+        }
+        __syncthreads();
+        if (stg_s >= 0) {
+            const int4 * s4 = (const int4 *) (args.stg.buf[b] + (int64_t) stg_s*nb);
+            int4       * d4 = (int4 *) (args.dst[b] + (int64_t) fill_s[j]*nb);
+            const int64_t n4 = nb/16; // (staging slots and bank rows are 16-byte multiples, see moe_stg_register)
+            for (int64_t i = (int64_t) blockIdx.z*blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.z*blockDim.x) {
+                d4[i] = __ldcg(s4 + i);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                // still the same request: no new copy can have started into the slot (a pick writes the slot's key and number
+                // before its request exists), so the bytes read are the staged expert's
+                __threadfence();
+                const volatile int32_t * vkey = args.stg.key;
+                const volatile int32_t * vseq = args.stg.seq;
+                if (vkey[stg_s] != ((args.stg.il << 16) | fill_e[j]) || vseq[stg_s] != stg_q) {
+                    stg_s = -1;
+                }
+            }
+            __syncthreads();
+            if (stg_s >= 0) {
+                return;
+            }
+            // rewritten while copying: from host memory below
+        }
+    }
 
     const char * src = args.src[b] + fill_e[j]*nb;
     char       * dst = args.dst[b] + fill_s[j]*nb;
@@ -997,6 +1174,11 @@ bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
     }
     if (mode == 8) {
         const int n_expert = (int) op->src[1]->ne[0];
+#if !defined(MOE_STG_OK)
+        if (ggml_get_op_params_i32(op, 14) > 0) {
+            return false; // staged prefetch: CUDA only
+        }
+#endif
         return n_banks >= 1 && n_banks <= 4 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
             op->src[2]->type == GGML_TYPE_I32 && op->src[0]->ne[0] == n_expert && (size_t) n_expert*sizeof(float) <= 48*1024 &&
             ggml_get_op_params_i32(op, 11)*op->src[0]->ne[1] <= MOE_PF_MAX_IDS;
@@ -1033,8 +1215,11 @@ bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
 
 // max_z > 0: at most max_z blocks per expert and bank (each copies several chunks), so that an overlapped fetch, which mostly waits
 // for host memory, leaves the SMs to the kernels that run beside it
+static moe_stg_view moe_stg_view_of(const void * bank0, int il);
+
+// staged: the fill may come from a staged copy (see moe_stg_pick); not for deferred copies, which no join orders before the next pick
 static void moe_cache_fetch_launch(cudaStream_t stream, const ggml_tensor * dst, const ggml_tensor * const * banks, const int n_banks, const int32_t * info, const int n_ids, const int ne0,
-        const int max_z = 0, int32_t * admitted = nullptr) {
+        const int max_z = 0, int32_t * admitted = nullptr, const bool staged = true) {
     moe_cache_fetch_args args = {};
     int64_t max_nb = 0;
     for (int b = 0; b < n_banks; ++b) {
@@ -1044,6 +1229,7 @@ static void moe_cache_fetch_launch(cudaStream_t stream, const ggml_tensor * dst,
         args.nb[b]  = bank->nb[2];
         max_nb = std::max(max_nb, (int64_t) bank->nb[2]);
     }
+    args.stg = staged && n_banks > 0 ? moe_stg_view_of(banks[0]->data, ggml_get_op_params_i32(dst, 0)) : moe_stg_view{};
 
     // GGML_CUDA_MOE_FETCH_CHUNK: bytes per block of the copies (default 64 KiB); smaller chunks put more blocks, and so more host
     // memory reads, in flight at once (the copy is the same, only the split of the work changes)
@@ -1388,6 +1574,368 @@ static void moe_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     p.pending = true;
 }
 
+// ---- staged prefetch through the copy engine (see moe_stg_view) ----
+#if defined(MOE_STG_OK)
+
+// one block, one thread: of the predicted ids (rank-major, see moe_pf_topn) the first max_fill experts that layer il does not hold
+// and that no staging slot of the group holds get the next slots of the group's round robin, each a request in the ring
+static __global__ void moe_stg_pick(const int32_t * __restrict__ ids, const int n_ids, const int32_t * __restrict__ row, const int n_expert,
+        const int il, int32_t * __restrict__ dstate, const int n_stg, const int max_fill, moe_stg_host * __restrict__ h,
+        int32_t * __restrict__ ctr, const int reg, unsigned long long * __restrict__ stat) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    int32_t * key = dstate;
+    int32_t * seq = dstate + MOE_STG_MAX_SLOTS;
+    int32_t * cur = dstate + 3*MOE_STG_MAX_SLOTS;
+    int32_t picked[MOE_STG_MAX_SLOTS];
+    int n_pick = 0;
+    for (int i = 0; i < n_ids && n_pick < max_fill; ++i) {
+        const int32_t e = ids[i];
+        if ((uint32_t) e >= (uint32_t) n_expert || row[e] >= 0) {
+            continue; // cached for layer il (or out of range)
+        }
+        const int32_t k = (il << 16) | e;
+        bool have = false;
+        for (int s = 0; s < n_stg && !have; ++s) {
+            have = key[s] == k;
+        }
+        for (int p = 0; p < n_pick && !have; ++p) {
+            have = picked[p] == k;
+        }
+        if (have) {
+            continue;
+        }
+        const int s = *cur;
+        *cur = s + 1 < n_stg ? s + 1 : 0;
+        const int32_t idx = atomicAdd(ctr, 1);
+        const int32_t sq  = idx + 1;
+        // key emptied first, then the number, then the key (read as a pair by moe_stg_source)
+        *(volatile int32_t *) (key + s) = -1;
+        __threadfence();
+        *(volatile int32_t *) (seq + s) = sq;
+        __threadfence();
+        *(volatile int32_t *) (key + s) = k;
+        moe_stg_req * r = h->req + (uint32_t) idx % MOE_STG_RING;
+        *(volatile int32_t *) &r->reg = reg;
+        *(volatile int32_t *) &r->s   = s;
+        *(volatile int32_t *) &r->key = k;
+        __threadfence_system();
+#if __CUDA_ARCH__ >= 700
+        asm volatile("st.release.sys.b32 [%0], %1;" :: "l"(&r->seq), "r"(sq) : "memory");
+#else
+        *(volatile int32_t *) &r->seq = sq;
+#endif
+        picked[n_pick++] = k;
+    }
+    if (n_pick > 0) {
+        atomicAdd(stat + MOE_STG_STAT_REQ, (unsigned long long) n_pick);
+    }
+}
+
+static __global__ void moe_stg_done(int32_t * __restrict__ done, const int32_t v) {
+    __threadfence();
+    *(volatile int32_t *) done = v;
+}
+
+#define MOE_STG_MAX_LAYERS 512
+struct moe_stg_group {
+    int          device  = -1;
+    int          owner   = 0;        // the cache instance (see ggml_moe_cache_prefetch_set_stage)
+    int          n_stg   = 0;
+    int          cap_stg = 0;        // slots the buffers hold
+    int          n_banks = 0;
+    int64_t      nb[4]   = {};
+    int64_t      cap_nb[4] = {};     // bytes per slot the buffers hold
+    char *       buf[4]  = {};
+    int32_t *    dstate  = nullptr;  // key [MOE_STG_MAX_SLOTS], seq [..], done [..], round-robin cursor [1]
+    const void * bank0   = nullptr;
+    int          n_layer = 0;
+    // per layer: the host experts of each bank (set by the layer's pick op at graph build); fixed size, read by the copy thread
+    std::array<std::array<const char *, 4>, MOE_STG_MAX_LAYERS> host = {};
+};
+struct moe_stg_dev {
+    moe_stg_host *       h      = nullptr; // host address
+    moe_stg_host *       h_dev  = nullptr; // its device address
+    int32_t *            ctr    = nullptr; // requests made (device)
+    unsigned long long * stat   = nullptr; // MOE_STG_STAT_* (device)
+    cudaStream_t         stream = nullptr; // the copy thread's stream
+    std::thread          th;
+    bool                 failed = false;
+};
+static std::mutex          moe_stg_mutex;
+static moe_stg_group       moe_stg_groups[MOE_STG_MAX_GROUPS];
+static std::atomic<int>    moe_stg_n_groups{0};
+static moe_stg_dev         moe_stg_devs[GGML_CUDA_MAX_DEVICES];
+static std::atomic<bool>   moe_stg_stop{false};
+static std::atomic<unsigned long long> moe_stg_lost{0};
+
+// the copy thread of a device: queues the copies of each request in ring order, then the done word, then the acknowledgement
+static void moe_stg_thread(const int device) {
+    ggml_cuda_set_device(device);
+    moe_stg_dev & d = moe_stg_devs[device];
+    int32_t next = 1;
+    auto last = std::chrono::steady_clock::now();
+    while (!moe_stg_stop.load(std::memory_order_relaxed)) {
+        moe_stg_req * r = d.h->req + (uint32_t) (next - 1) % MOE_STG_RING;
+        const int32_t sq = __atomic_load_n(&r->seq, __ATOMIC_ACQUIRE);
+        if (sq - next < 0) {
+            // nothing new: spin while requests are recent (decode windows come every few ms), sleep when idle
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last > std::chrono::milliseconds(20)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(now - last > std::chrono::seconds(1) ? 1000 : 50));
+            } else {
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#else
+                std::this_thread::yield();
+#endif
+            }
+            continue;
+        }
+        if (sq != next) {
+            // the ring wrapped past requests this thread never read: they stay unacknowledged, so their fetches read host memory
+            moe_stg_lost.fetch_add((unsigned long long) (sq - next), std::memory_order_relaxed);
+            next = sq;
+        }
+        const int     reg = __atomic_load_n(&r->reg, __ATOMIC_RELAXED);
+        const int     s   = __atomic_load_n(&r->s, __ATOMIC_RELAXED);
+        const int32_t k   = __atomic_load_n(&r->key, __ATOMIC_RELAXED);
+        last = std::chrono::steady_clock::now();
+        if (reg >= 0 && reg < moe_stg_n_groups.load(std::memory_order_acquire) && s >= 0 && s < moe_stg_groups[reg].n_stg) {
+            const moe_stg_group & g = moe_stg_groups[reg];
+            const int il = k >> 16;
+            const int e  = k & 0xffff;
+            bool ok = il >= 0 && il < g.n_layer && il < MOE_STG_MAX_LAYERS;
+            const char * hp[4] = {nullptr, nullptr, nullptr, nullptr};
+            for (int b = 0; ok && b < g.n_banks; ++b) {
+                hp[b] = __atomic_load_n(&g.host[il][b], __ATOMIC_ACQUIRE);
+                ok = hp[b] != nullptr;
+            }
+            if (ok) {
+                for (int b = 0; b < g.n_banks; ++b) {
+                    if (cudaMemcpyAsync(g.buf[b] + (int64_t) s*g.nb[b], hp[b] + (int64_t) e*g.nb[b], (size_t) g.nb[b],
+                            cudaMemcpyDefault, d.stream) != cudaSuccess) {
+                        ok = false;
+                    }
+                }
+                moe_stg_done<<<1, 1, 0, d.stream>>>(g.dstate + 2*MOE_STG_MAX_SLOTS + s, next);
+                ok = ok && cudaGetLastError() == cudaSuccess;
+            }
+            if (ok) {
+                __atomic_store_n(&d.h->ack[reg][s], next, __ATOMIC_RELEASE);
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+        next++;
+    }
+}
+
+static void moe_stg_report() {
+    // the copy threads first (before the CUDA runtime's exit handlers, registered before this one)
+    moe_stg_stop.store(true);
+    for (int id = 0; id < GGML_CUDA_MAX_DEVICES; ++id) {
+        moe_stg_dev & d = moe_stg_devs[id];
+        if (d.th.joinable()) {
+            d.th.join();
+        }
+        unsigned long long c[MOE_STG_STAT_N] = {};
+        if (d.stat == nullptr || cudaSetDevice(id) != cudaSuccess || cudaMemcpy(c, d.stat, sizeof(c), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            continue;
+        }
+        fprintf(stderr, "ggml_cuda: device %d: staged prefetch through the copy engine: %llu experts staged, %llu fills looked at, "
+            "%llu copied from staging (%llu waited for their copy), %llu staged but not queued yet, %llu waits too long, %llu requests lost; "
+            "LLAMA_MOE_PREFETCH_STAGE=0 off\n", id, c[MOE_STG_STAT_REQ], c[MOE_STG_STAT_FILLS], c[MOE_STG_STAT_USED],
+            c[MOE_STG_STAT_WAITED], c[MOE_STG_STAT_NOACK], c[MOE_STG_STAT_TIMEOUT], moe_stg_lost.load());
+    }
+}
+
+// the staging of a device and of the group of bank0 (made at the first pick op of the group, at graph build or capture; a pick op of
+// another cache instance whose banks reuse the address resets it); -1 if it cannot be made (memory), which leaves the prefetch off
+// for that group. Buffers are never freed while the process runs (a copy queued for an old instance may still land in them)
+static int moe_stg_register(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const int n_stg) {
+    const int n_banks = ggml_get_op_params_i32(dst, 1);
+    const int il      = ggml_get_op_params_i32(dst, 0);
+    const int owner   = ggml_get_op_params_i32(dst, 15);
+    const ggml_tensor * map = dst->src[1];
+    const void * bank0 = dst->src[3]->data;
+    if (n_stg <= 0 || n_stg > MOE_STG_MAX_SLOTS || n_banks < 1 || n_banks > 4 || map->ne[1] > MOE_STG_MAX_LAYERS || il >= map->ne[1]) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(moe_stg_mutex);
+    moe_stg_dev & d = moe_stg_devs[ctx.device];
+    if (d.failed) {
+        return -1;
+    }
+    if (d.h == nullptr) {
+        // first group of the device: ring, counters, stream, thread
+        if (cudaHostAlloc((void **) &d.h, sizeof(moe_stg_host), cudaHostAllocMapped) != cudaSuccess ||
+                cudaHostGetDevicePointer((void **) &d.h_dev, d.h, 0) != cudaSuccess ||
+                cudaMalloc((void **) &d.ctr, sizeof(int32_t)) != cudaSuccess ||
+                cudaMalloc((void **) &d.stat, MOE_STG_STAT_N*sizeof(unsigned long long)) != cudaSuccess ||
+                cudaStreamCreateWithFlags(&d.stream, cudaStreamNonBlocking) != cudaSuccess) {
+            (void) cudaGetLastError();
+            d.failed = true;
+            GGML_LOG_WARN("%s: device %d: no staged prefetch (the ring or the copy stream could not be made)\n", __func__, ctx.device);
+            return -1;
+        }
+        memset(d.h, 0, sizeof(moe_stg_host));
+        CUDA_CHECK(cudaMemset(d.ctr, 0, sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d.stat, 0, MOE_STG_STAT_N*sizeof(unsigned long long)));
+        static const bool reg_exit = std::atexit(moe_stg_report) == 0;
+        GGML_UNUSED(reg_exit);
+        d.th = std::thread(moe_stg_thread, ctx.device);
+    }
+    int reg = -1;
+    for (int i = 0; i < moe_stg_n_groups.load(); ++i) {
+        if (moe_stg_groups[i].bank0 == bank0 && moe_stg_groups[i].device == ctx.device) {
+            reg = i;
+            break;
+        }
+    }
+    const bool fresh = reg < 0;
+    if (fresh && moe_stg_n_groups.load() >= MOE_STG_MAX_GROUPS) {
+        return -1;
+    }
+    moe_stg_group & g = moe_stg_groups[fresh ? moe_stg_n_groups.load() : reg];
+    if (fresh || g.owner != owner) {
+        // a new group, or the group of a new cache whose banks took the address of an old one's: sizes, buffers, empty keys
+        bool ok = g.dstate != nullptr || cudaMalloc((void **) &g.dstate, (size_t) (3*MOE_STG_MAX_SLOTS + 1)*sizeof(int32_t)) == cudaSuccess;
+        bool realloc_all = n_stg > g.cap_stg;
+        for (int b = 0; ok && b < n_banks; ++b) {
+            const int64_t nb = dst->src[3 + b]->nb[2];
+            ok = nb % 16 == 0;
+            realloc_all = realloc_all || g.buf[b] == nullptr || nb > g.cap_nb[b];
+        }
+        if (ok && realloc_all) {
+            const int cap = std::max(n_stg, g.cap_stg);
+            for (int b = 0; ok && b < n_banks; ++b) {
+                const int64_t nb = std::max<int64_t>(dst->src[3 + b]->nb[2], g.cap_nb[b]);
+                char * p = nullptr;
+                ok = cudaMalloc((void **) &p, (size_t) cap*nb) == cudaSuccess;
+                if (ok) {
+                    g.buf[b]    = p; // (an older buffer is left allocated: see above)
+                    g.cap_nb[b] = nb;
+                }
+            }
+            g.cap_stg = ok ? cap : 0;
+        }
+        if (!ok) {
+            (void) cudaGetLastError();
+            GGML_LOG_WARN("%s: device %d: no staged prefetch for a cache group (staging memory)\n", __func__, ctx.device);
+            return -1;
+        }
+        for (int b = 0; b < n_banks; ++b) {
+            g.nb[b] = dst->src[3 + b]->nb[2];
+        }
+        // the keys empty (synchronous, outside any capture's stream: the previous instance's work has finished); seq / done keep
+        // counting, so an acknowledgement of an old request never matches a new one
+        CUDA_CHECK(cudaMemset(g.dstate, 0xff, (size_t) MOE_STG_MAX_SLOTS*sizeof(int32_t)));
+        if (fresh) {
+            CUDA_CHECK(cudaMemset(g.dstate + MOE_STG_MAX_SLOTS, 0, (size_t) (2*MOE_STG_MAX_SLOTS + 1)*sizeof(int32_t)));
+        }
+        g.device  = ctx.device;
+        g.owner   = owner;
+        g.n_stg   = n_stg;
+        g.n_banks = n_banks;
+        g.bank0   = bank0;
+        g.n_layer = (int) map->ne[1];
+        for (auto & hl : g.host) {
+            hl = {nullptr, nullptr, nullptr, nullptr};
+        }
+        if (fresh) {
+            reg = moe_stg_n_groups.load();
+            moe_stg_n_groups.store(reg + 1, std::memory_order_release);
+        }
+    }
+    // the host experts of layer il (also after a reload of the same instance's graphs: the op params are the current ones)
+    for (int b = 0; b < n_banks; ++b) {
+        const char * hp = nullptr;
+        memcpy(&hp, (const int32_t *) dst->op_params + 2 + 2*b, sizeof(void *));
+        __atomic_store_n(&g.host[il][b], hp, __ATOMIC_RELEASE);
+    }
+    return reg;
+}
+
+static moe_stg_view moe_stg_view_of(const void * bank0, const int il) {
+    moe_stg_view v = {};
+    if (moe_stg_n_groups.load(std::memory_order_acquire) == 0) {
+        return v; // no staged prefetch in the process
+    }
+    std::lock_guard<std::mutex> lock(moe_stg_mutex);
+    for (int i = 0; i < moe_stg_n_groups.load(); ++i) {
+        const moe_stg_group & g = moe_stg_groups[i];
+        if (g.bank0 != bank0) {
+            continue;
+        }
+        const moe_stg_dev & d = moe_stg_devs[g.device];
+        v.key  = g.dstate;
+        v.seq  = g.dstate + MOE_STG_MAX_SLOTS;
+        v.done = g.dstate + 2*MOE_STG_MAX_SLOTS;
+        v.ack  = d.h_dev->ack[i];
+        for (int b = 0; b < g.n_banks; ++b) {
+            v.buf[b] = g.buf[b];
+        }
+        v.stat = d.stat;
+        v.n    = g.n_stg;
+        v.il   = il;
+        break;
+    }
+    return v;
+}
+
+static void moe_stg_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * logits = dst->src[0];
+    const ggml_tensor * map    = dst->src[1];
+    const int il       = ggml_get_op_params_i32(dst, 0);
+    const int n_top    = ggml_get_op_params_i32(dst, 11);
+    const int max_fill = ggml_get_op_params_i32(dst, 12);
+    const int n_stg    = ggml_get_op_params_i32(dst, 14);
+    const int n_expert = (int) map->ne[0];
+    const int n_tokens = (int) logits->ne[1];
+    const int n_ids    = n_top*n_tokens;
+    if (n_tokens <= 0 || n_top > n_expert || n_ids > MOE_PF_MAX_IDS || il >= (1 << 15) || n_expert > (1 << 16)) {
+        return;
+    }
+    const int reg = moe_stg_register(ctx, dst, n_stg);
+    if (reg < 0) {
+        return;
+    }
+    const moe_stg_group & g = moe_stg_groups[reg];
+    const moe_stg_dev   & d = moe_stg_devs[ctx.device];
+    // the predicted ids: one scratch row per layer of the context (the pick reads them right after, in the same stream)
+    int32_t * ids = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(moe_pf_mutex);
+        moe_pf_ctx & p = moe_pf_ctxs[&ctx];
+        const int n_layer = (int) map->ne[1];
+        if (p.buf == nullptr || p.n_layer < n_layer) {
+            if (p.buf != nullptr) {
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaFree(p.buf));
+            }
+            CUDA_CHECK(cudaMalloc(&p.buf, (size_t) n_layer*MOE_PF_STRIDE*sizeof(int32_t)));
+            p.n_layer = n_layer;
+        }
+        ids = p.buf + (size_t) il*MOE_PF_STRIDE;
+    }
+    cudaStream_t stream = ctx.stream();
+    moe_pf_topn<<<n_tokens, MOE_PF_THREADS, (size_t) n_expert*sizeof(float), stream>>>((const float *) logits->data, n_expert, n_top,
+        n_tokens, ids);
+    CUDA_CHECK(cudaGetLastError());
+    moe_stg_pick<<<1, 32, 0, stream>>>(ids, n_ids, (const int32_t *) map->data + (int64_t) il*n_expert, n_expert, il, g.dstate, g.n_stg,
+        std::min(std::max(max_fill, 1), g.n_stg), d.h_dev, d.ctr, reg, d.stat);
+    CUDA_CHECK(cudaGetLastError());
+}
+#else
+static moe_stg_view moe_stg_view_of(const void * bank0, const int il) {
+    GGML_UNUSED(bank0);
+    GGML_UNUSED(il);
+    return moe_stg_view{};
+}
+#endif // defined(MOE_STG_OK)
+
 // single-graph host misses (see ggml_moe_mailbox_publish): flags of the mapped mailbox at system scope
 #if defined(MOE_MAILBOX_OK)
 static __device__ __forceinline__ uint32_t moe_mailbox_load_acquire(const uint32_t * p) {
@@ -1627,6 +2175,12 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
 #endif
 
     if (mode == 8) {
+#if defined(MOE_STG_OK)
+        if (ggml_get_op_params_i32(dst, 14) > 0) {
+            moe_stg_run(ctx, dst); // staged through the copy engine, see moe_stg_view
+            return;
+        }
+#endif
         moe_pf_run(ctx, dst); // see ggml_moe_cache_prefetch
         return;
     }
@@ -1725,7 +2279,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
                 const char * env = getenv("GGML_CUDA_MOE_FETCH_OVERLAP_Z");
                 return env != nullptr ? std::max(0, atoi(env)) : 2;
             }();
-            moe_cache_fetch_launch(side, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), info, n_ids, ne0, max_z, nullptr);
+            moe_cache_fetch_launch(side, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), info, n_ids, ne0, max_z, nullptr, false);
             CUDA_CHECK(cudaEventRecord(ctx.moe_join, side));
             ctx.moe_join_pending = true;
             return;
