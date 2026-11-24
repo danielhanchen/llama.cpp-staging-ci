@@ -230,8 +230,9 @@ int main(int argc, char ** argv) {
                 printf("\n");
             }
         }
-        if (gpu) {
+        if (gpu && strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0) {
             // control: past the gate's other side the order of a single row and of several rows differ, and the check sees it
+            // (CUDA only: ROCm gfx1151 returns the per-row order for several rows too, so there is no order change to see)
             const tcase cc = { 3, 2048, 20, 0 };
             const std::vector<float> x = make_data(cc, 5);
             const bool ok = !same(run_case(backend, cc, x, false, 0), run_case(backend, cc, x, true, 0));

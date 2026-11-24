@@ -44,6 +44,11 @@ struct cfg {
     bool      unified = true;
 };
 
+// --ngl N: layers on the GPU. There the bit-for-bit checks against a plain cache become tolerance checks (the stopgap or the
+// two-source kernel and the plain kernels differ in staging and split); rollback stays bit for bit (same shapes, same kernels), state
+// within the plain cache's own save / restore difference
+static int g_ngl = 0;
+
 static llama_context * make_ctx(llama_model * model, const cfg & c) {
     auto cp = llama_context_default_params();
     cp.n_ctx           = c.n_ctx;
@@ -53,6 +58,9 @@ static llama_context * make_ctx(llama_model * model, const cfg & c) {
     cp.n_rs_seq        = 4; // recurrent states of hybrid models roll back with the drafts
     cp.kv_unified      = c.unified;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    // the bitwise CPU compares (no layers offloaded) stay on the CPU: a GPU build would offload the large-batch host ops of one
+    // arm and not those of the other (ROCm gfx1151: max rel 1e-7, not bit-equal)
+    cp.op_offload      = g_ngl > 0;
     cp.n_threads       = std::max(1, std::min(4, (int) std::thread::hardware_concurrency())); // no more threads than cores
     cp.n_threads_batch = cp.n_threads;
     cp.type_k          = c.type;
@@ -165,10 +173,6 @@ static double cosine(const std::vector<float> & a, const std::vector<float> & b)
     return ab/sqrt(aa*bb + 1e-30);
 }
 
-// --ngl N: layers on the GPU. There the bit-for-bit checks against a plain cache become tolerance checks (the stopgap or the
-// two-source kernel and the plain kernels differ in staging and split); rollback stays bit for bit (same shapes, same kernels), state
-// within the plain cache's own save / restore difference
-static int g_ngl = 0;
 
 static int n_fail = 0;
 static int n_pass = 0;

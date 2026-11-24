@@ -305,7 +305,10 @@ int main(int argc, char ** argv) {
         if (mode == 3) {
             set_env("TOPK_BATCH_TEST_REF", "1");
         }
-        const std::string cmd = "\"" + std::string(argv[0]) + "\" --child \"" + argv[1] + "\" " + device + " \"" + path + "\"";
+        std::string cmd = "\"" + std::string(argv[0]) + "\" --child \"" + argv[1] + "\" " + device + " \"" + path + "\"";
+#if defined(_WIN32)
+        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
+#endif
         const int rc = std::system(cmd.c_str());
         if (rc != 0) {
             printf("FAIL: child mode %d rc %d\n", mode, rc);

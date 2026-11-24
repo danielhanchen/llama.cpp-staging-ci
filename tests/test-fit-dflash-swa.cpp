@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -46,8 +47,9 @@ int main() {
     gguf_set_arr_str(g, "tokenizer.ggml.tokens", tok_ptrs.data(), tok_ptrs.size());
     gguf_add_tensor(g, fc);
 
-    const char * tmp = getenv("TMPDIR");
-    const std::string path = std::string(tmp != nullptr ? tmp : "/tmp") + "/test-fit-dflash-swa-" + std::to_string((long long) ggml_time_us()) + ".gguf";
+    // the system temp dir (TMPDIR on POSIX, GetTempPath on Windows, where /tmp does not exist)
+    const std::string path = (std::filesystem::temp_directory_path() /
+        ("test-fit-dflash-swa-" + std::to_string((long long) ggml_time_us()) + ".gguf")).string();
     if (!gguf_write_to_file(g, path.c_str(), false)) {
         fprintf(stderr, "cannot write %s\n", path.c_str());
         return 1;
