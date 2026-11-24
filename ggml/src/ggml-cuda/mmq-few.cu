@@ -1155,7 +1155,7 @@ void ggml_cuda_mul_mat_q_few_id(ggml_backend_cuda_context & ctx, const ggml_tens
     }
 }
 
-// the src1 quantization of the few-row MMQ (upstream quantize.cu)
+// the src1 quantization of the few-row MMQ
 // Stores the 4 values xi of a thread, values [iu, iu + 4) of column g in a unit of 256 values, in the column group yg of the unit.
 template <mmq_q8_1_ds_layout ds_layout>
 static __device__ __forceinline__ void quantize_mmq_few_store(const float4 xi, int4 * yg, const int iu, const int g) {
