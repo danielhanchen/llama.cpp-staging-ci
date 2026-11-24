@@ -11,6 +11,9 @@
 // llama_moe_cache limits the batches it publishes at run time (LLAMA_MOE_SINGLE_MAX_TOKENS, default 4 = the previous behaviour; 8 opt-in)
 #define GGML_MOE_MAILBOX_MAX_TOKENS 8
 
+// most pollers of a merge (GGML_MOE_MAILBOX_POLLERS), each on its own line of ggml_moe_mailbox_hdr::done_rep
+#define GGML_MOE_MAILBOX_POLL_LINES 8
+
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define GGML_MOE_MAILBOX_FN static inline __host__ __device__
 #else
@@ -30,7 +33,11 @@ struct ggml_moe_mailbox_hdr {
     // [5] ns from the host's completion stamp ([7], host CLOCK_REALTIME) to the end of the wait; [6] the publish's globaltimer stamp,
     // stored before the request (the host reads it at the pickup); [7] the host's CLOCK_REALTIME stamp, stored before completed;
     // [8] the smallest (end of the wait - [7]) as int64, for the clock offset (see llama_moe_cache single_timing_report)
+    // [9] polls of the merges' waits, [10] ns those polls took (issue to value), [11] ns of the host row reads after the wait
     uint64_t tm[12];    uint64_t pad6[4];
+    // host -> device: completed again, one line each (GGML_MOE_MAILBOX_POLLERS > 1: the merge's pollers read one line each, so their
+    // reads are separate requests); stored after completed, only while that switch is set
+    uint32_t done_rep[GGML_MOE_MAILBOX_POLL_LINES][32];
 };
 
 // device memory of a mailbox (zeroed at allocation)
@@ -42,8 +49,9 @@ struct ggml_moe_mailbox_ctl {
     uint64_t t_pub;   // GGML_MOE_MAILBOX_TIMING: globaltimer at the end of the last publish with host rows
     uint64_t sums[6]; // GGML_MOE_MAILBOX_TIMING: the sums of ggml_moe_mailbox_hdr::tm, kept here and stored there
     int64_t  min_d2;  // GGML_MOE_MAILBOX_TIMING: hdr tm[8] (0 = none yet)
+    uint64_t xs[3];   // GGML_MOE_MAILBOX_TIMING: the sums of ggml_moe_mailbox_hdr::tm[9..11]
     uint32_t pub_done; // blocks of the running publish that wrote their rows (the row publish, see moe_mailbox_publish_rows); 0 between publishes
-    uint32_t pad[43];
+    uint32_t pad[37];
 };
 
 GGML_MOE_MAILBOX_FN size_t ggml_moe_mailbox_align(size_t n) {

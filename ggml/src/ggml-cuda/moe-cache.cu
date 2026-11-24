@@ -2127,34 +2127,129 @@ static __global__ void moe_mailbox_publish_rows(const int32_t * hid, const int n
     }
 }
 
+static __device__ __forceinline__ uint32_t moe_mailbox_load_relaxed(const uint32_t * p) {
+    uint32_t v;
+#if __CUDA_ARCH__ >= 700
+    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+#else
+    v = *(const volatile uint32_t *) p;
+#endif
+    return v;
+}
+
+static __device__ __forceinline__ void moe_mailbox_fence_acquire() {
+#if __CUDA_ARCH__ >= 700
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+#else
+    __threadfence_system();
+#endif
+}
+
+// the wait options of the fast merge (GGML_MOE_MAILBOX_FAST without a timeout), see ggml_cuda_op_moe_cache_lookup
+#define MOE_MBX_RELAXED 1   // polls are relaxed loads, one acquire fence after the sequence is seen (GGML_MOE_MAILBOX_POLL_RELAXED)
+#define MOE_MBX_ROWLOAD 2   // a thread loads all its host chunks before its first store (GGML_MOE_MAILBOX_ROWLOAD)
+#define MOE_MBX_ONEREAD 4   // the wait ends on the poll that saw the sequence (GGML_MOE_MAILBOX_POLL_REREAD=1: read once more)
+
 // one block per row [n_embd] of dev: rows on the host wait for the host and add its result
 // (GGML_MOE_MAILBOX_FAST, default on; =0 restores the loop below): with no timeout (what llama_moe_cache passes) only completed is
 // polled, error every 16th poll and no sleep, so a wait costs one mapped read per poll instead of four plus 100 ns; the host rows are
 // read 16 bytes at a time (a quarter of the mapped reads). The same sums of the same values, in the same order per element.
+// In the fast form, opts (MOE_MBX_*) and pollers (GGML_MOE_MAILBOX_POLLERS, 1 = thread 0 alone) change how the wait reads the flag
+// and how the host rows are loaded, never what is added: pollers > 1 = the first lane of warps 0..pollers-1 polls its own line of
+// done_rep (the host stores completed there too), warp w starting w*gap_ns after warp 0, so a new value is seen up to one mapped
+// read round trip / pollers earlier; the first poller to see it ends the others' loops
 static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, const int n_embd, const char * mbox, const int n_used,
-        ggml_moe_mailbox_ctl * ctl, float * dst, const uint64_t timeout_ns, const int fast, const int timing) {
+        ggml_moe_mailbox_ctl * ctl, float * dst, const uint64_t timeout_ns, const int fast, const int timing, const int opts,
+        const int pollers, const int gap_ns) {
     const int row = blockIdx.x;
     __shared__ int st;
-    if (threadIdx.x == 0) {
+    __shared__ int first_s;
+    __shared__ volatile int seen;
+    ggml_moe_mailbox_hdr * hdr = (ggml_moe_mailbox_hdr *) mbox;
+    const bool fast_wait = fast && timeout_ns == 0;
+    const bool relaxed   = fast_wait && (opts & MOE_MBX_RELAXED) != 0;
+    const int  n_poll    = fast_wait ? max(1, min(pollers, min((int) (blockDim.x/32), GGML_MOE_MAILBOX_POLL_LINES))) : 1;
+    uint64_t t_in = 0;
+    uint64_t n_polls = 0, poll_ns = 0;
+    if (n_poll > 1) {
+        // every thread reads the same device words: the same decision in the whole block
+        const bool need = ctl->pending && hid[row] >= 0;
+        const uint32_t seq = ctl->seq;
+        if (threadIdx.x == 0) {
+            seen = 0;
+            t_in = moe_mailbox_ns();
+        }
+        __syncthreads();
+        const int w = threadIdx.x/32;
+        if (need && threadIdx.x % 32 == 0 && w < n_poll) {
+            if (w > 0 && gap_ns > 0) {
+#if __CUDA_ARCH__ >= 700
+                __nanosleep((unsigned) (w*gap_ns));
+#endif
+            }
+            const uint32_t * p = w == 0 ? &hdr->completed : &hdr->done_rep[w][0];
+            for (uint32_t it = 1; seen == 0; ++it) {
+                const uint64_t ta = timing ? moe_mailbox_ns() : 0;
+                const uint32_t v = relaxed ? moe_mailbox_load_relaxed(p) : moe_mailbox_load_acquire(p);
+                const bool done = v == seq;
+                if (timing && w == 0) {
+                    n_polls++;
+                    poll_ns += moe_mailbox_ns() - ta;
+                }
+                if (done) {
+                    if (relaxed) {
+                        moe_mailbox_fence_acquire();
+                    }
+                    seen = 1;
+                    break;
+                }
+                if (w == 0 && (it & 15) == 0 && moe_mailbox_load_acquire(&hdr->error) != 0) {
+                    seen = 2;
+                    break;
+                }
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int s = need ? (seen == 2 ? 2 : 1) : 0;
+            if (ctl->failed) {
+                s = 2;
+            }
+            st = s;
+        }
+    } else if (threadIdx.x == 0) {
         int s = 0;
         if (ctl->pending) {
-            ggml_moe_mailbox_hdr * hdr = (ggml_moe_mailbox_hdr *) mbox;
             const uint32_t seq = ctl->seq;
             if (hid[row] >= 0) {
                 // timeout_ns 0 (what llama_moe_cache passes): wait for the host as long as it takes, so the result is the split's; a
                 // nonzero timeout runs only while the host thread neither computes this batch (started) nor another one (busy)
                 uint64_t t0 = moe_mailbox_ns();
-                const uint64_t t_in = t0;
+                t_in = t0;
                 s = 1;
-                if (fast && timeout_ns == 0) {
-                    for (uint32_t it = 1; moe_mailbox_load_acquire(&hdr->completed) != seq; ++it) {
+                if (fast_wait) {
+                    for (uint32_t it = 1; ; ++it) {
+                        const uint64_t ta = timing ? moe_mailbox_ns() : 0;
+                        const uint32_t v = relaxed ? moe_mailbox_load_relaxed(&hdr->completed) : moe_mailbox_load_acquire(&hdr->completed);
+                        const bool done = v == seq;
+                        if (timing) {
+                            n_polls++;
+                            poll_ns += moe_mailbox_ns() - ta;
+                        }
+                        if (done) {
+                            if (relaxed) {
+                                moe_mailbox_fence_acquire();
+                            }
+                            break;
+                        }
                         if ((it & 15) == 0 && moe_mailbox_load_acquire(&hdr->error) != 0) {
                             s = 2;
                             break;
                         }
                     }
                 }
-                while (s == 1 && moe_mailbox_load_acquire(&hdr->completed) != seq) {
+                // (MOE_MBX_ONEREAD off: completed is read once more after the fast loop saw it, one more mapped round trip)
+                while (s == 1 && !(fast_wait && (opts & MOE_MBX_ONEREAD)) && moe_mailbox_load_acquire(&hdr->completed) != seq) {
                     if (moe_mailbox_load_acquire(&hdr->error) != 0) {
                         s = 2;
                         break;
@@ -2171,39 +2266,47 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
                     __nanosleep(100);
 #endif
                 }
-                // GGML_MOE_MAILBOX_TIMING: the block of the batch's first host row adds this batch to the sums
-                bool first = timing != 0 && s == 1;
-                for (int r = 0; first && r < row; ++r) {
-                    first = hid[r] < 0;
-                }
-                if (first) {
-                    const uint64_t t_out = moe_mailbox_ns();
-                    const uint64_t t_pub = ctl->t_pub;
-                    const uint64_t dev   = t_in > t_pub ? t_in - t_pub : 0;
-                    const uint64_t wait  = t_out - t_in;
-                    ctl->sums[0] += 1;
-                    ctl->sums[1] += dev;
-                    ctl->sums[2] += wait;
-                    ctl->sums[3] += wait > 2000;
-                    ctl->sums[4] += dev + wait;
-                    volatile uint64_t * tm = hdr->tm;
-                    // signed: the two clocks are apart by an offset (sums wrap as two's complement)
-                    const int64_t d2 = (int64_t) (t_out - tm[7]);
-                    ctl->sums[5] += (uint64_t) d2;
-                    if (ctl->sums[0] == 1 || d2 < ctl->min_d2) {
-                        ctl->min_d2 = d2;
-                    }
-                    for (int k = 0; k < 6; ++k) {
-                        tm[k] = ctl->sums[k];
-                    }
-                    tm[8] = (uint64_t) ctl->min_d2;
-                }
             }
         }
         if (ctl->failed) {
             s = 2;
         }
         st = s;
+    }
+    if (threadIdx.x == 0) {
+        // GGML_MOE_MAILBOX_TIMING: the block of the batch's first host row adds this batch to the sums
+        bool first = timing != 0 && st == 1;
+        for (int r = 0; first && r < row; ++r) {
+            first = hid[r] < 0;
+        }
+        first_s = first;
+        if (first) {
+            const uint64_t t_out = moe_mailbox_ns();
+            const uint64_t t_pub = ctl->t_pub;
+            const uint64_t dev   = t_in > t_pub ? t_in - t_pub : 0;
+            const uint64_t wait  = t_out - t_in;
+            ctl->sums[0] += 1;
+            ctl->sums[1] += dev;
+            ctl->sums[2] += wait;
+            ctl->sums[3] += wait > 2000;
+            ctl->sums[4] += dev + wait;
+            ctl->xs[0]   += n_polls;
+            ctl->xs[1]   += poll_ns;
+            volatile uint64_t * tm = hdr->tm;
+            // signed: the two clocks are apart by an offset (sums wrap as two's complement)
+            const int64_t d2 = (int64_t) (t_out - tm[7]);
+            ctl->sums[5] += (uint64_t) d2;
+            if (ctl->sums[0] == 1 || d2 < ctl->min_d2) {
+                ctl->min_d2 = d2;
+            }
+            for (int k = 0; k < 6; ++k) {
+                tm[k] = ctl->sums[k];
+            }
+            tm[8]  = (uint64_t) ctl->min_d2;
+            tm[9]  = ctl->xs[0];
+            tm[10] = ctl->xs[1];
+            t_in = t_out; // (the start of the row reads, below)
+        }
     }
     __syncthreads();
     const float * h = (const float *) (mbox + ggml_moe_mailbox_off_out(n_used, n_embd)) + (int64_t) row*n_embd;
@@ -2213,17 +2316,67 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
         const float4 * h4 = (const float4 *) h;
         const float4 * d4 = (const float4 *) dr;
         float4       * o4 = (float4 *) o;
-        for (int i = threadIdx.x; i < n_embd/4; i += blockDim.x) {
-            const float4 hv = __ldcv(h4 + i);
-            const float4 dv = d4[i];
-            o4[i] = make_float4(dv.x + hv.x, dv.y + hv.y, dv.z + hv.z, dv.w + hv.w);
+        const int n4 = n_embd/4;
+        int i = threadIdx.x;
+        if (opts & MOE_MBX_ROWLOAD) {
+            // up to 4 chunks of this thread: every mapped load issued before the first store (a store to o could alias h, so the
+            // loop below waits for each chunk's round trip before it loads the next); the same element sums
+            constexpr int R = 4;
+            for (; i + (R - 1)*(int) blockDim.x < n4; i += R*blockDim.x) {
+                float4 hv[R];
+                float4 dv[R];
+#pragma unroll
+                for (int u = 0; u < R; ++u) {
+                    hv[u] = __ldcv(h4 + i + u*blockDim.x);
+                }
+#pragma unroll
+                for (int u = 0; u < R; ++u) {
+                    dv[u] = d4[i + u*blockDim.x];
+                }
+#pragma unroll
+                for (int u = 0; u < R; ++u) {
+                    o4[i + u*blockDim.x] = make_float4(dv[u].x + hv[u].x, dv[u].y + hv[u].y, dv[u].z + hv[u].z, dv[u].w + hv[u].w);
+                }
+            }
+            if (i < n4) {
+                float4 hv[R];
+                float4 dv[R];
+#pragma unroll
+                for (int u = 0; u < R; ++u) {
+                    hv[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    if (i + u*(int) blockDim.x < n4) {
+                        hv[u] = __ldcv(h4 + i + u*blockDim.x);
+                    }
+                }
+#pragma unroll
+                for (int u = 0; u < R; ++u) {
+                    if (i + u*(int) blockDim.x < n4) {
+                        dv[u] = d4[i + u*blockDim.x];
+                        o4[i + u*blockDim.x] = make_float4(dv[u].x + hv[u].x, dv[u].y + hv[u].y, dv[u].z + hv[u].z, dv[u].w + hv[u].w);
+                    }
+                }
+            }
+        } else {
+            for (; i < n4; i += blockDim.x) {
+                const float4 hv = __ldcv(h4 + i);
+                const float4 dv = d4[i];
+                o4[i] = make_float4(dv.x + hv.x, dv.y + hv.y, dv.z + hv.z, dv.w + hv.w);
+            }
         }
-        return;
+    } else {
+        for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+            // a merge that gave up keeps the device rows only: finite values, since the ubatch is taken back or failed anyway (see
+            // single_check) and NaN rows would stay in the KV cells it wrote, which masked attention of later requests still reads
+            o[i] = st == 1 ? dr[i] + __ldcv(h + i) : dr[i];
+        }
     }
-    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
-        // a merge that gave up keeps the device rows only: finite values, since the ubatch is taken back or failed anyway (see
-        // single_check) and NaN rows would stay in the KV cells it wrote, which masked attention of later requests still reads
-        o[i] = st == 1 ? dr[i] + __ldcv(h + i) : dr[i];
+    if (timing) {
+        // GGML_MOE_MAILBOX_TIMING: the host row reads of the timed block, wait end to all its loads back
+        __syncthreads();
+        if (threadIdx.x == 0 && first_s) {
+            ctl->xs[2] += moe_mailbox_ns() - t_in;
+            hdr->tm[11] = ctl->xs[2];
+        }
     }
 }
 #endif
@@ -2281,9 +2434,37 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
                 const char * e = getenv("GGML_MOE_MAILBOX_FAST");
                 return e == nullptr || atoi(e) != 0 ? 1 : 0;
             }();
+            // the fast wait's read options (exact: the same bytes are added, see moe_mailbox_merge):
+            // GGML_MOE_MAILBOX_POLL_RELAXED (default 1, 0 = acquire loads): the polls are relaxed loads and one acquire fence follows the
+            // sequence; GGML_MOE_MAILBOX_ROWLOAD (default 1, 0 = one chunk per round trip): each thread issues all its host row loads
+            // before it stores; GGML_MOE_MAILBOX_POLLERS (default 1, 2..8; the host thread stores completed on that many lines) with
+            // GGML_MOE_MAILBOX_POLL_GAP_NS (default 1500) between the pollers' first reads
+            static const int opts = [] {
+                const char * er = getenv("GGML_MOE_MAILBOX_POLL_RELAXED");
+                const char * el = getenv("GGML_MOE_MAILBOX_ROWLOAD");
+                const char * eo = getenv("GGML_MOE_MAILBOX_POLL_REREAD");
+                const int o = ((er == nullptr || atoi(er) != 0) ? MOE_MBX_RELAXED : 0) | ((el == nullptr || atoi(el) != 0) ? MOE_MBX_ROWLOAD : 0) |
+                    ((eo == nullptr || atoi(eo) == 0) ? MOE_MBX_ONEREAD : 0);
+                GGML_LOG_INFO("%s: mailbox merge: relaxed polls %d, batched host row loads %d, one read of the seen flag %d "
+                    "(GGML_MOE_MAILBOX_POLL_RELAXED / GGML_MOE_MAILBOX_ROWLOAD / GGML_MOE_MAILBOX_POLL_REREAD)\n", __func__,
+                    (o & MOE_MBX_RELAXED) != 0, (o & MOE_MBX_ROWLOAD) != 0, (o & MOE_MBX_ONEREAD) != 0);
+                return o;
+            }();
+            static const int pollers = [] {
+                const char * e = getenv("GGML_MOE_MAILBOX_POLLERS");
+                const int p = e != nullptr ? std::max(1, std::min(atoi(e), GGML_MOE_MAILBOX_POLL_LINES)) : 1;
+                if (p > 1) {
+                    GGML_LOG_INFO("%s: mailbox merge: %d pollers on their own lines (GGML_MOE_MAILBOX_POLLERS)\n", __func__, p);
+                }
+                return p;
+            }();
+            static const int gap_ns = [] {
+                const char * e = getenv("GGML_MOE_MAILBOX_POLL_GAP_NS");
+                return e != nullptr ? std::max(0, atoi(e)) : 1500;
+            }();
             moe_mailbox_merge<<<n_rows, 256, 0, ctx.stream()>>>((const float *) d->data, (const int32_t *) hid->data, n_embd,
                 (const char *) mbox, (int) d->ne[1], (ggml_moe_mailbox_ctl *) ctl, (float *) dst->data, timeout_ns, fast,
-                ggml_moe_mailbox_timing());
+                ggml_moe_mailbox_timing(), opts, pollers, gap_ns);
         }
         CUDA_CHECK(cudaGetLastError());
         return;

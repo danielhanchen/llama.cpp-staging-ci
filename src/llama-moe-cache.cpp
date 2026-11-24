@@ -3711,6 +3711,7 @@ struct llama_moe_cache::impl {
         double  pick = 0, pre = 0, post = 0;
         int64_t pick_n = 0;
         int64_t min_d1 = INT64_MAX, min_d2 = INT64_MAX;
+        double  xp = 0, xpn = 0, xr = 0; // polls, their ns, host row read ns (tm[9..11])
         std::string bands;
         double b[5] = { 0, 0, 0, 0, 0 };
         int64_t bhn = 0, bhus = 0;
@@ -3724,6 +3725,7 @@ struct llama_moe_cache::impl {
                 for (int k = 0; k < 5; ++k) {
                     b[k] += (double) tm[k];
                 }
+                xp += (double) tm[9]; xpn += (double) tm[10]; xr += (double) tm[11];
                 pick += (double) mboxes[i]->h_pick_ns; pick_n += mboxes[i]->h_pick_n;
                 pre  += (double) mboxes[i]->h_pre_ns;  post += (double) mboxes[i]->h_post_ns;
                 min_d1 = std::min(min_d1, mboxes[i]->h_pick_min);
@@ -3762,6 +3764,8 @@ struct llama_moe_cache::impl {
             "wait %.1f us (clock offset %.1f us from the smallest samples %.1f / %.1f us); host pickup to compute %.2f us, compute to completed "
             "%.2f us\n", tag, (d1 - off)/1e3, (d2 + off)/1e3, off/1e3, min_d1/1e3, min_d2/1e3, pick_n > 0 ? pre/pick_n/1e3 : 0.0,
             pick_n > 0 ? post/pick_n/1e3 : 0.0);
+        LLAMA_LOG_INFO("llama_moe_cache%s: GGML_MOE_MAILBOX_TIMING: %.1f polls per wait, %.2f us per poll (issue to value), host row reads "
+            "after the wait %.2f us\n", tag, xp/t[0], xp > 0 ? xpn/xp/1e3 : 0.0, xr/t[0]/1e3);
     }
 
     // the plan of n_tokens tokens of a mailbox: the experts of the host ids, reading and writing the mailbox
@@ -3970,11 +3974,36 @@ struct llama_moe_cache::impl {
                 ((volatile uint64_t *) hdr->tm)[7] = (uint64_t) single_rt_ns();
             }
             llama_mb_store_rel(&hdr->completed, req);
+            single_publish_done(hdr, req);
             if (ok && single_hub().prefetch_sync != nullptr && single_hub().pf_threads > 1 && (single_hub().pf_all_sizes || n_tokens >= 6)) {
                 single_read_ahead(single_hub(), i, single_hub().pf_threads);
             }
         }
         return work;
+    }
+
+    // after completed: GGML_MOE_MAILBOX_POLLERS=N (2..GGML_MOE_MAILBOX_POLL_LINES, read by the device's merge too) stores the sequence on
+    // lines 1..N-1 of done_rep, one per poller of the merge (poller 0 reads completed); LLAMA_MOE_MAILBOX_HOST_FLUSH=1 (diagnostic, x86)
+    // writes the completed line back from the host caches (clflush), to tell a write that is seen late from a read that returns late
+    static void single_publish_done(ggml_moe_mailbox_hdr * hdr, uint32_t req) {
+        static const int pollers = [] {
+            const char * e = getenv("GGML_MOE_MAILBOX_POLLERS");
+            return e != nullptr ? std::max(1, std::min(atoi(e), (int) GGML_MOE_MAILBOX_POLL_LINES)) : 1;
+        }();
+        static const bool flush = [] {
+            const char * e = getenv("LLAMA_MOE_MAILBOX_HOST_FLUSH");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        for (int k = 1; k < pollers; ++k) {
+            llama_mb_store_rel(&hdr->done_rep[k][0], req);
+        }
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+        if (flush) {
+            __builtin_ia32_clflush((const void *) &hdr->completed);
+        }
+#else
+        GGML_UNUSED(flush);
+#endif
     }
 
     // nonzero busy in every mailbox of the process while the host thread computes one batch: merges waiting on another mailbox
