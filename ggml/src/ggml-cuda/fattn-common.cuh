@@ -54,6 +54,8 @@ struct ggml_cuda_fattn_dev_len {
     // the first source's KV tiles [x, y) that hold a finite mask value for some row of the tile (flash_attn_src2_body_range),
     // nullptr: every tile
     const int2 * body_range;
+    // 1: the multi-stage MMA kernel rotates the KV tile order of a stream-k launch (flash_attn_ext_f16, GGML_CUDA_FATTN_KV_ROTATE)
+    int32_t kv_rotate;
 };
 
 // the first bit >= k (set: a set bit, else a clear bit) of bits, stop if there is none before stop
@@ -1775,6 +1777,25 @@ void launch_fattn(
         src2.nbatch_fa = dev_len.nbatch_fa; src2.ntiles_dst = dev_len.ntiles_dst; src2.max_blocks = dev_len.max_blocks;
         src2.ntiles_dst_ref = dev_len.ntiles_dst_ref; src2.stream_k = dev_len.stream_k;
         dev_len = src2;
+    }
+
+    // GGML_CUDA_FATTN_KV_ROTATE (unset / 1 = on, 0 = off): the stream-k blocks of the multi-stage MMA kernel (cp.async, cc >= 8.0)
+    // read the KV tiles of an output tile in a rotated order, so the blocks running at the same time share them in L2 (long
+    // contexts). IEEE reorder of the partial sums, not bit-identical to 0. One KV source only; the kernel ignores it elsewhere
+    if (K2 == nullptr && use_stream_k && async_kv_preload) {
+        static const bool kv_rotate = [] {
+            const char * e = getenv("GGML_CUDA_FATTN_KV_ROTATE");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        dev_len.kv_rotate = kv_rotate ? 1 : 0;
+        if (kv_rotate && (int) blocks_num.x != ntiles_dst) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                GGML_LOG_INFO("%s: FA MMA KV tile order rotated across %d stream-k blocks of %d tiles (GGML_CUDA_FATTN_KV_ROTATE=0: off)\n",
+                    __func__, (int) blocks_num.x, ntiles_dst);
+            }
+        }
     }
 
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
