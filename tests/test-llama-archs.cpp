@@ -1004,6 +1004,28 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
+// a model file is written under a name of its own in the same directory, then renamed over the target. A process that has the old
+// file mapped (a test of a concurrent ctest run, or one started by hand beside it, reading the same test-models dir) keeps the old
+// pages; rewriting the file in place truncated them under it, and its next access to the weights died with SIGBUS
+static std::string unique_tmp_path(const std::string & path) {
+    std::random_device rd;
+    const uint64_t tag = ((uint64_t) rd() << 32) ^ (uint64_t) rd() ^ (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
+    char buf[32];
+    snprintf(buf, sizeof(buf), ".%016" PRIx64 ".tmp", tag);
+    return path + buf;
+}
+
+static bool replace_file(const std::string & tmp, const std::string & path) {
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        LOG_ERR("%s: cannot rename %s to %s: %s\n", __func__, tmp.c_str(), path.c_str(), ec.message().c_str());
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
 static int save_models(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -1055,7 +1077,12 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
             auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {});
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
-            llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
+            const std::string path_new = unique_tmp_path(path);
+            llama_model_save_to_file(model_and_ctx.first.get(), path_new.c_str());
+            if (!replace_file(path_new, path)) {
+                llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+                return 1;
+            }
         }
     }
     // a qwen35moe with its NextN (MTP) block, for test-mtp-meta; in a directory of its own (test-llama-context loads every model of dir)
@@ -1082,7 +1109,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
         std::filesystem::create_directories(dir + "/mtp");
         const std::string path = dir + "/mtp/" + arch + "-mtp.gguf";
         LOG_INF("%s: Saving %s model (MTP) to %s...\n", __func__, arch.c_str(), path.c_str());
-        const std::string path_tmp = path + ".tmp";
+        const std::string path_tmp = unique_tmp_path(path);
         llama_model_save_to_file(model.get(), path_tmp.c_str());
         // without the NextN block's own LM head (as the Qwen3.5 / 3.6 GGUFs): the MTP graph projects with output.weight, which a
         // tensor split divides by vocabulary rows
@@ -1097,10 +1124,12 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
                 gguf_add_tensor(dst.get(), ggml_get_tensor(tctx, name));
             }
         }
-        const bool ok = gguf_write_to_file(dst.get(), path.c_str(), false);
+        const std::string path_new = unique_tmp_path(path);
+        const bool ok = gguf_write_to_file(dst.get(), path_new.c_str(), false) && replace_file(path_new, path);
         ggml_free(tctx);
         std::remove(path_tmp.c_str());
         if (!ok) {
+            std::remove(path_new.c_str());
             LOG_ERR("%s: failed to write %s\n", __func__, path.c_str());
             llama_log_set(ud.log_old.callback, ud.log_old.user_data);
             return 1;

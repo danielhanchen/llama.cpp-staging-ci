@@ -61,8 +61,9 @@ static ggml_backend_buffer_t other_type_alloc(ggml_backend_buffer_type_t, size_t
 }
 
 struct fault {
-    std::atomic<int> mode { 0 }; // 0 none, 4 corrupt one byte of the second read, 5 EIO always, 6 slow (2 ms per read)
+    std::atomic<int> mode { 0 }; // 0 none, 4 corrupt the second read, 5 EIO always, 6 slow (2 ms per read)
     std::atomic<int> calls { 0 };
+    std::atomic<bool> hold { false }; // slow mode: reads that enter the hook wait here until it is cleared
 };
 
 static int64_t read_hook(int fd, void * buf, size_t n, uint64_t off, bool, void * ud) {
@@ -73,13 +74,20 @@ static int64_t read_hook(int fd, void * buf, size_t n, uint64_t off, bool, void 
     }
     if (f->mode.load() == 6) {
         usleep(2000);
+        while (f->hold.load()) {
+            usleep(100);
+        }
     }
     const ssize_t r = pread(fd, buf, n, (off_t) off);
     if (r < 0) {
         return -errno;
     }
     if (f->mode.load() == 4 && r > 0 && c == 1) {
-        ((uint8_t *) buf)[r/2] ^= 0x5a;
+        // every byte of the read: an unbuffered read starts at the 4 KiB boundary before the region, so a single byte (it was the
+        // middle one) can land in that lead, which nothing compares; which region gets call 1 depends on how the 2 IO threads run
+        for (ssize_t k = 0; k < r; ++k) {
+            ((uint8_t *) buf)[k] ^= 0x5a;
+        }
     }
     return r;
 }
@@ -961,13 +969,22 @@ int main(int argc, char ** argv) {
             }
             // cancel: a queued read (slow reads, one ticket per expert, the last queued) is dropped, a completed one is not
             if (fmode == 6) {
+                // the reads are held in the hook until both cancels ran, so the outcome does not depend on how fast the IO threads
+                // are scheduled (a fixed sleep failed on a loaded host: c1 had not started yet and was cancelled whole)
+                const int calls0 = flt.calls.load();
+                flt.hold = true;
                 const uint64_t c1 = ws.read_host_async(rd[14].data(), rd[14].size(), true);
                 const uint64_t c2 = ws.read_host_async(rd[14].data(), rd[14].size(), true);
                 CHECK(c1 != 0 && c2 != 0);
-                CHECK(ws.host_cancel(c2));    // behind c1: not started
+                CHECK(ws.host_cancel(c2));    // behind c1 (FIFO), the 2 IO threads can only be held in reads of c1: not started
                 CHECK(!ws.host_cancel(c2));   // collected
-                usleep(1000);                 // 2 IO threads, 2 ms per read: 2 of the 3 reads of c1 are in progress, 1 is queued
+                // 2 IO threads: wait until a read of c1 has started (it is held in the hook), at most 30 s
+                for (int w = 0; w < 300000 && flt.calls.load() == calls0; ++w) {
+                    usleep(100);
+                }
+                CHECK(flt.calls.load() > calls0);
                 CHECK(!ws.host_cancel(c1));   // partly started: it completes as issued
+                flt.hold = false;
                 ws.host_wait(c1);
                 CHECK(!ws.host_cancel(c1));   // done and collected
                 CHECK(ws.get_stats().spec_cancelled_bytes == src[0]->nb[2] + src[1]->nb[2] + src[2]->nb[2]);

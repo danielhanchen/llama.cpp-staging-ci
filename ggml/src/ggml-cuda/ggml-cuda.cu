@@ -10121,6 +10121,25 @@ static constexpr int GGML_CUDA_SIDE_MV_MIN_GAP   = 24; // nodes between the move
 static constexpr int GGML_CUDA_SIDE_MV_LOOKAHEAD = 16; // the join is placed this many nodes early (a fused group may start there)
 static constexpr int GGML_CUDA_SIDE_MV_MAX_COLS  = 64; // a graph with a planned product over more columns (a prompt) does not use the side stream
 
+// the last node (offset from i) that a fused MoE weighted reduction group starting at node i covers, 0 if none starts there. The
+// reduction takes 2 k nodes for k experts used (up to 15; 2 k + 1 with an expert scale); with the MoE cache's hit + fetched ADD
+// before it and the following ADD (ggml_cuda_try_fuse_moe_red_add2) 2 k + 2. That ADD is where a shared expert without a gate joins
+// the routed experts, the reader of its side-stream branch: from k = 8 on it lies past GGML_CUDA_SIDE_MV_LOOKAHEAD, the join placed
+// at the reader's lookahead was never reached (the loop resumes after the group), and the fused kernel read the branch's output
+// without waiting for it.
+static int ggml_cuda_fused_reach(const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_MUL && node->op != GGML_OP_ADD) {
+        return 0;
+    }
+    ggml_cuda_moe_weighted_reduction_match match;
+    if (node->op == GGML_OP_MUL) {
+        return ggml_cuda_match_moe_weighted_reduction(cgraph, i, match) ? match.node_count - 1 : 0;
+    }
+    // the hit + fetched ADD, the reduction, the ADD after it
+    return i + 1 < cgraph->n_nodes && ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) ? match.node_count + 1 : 0;
+}
+
 // planning only looks at the weight and the topology, not at the batch size: the prompt and decode graphs of a model then get
 // the same node order and the same allocation dependencies, so switching between them does not force a new allocation plan
 // (planning only the decode graphs was measured: the scheduler then re-reserves and synchronizes at every prompt ubatch).
@@ -10582,9 +10601,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     side_chain_reader = -1;
                 }
                 if (!side_mv_pending.empty()) {
-                    // a fused group starting here may cover the reader, so join a few nodes early
-                    side_mv_join_until(i + GGML_CUDA_SIDE_MV_LOOKAHEAD);
-                    if (side_chain_reader >= 0 && i + GGML_CUDA_SIDE_MV_LOOKAHEAD >= side_chain_reader) {
+                    // a fused group starting here may cover the reader, so join a few nodes early; a MoE weighted reduction group
+                    // can reach further (see ggml_cuda_fused_reach): then up to its last node
+                    const int reach = std::max(GGML_CUDA_SIDE_MV_LOOKAHEAD, ggml_cuda_fused_reach(cgraph, i));
+                    side_mv_join_until(i + reach);
+                    if (side_chain_reader >= 0 && i + reach >= side_chain_reader) {
                         side_chain_reader = -1;
                     }
                 }
@@ -10792,6 +10813,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                // Debug (GGML_CUDA_SIDE_JOIN_AUDIT=1): a fused group that covers the reader of a side-stream branch whose join is
+                // still pending ran without waiting for that branch (logged with the group's first node, counted per process)
+                static const bool join_audit = ggml_cuda_env_flag("GGML_CUDA_SIDE_JOIN_AUDIT");
+                if (join_audit && nodes_to_skip > 0) {
+                    static int64_t n_unjoined = 0;
+                    for (const auto & pj : side_mv_pending) {
+                        if (pj.first > i && pj.first <= i + nodes_to_skip) {
+                            if (n_unjoined++ < 8) {
+                                GGML_LOG_INFO("side-join audit: fused group at %d (%s %s, %d nodes) covers branch reader %d (%s) with its join pending (%lld)\n",
+                                    i, ggml_op_desc(node), node->name, nodes_to_skip + 1, pj.first, cgraph->nodes[pj.first]->name, (long long) n_unjoined);
+                            }
+                        }
+                    }
+                }
                 bool fused_multi = false; // a multi-matrix mul_mat_vec_q launch took node i (and maybe nodes after it)
                 if (nodes_to_skip == 0 && node->op == GGML_OP_MUL_MAT && !is_concurrent_event_active) {
                     int run = ggml_cuda_try_fuse_mmvq_multi(cuda_ctx, cgraph, i);

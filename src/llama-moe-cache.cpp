@@ -11,6 +11,7 @@
 #include "llama-build-id.h"
 #include "llama-moe-trial-persist.h"
 #include "llama-autoprof.h"
+#include "llama-kick-wait.h"
 
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
@@ -4066,15 +4067,19 @@ struct llama_moe_cache::impl {
                     work = o->single_poll(h.cpu.get()) || work;
                 }
             }
-            const int64_t now = single_now_us();
+            const int64_t kick0 = h.kick_us.load(std::memory_order_acquire);
+            const int64_t now   = single_now_us();
             if (work) {
                 last_work = now;
-            } else if (now - std::max(last_work, h.kick_us.load(std::memory_order_relaxed)) > 20000) {
+            } else if (now - std::max(last_work, kick0) > 20000) {
                 // no decode graph started for 20 ms: sleep until the next one (single_kick), at most 1 ms at a time, since a graph
                 // that publishes without a kick (layer-major, a draft context's first graph) would wait for this sleep (RTX PRO 6000 nsys: the
-                // first decode forward after an 8k prompt waited 100 ms in the merges with a 100 ms sleep, -8.6% prompt)
-                std::unique_lock<std::mutex> lock(h.mtx);
-                h.cv.wait_for(lock, std::chrono::milliseconds(1), [&h] { return h.run_state.load(std::memory_order_acquire) == 1; });
+                // first decode forward after an 8k prompt waited 100 ms in the merges with a 100 ms sleep, -8.6% prompt). A kick ends
+                // the sleep (its stamp is part of the predicate, llama-kick-wait.h); LLAMA_MOE_SINGLE_KICK_GEN=0: only a posted region
+                // does, a kick then waited for the 1 ms timeout as before
+                static const bool kick_gen = getenv("LLAMA_MOE_SINGLE_KICK_GEN") == nullptr || atoi(getenv("LLAMA_MOE_SINGLE_KICK_GEN")) != 0;
+                llama_kick_wait_for(h.mtx, h.cv, h.kick_us, kick0, std::chrono::milliseconds(1), kick_gen,
+                    [&h] { return h.run_state.load(std::memory_order_acquire) == 1; });
             } else {
                 llama_mb_spin_pause();
             }
@@ -4109,9 +4114,9 @@ struct llama_moe_cache::impl {
         single_hub_t & h = single_hub();
         h.run_caller.store(single_thread_key(), std::memory_order_relaxed);
         const int64_t now  = single_now_us();
-        const int64_t prev = h.kick_us.exchange(now, std::memory_order_relaxed);
+        const int64_t prev = h.kick_us.exchange(now, std::memory_order_acq_rel);
         if (now - prev > 20000) {
-            h.cv.notify_one();
+            llama_kick_notify(h.mtx, h.cv);
         }
     }
 

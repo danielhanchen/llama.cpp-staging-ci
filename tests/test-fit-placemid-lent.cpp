@@ -46,6 +46,14 @@ static int64_t placemid(int64_t free, int64_t margin, int64_t rest_rel, int64_t 
 }
 
 int main() {
+    // the extra model's price is keyed by the ubatch size too: the small-device / mid-size placements measure at a smaller n_ubatch
+    // for the same context (a DFlash draft's price grows with n_ubatch), and reused the price of the first measurement before
+    common_set_env("LLAMA_FIT_EXTRA_KEY_UB", "1"); // off by default; read once, at the first call
+    CHECK(common_fit_extra_key(16384, 2048, "") != common_fit_extra_key(16384, 31, ""));
+    CHECK(common_fit_extra_key(16384, 2048, "") == common_fit_extra_key(16384, 2048, ""));
+    CHECK(common_fit_extra_key(16384, 2048, "") != common_fit_extra_key(8192, 2048, ""));
+    CHECK(common_fit_extra_key(16384, 31, " ngl 99") != common_fit_extra_key(16384, 31, ""));
+
     // truth table of the lent accounting
     CHECK(!common_fit_extra_lent_excluded(false, false));
     CHECK(!common_fit_extra_lent_excluded(false, true));

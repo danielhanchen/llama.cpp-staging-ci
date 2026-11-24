@@ -328,6 +328,12 @@ bool common_fit_extra_lent_excluded(bool lent, bool decode_sized) {
     return lent && !decode_sized;
 }
 
+std::string common_fit_extra_key(uint32_t n_ctx, uint32_t n_ubatch, const std::string & placement) {
+    // off by default until a real small-device launch shows the larger cache it leaves holds (LLAMA_FIT_EXTRA_KEY_UB=1 on)
+    static const bool with_ub = getenv("LLAMA_FIT_EXTRA_KEY_UB") != nullptr && atoi(getenv("LLAMA_FIT_EXTRA_KEY_UB")) != 0;
+    return std::to_string(n_ctx) + (with_ub ? " ub " + std::to_string(n_ubatch) : std::string()) + placement;
+}
+
 bool common_fit_placemid_decode_sized() {
     const char * e = getenv("LLAMA_FIT_PLACEMID_DECODE_SIZED");
     return e == nullptr || atoi(e) != 0;
@@ -929,7 +935,8 @@ static void common_params_fit_impl(
     const bool has_drafter = extra != nullptr || mparams->load_mtp; // a draft model or MTP heads beside the target (the drafter margin rule)
 
     dmds_t      dmds_extra;    // memory of the extra model, laid out on the devices of the main model
-    std::string key_extra;     // context (and placement, see below) that memory was measured at
+    std::string key_extra;     // context, ubatch size (and placement, see below) that memory was measured at
+    uint32_t    ub_extra = 0;  // the ubatch size of that measurement
 
     // an extra model that shares the weights of the main model (an MTP context) runs them in the placement the fit gives the
     // main model, and takes its share of the main model's MoE cache budget (llama_moe_cache::budget, layer_set::nextn). Measured with
@@ -968,9 +975,16 @@ static void common_params_fit_impl(
             cp_cur = cparams;
         }
         const bool follow = extra->shares_model && extra_follow;
-        const std::string key = std::to_string(cparams->n_ctx) + (follow ? placement_key(mp_cur, cp_cur) : std::string());
+        const std::string key = common_fit_extra_key(cparams->n_ctx, cparams->n_ubatch, follow ? placement_key(mp_cur, cp_cur) : std::string());
 
+        if (!dmds_extra.empty() && key_extra == key && ub_extra != cparams->n_ubatch) {
+            LOG_INF("%s: the extra model's price measured at n_ubatch %u reused at n_ubatch %u (n_ctx %u; LLAMA_FIT_EXTRA_KEY_UB=1 prices it again)\n",
+                __func__, ub_extra, cparams->n_ubatch, cparams->n_ctx);
+        }
         if (dmds_extra.empty() || key_extra != key) {
+            LOG_INF("%s: pricing the extra model at n_ctx %u, n_ubatch %u%s\n", __func__, cparams->n_ctx, cparams->n_ubatch,
+                dmds_extra.empty() ? "" : " (a new key)");
+            ub_extra = cparams->n_ubatch;
             std::vector<ggml_backend_dev_t> devs_extra;
             uint32_t ngl_extra = 0;
             uint32_t nct_extra = 0;
