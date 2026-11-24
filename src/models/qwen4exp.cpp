@@ -747,7 +747,7 @@ public:
         const bool no_sel = writes_only || allfit;
         mctx->set_input_kpool(no_sel ? nullptr : pool_cells, no_sel ? nullptr : pool_idxs, no_sel ? nullptr : pool_mask,
                               no_sel ? nullptr : tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
-                              ubatch, new_pool_pos, allfit_idx);
+                              ubatch, new_pool_pos, allfit_idx, no_sel ? nullptr : pool_live, n_top_pool);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -784,6 +784,7 @@ public:
     ggml_tensor * new_pool_pos  = nullptr; // I32 [4*n_new]        M-RoPE position of each new block's first member
     ggml_tensor * allfit_idx    = nullptr; // I32 [n_sel, n_tokens] the selection when the top_k keeps every visible pool
     ggml_tensor * allfit_idx3   = nullptr; // [n_sel, n_tokens, 1] view of allfit_idx, shared by the QSA layers
+    ggml_tensor * pool_live     = nullptr; // I32 [1]              max(real pools, n_top_pool): the indexer's and top_k's live columns
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
@@ -792,6 +793,7 @@ public:
     uint32_t n_new = 0; // padded to a stable bound, never below 1
     uint32_t n_sel = 0;
     uint32_t n_kv  = 0;
+    uint32_t n_top_pool = 0;
 };
 
 llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb) {
@@ -827,12 +829,26 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
         ggml_build_forward_expand(gf, inp->pool_idxs);
         ggml_build_forward_expand(gf, inp->pool_mask);
         ggml_build_forward_expand(gf, inp->tail_idxs);
+        // the live pool count on the device: the indexer and its top_k skip the padded pools past it, which the bucketed pool count
+        // (n_kv buckets, kpool_pad) adds; the same scores, selection and order (LLAMA_KPOOL_LIVE_LEN=0: off, every pool scored)
+        static const bool live_len = getenv("LLAMA_KPOOL_LIVE_LEN") == nullptr || atoi(getenv("LLAMA_KPOOL_LIVE_LEN")) != 0;
+        if (live_len) {
+            inp->pool_live = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+            ggml_set_name(inp->pool_live, "kpool_live");
+            ggml_set_input(inp->pool_live);
+            static std::atomic<bool> logged { false };
+            if (!logged.exchange(true)) {
+                LLAMA_LOG_INFO("%s: QSA: kpool live: the indexer scores the real pools only (%u in the graph; LLAMA_KPOOL_LIVE_LEN=0: off)\n",
+                        __func__, n_pool);
+            }
+        }
     }
 
     inp->n_kv  = mctx_idx->get_n_kv();
     inp->n_new = mctx_hyb->get_n_kpool_new();
     // the top blocks plus the tail
     inp->n_sel = kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
+    inp->n_top_pool = std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool);
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
@@ -966,11 +982,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         qsa_c.weights = weights;
     }
     ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+    ggml_lightning_indexer_set_live_len(score, inp_kpool->pool_live);
     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     cb(score, "indexer_score", il);
 
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
     ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
+    ggml_top_k_set_live_len(top_k, inp_kpool->pool_live);
     cb(top_k, "indexer_top_k", il);
 
     // the top blocks, then the incomplete tail with n_kv for missing cells
