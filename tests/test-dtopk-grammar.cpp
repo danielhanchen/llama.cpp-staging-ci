@@ -402,6 +402,9 @@ static int run_main(int argc, char ** argv) {
         std::remove(spm.c_str());
         return 1;
     }
+    // the mapping keeps the copy alive: unlinked now, a run that is killed leaves nothing behind (where a mapped file cannot be
+    // removed, the removal at the end does it)
+    std::remove(spm.c_str());
     g_vocab = llama_model_get_vocab(g_model);
     g_n_vocab = llama_vocab_n_tokens(g_vocab);
     printf("model %s: vocab %d\n", spm.c_str(), g_n_vocab);
