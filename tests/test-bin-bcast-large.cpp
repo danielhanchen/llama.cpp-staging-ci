@@ -23,6 +23,7 @@ static float val_a(int64_t i) { return (float) ((i * 2654435761u) % 61) * 0.125f
 static float val_m(int64_t i) { return (float) ((i * 40503u) % 17) - 8.0f; }
 
 int main() {
+    ggml_backend_load_all(); // dynamic backends (GGML_BACKEND_DL); a no-op for the built-in ones
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     if (dev == nullptr) {
         printf("test-bin-bcast-large: SKIP (no GPU)\n");
