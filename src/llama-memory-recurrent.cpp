@@ -40,9 +40,11 @@ llama_memory_recurrent::llama_memory_recurrent(
     // commit by replay for the delta-net models (see llama_memory_recurrent::replay). LLAMA_RS_REPLAY unset / auto: when layer
     // weights spill to host memory while others are on a device (a MoE cache / host experts: the memory the snapshot rows would take
     // goes to the cache there), and when every layer sits on a device whose delta-net op folds the commit into the next window
-    // (CUDA / ROCm / MUSA): the snapshot rows are 1 + n_rs_seq state rows per sequence, and a verify window writes one state per token.
-    // With every weight in host memory, or on another device type, the snapshot rows stay. LLAMA_RS_REPLAY=spill: replay only when
-    // the weights spill (the previous auto), =1 forces replay, =0 the snapshot rows.
+    // (CUDA / ROCm / MUSA): the snapshot rows are 1 + n_rs_seq state rows per sequence, and a verify window writes one state per token
+    // (RTX PRO 6000 / L4 / A100, MTP and DFlash2 drafters: Qwen3.8-27B +0.7..+2.5% decode, Qwen3.8-Flash-Next +0.4..+1.8%, 74-79% less
+    // recurrent state). Not for the Qwen3.5 MoE arch with every layer resident: Qwen3.6-35B-A3B measured level to -0.5% there, so it
+    // keeps the snapshot rows. With every weight in host memory, or on another device type, the snapshot rows stay.
+    // LLAMA_RS_REPLAY=spill: replay only when the weights spill (the previous auto), =1 forces replay, =0 the snapshot rows.
     // The placement is read from the weights' buffers, which a no_alloc (fit probe) model also sets, so a probe sizes the same rows.
     {
         const char * e = getenv("LLAMA_RS_REPLAY");
@@ -87,7 +89,7 @@ llama_memory_recurrent::llama_memory_recurrent(
             const bool multi_ok = em != nullptr ? atoi(em) != 0 : scoped;
             const bool multi    = n_seq_max > 1 && !multi_ok;
             const bool spill    = on_host && on_dev;
-            const bool resident = !on_host && on_dev && dev_fold && mode == -1;
+            const bool resident = !on_host && on_dev && dev_fold && mode == -1 && model.arch != LLM_ARCH_QWEN35MOE;
             want = (spill || resident) && !multi;
             LLAMA_LOG_INFO("%s: delta-net rollback: %s (LLAMA_RS_REPLAY %s: layer weights %s%s; =1 / =0 forces replay / snapshot rows%s)\n",
                     __func__, want ? "replay" : "snapshot rows", mode == -2 ? "spill" : "auto", spill ? "spill to host memory" :
