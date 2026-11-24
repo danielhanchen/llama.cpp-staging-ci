@@ -1,0 +1,30 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 70936fd7ef0..d6971e82106 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1774,7 +1774,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+         case GGML_OP_LIGHTNING_INDEXER:
+             // candidate blocks (src[4]) are not read by the kernel
+-            if (op->src[4] != nullptr || op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK) {
++            if (op->src[4] != NULL || op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK) {
+                 return false;
+             }
+             if (!has_simdgroup_mm ||
+diff --git a/tests/test-hostgap-exact.cpp b/tests/test-hostgap-exact.cpp
+index 882d239be9a..2a16fddbad7 100644
+--- a/tests/test-hostgap-exact.cpp
++++ b/tests/test-hostgap-exact.cpp
+@@ -16,6 +16,12 @@
+ #include <string>
+ #include <vector>
+ 
++#if defined(_WIN32)
++// the child processes run on POSIX only (main), but the test is built on Windows static builds too
++#define popen  _popen
++#define pclose _pclose
++#endif
++
+ static uint64_t fnv1a(const uint8_t * p, size_t n, uint64_t h = 1469598103934665603ull) {
+     for (size_t i = 0; i < n; ++i) {
+         h = (h ^ p[i]) * 1099511628211ull;

@@ -46,6 +46,17 @@ jobs:
             os: windows-latest
             gpu: none
             cmake_extra: "-DBUILD_SHARED_LIBS=OFF"
+          # fix = head + ci/platfix.patch: the Metal build and the MSVC static test build
+          - arm: fix
+            leg: mac-metal
+            os: macos-15
+            gpu: metal
+            cmake_extra: ""
+          - arm: fix
+            leg: win-static
+            os: windows-latest
+            gpu: none
+            cmake_extra: "-DBUILD_SHARED_LIBS=OFF"
     name: ${{ matrix.leg }} ${{ matrix.arm }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 330
@@ -66,6 +77,12 @@ jobs:
           ref: ci/integration-1a1410c
           path: b
           persist-credentials: false
+
+      - name: Apply the fix branch (fix arm)
+        if: matrix.arm == 'fix'
+        run: |
+          git -C h apply --whitespace=nowarn ci/platfix.patch
+          git -C h status --short | head
 
       - name: System info
         run: |
@@ -104,14 +121,14 @@ jobs:
           echo "build_rc=$rc build_s=$(( $(date +%s) - t0 ))" | tee -a $L/summary.txt
           grep -n -E "warning( C[0-9]+)?:|error( C[0-9]+| LNK[0-9]+)?:" $L/build.log | sort -u > $L/build_diags.txt 2>/dev/null || true
           echo "build_warnings=$(grep -c -E 'warning( C[0-9]+)?:' $L/build_diags.txt || true) build_errors=$(grep -c -E 'error( C[0-9]+| LNK[0-9]+)?:' $L/build_diags.txt || true)" | tee -a $L/summary.txt
-          grep -E "error( C[0-9]+| LNK[0-9]+)?:" $L/build_diags.txt | head -40
+          grep -E "error( C[0-9]+| LNK[0-9]+)?:" $L/build_diags.txt | head -40 || true
           if [ -d build/bin/Release ]; then B=build/bin/Release; else B=build/bin; fi
           echo "BIN=$SRC/$B" >> "$GITHUB_ENV"
           echo "binaries: $(ls $B | wc -l)" | tee -a $L/summary.txt
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
 
       - name: ctest
-        if: steps.build.outputs.rc == '0'
+        if: always() && steps.build.outcome == 'success'
         run: |
           cd "$SRC/build"
           rc=0; L=$GITHUB_WORKSPACE/ci-logs
