@@ -1,0 +1,2488 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-common.cpp b/ggml/src/ggml-metal/ggml-metal-common.cpp
+index 70fd551e34b..5b5a2a05704 100644
+--- a/ggml/src/ggml-metal/ggml-metal-common.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-common.cpp
+@@ -263,6 +263,10 @@ static bool ggml_mem_ranges_add_dst(ggml_mem_ranges_t mrs, const ggml_tensor * t
+     return ggml_mem_ranges_add(mrs, mr);
+ }
+ 
++bool ggml_mem_ranges_add_src_tensor(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
++    return ggml_mem_ranges_add_src(mrs, tensor);
++}
++
+ bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+     for (int i = 0; i < GGML_MAX_SRC; i++) {
+         if (tensor->src[i]) {
+diff --git a/ggml/src/ggml-metal/ggml-metal-common.h b/ggml/src/ggml-metal/ggml-metal-common.h
+index c86d92b9d11..805d0ba65a2 100644
+--- a/ggml/src/ggml-metal/ggml-metal-common.h
++++ b/ggml/src/ggml-metal/ggml-metal-common.h
+@@ -39,6 +39,9 @@ void ggml_mem_ranges_reset(ggml_mem_ranges_t mrs);
+ // add src or dst ranges to track
+ bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const struct ggml_tensor * tensor);
+ 
++// add the whole allocation of tensor (its base tensor) as a src range: a node that reads memory beyond its own srcs
++bool ggml_mem_ranges_add_src_tensor(ggml_mem_ranges_t mrs, const struct ggml_tensor * tensor);
++
+ // return false if:
+ // - new src range overlaps with any existing dst range
+ // - new dst range overlaps with any existing range (src or dst)
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 9d1c6ee1ce5..f0b0dba527c 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -7,6 +7,7 @@
+ #include "ggml-impl.h"
+ 
+ #include <cassert>
++#include <cstdlib>
+ #include <memory>
+ #include <string>
+ #include <unordered_map>
+@@ -1294,15 +1295,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
+     // src1 prec [TAG_GGML_PREC]
+     const bool amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
+ 
++    // GGML_METAL_MMID_SGSPLIT=0: entry tiles of at most 16 rows leave simdgroups 2,3 idle, as before
++    // GGML_METAL_MMID_BSKIP=0: the 8-row B blocks past the valid rows of a tile are loaded and multiplied, as before
++    // (both exact: the same accumulators and K chains, see kernel_mul_mm_id; the tensor-API kernel ignores them)
++    static const bool sgsplit = getenv("GGML_METAL_MMID_SGSPLIT") == nullptr || atoi(getenv("GGML_METAL_MMID_SGSPLIT")) != 0;
++    static const bool bskip   = getenv("GGML_METAL_MMID_BSKIP")   == nullptr || atoi(getenv("GGML_METAL_MMID_BSKIP"))   != 0;
++
+     snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+-    snprintf(name, 256, "%s_bci=%d_amax=%d", base, bc_inp, amax);
++    snprintf(name, 256, "%s_bci=%d_amax=%d_sgs=%d_bsk=%d", base, bc_inp, amax, sgsplit, bskip);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         ggml_metal_cv_t cv = ggml_metal_cv_init();
+ 
+-        ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
+-        ggml_metal_cv_set_bool(cv, amax,   FC_MUL_MM + 6);
++        ggml_metal_cv_set_bool(cv, bc_inp,  FC_MUL_MM + 0);
++        ggml_metal_cv_set_bool(cv, amax,    FC_MUL_MM + 6);
++        ggml_metal_cv_set_bool(cv, sgsplit, FC_MUL_MM + 8);
++        ggml_metal_cv_set_bool(cv, bskip,   FC_MUL_MM + 9);
+ 
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+@@ -1544,6 +1553,66 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sel_mask(ggml_metal_library_t lib, const ggml_tensor * op) {
++    GGML_ASSERT(op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F16);
++
++    const char * name = "kernel_sel_mask_f16";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_pair_map(ggml_metal_library_t lib, int n_routes) {
++    const char * name = "kernel_mul_mv_id_pair_map";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    // expert + leader flag of every route
++    res.smem = GGML_PAD(2*(size_t) n_routes*sizeof(int32_t), 16);
++
++    return res;
++}
++
++// the paired variant of the mat-vec kernel of kernel_mul_mv_id: same simdgroups, rows and scratch
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_pair(ggml_metal_library_t lib, const ggml_tensor * op) {
++    const ggml_metal_pipeline_with_params single = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
++
++    char base[256];
++    char name[256];
++
++    snprintf(base, 256, "kernel_mul_mv_id_pair_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
++    snprintf(name, 256, "%s_nsg=%d", base, single.nsg);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++
++        ggml_metal_cv_set_int16(cv, single.nsg, FC_MUL_MV + 0);
++        ggml_metal_cv_set_int16(cv, 1,          FC_MUL_MV + 2);
++        ggml_metal_cv_set_int16(cv, 1,          FC_MUL_MV + 3);
++        ggml_metal_cv_set_int16(cv, 1,          FC_MUL_MV + 4);
++        ggml_metal_cv_set_bool (cv, false,      FC_MUL_MV + 5);
++
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++
++        ggml_metal_cv_free(cv);
++    }
++
++    res.nr0  = single.nr0;
++    res.nr1  = single.nr1;
++    res.nsg  = single.nsg;
++    res.smem = single.smem;
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_metal_library_t lib, const ggml_tensor * op) {
+     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+     GGML_ASSERT(ggml_is_contiguous_1(op->src[0]));
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 4012b9d5f69..d65ed8e99b6 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -144,7 +144,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_pair_map(ggml_metal_library_t lib, int n_routes);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_pair    (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sel_mask          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht              (ggml_metal_library_t lib, int n, enum ggml_type tsrc);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index d6971e82106..8904a8ce4cb 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1689,6 +1689,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                 op->type == GGML_TYPE_I64;
+         case GGML_OP_ARGMAX:
+             return has_simdgroup_reduction;
++        case GGML_OP_KQ_MASK:
++            // the selection mask kind only (ggml_sel_mask); the other kinds stay on the CPU
++            return ggml_get_op_params_i32(op, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL &&
++                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F16 &&
++                ggml_is_contiguous(op) && ggml_is_contiguous(op->src[1]) && op->src[0]->nb[0] == sizeof(int32_t) &&
++                op->src[0]->ne[1] == ggml_nrows(op);
+         case GGML_OP_NORM:
+         case GGML_OP_RMS_NORM:
+             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 4ffb5a77ddf..522502bdfb1 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1383,6 +1383,15 @@ typedef struct {
+     uint64_t nb01;
+ } ggml_metal_kargs_argmax;
+ 
++// ggml_sel_mask (GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL)
++typedef struct {
++     int64_t n_kv;
++     int64_t n_sel;
++    uint64_t nb1_idx;
++    uint64_t nb1_kq;
++    uint64_t nb1_dst;
++} ggml_metal_kargs_sel_mask;
++
+ typedef struct {
+     int64_t  np;
+ } ggml_metal_kargs_opt_step_adamw;
+diff --git a/ggml/src/ggml-metal/ggml-metal-mmid-pair.h b/ggml/src/ggml-metal/ggml-metal-mmid-pair.h
+new file mode 100644
+index 00000000000..c59e4505569
+--- /dev/null
++++ b/ggml/src/ggml-metal/ggml-metal-mmid-pair.h
+@@ -0,0 +1,86 @@
++#pragma once
++
++// paired routes of the mat-vec MUL_MAT_ID path (GGML_METAL_MMID_PAIR=1)
++//
++// A route is one (token, slot) pair of the ids, numbered p = token*n_used + slot. Routes of the same
++// expert are paired in increasing p: the 1st with the 2nd, the 3rd with the 4th, ... (an odd last one
++// stays single). Every pair or single is one entry (expert, route A, route B or -1), and the entries are
++// ordered by route A. Layout of the list: [0] = number of entries, then 3 int32 per entry.
++//
++// This is the reference of kernel_mul_mv_id_pair_map (kernels/mul_mv.metal), written the way the
++// kernel computes it: one thread per route, each with
++//   rank    = routes q < p of the same expert
++//   partner = the first route q > p of the same expert, or -1
++//   leader  = rank is even (emits the entry of its pair or single)
++//   pos     = leaders q < p (the entry index)
++// The kernel must produce exactly this list (tests/test-metal-mmid-pair-model.cpp checks it against an
++// independent sequential pairing).
++
++#include <stdint.h>
++
++// at most this many routes per op take the paired path (one threadgroup of the map kernel, a thread per route)
++#define GGML_METAL_MMID_PAIR_MAX_ROUTES 256
++
++// the most tokens of a mat-vec MUL_MAT_ID that take the paired path
++#define GGML_METAL_MMID_PAIR_MAX_TOKENS 16
++
++// the size in int32 of the list of n routes
++static inline int64_t ggml_metal_mmid_pair_list_len(int64_t n_routes) {
++    return 1 + 3*n_routes;
++}
++
++// ids: n_tokens rows of n_used int32, row r at ids + r*row_stride (in int32); out: ggml_metal_mmid_pair_list_len(n) int32
++// returns the number of entries. The phases are those of the kernel (expert per route; rank / partner / leader per route;
++// entry index = leaders before the route), with the per-thread arrays as local ones.
++static inline int32_t ggml_metal_mmid_pair_build(const int32_t * ids, int64_t row_stride, int32_t n_used, int32_t n_tokens, int32_t * out) {
++    const int32_t n = n_used*n_tokens;
++
++    if (n > GGML_METAL_MMID_PAIR_MAX_ROUTES) {
++        out[0] = -1;
++        return -1;
++    }
++
++    int32_t eid    [GGML_METAL_MMID_PAIR_MAX_ROUTES];
++    int32_t lead   [GGML_METAL_MMID_PAIR_MAX_ROUTES];
++    int32_t partner[GGML_METAL_MMID_PAIR_MAX_ROUTES];
++
++    for (int32_t p = 0; p < n; ++p) {
++        eid[p] = ids[(p/n_used)*row_stride + p%n_used];
++    }
++
++    for (int32_t p = 0; p < n; ++p) {
++        int32_t rank = 0;
++
++        partner[p] = -1;
++
++        for (int32_t q = 0; q < n; ++q) {
++            rank      += q < p && eid[q] == eid[p];
++            partner[p] = q > p && eid[q] == eid[p] && partner[p] < 0 ? q : partner[p];
++        }
++
++        lead[p] = rank % 2 == 0;
++    }
++
++    int32_t n_entries = 0;
++
++    for (int32_t p = 0; p < n; ++p) {
++        if (!lead[p]) {
++            continue;
++        }
++
++        int32_t pos = 0;
++        for (int32_t q = 0; q < p; ++q) {
++            pos += lead[q];
++        }
++
++        out[1 + 3*pos + 0] = eid[p];
++        out[1 + 3*pos + 1] = p;
++        out[1 + 3*pos + 2] = partner[p];
++
++        n_entries++;
++    }
++
++    out[0] = n_entries;
++
++    return n_entries;
++}
+diff --git a/ggml/src/ggml-metal/ggml-metal-mmid.h b/ggml/src/ggml-metal/ggml-metal-mmid.h
+new file mode 100644
+index 00000000000..422c390f437
+--- /dev/null
++++ b/ggml/src/ggml-metal/ggml-metal-mmid.h
+@@ -0,0 +1,97 @@
++#pragma once
++
++// host side of the kernel_mul_mm_id expert map (kernel_mul_mm_id_map0): the tile bound, the key under which one map is
++// shared by the MUL_MAT_ID nodes of an encoder, and a CPU reference of the map the kernel builds (plain C++, no Metal:
++// tests/test-metal-mmid-map.cpp runs it on any host)
++
++#include <cstdint>
++#include <vector>
++
++// rows per entry tile, NR1 of kernel_mul_mm_id and NTILE of kernel_mul_mm_id_map0
++static constexpr int64_t GGML_METAL_MMID_NTILE = 32;
++
++// upper bound on the number of entry tiles emitted by kernel_mul_mm_id_map0: the full tiles over all entries plus at
++// most one partial tile per expert
++static inline int64_t ggml_metal_mmid_max_tiles(int64_t ne02, int64_t ne20, int64_t ne21) {
++    const int64_t n_rows = ne20*ne21;
++    const int64_t tiles  = (n_rows + GGML_METAL_MMID_NTILE - 1)/GGML_METAL_MMID_NTILE + (ne02 < n_rows ? ne02 : n_rows) - 1;
++
++    return n_rows < tiles ? n_rows : tiles;
++}
++
++// the map depends on the ids and their shape only (not on src0 / src1): two MUL_MAT_ID nodes with equal keys read
++// identical maps, as long as neither the ids nor the scratch holding the map were written in between
++struct ggml_metal_mmid_map_key {
++    const void * ids_buf  = nullptr; // buffer of the ids (base tensor)
++    const void * ids_data = nullptr; // address of the ids
++    int64_t ne20 = 0; // n_expert_used
++    int64_t ne21 = 0; // n_tokens
++    int64_t nb20 = 0;
++    int64_t nb21 = 0;
++    int64_t ne02 = 0; // n_expert
++
++    bool operator==(const ggml_metal_mmid_map_key & o) const {
++        return ids_buf == o.ids_buf && ids_data == o.ids_data && ne20 == o.ne20 && ne21 == o.ne21 &&
++               nb20 == o.nb20 && nb21 == o.nb21 && ne02 == o.ne02;
++    }
++};
++
++// [a0, a1) of buffer a and [b0, b1) of buffer b share a byte
++static inline bool ggml_metal_mmid_ranges_overlap(const void * a, uint64_t a0, uint64_t a1, const void * b, uint64_t b0, uint64_t b1) {
++    return a == b && a0 < b1 && b0 < a1;
++}
++
++// CPU reference of kernel_mul_mm_id_map0. ids: [ne21][ne20] expert ids (row stride ne20). Output tpe: tile count, then
++// (expert, first entry, valid rows) per tile; hids: the entries ((token)*ne20 + slot) of every expert in token order, the
++// first matching slot of a token first, then its other matching slots (duplicate ids), each expert's slice followed by one
++// padding slot (the kernel's dummy store; left at -1 here)
++static inline void ggml_metal_mmid_map0_ref(const int32_t * ids, int64_t ne20, int64_t ne21, int64_t ne02,
++        std::vector<uint32_t> & tpe, std::vector<int32_t> & hids) {
++    std::vector<uint32_t> cnt(ne02, 0);
++    for (int64_t t = 0; t < ne21; ++t) {
++        for (int64_t s = 0; s < ne20; ++s) {
++            const int32_t e = ids[t*ne20 + s];
++            if (e >= 0 && e < ne02) {
++                cnt[e]++;
++            }
++        }
++    }
++
++    std::vector<uint32_t> bas(ne02, 0);
++    tpe.assign(1, 0);
++    uint32_t base = 0;
++    for (int64_t e = 0; e < ne02; ++e) {
++        bas[e] = base;
++        for (uint32_t k = 0; k < cnt[e]; k += GGML_METAL_MMID_NTILE) {
++            tpe.push_back((uint32_t) e);
++            tpe.push_back(base + k);
++            tpe.push_back(cnt[e] - k < GGML_METAL_MMID_NTILE ? cnt[e] - k : (uint32_t) GGML_METAL_MMID_NTILE);
++            tpe[0]++;
++        }
++        base += cnt[e] + 1;
++    }
++
++    hids.assign(base, -1);
++    for (int64_t e = 0; e < ne02; ++e) {
++        uint32_t ient = bas[e];
++        for (int64_t t = 0; t < ne21; ++t) {
++            int64_t first = -1;
++            for (int64_t s = 0; s < ne20; ++s) {
++                if (ids[t*ne20 + s] == e) {
++                    if (first < 0) {
++                        first = s;
++                    }
++                }
++            }
++            if (first < 0) {
++                continue;
++            }
++            hids[ient++] = (int32_t) (t*ne20 + first);
++            for (int64_t s = 0; s < ne20; ++s) {
++                if (ids[t*ne20 + s] == e && s != first) {
++                    hids[ient++] = (int32_t) (t*ne20 + s);
++                }
++            }
++        }
++    }
++}
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 8a6e2f4937f..4b19b2a8180 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -9,6 +9,8 @@
+ #include "ggml-metal-device.h"
+ #include "ggml-metal-fusion.h"
+ #include "ggml-metal-tuning.h"
++#include "ggml-metal-mmid.h"
++#include "ggml-metal-mmid-pair.h"
+ 
+ #include <cassert>
+ #include <algorithm>
+@@ -68,6 +70,10 @@ struct ggml_metal_op {
+     }
+ 
+     ~ggml_metal_op() {
++        static const bool mmid_debug = getenv("GGML_METAL_MMID_MAP_DEBUG") != nullptr && atoi(getenv("GGML_METAL_MMID_MAP_DEBUG")) != 0;
++        if (mmid_debug && (n_mmid_built > 0 || n_mmid_shared > 0)) {
++            GGML_LOG_INFO("ggml_metal_op: mul_mat_id expert maps: %d built, %d shared (nodes %d .. %d)\n", n_mmid_built, n_mmid_shared, idx_start, idx_end);
++        }
+         ggml_metal_encoder_end_encoding(this->enc);
+         ggml_metal_encoder_free(this->enc);
+         ggml_mem_ranges_free(this->mem_ranges);
+@@ -110,6 +116,18 @@ struct ggml_metal_op {
+     // shared fusion debugging context
+     ggml_metal_fusion_info * finfo;
+ 
++    // the kernel_mul_mm_id expert map built last in this encoder (GGML_METAL_MMID_MAP_SHARE): a later MUL_MAT_ID node
++    // routed by the same ids reads it instead of building its own (see ggml_metal_op_mul_mat_id)
++    struct {
++        const ggml_tensor *     op  = nullptr; // the node whose scratch holds the map
++        int                     idx = -1;      // its node index in this encoder
++        ggml_metal_mmid_map_key key;
++    } mmid_map;
++
++    // GGML_METAL_MMID_MAP_DEBUG=1: maps built / shared in this encoder, logged at the end of the encoder
++    int n_mmid_built  = 0;
++    int n_mmid_shared = 0;
++
+     bool use_concurrency;
+     bool use_capture;
+ 
+@@ -505,6 +523,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_argmax(ctx, idx);
+             } break;
++        case GGML_OP_KQ_MASK:
++            {
++                n_fuse = ggml_metal_op_kq_mask(ctx, idx);
++            } break;
+         case GGML_OP_OPT_STEP_ADAMW:
+             {
+                 n_fuse = ggml_metal_op_opt_step_adamw(ctx, idx);
+@@ -2780,14 +2802,55 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+ // upper bound on the number of entry tiles emitted by kernel_mul_mm_id_map0: the full tiles
+ // over all entries plus at most one partial tile per expert
+ static int64_t ggml_metal_op_mul_mat_id_max_tiles(const ggml_tensor * op) {
+-    const int64_t ne02 = op->src[0]->ne[2]; // n_expert
+-    const int64_t ne20 = op->src[2]->ne[0]; // n_expert_used
+-    const int64_t ne21 = op->src[2]->ne[1]; // n_token
++    return ggml_metal_mmid_max_tiles(op->src[0]->ne[2], op->src[2]->ne[0], op->src[2]->ne[1]);
++}
++
++// the byte range [p0, p1) of buffer *pb that the base tensor of t may write (its whole allocation)
++static void ggml_metal_op_alloc_range(const ggml_tensor * t, const void ** pb, uint64_t * p0, uint64_t * p1) {
++    const ggml_tensor * b = t->view_src ? t->view_src : t;
++
++    *pb = b->buffer;
++    *p0 = (uint64_t) b->data;
++    *p1 = (uint64_t) b->data + (b->buffer ? ggml_backend_buft_get_alloc_size(b->buffer->buft, b) : ggml_nbytes(b));
++}
++
++// whether node idx may read the expert map that the MUL_MAT_ID node ctx->mmid_map.op built in its scratch: same ids and
++// shapes (key), and no node from there up to and including idx writes the ids or that scratch (a later node of the graph
++// may be placed in the memory of the first node once its consumers are done - e.g. the down projection over the gate's)
++static bool ggml_metal_op_mul_mat_id_map_valid(ggml_metal_op_t ctx, int idx, const ggml_metal_mmid_map_key & key) {
++    const ggml_tensor * a = ctx->mmid_map.op;
++    if (a == nullptr || ctx->mmid_map.idx < 0 || ctx->mmid_map.idx >= idx || !(ctx->mmid_map.key == key)) {
++        return false;
++    }
+ 
+-    const int64_t n_rows = ne20*ne21;
+-    const int64_t tiles  = (n_rows + 31)/32 + (ne02 < n_rows ? ne02 : n_rows) - 1;
++    const void * ab;
++    uint64_t a0, a1;
++    ggml_metal_op_alloc_range(a, &ab, &a0, &a1);
++    // the map: the tpe + ids part of the scratch after the result
++    const uint64_t m0 = (uint64_t) a->data + ggml_nbytes(a);
++    const uint64_t m1 = m0 + ggml_metal_op_mul_mat_id_extra_tpe(a) + ggml_metal_op_mul_mat_id_extra_ids(a);
++    if (a->view_src != nullptr || m1 > a1) {
++        return false;
++    }
++
++    const void * ib;
++    uint64_t i0, i1;
++    ggml_metal_op_alloc_range(ctx->node(idx)->src[2], &ib, &i0, &i1);
++
++    for (int k = ctx->mmid_map.idx + 1; k <= idx; ++k) {
++        const ggml_tensor * n = ctx->node(k);
++        if (ggml_op_is_empty(n->op)) {
++            continue;
++        }
++        const void * nb;
++        uint64_t n0, n1;
++        ggml_metal_op_alloc_range(n, &nb, &n0, &n1);
++        if (ggml_metal_mmid_ranges_overlap(nb, n0, n1, ab, m0, m1) || ggml_metal_mmid_ranges_overlap(nb, n0, n1, ib, i0, i1)) {
++            return false;
++        }
++    }
+ 
+-    return n_rows < tiles ? n_rows : tiles;
++    return true;
+ }
+ 
+ size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
+@@ -2821,6 +2884,52 @@ size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
+     return 8 + N_MM_NPART_AMAX*sizeof(float);
+ }
+ 
++// GGML_METAL_MMID_PAIR=1: the mat-vec MUL_MAT_ID of a verify window (2..16 tokens) runs two routes that use the same
++// expert in one threadgroup, which reads and unpacks the expert rows once for both (outputs bit-identical to the
++// single-route kernel). Off by default: the list costs one more dispatch and a barrier per op, and how often the
++// routes of a window collide (what the pairing saves) has not been measured on Apple GPUs yet.
++static bool ggml_metal_op_mul_mat_id_pair_enabled() {
++    static const bool on = getenv("GGML_METAL_MMID_PAIR") != nullptr && atoi(getenv("GGML_METAL_MMID_PAIR")) != 0;
++    return on;
++}
++
++// the op takes the paired path (independent of the device: 2..16 tokens never take the matrix-matrix kernel)
++static bool ggml_metal_op_mul_mat_id_use_pair(const ggml_tensor * op) {
++    if (!ggml_metal_op_mul_mat_id_pair_enabled()) {
++        return false;
++    }
++
++    const ggml_tensor * src0 = op->src[0];
++    const ggml_tensor * src1 = op->src[1];
++    const ggml_tensor * ids  = op->src[2];
++
++    switch (src0->type) {
++        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K:
++        case GGML_TYPE_Q6_K:
++            break;
++        default:
++            return false;
++    }
++
++    const int64_t n_tokens = ids->ne[1];
++    const int64_t n_routes = ids->ne[0]*ids->ne[1];
++
++    return src1->type == GGML_TYPE_F32 && ids->nb[0] == sizeof(int32_t) &&
++           n_tokens >= 2 && n_tokens <= GGML_METAL_MMID_PAIR_MAX_TOKENS && n_routes <= GGML_METAL_MMID_PAIR_MAX_ROUTES;
++}
++
++size_t ggml_metal_op_mul_mat_id_extra_pair(const ggml_tensor * op) {
++    assert(op->op == GGML_OP_MUL_MAT_ID);
++
++    if (!ggml_metal_op_mul_mat_id_use_pair(op)) {
++        return 0;
++    }
++
++    return ggml_type_size(GGML_TYPE_I32)*ggml_metal_mmid_pair_list_len(op->src[2]->ne[0]*op->src[2]->ne[1]);
++}
++
+ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+@@ -2875,6 +2984,40 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_buffer_id bid_amax = bid_ids;
+         bid_amax.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
+ 
++        // GGML_METAL_MMID_MAP_SHARE=0: every node builds its own map, as before. Otherwise the gate / up / down
++        // projections of a layer (same ids) read the map of the first of them: one map0 dispatch and one barrier less
++        // per sharing node; the map bytes are identical (they depend on the ids and shapes only)
++        static const bool map_share = getenv("GGML_METAL_MMID_MAP_SHARE") == nullptr || atoi(getenv("GGML_METAL_MMID_MAP_SHARE")) != 0;
++
++        const ggml_tensor * ids_base = op->src[2]->view_src ? op->src[2]->view_src : op->src[2];
++
++        ggml_metal_mmid_map_key map_key;
++        map_key.ids_buf  = ids_base->buffer;
++        map_key.ids_data = op->src[2]->data;
++        map_key.ne20     = ne20;
++        map_key.ne21     = ne21;
++        map_key.nb20     = (int64_t) nb20;
++        map_key.nb21     = (int64_t) nb21;
++        map_key.ne02     = ne02;
++
++        const bool map_shared = map_share && ggml_metal_op_mul_mat_id_map_valid(ctx, idx, map_key);
++        if (map_shared) {
++            const ggml_tensor * a = ctx->mmid_map.op;
++
++            bid_tpe = ggml_metal_get_buffer_id(a);
++            bid_tpe.offs += ggml_nbytes(a);
++
++            bid_ids = bid_tpe;
++            bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(a);
++
++            // the map is read beyond the srcs of this node: later nodes must not overwrite it while this one runs
++            if (ctx->mem_ranges) {
++                ggml_mem_ranges_add_src_tensor(ctx->mem_ranges, a);
++            }
++
++            ctx->n_mmid_shared++;
++        }
++
+         // src1 prec [TAG_GGML_PREC]
+         const bool use_amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
+ 
+@@ -2905,7 +3048,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+             ggml_metal_encoder_dispatch_threadgroups(enc, N_MM_NPART_AMAX, 1, 1, 256, 1, 1);
+         }
+ 
+-        {
++        if (!map_shared) {
+             ggml_metal_kargs_mul_mm_id_map0 args = {
+                 ne10,
+                 ne11, // n_expert_used (bcast)
+@@ -2933,9 +3076,19 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+             ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
+-        }
+ 
+-        ggml_metal_op_concurrency_reset(ctx);
++            ctx->mmid_map.op  = op;
++            ctx->mmid_map.idx = idx;
++            ctx->mmid_map.key = map_key;
++
++            ctx->n_mmid_built++;
++
++            // the matmul has to wait for the map
++            ggml_metal_op_concurrency_reset(ctx);
++        } else if (use_amax) {
++            // the amax kernel below reads the partial scales of the amax_part dispatch above
++            ggml_metal_op_concurrency_reset(ctx);
++        }
+ 
+         if (use_amax) {
+             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_amax(lib);
+@@ -3025,6 +3178,63 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+             GGML_ASSERT(ne00 >= nsg*nr0);
+         }
+ 
++        const int64_t _ne1 = 1;
++        const int64_t ne123 = ne20*ne21;
++
++        if (ggml_metal_op_mul_mat_id_use_pair(op)) {
++            // the list of paired routes, after the scratch of the matrix-matrix path
++            ggml_metal_buffer_id bid_pair = bid_dst;
++            bid_pair.offs += ggml_nbytes(op) + ggml_metal_op_mul_mat_id_extra_tpe(op) + ggml_metal_op_mul_mat_id_extra_ids(op) +
++                ggml_metal_op_mul_mat_id_extra_amax(op);
++
++            {
++                auto pipeline_map = ggml_metal_library_get_pipeline_mul_mv_id_pair_map(lib, (int) ne123);
++
++                GGML_ASSERT(ne123 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_map));
++                GGML_ASSERT(pipeline_map.smem <= props_dev->max_theadgroup_memory_size);
++
++                ggml_metal_encoder_set_pipeline(enc, pipeline_map);
++                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++                ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
++                ggml_metal_encoder_set_buffer  (enc, bid_pair, 2);
++
++                ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline_map.smem, 0);
++
++                ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, (int) ne123, 1, 1);
++            }
++
++            // the list is read by every threadgroup of the next kernel
++            ggml_metal_op_concurrency_reset(ctx);
++
++            auto pipeline_pair = ggml_metal_library_get_pipeline_mul_mv_id_pair(lib, op);
++
++            GGML_ASSERT(pipeline_pair.nsg == nsg && pipeline_pair.nr0 == nr0);
++
++            static const bool pair_debug = getenv("GGML_METAL_MMID_PAIR_DEBUG") != nullptr && atoi(getenv("GGML_METAL_MMID_PAIR_DEBUG")) != 0;
++            if (pair_debug) {
++                GGML_LOG_INFO("%s: mmid pair: %s %s, routes %d (tokens %d x used %d), dispatches 2 (map + paired, grid z <= %d entries) instead of 1 (grid z %d)\n",
++                    __func__, ggml_get_name(op), ggml_type_name(op->src[0]->type), (int) ne123, (int) ne21, (int) ne20, (int) ne123, (int) ne123);
++            }
++
++            ggml_metal_encoder_set_pipeline(enc, pipeline_pair);
++            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
++            ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
++            ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
++            ggml_metal_encoder_set_buffer  (enc, bid_pair, 4);
++
++            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
++
++            // grid z: the most entries (every route single); the threadgroups past the count exit
++            if (op->src[0]->type == GGML_TYPE_Q8_0) {
++                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0 - 1)/(nr0), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
++            } else {
++                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
++            }
++
++            return 1;
++        }
++
+         ggml_metal_encoder_set_pipeline(enc, pipeline);
+         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+         ggml_metal_encoder_set_buffer(enc, bid_src0, 1);
+@@ -3032,9 +3242,6 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_set_buffer(enc, bid_dst,  3);
+         ggml_metal_encoder_set_buffer(enc, bid_src2, 4);
+ 
+-        const int64_t _ne1 = 1;
+-        const int64_t ne123 = ne20*ne21;
+-
+         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+         if (op->src[0]->type == GGML_TYPE_F32 ||
+@@ -5483,6 +5690,51 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++// GGML_OP_KQ_MASK, the selection mask kind only (ggml_sel_mask; supports_op refuses the other kinds): one threadgroup per row
++// fills the row with kq - INFINITY and then writes kq + 0 at the selected cells of the row
++int ggml_metal_op_kq_mask(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    GGML_ASSERT(ggml_get_op_params_i32(op, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL);
++
++    const ggml_tensor * idx_t = op->src[0];
++    const ggml_tensor * kq    = op->src[1];
++
++    GGML_ASSERT(ggml_is_contiguous(op) && ggml_is_contiguous(kq) && idx_t->nb[0] == sizeof(int32_t));
++
++    const int64_t n_kv   = op->ne[0];
++    const int64_t n_rows = op->ne[1]*op->ne[2]*op->ne[3];
++
++    if (n_kv == 0 || n_rows == 0) {
++        return 1;
++    }
++
++    ggml_metal_kargs_sel_mask args = {
++        /*.n_kv    =*/ n_kv,
++        /*.n_sel   =*/ idx_t->ne[0],
++        /*.nb1_idx =*/ idx_t->nb[1],
++        /*.nb1_kq  =*/ kq->nb[1],
++        /*.nb1_dst =*/ op->nb[1],
++    };
++
++    auto pipeline = ggml_metal_library_get_pipeline_sel_mask(lib, op);
++
++    const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), 1024);
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(idx_t), 1);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kq),    2);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),    3);
++
++    ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_rows, 1, 1, nth, 1, 1);
++
++    return 1;
++}
++
+ int ggml_metal_op_argsort(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 583d1156bf2..df6ea2be3ef 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -38,6 +38,9 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
+ size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
+ size_t ggml_metal_op_mul_mat_id_extra_amax(const struct ggml_tensor * op);
+ 
++// list of the paired routes of the mat-vec path (GGML_METAL_MMID_PAIR=1), 0 when the op does not take it
++size_t ggml_metal_op_mul_mat_id_extra_pair(const struct ggml_tensor * op);
++
+ // return true if we should use the FA vector kernel for this op
+ bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
+ 
+@@ -96,6 +99,7 @@ int ggml_metal_op_roll              (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_arange            (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_kq_mask           (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_argsort           (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_top_k             (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_topk_moe          (ggml_metal_op_t ctx, int idx);
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index 344882e044f..22e6953c4c4 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -227,6 +227,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
+                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
+                 res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
+                 res += ggml_metal_op_mul_mat_id_extra_amax(tensor);
++                res += ggml_metal_op_mul_mat_id_extra_pair(tensor);
+             } break;
+         case GGML_OP_FLASH_ATTN_EXT:
+             {
+diff --git a/ggml/src/ggml-metal/kernels/fa_aux.metal b/ggml/src/ggml-metal/kernels/fa_aux.metal
+index ebee1becd28..731940a47bb 100644
+--- a/ggml/src/ggml-metal/kernels/fa_aux.metal
++++ b/ggml/src/ggml-metal/kernels/fa_aux.metal
+@@ -301,13 +301,17 @@ kernel void kernel_flash_attn_ext_vec_reduce(
+ 
+     const short iwg = tiisg;
+ 
++    // one lane per workgroup partial: with NWG < 32 the lanes past NWG read nothing and add nothing (same result as
++    // today's NWG = 32, where every lane is live)
++    const bool live = iwg < NWG;
++
+     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
+ 
+-    float S = ss[rid*(2*NWG) + 2*iwg + 0];
+-    float M = ss[rid*(2*NWG) + 2*iwg + 1];
++    float S = live ? ss[rid*(2*NWG) + 2*iwg + 0] : 0.0f;
++    float M = live ? ss[rid*(2*NWG) + 2*iwg + 1] : -FLT_MAX;
+ 
+     const float m  = simd_max(M);
+-    const float ms = exp(M - m);
++    const float ms = live ? exp(M - m) : 0.0f;
+ 
+     S = simd_sum(S*ms);
+     S = S == 0.0f ? 0.0f : 1.0f/S;
+@@ -318,7 +322,7 @@ kernel void kernel_flash_attn_ext_vec_reduce(
+     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
+ 
+     for (short i = sgitg; i < DV4; i += NWG) {
+-        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
++        const float4 v = simd_sum(live ? htmp4[i*NWG + iwg]*ms : float4(0.0f));
+ 
+         if (iwg == 0) {
+             dst4[i] = v*S;
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index b48a4ca7f51..c15e96d1102 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -776,3 +776,47 @@ kernel void kernel_dsv4_hc_post_f32(
+         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
+     }
+ }
++
++// ggml_sel_mask (GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL): each cell is the f16 sum of the chain it replaces,
++// f16(-INFINITY + kq) everywhere, then f16(0 + kq) at the selected cells. Done on the bits, so fast math cannot fold
++// the infinity: -inf for every kq except +inf / NaN (NaN); kq for 0 + kq, except -0 (+0) and NaN (quieted)
++static inline ushort sel_mask_minus_inf(ushort k) {
++    const bool nan  = (k & 0x7C00) == 0x7C00 && (k & 0x03FF) != 0;
++    const bool pinf = k == 0x7C00;
++    return nan ? (ushort) (k | 0x0200) : (pinf ? (ushort) 0x7E00 : (ushort) 0xFC00);
++}
++
++static inline ushort sel_mask_plus_zero(ushort k) {
++    const bool nan = (k & 0x7C00) == 0x7C00 && (k & 0x03FF) != 0;
++    return nan ? (ushort) (k | 0x0200) : (k == 0x8000 ? (ushort) 0 : k);
++}
++
++kernel void kernel_sel_mask_f16(
++        constant ggml_metal_kargs_sel_mask & args,
++        device const char * idx,
++        device const char * kq,
++        device       char * dst,
++        uint   tgpig[[threadgroup_position_in_grid]],
++        ushort tpitg[[thread_position_in_threadgroup]],
++        ushort   ntg[[threads_per_threadgroup]]) {
++    const uint64_t r = tgpig;
++
++    device const ushort  * kq_r  = (device const ushort  *) (kq  + r*args.nb1_kq);
++    device       ushort  * dst_r = (device       ushort  *) (dst + r*args.nb1_dst);
++    device const int32_t * idx_r = (device const int32_t *) (idx + r*args.nb1_idx);
++
++    for (int64_t j = tpitg; j < args.n_kv; j += ntg) {
++        dst_r[j] = sel_mask_minus_inf(kq_r[j]);
++    }
++
++    // the row belongs to this threadgroup alone: its fill stores are ordered before the scatter
++    threadgroup_barrier(mem_flags::mem_device);
++
++    for (int64_t s = tpitg; s < args.n_sel; s += ntg) {
++        const int32_t j = idx_r[s];
++        if (j < 0 || j >= args.n_kv) {
++            continue; // a dead slot
++        }
++        dst_r[j] = sel_mask_plus_zero(kq_r[j]);
++    }
++}
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+index dfa5102c56f..6bfaa200bd8 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -9,6 +9,8 @@ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
+ constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
+ constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
+ constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
++constant bool FC_mul_mm_id_sgsplit [[function_constant(FC_MUL_MM + 8)]];
++constant bool FC_mul_mm_id_bskip   [[function_constant(FC_MUL_MM + 9)]];
+ 
+ // each block_q contains 16*nl weights
+ #ifdef GGML_METAL_HAS_TENSOR
+@@ -709,7 +711,19 @@ kernel void kernel_mul_mm_id(
+     }
+ 
+     // simdgroups 2,3 own rows NR1H..NR1-1
+-    const bool sg_active = has_hi || sgitg < 2;
++    // sgsplit (GGML_METAL_MMID_SGSPLIT): a tile of at most NR1H rows spreads its 2 x 8 output blocks over all 4
++    // simdgroups (A rows 16*sgitg .. 16*sgitg + 15 each, all B rows) instead of idling simdgroups 2,3; every
++    // output block keeps its own accumulator and the same chain of multiply-accumulates over K, so the result
++    // is identical
++    const bool split4    = FC_mul_mm_id_sgsplit && !has_hi;
++    const bool sg_active = split4 || has_hi || sgitg < 2;
++
++    // first B row of the blocks of this simdgroup
++    const short r1b = split4 ? 0 : NR1H*(sgitg >> 1);
++
++    // bskip (GGML_METAL_MMID_BSKIP): the second 8-row B block of this simdgroup is not loaded and its
++    // multiply-accumulates are not run when all of its rows are >= nr1 (those accumulators are never written to dst)
++    const bool b1_live = !FC_mul_mm_id_bskip || r1b + 8 < nr1;
+ #else
+     auto cT0 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB0), float>();
+     auto cT1 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB1), float>();
+@@ -855,7 +869,40 @@ kernel void kernel_mul_mm_id(
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+ #ifndef GGML_METAL_HAS_TENSOR
+-        if (sg_active) {
++        if (split4) {
++            // A blocks 2*sgitg, 2*sgitg + 1 against B blocks 0 (and 1): mc[2*b + i] = mb[b] x ma[i]
++            threadgroup const S0 * lsma = (sa + 2*64*sgitg);
++            threadgroup const S1 * lsmb = (sb);
++
++            FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
++                simdgroup_barrier(mem_flags::mem_none);
++
++                FOR_UNROLL (short i = 0; i < 2; i++) {
++                    simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
++                }
++
++                simdgroup_barrier(mem_flags::mem_none);
++
++                simdgroup_load(mb[0], lsmb, 8, 0, false);
++                if (b1_live) {
++                    simdgroup_load(mb[1], lsmb + 64, 8, 0, false);
++                }
++
++                simdgroup_barrier(mem_flags::mem_none);
++
++                FOR_UNROLL (short i = 0; i < 2; i++) {
++                    simdgroup_multiply_accumulate(mc[i], mb[0], ma[i], mc[i]);
++                }
++                if (b1_live) {
++                    FOR_UNROLL (short i = 0; i < 2; i++) {
++                        simdgroup_multiply_accumulate(mc[2 + i], mb[1], ma[i], mc[2 + i]);
++                    }
++                }
++
++                lsma += 8*64;
++                lsmb += 4*64;
++            }
++        } else if (sg_active) {
+             // load matrices from threadgroup memory and conduct outer products
+             threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
+             threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
+@@ -869,14 +916,20 @@ kernel void kernel_mul_mm_id(
+ 
+                 simdgroup_barrier(mem_flags::mem_none);
+ 
+-                FOR_UNROLL (short i = 0; i < 2; i++) {
+-                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
++                simdgroup_load(mb[0], lsmb, 8, 0, false);
++                if (b1_live) {
++                    simdgroup_load(mb[1], lsmb + 64, 8, 0, false);
+                 }
+ 
+                 simdgroup_barrier(mem_flags::mem_none);
+ 
+-                FOR_UNROLL (short i = 0; i < 8; i++){
+-                    simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
++                FOR_UNROLL (short i = 0; i < 4; i++){
++                    simdgroup_multiply_accumulate(mc[i], mb[0], ma[i], mc[i]);
++                }
++                if (b1_live) {
++                    FOR_UNROLL (short i = 4; i < 8; i++){
++                        simdgroup_multiply_accumulate(mc[i], mb[1], ma[i%4], mc[i]);
++                    }
+                 }
+ 
+                 lsma += 8*64;
+@@ -909,10 +962,17 @@ kernel void kernel_mul_mm_id(
+         cT1.store(tC1);
+     }
+ #else
+-    if (sg_active) {
++    if (split4) {
++        // A columns 16*sgitg .., B rows 0 .. 15
++        threadgroup float * temp_str = ((threadgroup float *) shmem) + 16*sgitg;
++
++        for (short i = 0; i < (b1_live ? 4 : 2); i++) {
++            simdgroup_store(mc[i], temp_str + 8*(i%2) + 8*NR0*(i/2), NR0, 0, false);
++        }
++    } else if (sg_active) {
+         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+ 
+-        for (short i = 0; i < 8; i++) {
++        for (short i = 0; i < (b1_live ? 8 : 4); i++) {
+             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+         }
+     }
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 15d0da60351..bf0f1df93c6 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -1867,6 +1867,526 @@ kernel void kernel_mul_mv_q6_K_f32(
+     kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+ }
+ 
++// paired-route variants of the q8_0 / q4_K / q5_K / q6_K mat-vec kernels for kernel_mul_mv_id_pair: two src1 rows
++// that use the same expert share the loads and the unpack of src0, each with the exact arithmetic of the
++// single-row kernel above (the same expressions per row of src1, the same lane order and reductions), so every
++// output equals the one of kernel_mul_mv_id bit for bit
++
++typedef void (kernel_mul_mv_pair_disp_t)(
++        ggml_metal_kargs_mul_mv args,
++        device const char * src0,
++        device const char * src1a,
++        device const char * src1b,
++        device       char * dsta,
++        device       char * dstb,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg);
++
++template<short NR0, typename args_t>
++void kernel_mul_mv_q8_0_f32_pair_impl(
++        args_t args,
++        device const char * src0,
++        device const char * src1a,
++        device const char * src1b,
++        device       char * dsta,
++        device       char * dstb,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++
++    constexpr short NW = N_SIMDWIDTH;
++    constexpr short NQ = 8;
++
++    const int nb = args.ne00/QK8_0;
++
++    const int r0 = tgpig.x*NR0;
++    const int r1 = tgpig.y;
++    const int im = tgpig.z;
++
++    const uint i12 = im%FC_mul_mv_ne12;
++    const uint i13 = im/FC_mul_mv_ne12;
++
++    const uint64_t offset1 = r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
++
++    device const float * ya = (device const float *) (src1a + offset1);
++    device const float * yb = (device const float *) (src1b + offset1);
++
++    device const block_q8_0 * ax[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
++
++        ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
++    }
++
++    float sumfa[NR0] = { 0.f };
++    float sumfb[NR0] = { 0.f };
++
++    const short ix = tiisg/(NW/NQ);
++    const short il = tiisg%(NW/NQ);
++
++    const int ib0 = sgitg*NQ + ix;
++
++    float yla[NQ];
++    float ylb[NQ];
++
++    device const float * yba = ya + ib0*QK8_0 + il*NQ;
++    device const float * ybb = yb + ib0*QK8_0 + il*NQ;
++
++    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
++        for (short i = 0; i < NQ; ++i) {
++            yla[i] = yba[i];
++            ylb[i] = ybb[i];
++        }
++
++        for (short row = 0; row < NR0; row++) {
++            device const int8_t * qs = ax[row][ib].qs + il*NQ;
++
++            float sumqa = 0.f;
++            float sumqb = 0.f;
++            FOR_UNROLL (short i = 0; i < NQ; ++i) {
++                sumqa += qs[i] * yla[i];
++                sumqb += qs[i] * ylb[i];
++            }
++
++            sumfa[row] += sumqa*ax[row][ib].d;
++            sumfb[row] += sumqb*ax[row][ib].d;
++        }
++
++        yba += NSG*NQ*QK8_0;
++        ybb += NSG*NQ*QK8_0;
++    }
++
++    device float * dsta_f32 = (device float *) dsta + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
++    device float * dstb_f32 = (device float *) dstb + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
++
++    helper_mv_reduce_and_write<NR0>(dsta_f32, sumfa, r0, args.ne01, tiisg, sgitg, shmem);
++
++    // the second reduction reuses the scratch of the first
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    helper_mv_reduce_and_write<NR0>(dstb_f32, sumfb, r0, args.ne01, tiisg, sgitg, shmem);
++}
++
++template<int nr0, typename args_t>
++void kernel_mul_mv_q4_K_f32_pair_impl(
++        args_t args,
++        device const char * src0,
++        device const char * src1a,
++        device const char * src1b,
++        device       char * dsta,
++        device       char * dstb,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++
++    constexpr uint16_t kmask1 = 0x3f3f;
++    constexpr uint16_t kmask2 = 0x0f0f;
++    constexpr uint16_t kmask3 = 0xc0c0;
++
++    const short ix = tiisg/8;  // 0...3
++    const short it = tiisg%8;  // 0...7
++    const short iq = it/4;     // 0 or 1
++    const short ir = it%4;     // 0...3
++
++    const int nb = args.ne00/QK_K;
++
++    const int r0 = tgpig.x;
++    const int r1 = tgpig.y;
++    const int im = tgpig.z;
++
++    const int first_row = (r0 * NSG + sgitg) * nr0;
++
++    const uint i12 = im%FC_mul_mv_ne12;
++    const uint i13 = im/FC_mul_mv_ne12;
++
++    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
++    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
++
++    device const block_q4_K * x  = (device const block_q4_K *) (src0  + offset0);
++    device const float      * ya = (device const float      *) (src1a + offset1);
++    device const float      * yb = (device const float      *) (src1b + offset1);
++
++    float yla[16];
++    float yha[16];
++    float ylb[16];
++    float yhb[16];
++
++    float sumfa[nr0]={0.f};
++    float sumfb[nr0]={0.f};
++
++    device const float * y4a = ya + ix * QK_K + 64 * iq + 8 * ir;
++    device const float * y4b = yb + ix * QK_K + 64 * iq + 8 * ir;
++
++    uint16_t sc16[4];
++    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
++
++    for (int ib = ix; ib < nb; ib += 4) {
++        float4 sumya = {0.f, 0.f, 0.f, 0.f};
++        float4 sumyb = {0.f, 0.f, 0.f, 0.f};
++
++        for (short i = 0; i < 8; ++i) {
++            yla[i+0] = y4a[i+  0]; sumya[0] += yla[i+0];
++            yla[i+8] = y4a[i+ 32]; sumya[1] += yla[i+8];
++            yha[i+0] = y4a[i+128]; sumya[2] += yha[i+0];
++            yha[i+8] = y4a[i+160]; sumya[3] += yha[i+8];
++
++            ylb[i+0] = y4b[i+  0]; sumyb[0] += ylb[i+0];
++            ylb[i+8] = y4b[i+ 32]; sumyb[1] += ylb[i+8];
++            yhb[i+0] = y4b[i+128]; sumyb[2] += yhb[i+0];
++            yhb[i+8] = y4b[i+160]; sumyb[3] += yhb[i+8];
++        }
++
++        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
++        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
++        device const half     * dh = &x[ib].d;
++
++        for (short row = 0; row < nr0; row++) {
++            sc16[0] = sc[0] & kmask1;
++            sc16[1] = sc[2] & kmask1;
++            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
++            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
++
++            device const uint16_t * q2 = q1 + 32;
++
++            float4 acc1a = {0.f, 0.f, 0.f, 0.f};
++            float4 acc2a = {0.f, 0.f, 0.f, 0.f};
++            float4 acc1b = {0.f, 0.f, 0.f, 0.f};
++            float4 acc2b = {0.f, 0.f, 0.f, 0.f};
++
++            FOR_UNROLL (short i = 0; i < 4; ++i) {
++                acc1a[0] += yla[2*i + 0] * (q1[i] & 0x000F);
++                acc1a[1] += yla[2*i + 1] * (q1[i] & 0x0F00);
++                acc1a[2] += yla[2*i + 8] * (q1[i] & 0x00F0);
++                acc1a[3] += yla[2*i + 9] * (q1[i] & 0xF000);
++                acc2a[0] += yha[2*i + 0] * (q2[i] & 0x000F);
++                acc2a[1] += yha[2*i + 1] * (q2[i] & 0x0F00);
++                acc2a[2] += yha[2*i + 8] * (q2[i] & 0x00F0);
++                acc2a[3] += yha[2*i + 9] * (q2[i] & 0xF000);
++
++                acc1b[0] += ylb[2*i + 0] * (q1[i] & 0x000F);
++                acc1b[1] += ylb[2*i + 1] * (q1[i] & 0x0F00);
++                acc1b[2] += ylb[2*i + 8] * (q1[i] & 0x00F0);
++                acc1b[3] += ylb[2*i + 9] * (q1[i] & 0xF000);
++                acc2b[0] += yhb[2*i + 0] * (q2[i] & 0x000F);
++                acc2b[1] += yhb[2*i + 1] * (q2[i] & 0x0F00);
++                acc2b[2] += yhb[2*i + 8] * (q2[i] & 0x00F0);
++                acc2b[3] += yhb[2*i + 9] * (q2[i] & 0xF000);
++            }
++
++            sumfa[row] += dh[0] * ((acc1a[0] + 1.f/256.f * acc1a[1]) * sc8[0] +
++                                   (acc1a[2] + 1.f/256.f * acc1a[3]) * sc8[1] * 1.f/16.f +
++                                   (acc2a[0] + 1.f/256.f * acc2a[1]) * sc8[4] +
++                                   (acc2a[2] + 1.f/256.f * acc2a[3]) * sc8[5] * 1.f/16.f) -
++                          dh[1] * (sumya[0] * sc8[2] + sumya[1] * sc8[3] + sumya[2] * sc8[6] + sumya[3] * sc8[7]);
++
++            sumfb[row] += dh[0] * ((acc1b[0] + 1.f/256.f * acc1b[1]) * sc8[0] +
++                                   (acc1b[2] + 1.f/256.f * acc1b[3]) * sc8[1] * 1.f/16.f +
++                                   (acc2b[0] + 1.f/256.f * acc2b[1]) * sc8[4] +
++                                   (acc2b[2] + 1.f/256.f * acc2b[3]) * sc8[5] * 1.f/16.f) -
++                          dh[1] * (sumyb[0] * sc8[2] + sumyb[1] * sc8[3] + sumyb[2] * sc8[6] + sumyb[3] * sc8[7]);
++
++            q1 += args.nb01/2;
++            sc += args.nb01/2;
++            dh += args.nb01/2;
++        }
++
++        y4a += 4 * QK_K;
++        y4b += 4 * QK_K;
++    }
++
++    device float * dsta_f32 = (device float *) dsta + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
++    device float * dstb_f32 = (device float *) dstb + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
++
++    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
++        float sum_alla = simd_sum(sumfa[row]);
++        float sum_allb = simd_sum(sumfb[row]);
++        if (tiisg == 0) {
++            dsta_f32[first_row + row] = sum_alla;
++            dstb_f32[first_row + row] = sum_allb;
++        }
++    }
++}
++
++template<int nr0, typename args_t>
++void kernel_mul_mv_q5_K_f32_pair_impl(
++        args_t args,
++        device const char * src0,
++        device const char * src1a,
++        device const char * src1b,
++        device       char * dsta,
++        device       char * dstb,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++
++    const int nb = args.ne00/QK_K;
++
++    const int r0 = tgpig.x;
++    const int r1 = tgpig.y;
++    const int im = tgpig.z;
++
++    const int first_row = (r0 * NSG + sgitg) * nr0;
++
++    const uint i12 = im%FC_mul_mv_ne12;
++    const uint i13 = im/FC_mul_mv_ne12;
++
++    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
++    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
++
++    device const block_q5_K * x   = (device const block_q5_K *) (src0  + offset0);
++    device const float      * yya = (device const float      *) (src1a + offset1);
++    device const float      * yyb = (device const float      *) (src1b + offset1);
++
++    float sumfa[nr0]={0.f};
++    float sumfb[nr0]={0.f};
++
++    float yla[16], yha[16];
++    float ylb[16], yhb[16];
++
++    constexpr uint16_t kmask1 = 0x3f3f;
++    constexpr uint16_t kmask2 = 0x0f0f;
++    constexpr uint16_t kmask3 = 0xc0c0;
++
++    const short tid = tiisg/4;
++    const short ix  = tiisg%4;
++    const short iq  = tid/4;
++    const short ir  = tid%4;
++
++    const short l0 = 8*ir;
++    const short q_offset = 32*iq + l0;
++    const short y_offset = 64*iq + l0;
++
++    const uint8_t hm1 = 1u << (2*iq);
++    const uint8_t hm2 = hm1 << 1;
++    const uint8_t hm3 = hm1 << 4;
++    const uint8_t hm4 = hm2 << 4;
++
++    uint16_t sc16[4];
++    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
++
++    device const float * y1a = yya + ix*QK_K + y_offset;
++    device const float * y1b = yyb + ix*QK_K + y_offset;
++
++    for (int i = ix; i < nb; i += 4) {
++        device const uint8_t * q1 = x[i].qs + q_offset;
++        device const uint8_t * qh = x[i].qh + l0;
++        device const half * dh = &x[i].d;
++        device const uint16_t * a = (device const uint16_t *)x[i].scales + iq;
++
++        device const float * y2a = y1a + 128;
++        device const float * y2b = y1b + 128;
++        float4 sumya = {0.f, 0.f, 0.f, 0.f};
++        float4 sumyb = {0.f, 0.f, 0.f, 0.f};
++        for (short l = 0; l < 8; ++l) {
++            yla[l+0] = y1a[l+ 0]; sumya[0] += yla[l+0];
++            yla[l+8] = y1a[l+32]; sumya[1] += yla[l+8];
++            yha[l+0] = y2a[l+ 0]; sumya[2] += yha[l+0];
++            yha[l+8] = y2a[l+32]; sumya[3] += yha[l+8];
++
++            ylb[l+0] = y1b[l+ 0]; sumyb[0] += ylb[l+0];
++            ylb[l+8] = y1b[l+32]; sumyb[1] += ylb[l+8];
++            yhb[l+0] = y2b[l+ 0]; sumyb[2] += yhb[l+0];
++            yhb[l+8] = y2b[l+32]; sumyb[3] += yhb[l+8];
++        }
++
++        for (short row = 0; row < nr0; ++row) {
++            device const uint8_t * q2 = q1 + 64;
++
++            sc16[0] = a[0] & kmask1;
++            sc16[1] = a[2] & kmask1;
++            sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
++            sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
++
++            float4 acc1a = {0.f};
++            float4 acc2a = {0.f};
++            float4 acc1b = {0.f};
++            float4 acc2b = {0.f};
++            FOR_UNROLL (short l = 0; l < 8; ++l) {
++                uint8_t h = qh[l];
++                acc1a[0] += yla[l+0] * (q1[l] & 0x0F);
++                acc1a[1] += yla[l+8] * (q1[l] & 0xF0);
++                acc1a[2] += yha[l+0] * (q2[l] & 0x0F);
++                acc1a[3] += yha[l+8] * (q2[l] & 0xF0);
++                acc2a[0] += h & hm1 ? yla[l+0] : 0.f;
++                acc2a[1] += h & hm2 ? yla[l+8] : 0.f;
++                acc2a[2] += h & hm3 ? yha[l+0] : 0.f;
++                acc2a[3] += h & hm4 ? yha[l+8] : 0.f;
++
++                acc1b[0] += ylb[l+0] * (q1[l] & 0x0F);
++                acc1b[1] += ylb[l+8] * (q1[l] & 0xF0);
++                acc1b[2] += yhb[l+0] * (q2[l] & 0x0F);
++                acc1b[3] += yhb[l+8] * (q2[l] & 0xF0);
++                acc2b[0] += h & hm1 ? ylb[l+0] : 0.f;
++                acc2b[1] += h & hm2 ? ylb[l+8] : 0.f;
++                acc2b[2] += h & hm3 ? yhb[l+0] : 0.f;
++                acc2b[3] += h & hm4 ? yhb[l+8] : 0.f;
++            }
++
++            sumfa[row] += dh[0] * (sc8[0] * (acc1a[0]      + 16.f*acc2a[0]) +
++                                   sc8[1] * (acc1a[1]/16.f + 16.f*acc2a[1]) +
++                                   sc8[4] * (acc1a[2]      + 16.f*acc2a[2]) +
++                                   sc8[5] * (acc1a[3]/16.f + 16.f*acc2a[3])) -
++                          dh[1] * (sumya[0] * sc8[2] + sumya[1] * sc8[3] + sumya[2] * sc8[6] + sumya[3] * sc8[7]);
++
++            sumfb[row] += dh[0] * (sc8[0] * (acc1b[0]      + 16.f*acc2b[0]) +
++                                   sc8[1] * (acc1b[1]/16.f + 16.f*acc2b[1]) +
++                                   sc8[4] * (acc1b[2]      + 16.f*acc2b[2]) +
++                                   sc8[5] * (acc1b[3]/16.f + 16.f*acc2b[3])) -
++                          dh[1] * (sumyb[0] * sc8[2] + sumyb[1] * sc8[3] + sumyb[2] * sc8[6] + sumyb[3] * sc8[7]);
++
++            q1 += args.nb01;
++            qh += args.nb01;
++            dh += args.nb01/2;
++            a  += args.nb01/2;
++        }
++
++        y1a += 4 * QK_K;
++        y1b += 4 * QK_K;
++    }
++
++    device float * dsta_f32 = (device float *) dsta + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
++    device float * dstb_f32 = (device float *) dstb + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
++
++    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
++        const float tota = simd_sum(sumfa[row]);
++        const float totb = simd_sum(sumfb[row]);
++        if (tiisg == 0) {
++            dsta_f32[first_row + row] = tota;
++            dstb_f32[first_row + row] = totb;
++        }
++    }
++}
++
++template<int nr0, typename args_t>
++void kernel_mul_mv_q6_K_f32_pair_impl(
++        args_t args,
++        device const char * src0,
++        device const char * src1a,
++        device const char * src1b,
++        device       char * dsta,
++        device       char * dstb,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++
++    constexpr uint8_t kmask1 = 0x03;
++    constexpr uint8_t kmask2 = 0x0C;
++    constexpr uint8_t kmask3 = 0x30;
++    constexpr uint8_t kmask4 = 0xC0;
++
++    const int nb = args.ne00/QK_K;
++
++    const int r0 = tgpig.x;
++    const int r1 = tgpig.y;
++    const int im = tgpig.z;
++
++    const int first_row = (r0 * NSG + sgitg) * nr0;
++
++    const uint i12 = im%FC_mul_mv_ne12;
++    const uint i13 = im/FC_mul_mv_ne12;
++
++    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
++    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
++
++    device const block_q6_K * x   = (device const block_q6_K *) (src0  + offset0);
++    device const float      * yya = (device const float      *) (src1a + offset1);
++    device const float      * yyb = (device const float      *) (src1b + offset1);
++
++    float sumfa[nr0] = { 0.f };
++    float sumfb[nr0] = { 0.f };
++
++    float yla[16];
++    float ylb[16];
++
++    const short tid = tiisg/2;
++    const short ix  = tiisg%2;
++    const short ip  = tid/8;         // 0 or 1
++    const short il  = tid%8;
++    const short l0  = 4*il;
++    const short is  = 8*ip + l0/16;
++
++    const short y_offset   = 128*ip + l0;
++    const short q_offset_l =  64*ip + l0;
++    const short q_offset_h =  32*ip + l0;
++
++    for (int i = ix; i < nb; i += 2) {
++        device const uint8_t * q1 = x[i].ql + q_offset_l;
++        device const uint8_t * q2 = q1 + 32;
++        device const uint8_t * qh = x[i].qh + q_offset_h;
++        device const int8_t  * sc = x[i].scales + is;
++        device const half    * dh = &x[i].d;
++
++        device const float * ya = yya + i * QK_K + y_offset;
++        device const float * yb = yyb + i * QK_K + y_offset;
++
++        for (short l = 0; l < 4; ++l) {
++            yla[4*l + 0] = ya[l +  0];
++            yla[4*l + 1] = ya[l + 32];
++            yla[4*l + 2] = ya[l + 64];
++            yla[4*l + 3] = ya[l + 96];
++
++            ylb[4*l + 0] = yb[l +  0];
++            ylb[4*l + 1] = yb[l + 32];
++            ylb[4*l + 2] = yb[l + 64];
++            ylb[4*l + 3] = yb[l + 96];
++        }
++
++        for (short row = 0; row < nr0; ++row) {
++            float4 sumsa = {0.f, 0.f, 0.f, 0.f};
++            float4 sumsb = {0.f, 0.f, 0.f, 0.f};
++
++            FOR_UNROLL (short l = 0; l < 4; ++l) {
++                // the unpacked weights of this lane, shared by both src1 rows
++                const int8_t w0 = (int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32;
++                const int8_t w1 = (int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32;
++                const int8_t w2 = (int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32;
++                const int8_t w3 = (int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32;
++
++                sumsa[0] += yla[4*l + 0] * w0;
++                sumsa[1] += yla[4*l + 1] * w1;
++                sumsa[2] += yla[4*l + 2] * w2;
++                sumsa[3] += yla[4*l + 3] * w3;
++
++                sumsb[0] += ylb[4*l + 0] * w0;
++                sumsb[1] += ylb[4*l + 1] * w1;
++                sumsb[2] += ylb[4*l + 2] * w2;
++                sumsb[3] += ylb[4*l + 3] * w3;
++            }
++
++            sumfa[row] += dh[0] * (sumsa[0] * sc[0] + sumsa[1] * sc[2] + sumsa[2] * sc[4] + sumsa[3] * sc[6]);
++            sumfb[row] += dh[0] * (sumsb[0] * sc[0] + sumsb[1] * sc[2] + sumsb[2] * sc[4] + sumsb[3] * sc[6]);
++
++            q1 += args.nb01;
++            q2 += args.nb01;
++            qh += args.nb01;
++            sc += args.nb01;
++            dh += args.nb01/2;
++        }
++    }
++
++    device float * dsta_f32 = (device float *) dsta + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
++    device float * dstb_f32 = (device float *) dstb + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
++
++    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
++        float sum_alla = simd_sum(sumfa[row]);
++        float sum_allb = simd_sum(sumfb[row]);
++        if (tiisg == 0) {
++            dsta_f32[first_row + row] = sum_alla;
++            dstb_f32[first_row + row] = sum_allb;
++        }
++    }
++}
++
+ // ======================= "True" 2-bit
+ 
+ template<int nr0, typename args_t>
+@@ -3418,3 +3938,147 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
+ template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
+ template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
+ template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
++
++// paired routes (GGML_METAL_MMID_PAIR=1, see ggml-metal-mmid-pair.h, the reference of this kernel): the list of
++// (expert, route A, route B or -1) entries of the ids, one thread per route (n = nei0*nei1 threads, one threadgroup)
++kernel void kernel_mul_mv_id_pair_map(
++        constant ggml_metal_kargs_mul_mv_id & args,
++        device const char * ids,
++        device       char * pairs,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        ushort tpitg[[thread_position_in_threadgroup]],
++        ushort   ntg[[threads_per_threadgroup]]) {
++    const int n = args.nei0*args.nei1;
++
++    threadgroup int32_t * eid  = (threadgroup int32_t *) shmem; // expert of every route
++    threadgroup int32_t * lead = eid + n;                       // 1 for the route that emits the entry of its pair
++
++    const int p = tpitg;
++
++    if (p < n) {
++        eid[p] = ((device const int32_t *) (ids + (p/args.nei0)*args.nbi1))[p%args.nei0];
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    int32_t e       = 0;
++    int32_t rank    = 0;
++    int32_t partner = -1;
++
++    if (p < n) {
++        e = eid[p];
++
++        for (int q = 0; q < n; ++q) {
++            const int32_t eq = eid[q];
++
++            rank    += q < p && eq == e;
++            partner  = q > p && eq == e && partner < 0 ? q : partner;
++        }
++
++        lead[p] = rank % 2 == 0;
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    device int32_t * pr = (device int32_t *) pairs;
++
++    if (p < n && lead[p]) {
++        int32_t pos = 0;
++        for (int q = 0; q < p; ++q) {
++            pos += lead[q];
++        }
++
++        pr[1 + 3*pos + 0] = e;
++        pr[1 + 3*pos + 1] = p;
++        pr[1 + 3*pos + 2] = partner;
++    }
++
++    if (p == 0) {
++        int32_t cnt = 0;
++        for (int q = 0; q < n; ++q) {
++            cnt += lead[q];
++        }
++
++        pr[0] = cnt;
++    }
++}
++
++// one entry of the list per threadgroup (z): a single route runs the kernel of kernel_mul_mv_id as is, a pair the
++// paired variant of it; the grid is sized by the most entries (n routes), the tail exits early
++template<mul_mv_disp_fn_t disp_fn, kernel_mul_mv_pair_disp_t pair_fn>
++kernel void kernel_mul_mv_id_pair(
++        constant ggml_metal_kargs_mul_mv_id & args,
++        device const char * src0s,
++        device const char * src1,
++        device       char * dst,
++        device const char * pairs,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiitg[[thread_index_in_threadgroup]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    device const int32_t * pr = (device const int32_t *) pairs;
++
++    const int ient = tgpig.z;
++
++    if (ient >= pr[0]) {
++        return;
++    }
++
++    const int32_t i02 = pr[1 + 3*ient + 0];
++    const int32_t pa  = pr[1 + 3*ient + 1];
++    const int32_t pb  = pr[1 + 3*ient + 2];
++
++    tgpig.z = 0;
++
++    device const char * src0_cur = src0s + i02*args.nb02;
++
++    // route A, addressed as in kernel_mul_mv_id
++    const int64_t iid1a = pa/args.nei0;
++    const int64_t idxa  = pa%args.nei0;
++
++    device const char * src1_a = src1 + (idxa % args.ne11)*args.nb11 + iid1a*args.nb12;
++    device       char * dst_a  = dst  + (idxa*args.ne0 + iid1a*args.ne1*args.ne0)*sizeof(float);
++
++    ggml_metal_kargs_mul_mv args0 = {
++        /*.ne00 =*/ args.ne00,
++        /*.ne01 =*/ args.ne01,
++        /*.ne02 =*/ 1, // args.ne02,
++        /*.nb00 =*/ args.nb00,
++        /*.nb01 =*/ args.nb01,
++        /*.nb02 =*/ args.nb02,
++        /*.nb03 =*/ args.nb02, // args.ne02 == 1
++        /*.ne10 =*/ args.ne10,
++        /*.ne11 =*/ 1, // args.ne11,
++        /*.ne12 =*/ 1, // args.ne12,
++        /*.nb10 =*/ args.nb10,
++        /*.nb11 =*/ args.nb11,
++        /*.nb12 =*/ args.nb12,
++        /*.nb13 =*/ args.nb12, // ne12 == 1
++        /*.ne0  =*/ args.ne0,
++        /*.ne1  =*/ 1, // args.ne1,
++        /*.nr0  =*/ args.nr0,
++        /*.r2   =*/ 1,
++        /*.r3   =*/ 1,
++    };
++
++    if (pb < 0) {
++        disp_fn(args0, src0_cur, src1_a, dst_a, shmem, tgpig, tiitg, tiisg, sgitg);
++        return;
++    }
++
++    const int64_t iid1b = pb/args.nei0;
++    const int64_t idxb  = pb%args.nei0;
++
++    device const char * src1_b = src1 + (idxb % args.ne11)*args.nb11 + iid1b*args.nb12;
++    device       char * dst_b  = dst  + (idxb*args.ne0 + iid1b*args.ne1*args.ne0)*sizeof(float);
++
++    pair_fn(args0, src0_cur, src1_a, src1_b, dst_a, dst_b, shmem, tgpig, tiisg, sgitg);
++}
++
++typedef decltype(kernel_mul_mv_id_pair<mmv_fn<kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0>>, kernel_mul_mv_q8_0_f32_pair_impl<N_R0_Q8_0>>) kernel_mul_mv_id_pair_t;
++
++template [[host_name("kernel_mul_mv_id_pair_q8_0_f32")]] kernel kernel_mul_mv_id_pair_t kernel_mul_mv_id_pair<mmv_fn<kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0>>, kernel_mul_mv_q8_0_f32_pair_impl<N_R0_Q8_0>>;
++template [[host_name("kernel_mul_mv_id_pair_q4_K_f32")]] kernel kernel_mul_mv_id_pair_t kernel_mul_mv_id_pair<mmv_fn<kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>>, kernel_mul_mv_q4_K_f32_pair_impl<N_R0_Q4_K>>;
++template [[host_name("kernel_mul_mv_id_pair_q5_K_f32")]] kernel kernel_mul_mv_id_pair_t kernel_mul_mv_id_pair<mmv_fn<kernel_mul_mv_q5_K_f32_impl<N_R0_Q5_K>>, kernel_mul_mv_q5_K_f32_pair_impl<N_R0_Q5_K>>;
++template [[host_name("kernel_mul_mv_id_pair_q6_K_f32")]] kernel kernel_mul_mv_id_pair_t kernel_mul_mv_id_pair<mmv_fn<kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K>>, kernel_mul_mv_q6_K_f32_pair_impl<N_R0_Q6_K>>;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index d0a630dfbcd..d4a87c3ffff 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -660,6 +660,14 @@ llama_build_and_test(test-dflash2-conv-exact.cpp LINK ggml)
+ llama_build_and_test(test-moe-reduce-exact.cpp LINK ggml)
+ # Metal asynchronous host <-> device copies at page and non-page offsets, round trip byte for byte (SKIP without a Metal device)
+ llama_build_and_test(test-metal-async-copy.cpp LINK ggml)
++# host models of the Metal MUL_MAT_ID expert map / simdgroup blocks and of the selection mask scratch (no device needed)
++llama_build_and_test(test-metal-mmid-map.cpp LINK ggml)
++# the list of paired routes of the Metal mat-vec MUL_MAT_ID (reference of its map kernel) vs a sequential pairing (CPU only)
++llama_build_and_test(test-metal-mmid-pair-model.cpp LINK ggml)
++if (GGML_METAL)
++    # the paired-route mat-vec MUL_MAT_ID on Metal (GGML_METAL_MMID_PAIR=1) vs the single-route kernel, byte for byte (SKIP when unsupported)
++    llama_build_and_test(test-metal-mmid-pair-exact.cpp LINK ggml)
++endif()
+ # the rows-per-block lever of the dense 2..8 column mat-vec vs the launch it replaces, byte for byte (SKIP without a CUDA device)
+ llama_build_and_test(test-mmvqcols-exact.cpp LINK ggml)
+ # the ported few-row int8 MMQ (GGML_CUDA_MMQ_FEW) on dense K-quant / IQ4_XS / Q8_0 products at 2..8 columns vs mmvq + fp64 reference (NMSE gates,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8e80be9c0d7..7817a2e3885 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1301,13 +1301,18 @@ struct test_case {
+     // the case sets some expert ids to -1 (a skipped slot): only the CPU and ggml-cuda (CUDA, ROCm, MUSA) implement that; Metal and
+     // Vulkan read out of bounds or keep stale rows (llama only makes -1 ids for ggml-cuda devices), so elsewhere the case is not run
+     virtual bool negative_ids() { return false; }
++    // repeated expert ids within a row of a MUL_MAT_ID: run only on the backends that handle them [TAG_MUL_MAT_ID_DUPLICATE_ID]
++    virtual bool duplicate_ids() { return false; }
+     bool ids_supported(ggml_backend_t backend) {
+-        if (!negative_ids()) {
++        if (!negative_ids() && !duplicate_ids()) {
+             return true;
+         }
+         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+         const char * reg = dev != nullptr ? ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) : "";
+-        return strcmp(reg, "CPU") == 0 || strcmp(reg, "CUDA") == 0 || strcmp(reg, "ROCm") == 0 || strcmp(reg, "MUSA") == 0;
++        if (duplicate_ids() && !(strcmp(reg, "CPU") == 0 || strcmp(reg, "MTL") == 0)) {
++            return false;
++        }
++        return !negative_ids() || strcmp(reg, "CPU") == 0 || strcmp(reg, "CUDA") == 0 || strcmp(reg, "ROCm") == 0 || strcmp(reg, "MUSA") == 0;
+     }
+ 
+     ggml_cgraph * gf = nullptr;
+@@ -6159,6 +6164,7 @@ struct test_mul_mat_id_sparse : public test_mul_mat_id {
+ struct test_mul_mat_id_dup : public test_mul_mat_id {
+     using test_mul_mat_id::test_mul_mat_id;
+     std::string vars() override { return test_mul_mat_id::vars() + ",dup=1"; }
++    bool duplicate_ids() override { return true; }
+     void initialize_tensors(ggml_context * ctx) override {
+         std::default_random_engine rng(1234);
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+@@ -13630,9 +13636,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
+ 
+-    // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
+-#if 0
+-    // repeated expert ids within a row
++    // repeated expert ids within a row: CPU and Metal only (duplicate_ids), until CUDA support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
+     for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+         for (int n : {9, 16, 33, 64}) {
+             test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
+@@ -13643,7 +13647,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 1025, 10, false, 64, 33, 256, 1.0f, 0, true));
+         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
+     }
+-#endif
+ 
+     for (ggml_type type_a : all_types) {
+         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
+diff --git a/tests/test-metal-mmid-map.cpp b/tests/test-metal-mmid-map.cpp
+new file mode 100644
+index 00000000000..1dde57d751b
+--- /dev/null
++++ b/tests/test-metal-mmid-map.cpp
+@@ -0,0 +1,282 @@
++// host-side models of the Metal MUL_MAT_ID and selection-mask changes, run on any host (no Metal device needed):
++//  1. the CPU reference of kernel_mul_mm_id_map0 (ggml-metal-mmid.h) against a direct count: every (token, slot) entry of
++//     an in-range expert lands in exactly one tile of its expert, tiles hold at most 32 rows, the tile count stays within
++//     the bound the host sizes the dispatch and the scratch by (ggml_metal_mmid_max_tiles), the map is a function of the ids
++//  2. the map-share key and range test of ggml_metal_op_mul_mat_id
++//  3. the simdgroup block assignment of kernel_mul_mm_id (non-tensor path) with GGML_METAL_MMID_SGSPLIT / _BSKIP on and
++//     off: every live output block is computed by exactly one simdgroup, as one accumulator over the full K chain, and
++//     every block written back is computed; prints the multiply-accumulates per K step (busiest simdgroup / total)
++//  4. the compute buffer of the selection mask: the ggml_sel_mask node against the chain it replaces (graph allocator
++//     sizes on the CPU buffer type)
++
++#include "../ggml/src/ggml-metal/ggml-metal-mmid.h"
++
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++#include "ggml-sel-mask.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <set>
++#include <vector>
++
++static int n_fail = 0;
++
++#define CHECK(cond, ...) do { if (!(cond)) { n_fail++; fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
++
++static void test_map0(std::mt19937 & rng) {
++    int n_cases = 0;
++    for (int64_t ne02 : { 1, 4, 28, 128, 512, 1024 }) {
++        for (int64_t ne20 : { 1, 2, 4, 8, 10 }) {
++            for (int64_t ne21 : { 1, 9, 16, 32, 33, 64, 300, 512 }) {
++                for (int mode = 0; mode < 4; ++mode) {
++                    // 0: distinct ids per token, 1: repeated ids (mostly expert 0), 2: all on one expert, 3: some ids out of range
++                    std::vector<int32_t> ids(ne20*ne21);
++                    for (int64_t t = 0; t < ne21; ++t) {
++                        std::vector<int32_t> perm(ne02);
++                        for (int64_t e = 0; e < ne02; ++e) {
++                            perm[e] = (int32_t) e;
++                        }
++                        std::shuffle(perm.begin(), perm.end(), rng);
++                        for (int64_t s = 0; s < ne20; ++s) {
++                            int32_t v = 0;
++                            switch (mode) {
++                                case 0: v = perm[s % ne02]; break;
++                                case 1: v = rng() % 4 == 0 ? (int32_t) (rng() % ne02) : 0; break;
++                                case 2: v = (int32_t) (ne02 - 1); break;
++                                case 3: v = rng() % 5 == 0 ? (int32_t) (ne02 + rng() % 3) : (int32_t) (rng() % ne02); break;
++                            }
++                            ids[t*ne20 + s] = v;
++                        }
++                    }
++
++                    std::vector<uint32_t> tpe;
++                    std::vector<int32_t>  hids;
++                    ggml_metal_mmid_map0_ref(ids.data(), ne20, ne21, ne02, tpe, hids);
++
++                    const int64_t n_tiles = tpe[0];
++                    const int64_t bound   = ggml_metal_mmid_max_tiles(ne02, ne20, ne21);
++                    CHECK(n_tiles <= bound, "tiles %lld > bound %lld (ne02 %lld ne20 %lld ne21 %lld mode %d)",
++                        (long long) n_tiles, (long long) bound, (long long) ne02, (long long) ne20, (long long) ne21, mode);
++                    // scratch sizes of the host (extra_tpe / extra_ids)
++                    CHECK((int64_t) tpe.size() <= 1 + 3*bound, "tpe size");
++                    CHECK((int64_t) hids.size() <= ne20*ne21 + ne02, "hids size %zu", hids.size());
++
++                    std::vector<int> seen(ne20*ne21, 0);
++                    int64_t prev_e = -1;
++                    for (int64_t i = 0; i < n_tiles; ++i) {
++                        const uint32_t e = tpe[1 + 3*i], first = tpe[1 + 3*i + 1], rows = tpe[1 + 3*i + 2];
++                        CHECK(rows >= 1 && rows <= GGML_METAL_MMID_NTILE, "rows %u", rows);
++                        CHECK((int64_t) e >= prev_e, "experts out of order");
++                        prev_e = e;
++                        for (uint32_t r = 0; r < rows; ++r) {
++                            const int32_t ent = hids[first + r];
++                            CHECK(ent >= 0 && ent < ne20*ne21, "entry %d", ent);
++                            if (ent >= 0 && ent < ne20*ne21) {
++                                CHECK(ids[ent] == (int32_t) e, "entry %d routes to %d, tile expert %u", ent, ids[ent], e);
++                                seen[ent]++;
++                            }
++                        }
++                    }
++                    for (int64_t k = 0; k < ne20*ne21; ++k) {
++                        const bool in_range = ids[k] >= 0 && ids[k] < ne02;
++                        CHECK(seen[k] == (in_range ? 1 : 0), "entry %lld seen %d times (id %d)", (long long) k, seen[k], ids[k]);
++                    }
++
++                    // the map is a function of the ids: a second build is identical
++                    std::vector<uint32_t> tpe2;
++                    std::vector<int32_t>  hids2;
++                    ggml_metal_mmid_map0_ref(ids.data(), ne20, ne21, ne02, tpe2, hids2);
++                    CHECK(tpe == tpe2 && hids == hids2, "map not deterministic");
++
++                    n_cases++;
++                }
++            }
++        }
++    }
++    printf("map0 reference: %d cases\n", n_cases);
++}
++
++static void test_share_key() {
++    int buf_a = 0, buf_b = 0;
++    ggml_metal_mmid_map_key k0;
++    k0.ids_buf = &buf_a; k0.ids_data = (const void *) 0x1000; k0.ne20 = 8; k0.ne21 = 512; k0.nb20 = 4; k0.nb21 = 32; k0.ne02 = 128;
++    ggml_metal_mmid_map_key k1 = k0;
++    CHECK(k0 == k1, "equal keys");
++    k1.ids_buf = &buf_b;    CHECK(!(k0 == k1), "buffer"); k1 = k0;
++    k1.ids_data = (const void *) 0x2000; CHECK(!(k0 == k1), "address"); k1 = k0;
++    k1.ne20 = 4;  CHECK(!(k0 == k1), "ne20"); k1 = k0;
++    k1.ne21 = 511; CHECK(!(k0 == k1), "ne21"); k1 = k0;
++    k1.nb21 = 64; CHECK(!(k0 == k1), "nb21"); k1 = k0;
++    k1.ne02 = 64; CHECK(!(k0 == k1), "ne02"); k1 = k0;
++
++    CHECK( ggml_metal_mmid_ranges_overlap(&buf_a, 0, 10, &buf_a, 9, 20), "overlap");
++    CHECK(!ggml_metal_mmid_ranges_overlap(&buf_a, 0, 10, &buf_a, 10, 20), "touching");
++    CHECK(!ggml_metal_mmid_ranges_overlap(&buf_a, 0, 10, &buf_b, 0, 10), "other buffer");
++    CHECK( ggml_metal_mmid_ranges_overlap(&buf_a, 5, 6, &buf_a, 0, 100), "inside");
++    printf("map share key / ranges: ok\n");
++}
++
++// kernel_mul_mm_id, non-tensor path: the (A block g, B block b) output blocks each simdgroup accumulates, and the ones it
++// writes to threadgroup memory. A block g covers A rows 8g .. 8g+7 (0..7), B block b token rows 8b .. 8b+7 (0..3).
++struct mmid_block { int sg, g, b; };
++
++static void mmid_blocks(int nr1, bool sgsplit, bool bskip, std::vector<mmid_block> & mma, std::vector<mmid_block> & stored) {
++    const int NR1H = 16;
++    const bool has_hi = nr1 > NR1H;
++    mma.clear();
++    stored.clear();
++    for (int sg = 0; sg < 4; ++sg) {
++        const bool split4    = sgsplit && !has_hi;
++        const bool sg_active = split4 || has_hi || sg < 2;
++        const int  r1b       = split4 ? 0 : NR1H*(sg >> 1);
++        const bool b1_live   = !bskip || r1b + 8 < nr1;
++        if (split4) {
++            for (int i = 0; i < 2; ++i) {
++                mma.push_back({ sg, 2*sg + i, 0 });
++                if (b1_live) {
++                    mma.push_back({ sg, 2*sg + i, 1 });
++                }
++            }
++            for (int i = 0; i < (b1_live ? 4 : 2); ++i) {
++                stored.push_back({ sg, 2*sg + (i % 2), i / 2 });
++            }
++        } else if (sg_active) {
++            for (int i = 0; i < 4; ++i) {
++                mma.push_back({ sg, 4*(sg % 2) + i, 2*(sg / 2) + 0 });
++            }
++            if (b1_live) {
++                for (int i = 4; i < 8; ++i) {
++                    mma.push_back({ sg, 4*(sg % 2) + (i % 4), 2*(sg / 2) + 1 });
++                }
++            }
++            for (int i = 0; i < (b1_live ? 8 : 4); ++i) {
++                stored.push_back({ sg, 4*(sg % 2) + (i % 4), 2*(sg / 2) + i / 4 });
++            }
++        }
++    }
++}
++
++static void test_mmid_blocks() {
++    printf("kernel_mul_mm_id multiply-accumulates per K step of 8 (busiest simdgroup / all), by valid rows of the tile:\n");
++    printf("  nr1 | before  | bskip   | sgsplit | both\n");
++    for (int nr1 = 1; nr1 <= 32; ++nr1) {
++        char line[256];
++        int  off = snprintf(line, sizeof(line), "  %3d", nr1);
++        for (int f = 0; f < 4; ++f) {
++            const bool sgsplit = f & 2, bskip = f & 1;
++            std::vector<mmid_block> mma, stored;
++            mmid_blocks(nr1, sgsplit, bskip, mma, stored);
++
++            // every live output block (B rows < nr1) once, as one accumulator
++            for (int b = 0; b < 4; ++b) {
++                for (int g = 0; g < 8; ++g) {
++                    int n = 0;
++                    for (const auto & m : mma) {
++                        n += m.g == g && m.b == b;
++                    }
++                    const bool live = 8*b < nr1;
++                    if (live) {
++                        CHECK(n == 1, "nr1 %d flags %d: live block (g %d, b %d) computed %d times", nr1, f, g, b, n);
++                    } else {
++                        CHECK(n <= 1, "nr1 %d flags %d: dead block (g %d, b %d) computed %d times", nr1, f, g, b, n);
++                    }
++                    int ns = 0;
++                    for (const auto & s : stored) {
++                        ns += s.g == g && s.b == b;
++                    }
++                    if (live) {
++                        CHECK(ns == 1, "nr1 %d flags %d: live block (g %d, b %d) stored %d times", nr1, f, g, b, ns);
++                    }
++                }
++            }
++            // a stored block is computed by the simdgroup that stores it
++            for (const auto & s : stored) {
++                bool found = false;
++                for (const auto & m : mma) {
++                    found |= m.sg == s.sg && m.g == s.g && m.b == s.b;
++                }
++                CHECK(found, "nr1 %d flags %d: sg %d stores (g %d, b %d) it did not compute", nr1, f, s.sg, s.g, s.b);
++            }
++            int per_sg[4] = { 0, 0, 0, 0 };
++            for (const auto & m : mma) {
++                per_sg[m.sg]++;
++            }
++            const int busiest = *std::max_element(per_sg, per_sg + 4);
++            off += snprintf(line + off, sizeof(line) - off, " | %2d / %2d", busiest, (int) mma.size());
++        }
++        if (nr1 <= 17 || nr1 == 24 || nr1 == 25 || nr1 == 32) {
++            printf("%s\n", line);
++        }
++    }
++}
++
++// compute buffer of the selection mask node vs the chain (as tests/test-backend-ops.cpp test_sel_mask / llama-graph)
++static size_t sel_mask_buffer(int64_t kv, int64_t nb, int64_t n_sel, bool chain) {
++    ggml_init_params ip = { 64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(ip);
++    ggml_tensor * kq  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
++    ggml_tensor * idx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_sel, nb, 1);
++    ggml_set_input(kq);
++    ggml_set_input(idx);
++    ggml_tensor * out;
++    if (!chain) {
++        out = ggml_sel_mask(ctx, idx, kq);
++    } else {
++        ggml_tensor * mask_all = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv + n_sel, 1, 1, 1), -INFINITY);
++        mask_all = ggml_repeat_4d(ctx, mask_all, kv + n_sel, nb, 1, 1);
++        mask_all = ggml_reshape_3d(ctx, mask_all, 1, kv + n_sel, nb);
++        ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_sel, 1, 1, 1), 0.0f);
++        zeros = ggml_repeat_4d(ctx, zeros, n_sel, nb, 1, 1);
++        zeros = ggml_reshape_3d(ctx, zeros, 1, n_sel, nb);
++        ggml_tensor * sel = ggml_set_rows(ctx, mask_all, zeros, idx);
++        const size_t row = sel->nb[2];
++        sel = ggml_view_4d(ctx, sel, kv, nb, 1, 1, row, row*nb, row*nb, 0);
++        out = ggml_add(ctx, sel, kq);
++    }
++    ggml_set_output(out);
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, out);
++    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
++    size_t size = 0;
++    if (ggml_gallocr_reserve(ga, gf)) {
++        size = ggml_gallocr_get_buffer_size(ga, 0);
++    }
++    ggml_gallocr_free(ga);
++    ggml_free(ctx);
++    return size;
++}
++
++static void test_sel_mask_scratch() {
++    printf("selection mask compute buffer (n_sel 2051), node vs chain:\n");
++    for (int64_t kv : { 8192, 65536, 262144 }) {
++        for (int64_t nb : { 512, 2048 }) {
++            const size_t node  = sel_mask_buffer(kv, nb, 2051, false);
++            const size_t chain = sel_mask_buffer(kv, nb, 2051, true);
++            CHECK(node > 0 && chain > 0 && node < chain, "kv %lld nb %lld: node %zu chain %zu", (long long) kv, (long long) nb, node, chain);
++            printf("  kv %6lld ub %4lld: node %8.1f MiB, chain %8.1f MiB, saved %8.1f MiB\n", (long long) kv, (long long) nb,
++                node/1048576.0, chain/1048576.0, (double) (chain - node)/1048576.0);
++        }
++    }
++}
++
++int main() {
++    std::mt19937 rng(42);
++
++    test_map0(rng);
++    test_share_key();
++    test_mmid_blocks();
++    test_sel_mask_scratch();
++
++    if (n_fail > 0) {
++        printf("FAILED: %d checks\n", n_fail);
++        return 1;
++    }
++    printf("OK\n");
++    return 0;
++}
+diff --git a/tests/test-metal-mmid-pair-exact.cpp b/tests/test-metal-mmid-pair-exact.cpp
+new file mode 100644
+index 00000000000..a06b7bf64cc
+--- /dev/null
++++ b/tests/test-metal-mmid-pair-exact.cpp
+@@ -0,0 +1,332 @@
++// bit identity of the paired-route mat-vec MUL_MAT_ID on Metal (GGML_METAL_MMID_PAIR=1) against the single-route kernel
++// (GGML_METAL_MMID_PAIR=0): verify windows of 2 to 16 tokens whose routes collide on a few experts (and repeated experts within
++// a token), Q8_0 / Q4_K / Q5_K / Q6_K experts, src1 per route and broadcast. The two arms run in child processes of this binary
++// (the switch is read once per process); the parent compares the output bytes of every case. The CPU backend is a sanity
++// reference (NMSE, not bytes). A negative control changes one src1 value: its output must differ. Prints the number of cases,
++// the paired / single entries of each case (from the reference list builder, ggml-metal-mmid-pair.h) and the differing ones;
++// exit 1 on any difference. SKIP (exit 0) without a Metal device or when MTL0 does not support the op.
++
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++
++#include "../ggml/src/ggml-metal/ggml-metal-mmid-pair.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++#include <unistd.h>
++
++struct pair_case {
++    ggml_type type;
++    int64_t   K, M, n_as, n_used, T;
++    bool      bcast;     // src1 [K, 1, T] instead of [K, n_used, T]
++    bool      dup;       // repeated experts within a token
++    bool      control;   // case 0 with one src1 value changed
++};
++
++static std::vector<pair_case> make_cases() {
++    std::vector<pair_case> cases;
++    const ggml_type types[] = { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K };
++    struct cfg { int64_t n_used, n_as; };
++    const cfg cfgs[] = { { 1, 4 }, { 2, 8 }, { 8, 128 }, { 10, 512 } };
++    int i = 0;
++    for (ggml_type t : types) {
++        for (const cfg & c : cfgs) {
++            for (int64_t T : { 2, 3, 5, 8, 16 }) {
++                const int64_t M = (i % 2) ? 70 : 96;
++                cases.push_back({ t, 512, M, c.n_as, c.n_used, T, c.n_used == 1 && T % 2 == 1, false, false });
++                i++;
++            }
++        }
++        cases.push_back({ t, 768, 64, 16, 4, 7, false, true, false });
++    }
++    pair_case ctl = cases[0];
++    ctl.control = true;
++    cases.push_back(ctl);
++    return cases;
++}
++
++// ids of a window that collides: the experts of every token come from a pool a little larger than n_used
++static uint32_t case_seed(const pair_case & c) {
++    return 1234 + (uint32_t) (c.K + 31*c.M + 131*c.n_as + 977*c.n_used + 7919*c.T + 104729*(int) c.type + 3*c.dup + 5*c.bcast);
++}
++
++static std::vector<int32_t> make_ids(const pair_case & c) {
++    std::mt19937 rng(case_seed(c) ^ 0x1D5u);
++    std::vector<int32_t> ids(c.n_used*c.T);
++    const int64_t pool = std::min<int64_t>(c.n_as, c.n_used + 2);
++    std::vector<int32_t> base(pool);
++    for (int64_t j = 0; j < pool; ++j) {
++        base[j] = (int32_t) ((j*7919 + 13) % c.n_as);
++    }
++    for (int64_t t = 0; t < c.T; ++t) {
++        std::vector<int32_t> p = base;
++        std::shuffle(p.begin(), p.end(), rng);
++        for (int64_t s = 0; s < c.n_used; ++s) {
++            ids[t*c.n_used + s] = c.dup && s > 0 && rng() % 3 == 0 ? ids[t*c.n_used + s - 1] : p[s];
++        }
++    }
++    return ids;
++}
++
++// output of one case on one backend; empty with *supported = false when the backend does not run the op
++static std::vector<float> run_case(ggml_backend_t be, const pair_case & c, bool * supported) {
++    std::mt19937 rng(case_seed(c));
++
++    ggml_init_params ip = { 16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(ip);
++
++    const int64_t n_b = c.bcast ? 1 : c.n_used;
++
++    ggml_tensor * as  = ggml_new_tensor_3d(ctx, c.type, c.K, c.M, c.n_as);
++    ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.K, n_b, c.T);
++    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.n_used, c.T);
++    ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
++
++    *supported = ggml_backend_supports_op(be, out);
++    if (!*supported) {
++        ggml_free(ctx);
++        return {};
++    }
++
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, out);
++
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
++
++    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
++
++    std::vector<float> wf(c.K*c.M*c.n_as);
++    for (float & v : wf) {
++        v = ud(rng);
++    }
++    std::vector<uint8_t> wq(ggml_nbytes(as));
++    ggml_quantize_chunk(c.type, wf.data(), wq.data(), 0, c.M*c.n_as, c.K, nullptr);
++    ggml_backend_tensor_set(as, wq.data(), 0, wq.size());
++
++    std::vector<float> bf(c.K*n_b*c.T);
++    for (float & v : bf) {
++        v = ud(rng);
++    }
++    if (c.control) {
++        bf[c.K + 3] += 0.5f;
++    }
++    ggml_backend_tensor_set(b, bf.data(), 0, bf.size()*sizeof(float));
++
++    std::vector<int32_t> iv = make_ids(c);
++    ggml_backend_tensor_set(ids, iv.data(), 0, iv.size()*sizeof(int32_t));
++
++    std::vector<float> res;
++    if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
++        res.resize(ggml_nelements(out));
++        ggml_backend_tensor_get(out, res.data(), 0, res.size()*sizeof(float));
++    }
++
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++
++    return res;
++}
++
++static ggml_backend_t init_metal() {
++    for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(d);
++        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
++        if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
++                strncmp(ggml_backend_dev_name(dev), "MTL", 3) == 0) {
++            return ggml_backend_dev_init(dev, nullptr);
++        }
++    }
++    return nullptr;
++}
++
++// child: every case on MTL0, written as (int32 supported, int64 n, n floats) records
++static int child(const char * path) {
++    ggml_backend_t be = init_metal();
++    if (be == nullptr) {
++        return 2;
++    }
++    FILE * f = fopen(path, "wb");
++    if (f == nullptr) {
++        return 3;
++    }
++    for (const pair_case & c : make_cases()) {
++        bool sup = false;
++        std::vector<float> r = run_case(be, c, &sup);
++        const int32_t s = sup && !r.empty();
++        const int64_t n = (int64_t) r.size();
++        fwrite(&s, sizeof(s), 1, f);
++        fwrite(&n, sizeof(n), 1, f);
++        if (n > 0) {
++            fwrite(r.data(), sizeof(float), n, f);
++        }
++    }
++    fclose(f);
++    ggml_backend_free(be);
++    return 0;
++}
++
++struct rec {
++    int32_t supported;
++    std::vector<float> v;
++};
++
++static bool read_recs(const std::string & path, size_t n_cases, std::vector<rec> & out) {
++    FILE * f = fopen(path.c_str(), "rb");
++    if (f == nullptr) {
++        return false;
++    }
++    out.assign(n_cases, {});
++    for (size_t i = 0; i < n_cases; ++i) {
++        int64_t n = 0;
++        if (fread(&out[i].supported, sizeof(int32_t), 1, f) != 1 || fread(&n, sizeof(n), 1, f) != 1) {
++            fclose(f);
++            return false;
++        }
++        out[i].v.resize(n);
++        if (n > 0 && fread(out[i].v.data(), sizeof(float), n, f) != (size_t) n) {
++            fclose(f);
++            return false;
++        }
++    }
++    fclose(f);
++    return true;
++}
++
++int main(int argc, char ** argv) {
++    ggml_backend_load_all();
++
++    if (argc == 3 && strcmp(argv[1], "--child") == 0) {
++        return child(argv[2]);
++    }
++
++    ggml_backend_t mtl = init_metal();
++    if (mtl == nullptr) {
++        printf("test-metal-mmid-pair-exact: SKIP (no Metal device)\n");
++        return 0;
++    }
++    ggml_backend_free(mtl);
++
++    const std::vector<pair_case> cases = make_cases();
++
++    const char * tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
++    std::string out_path[2];
++    int n_log[2] = { 0, 0 };
++    for (int arm = 0; arm < 2; ++arm) {
++        const std::string stem = std::string(tmp) + "/test-metal-mmid-pair-" + std::to_string((long) getpid()) + "-" + std::to_string(arm);
++        out_path[arm] = stem + ".bin";
++        const std::string log_path = stem + ".log";
++        // GGML_METAL_MMID_PAIR_DEBUG=1 in both arms: one log line per op that takes the paired path (0 in the off arm)
++        const std::string cmd = std::string("GGML_METAL_MMID_PAIR=") + std::to_string(arm) + " GGML_METAL_MMID_PAIR_DEBUG=1 '" + argv[0] +
++            "' --child '" + out_path[arm] + "' 2> '" + log_path + "'";
++        const int rc = system(cmd.c_str());
++        FILE * lf = fopen(log_path.c_str(), "r");
++        if (lf != nullptr) {
++            char line[1024];
++            while (fgets(line, sizeof(line), lf)) {
++                n_log[arm] += strstr(line, "mmid pair:") != nullptr;
++            }
++            fclose(lf);
++            unlink(log_path.c_str());
++        }
++        if (rc != 0) {
++            printf("test-metal-mmid-pair-exact: child (GGML_METAL_MMID_PAIR=%d) failed, rc %d\n", arm, rc);
++            return 1;
++        }
++    }
++
++    std::vector<rec> r[2];
++    for (int arm = 0; arm < 2; ++arm) {
++        if (!read_recs(out_path[arm], cases.size(), r[arm])) {
++            printf("test-metal-mmid-pair-exact: cannot read %s\n", out_path[arm].c_str());
++            return 1;
++        }
++        unlink(out_path[arm].c_str());
++    }
++
++    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++
++    int n_run = 0, n_unsup = 0, n_diff = 0, n_bad_ref = 0, n_pairs_all = 0, n_singles_all = 0;
++    bool ctl_ok = false;
++
++    for (size_t i = 0; i < cases.size(); ++i) {
++        const pair_case & c = cases[i];
++        if (!r[0][i].supported || !r[1][i].supported) {
++            n_unsup++;
++            continue;
++        }
++        if (c.control) {
++            // differs from case 0 (same inputs but one src1 value)
++            ctl_ok = r[1][i].v.size() == r[1][0].v.size() && memcmp(r[1][i].v.data(), r[1][0].v.data(), r[1][0].v.size()*sizeof(float)) != 0;
++            continue;
++        }
++        n_run++;
++
++        // the entries the map kernel builds for these ids
++        const std::vector<int32_t> iv = make_ids(c);
++        std::vector<int32_t> list(ggml_metal_mmid_pair_list_len(c.n_used*c.T));
++        const int32_t n_ent = ggml_metal_mmid_pair_build(iv.data(), c.n_used, (int32_t) c.n_used, (int32_t) c.T, list.data());
++        int n_pairs = 0;
++        for (int32_t e = 0; e < n_ent; ++e) {
++            n_pairs += list[1 + 3*e + 2] >= 0;
++        }
++        n_pairs_all   += n_pairs;
++        n_singles_all += n_ent - n_pairs;
++
++        size_t nd = 0;
++        if (r[0][i].v.size() != r[1][i].v.size()) {
++            nd = r[0][i].v.size() + 1;
++        } else {
++            for (size_t j = 0; j < r[0][i].v.size(); ++j) {
++                nd += memcmp(&r[0][i].v[j], &r[1][i].v[j], sizeof(float)) != 0;
++            }
++        }
++
++        double nmse = 0.0;
++        if (cpu != nullptr) {
++            bool sup = false;
++            std::vector<float> ref = run_case(cpu, c, &sup);
++            if (sup && ref.size() == r[0][i].v.size()) {
++                double num = 0.0, den = 0.0;
++                for (size_t j = 0; j < ref.size(); ++j) {
++                    num += (r[0][i].v[j] - ref[j])*(double) (r[0][i].v[j] - ref[j]);
++                    den += ref[j]*(double) ref[j];
++                }
++                nmse = den > 0 ? num/den : num;
++                n_bad_ref += !(nmse < 5e-4);
++            }
++        }
++
++        printf("  %-5s K %4lld M %3lld n_as %3lld used %2lld T %2lld%s%s: entries %3d (pairs %3d, singles %3d), nmse vs CPU %.2e, differ %zu\n",
++            ggml_type_name(c.type), (long long) c.K, (long long) c.M, (long long) c.n_as, (long long) c.n_used, (long long) c.T,
++            c.bcast ? " bcast" : "", c.dup ? " dup" : "", n_ent, n_pairs, n_ent - n_pairs, nmse, nd);
++
++        n_diff += nd != 0;
++    }
++
++    if (cpu != nullptr) {
++        ggml_backend_free(cpu);
++    }
++
++    if (n_run == 0) {
++        printf("test-metal-mmid-pair-exact: SKIP (MTL0 does not support MUL_MAT_ID: %d of %zu cases not supported)\n", n_unsup, cases.size());
++        return 0;
++    }
++
++    // the paired path must have run in the on arm (one line per op) and never in the off arm
++    const bool engaged = n_log[1] >= n_run && n_log[0] == 0;
++
++    printf("test-metal-mmid-pair-exact: %d cases, %d differ, %d not supported, entries %d paired + %d single, CPU sanity bad %d, control %s, "
++        "paired-path ops %d (off arm %d)%s\n",
++        n_run, n_diff, n_unsup, n_pairs_all, n_singles_all, n_bad_ref, ctl_ok ? "ok" : "FAIL", n_log[1], n_log[0], engaged ? "" : " NOT ENGAGED");
++
++    return n_diff == 0 && n_bad_ref == 0 && ctl_ok && engaged ? 0 : 1;
++}
+diff --git a/tests/test-metal-mmid-pair-model.cpp b/tests/test-metal-mmid-pair-model.cpp
+new file mode 100644
+index 00000000000..8568c8b84c9
+--- /dev/null
++++ b/tests/test-metal-mmid-pair-model.cpp
+@@ -0,0 +1,116 @@
++// the list of paired routes of the Metal mat-vec MUL_MAT_ID (ggml-metal-mmid-pair.h, the reference of kernel_mul_mv_id_pair_map)
++// against an independent sequential pairing, on random ids of verify windows (1 to 10 experts used, 2 to 16 tokens, 4 to 512
++// experts, few-expert pools so routes collide, repeated experts within a token). Checks: the list equals the sequential one entry
++// for entry, every route is covered exactly once, the routes of an entry share its expert, a pair's routes are in increasing order,
++// the count is at most the number of routes (the grid bound of the paired kernel), and a second build gives the same list.
++// CPU only: no device needed.
++
++#include "../ggml/src/ggml-metal/ggml-metal-mmid-pair.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <map>
++#include <random>
++#include <vector>
++
++// pair the routes of each expert in route order, the entries ordered by their first route
++static std::vector<int32_t> sequential(const std::vector<int32_t> & ids, int32_t n_used, int32_t n_tokens, int64_t stride) {
++    const int32_t n = n_used*n_tokens;
++    std::map<int32_t, std::vector<int32_t>> by_expert;
++    for (int32_t p = 0; p < n; ++p) {
++        by_expert[ids[(p/n_used)*stride + p%n_used]].push_back(p);
++    }
++    std::map<int32_t, std::pair<int32_t, int32_t>> entries; // first route -> (expert, second route)
++    for (const auto & [e, rs] : by_expert) {
++        for (size_t i = 0; i < rs.size(); i += 2) {
++            entries[rs[i]] = { e, i + 1 < rs.size() ? rs[i + 1] : -1 };
++        }
++    }
++    std::vector<int32_t> out(ggml_metal_mmid_pair_list_len(n), 0);
++    out[0] = (int32_t) entries.size();
++    int32_t k = 0;
++    for (const auto & [a, eb] : entries) {
++        out[1 + 3*k + 0] = eb.first;
++        out[1 + 3*k + 1] = a;
++        out[1 + 3*k + 2] = eb.second;
++        k++;
++    }
++    return out;
++}
++
++int main() {
++    std::mt19937 rng(42);
++
++    int n_cases = 0, n_bad = 0;
++    long long n_pairs = 0, n_singles = 0;
++
++    for (int it = 0; it < 4000; ++it) {
++        const int32_t n_used   = 1 + (int32_t) (rng() % 10);
++        const int32_t n_tokens = 2 + (int32_t) (rng() % 15);
++        const int32_t n_expert = std::max<int32_t>(n_used, 4 + (int32_t) (rng() % 509));
++        const int32_t pool     = std::min<int32_t>(n_expert, n_used + (int32_t) (rng() % 6));
++        const bool    dup      = rng() % 4 == 0;
++        const int64_t stride   = n_used + (int64_t) (rng() % 3); // row stride of the ids in int32 (padded rows)
++
++        if (n_used*n_tokens > GGML_METAL_MMID_PAIR_MAX_ROUTES) {
++            continue;
++        }
++
++        std::vector<int32_t> experts(pool);
++        for (int32_t j = 0; j < pool; ++j) {
++            experts[j] = (int32_t) (rng() % n_expert);
++        }
++
++        std::vector<int32_t> ids(n_tokens*stride, -7);
++        for (int32_t t = 0; t < n_tokens; ++t) {
++            for (int32_t s = 0; s < n_used; ++s) {
++                ids[t*stride + s] = dup && s > 0 && rng() % 3 == 0 ? ids[t*stride + s - 1] : experts[rng() % pool];
++            }
++        }
++
++        const int32_t n = n_used*n_tokens;
++        std::vector<int32_t> a(ggml_metal_mmid_pair_list_len(n), 0);
++        std::vector<int32_t> b(ggml_metal_mmid_pair_list_len(n), 0);
++        const int32_t na = ggml_metal_mmid_pair_build(ids.data(), stride, n_used, n_tokens, a.data());
++        const int32_t nb = ggml_metal_mmid_pair_build(ids.data(), stride, n_used, n_tokens, b.data());
++
++        bool ok = na == nb && a == b && na == a[0] && na <= n;
++
++        const std::vector<int32_t> ref = sequential(ids, n_used, n_tokens, stride);
++        ok = ok && ref == a;
++
++        std::vector<int> cover(n, 0);
++        for (int32_t e = 0; e < na && ok; ++e) {
++            const int32_t ex = a[1 + 3*e], pa = a[1 + 3*e + 1], pb = a[1 + 3*e + 2];
++            ok = ok && pa >= 0 && pa < n && ids[(pa/n_used)*stride + pa%n_used] == ex;
++            if (ok) {
++                cover[pa]++;
++            }
++            if (pb >= 0) {
++                ok = ok && pb > pa && pb < n && ids[(pb/n_used)*stride + pb%n_used] == ex;
++                if (ok) {
++                    cover[pb]++;
++                }
++                n_pairs++;
++            } else {
++                n_singles++;
++            }
++            ok = ok && (e == 0 || a[1 + 3*(e - 1) + 1] < pa);
++        }
++        for (int32_t p = 0; p < n && ok; ++p) {
++            ok = cover[p] == 1;
++        }
++
++        n_cases++;
++        if (!ok) {
++            n_bad++;
++            if (n_bad <= 5) {
++                printf("  FAIL: used %d tokens %d experts %d pool %d dup %d stride %lld\n", n_used, n_tokens, n_expert, pool, (int) dup, (long long) stride);
++            }
++        }
++    }
++
++    printf("test-metal-mmid-pair-model: %d cases, %d bad, entries %lld paired + %lld single\n", n_cases, n_bad, n_pairs, n_singles);
++
++    return n_bad == 0 && n_cases > 0 ? 0 : 1;
++}
