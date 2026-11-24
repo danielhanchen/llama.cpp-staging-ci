@@ -57,6 +57,70 @@ index 70936fd7ef0..d6971e82106 100644
                  return false;
              }
              if (!has_simdgroup_mm ||
+diff --git a/tests/test-fa-sparse-smem-exact.cpp b/tests/test-fa-sparse-smem-exact.cpp
+index c7a4fb56edb..7650ea3543d 100644
+--- a/tests/test-fa-sparse-smem-exact.cpp
++++ b/tests/test-fa-sparse-smem-exact.cpp
+@@ -252,7 +252,10 @@ int main(int argc, char ** argv) {
+         set_env("GGML_CUDA_FA_SPARSE_SMEM_FIX", std::to_string(mode).c_str());
+         set_env("GGML_CUDA_FATTN_SPARSE_MIN_KV", "4096"); // every case through the sparse gather
+         fflush(stdout);
+-        const std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++        std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++#if defined(_WIN32)
++        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
++#endif
+         const int rc = std::system(cmd.c_str());
+         FILE * f = rc == 0 ? fopen(path.c_str(), "rb") : nullptr;
+         if (f == nullptr) {
+diff --git a/tests/test-fattn-q4-exact.cpp b/tests/test-fattn-q4-exact.cpp
+index 7e20629d569..1b8abe781ba 100644
+--- a/tests/test-fattn-q4-exact.cpp
++++ b/tests/test-fattn-q4-exact.cpp
+@@ -309,7 +309,10 @@ int main(int argc, char ** argv) {
+         set_env("GGML_CUDA_FATTN_Q8_MODE", mode == 1 ? "1" : "0");
+         set_env("GGML_CUDA_FATTN_I8", "0"); // the staged reference is the f16 kernel (the INT8 Q*K^T route of q8_0 K prompts is not byte-equal)
+         fflush(stdout);
+-        const std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++        std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++#if defined(_WIN32)
++        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
++#endif
+         const int rc = std::system(cmd.c_str());
+         FILE * f = rc == 0 ? fopen(path.c_str(), "rb") : nullptr;
+         if (f == nullptr) {
+diff --git a/tests/test-fattn-q8-exact.cpp b/tests/test-fattn-q8-exact.cpp
+index 184f496ecda..8f8c260c5d6 100644
+--- a/tests/test-fattn-q8-exact.cpp
++++ b/tests/test-fattn-q8-exact.cpp
+@@ -263,7 +263,10 @@ int main(int argc, char ** argv) {
+         set_env("GGML_CUDA_FATTN_Q8_MODE", mode == 1 ? "1" : "0");
+         set_env("GGML_CUDA_FATTN_I8", "0"); // the staged reference is the f16 kernel (the INT8 Q*K^T route of q8_0 K prompts is not byte-equal)
+         fflush(stdout);
+-        const std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++        std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++#if defined(_WIN32)
++        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
++#endif
+         const int rc = std::system(cmd.c_str());
+         FILE * f = rc == 0 ? fopen(path.c_str(), "rb") : nullptr;
+         if (f == nullptr) {
+diff --git a/tests/test-fattn-src2-exact.cpp b/tests/test-fattn-src2-exact.cpp
+index 29f5c4f1d6a..a016f016540 100644
+--- a/tests/test-fattn-src2-exact.cpp
++++ b/tests/test-fattn-src2-exact.cpp
+@@ -367,7 +367,10 @@ int main(int argc, char ** argv) {
+             set_env("FATTN_SRC2_REF", "1");
+         }
+         fflush(stdout);
+-        const std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++        std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++#if defined(_WIN32)
++        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
++#endif
+         const int rc = std::system(cmd.c_str());
+         FILE * f = rc == 0 ? fopen(path.c_str(), "rb") : nullptr;
+         if (f == nullptr) {
 diff --git a/tests/test-fit-dflash-swa.cpp b/tests/test-fit-dflash-swa.cpp
 index 33136ca8516..343dca19970 100644
 --- a/tests/test-fit-dflash-swa.cpp
@@ -98,3 +162,129 @@ index 882d239be9a..2a16fddbad7 100644
  static uint64_t fnv1a(const uint8_t * p, size_t n, uint64_t h = 1469598103934665603ull) {
      for (size_t i = 0; i < n; ++i) {
          h = (h ^ p[i]) * 1099511628211ull;
+diff --git a/tests/test-kv-win.cpp b/tests/test-kv-win.cpp
+index f282c55351c..1bdf8d00e47 100644
+--- a/tests/test-kv-win.cpp
++++ b/tests/test-kv-win.cpp
+@@ -44,6 +44,11 @@ struct cfg {
+     bool      unified = true;
+ };
+ 
++// --ngl N: layers on the GPU. There the bit-for-bit checks against a plain cache become tolerance checks (the stopgap or the
++// two-source kernel and the plain kernels differ in staging and split); rollback stays bit for bit (same shapes, same kernels), state
++// within the plain cache's own save / restore difference
++static int g_ngl = 0;
++
+ static llama_context * make_ctx(llama_model * model, const cfg & c) {
+     auto cp = llama_context_default_params();
+     cp.n_ctx           = c.n_ctx;
+@@ -53,6 +58,9 @@ static llama_context * make_ctx(llama_model * model, const cfg & c) {
+     cp.n_rs_seq        = 4; // recurrent states of hybrid models roll back with the drafts
+     cp.kv_unified      = c.unified;
+     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++    // the bitwise CPU compares (no layers offloaded) stay on the CPU: a GPU build would offload the large-batch host ops of one
++    // arm and not those of the other (ROCm gfx1151: max rel 1e-7, not bit-equal)
++    cp.op_offload      = g_ngl > 0;
+     cp.n_threads       = std::max(1, std::min(4, (int) std::thread::hardware_concurrency())); // no more threads than cores
+     cp.n_threads_batch = cp.n_threads;
+     cp.type_k          = c.type;
+@@ -165,10 +173,6 @@ static double cosine(const std::vector<float> & a, const std::vector<float> & b)
+     return ab/sqrt(aa*bb + 1e-30);
+ }
+ 
+-// --ngl N: layers on the GPU. There the bit-for-bit checks against a plain cache become tolerance checks (the stopgap or the
+-// two-source kernel and the plain kernels differ in staging and split); rollback stays bit for bit (same shapes, same kernels), state
+-// within the plain cache's own save / restore difference
+-static int g_ngl = 0;
+ 
+ static int n_fail = 0;
+ static int n_pass = 0;
+diff --git a/tests/test-qsa-allfit-exact.cpp b/tests/test-qsa-allfit-exact.cpp
+index 507bcdae019..b929145ba8e 100644
+--- a/tests/test-qsa-allfit-exact.cpp
++++ b/tests/test-qsa-allfit-exact.cpp
+@@ -175,7 +175,10 @@ int main(int argc, char ** argv) {
+         set_env("LLAMA_QSA_ALLFIT", mode ? "1" : "0");
+         set_env("LLAMA_QSA_ALLFIT_LOG", "1");
+         fflush(stdout);
+-        const std::string cmd = "\"" + std::string(argv[0]) + "\" --child \"" + model + "\" \"" + path + "\"";
++        std::string cmd = "\"" + std::string(argv[0]) + "\" --child \"" + model + "\" \"" + path + "\"";
++#if defined(_WIN32)
++        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
++#endif
+         const int rc = std::system(cmd.c_str());
+         FILE * f = rc == 0 ? fopen(path.c_str(), "rb") : nullptr;
+         if (f == nullptr) {
+diff --git a/tests/test-topk-batch-exact.cpp b/tests/test-topk-batch-exact.cpp
+index b2b05f40f4c..71e7aa9eb60 100644
+--- a/tests/test-topk-batch-exact.cpp
++++ b/tests/test-topk-batch-exact.cpp
+@@ -230,8 +230,9 @@ int main(int argc, char ** argv) {
+                 printf("\n");
+             }
+         }
+-        if (gpu) {
++        if (gpu && strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0) {
+             // control: past the gate's other side the order of a single row and of several rows differ, and the check sees it
++            // (CUDA only: ROCm gfx1151 returns the per-row order for several rows too, so there is no order change to see)
+             const tcase cc = { 3, 2048, 20, 0 };
+             const std::vector<float> x = make_data(cc, 5);
+             const bool ok = !same(run_case(backend, cc, x, false, 0), run_case(backend, cc, x, true, 0));
+diff --git a/tests/test-topk-batch-sampling.cpp b/tests/test-topk-batch-sampling.cpp
+index fccdcb2ce44..2b2e4f9832f 100644
+--- a/tests/test-topk-batch-sampling.cpp
++++ b/tests/test-topk-batch-sampling.cpp
+@@ -305,7 +305,10 @@ int main(int argc, char ** argv) {
+         if (mode == 3) {
+             set_env("TOPK_BATCH_TEST_REF", "1");
+         }
+-        const std::string cmd = "\"" + std::string(argv[0]) + "\" --child \"" + argv[1] + "\" " + device + " \"" + path + "\"";
++        std::string cmd = "\"" + std::string(argv[0]) + "\" --child \"" + argv[1] + "\" " + device + " \"" + path + "\"";
++#if defined(_WIN32)
++        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
++#endif
+         const int rc = std::system(cmd.c_str());
+         if (rc != 0) {
+             printf("FAIL: child mode %d rc %d\n", mode, rc);
+diff --git a/tests/test-topk-oneblock-exact.cpp b/tests/test-topk-oneblock-exact.cpp
+index 0a3a7e2f60f..6fade3a9077 100644
+--- a/tests/test-topk-oneblock-exact.cpp
++++ b/tests/test-topk-oneblock-exact.cpp
+@@ -211,6 +211,9 @@ int main(int argc, char ** argv) {
+         set_env("GGML_CUDA_TOPK_ONEBLOCK_V2", mode == 0 ? "1" : "0");
+         set_env("GGML_CUDA_TOPK_ONEBLOCK", mode == 2 ? "0" : "1");
+         std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++#if defined(_WIN32)
++        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
++#endif
+         const int rc = std::system(cmd.c_str());
+         FILE * f = rc == 0 ? fopen(path.c_str(), "rb") : nullptr;
+         if (f == nullptr) {
+diff --git a/tests/test-topk-twostage-exact.cpp b/tests/test-topk-twostage-exact.cpp
+index b65c10b51cc..e86dcf51a6b 100644
+--- a/tests/test-topk-twostage-exact.cpp
++++ b/tests/test-topk-twostage-exact.cpp
+@@ -219,6 +219,9 @@ int main(int argc, char ** argv) {
+         set_env("GGML_CUDA_TOPK_DETERMINISTIC", "1");
+         set_env("GGML_CUDA_TOPK_TWO_STAGE", mode == 0 ? "1" : "0");
+         std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++#if defined(_WIN32)
++        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
++#endif
+         const int rc = std::system(cmd.c_str());
+         FILE * f = rc == 0 ? fopen(path.c_str(), "rb") : nullptr;
+         if (f == nullptr) {
+diff --git a/tests/test-topk384-exact.cpp b/tests/test-topk384-exact.cpp
+index b74f68f0b69..6cd57f3e9fa 100644
+--- a/tests/test-topk384-exact.cpp
++++ b/tests/test-topk384-exact.cpp
+@@ -208,6 +208,9 @@ int main(int argc, char ** argv) {
+         set_env("GGML_CUDA_TOPK_MOE_384", mode ? "1" : "0");
+         set_env("GGML_CUDA_TOPK_MOE_LOG", "1");
+         std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
++#if defined(_WIN32)
++        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
++#endif
+         const int rc = std::system(cmd.c_str());
+         if (rc != 0 || !read_dump(path, outs[mode], logs[mode], cs.size())) {
+             printf("FAIL: child mode %d rc %d\n", mode, rc);
