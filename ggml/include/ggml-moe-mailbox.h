@@ -42,7 +42,8 @@ struct ggml_moe_mailbox_ctl {
     uint64_t t_pub;   // GGML_MOE_MAILBOX_TIMING: globaltimer at the end of the last publish with host rows
     uint64_t sums[6]; // GGML_MOE_MAILBOX_TIMING: the sums of ggml_moe_mailbox_hdr::tm, kept here and stored there
     int64_t  min_d2;  // GGML_MOE_MAILBOX_TIMING: hdr tm[8] (0 = none yet)
-    uint32_t pad[44];
+    uint32_t pub_done; // blocks of the running publish that wrote their rows (the row publish, see moe_mailbox_publish_rows); 0 between publishes
+    uint32_t pad[43];
 };
 
 GGML_MOE_MAILBOX_FN size_t ggml_moe_mailbox_align(size_t n) {

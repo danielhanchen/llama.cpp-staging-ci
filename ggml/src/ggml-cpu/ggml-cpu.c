@@ -1750,6 +1750,8 @@ struct ggml_moe_host_job {
     atomic_int * gdone;
     // 1: a read-ahead job (ggml_moe_host_pf_thread), not a batch
     int    kind;
+    // GGML_MOE_HOST_LEAN bit 4: tused[t] = token t has a pair; NULL = every token (see ggml_moe_host_ffn_impl)
+    const uint8_t * tused;
 };
 
 // one up or gate row r (matrix m) of group g for every pair of the group: the computation of the ranges below
@@ -1879,6 +1881,9 @@ static void ggml_moe_host_ffn_thread_impl(struct ggml_moe_host_job * j, int ith,
 
     // 1. the activations of each token quantized for up and gate (whole rows: the graph quantizes block ranges, the same bytes)
     for (int t = 0; t < j->n_tokens; ++t) {
+        if (j->tused != NULL && !j->tused[t]) {
+            continue; // no pair reads this token's row (every product indexes the activations by its pair's token)
+        }
         j->q_u(j->x + (int64_t) t*n_embd, xu + (size_t) t*j->rsu, n_embd);
         if (!j->qshare) {
             j->q_g(j->x + (int64_t) t*n_embd, xg + (size_t) t*j->rsg, n_embd);
@@ -2467,11 +2472,12 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
     // only the host rows; the earlier form zeroed up to 7 of every 8 rows of the mapped mailbox on the calling thread before the region),
     // 2 = the gate activations reuse the up activations' quantized bytes when both have the same vec_dot type (the same bytes). Every
     // host row keeps its bytes. RTX PRO 6000 Flash-Next 4-bit 24 / 32 GB: 106 -> 88 us per 3-row host batch, decode +0.5..+3.3%,
-    // md5 equal in all 8 cells
+    // md5 equal in all 8 cells. 4 = the threads quantize only the activations of tokens with a host pair (default 7 = all three; the
+    // other rows are never read, and the device may publish only the rows of tokens with a host expert, see moe_mailbox_publish_rows)
     static int lean = -1;
     if (lean < 0) {
         const char * el = getenv("GGML_MOE_HOST_LEAN");
-        lean = el != NULL ? atoi(el) : 3;
+        lean = el != NULL ? atoi(el) : 7;
     }
 
     // the pairs (slot j of token t) with a host expert, tokens outer and slots inner (the order of the graph's row mapping), grouped
@@ -2483,9 +2489,11 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
     int32_t gstart[GGML_MOE_HOST_MAX_PAIRS + 1];
     int32_t glist[GGML_MOE_HOST_MAX_PAIRS];  // pairs of group g: glist[gstart[g] .. gstart[g + 1]), in pair order
     int32_t gcnt[GGML_MOE_HOST_MAX_PAIRS];
+    uint8_t tused[GGML_MOE_HOST_MAX_PAIRS];  // token t has a pair (n_tokens <= n_used*n_tokens <= GGML_MOE_HOST_MAX_PAIRS)
     int n_pair = 0;
     int n_grp  = 0;
     for (int t = 0; t < n_tokens; ++t) {
+        tused[t] = 0;
         for (int j = 0; j < n_used; ++j) {
             const int32_t e = ids[(int64_t) t*n_used + j];
             if (e < 0) {
@@ -2509,6 +2517,7 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
                 gcnt[g] = 0;
             }
             pe[n_pair] = e; po[n_pair] = t*n_used + j; pt[n_pair] = t; pg[n_pair] = g;
+            tused[t] = 1;
             gcnt[g]++;
             n_pair++;
         }
@@ -2544,6 +2553,7 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
     job.qact = base + 2*rows_b;
     job.thr0 = base + 2*rows_b + qact_b;
     job.kind  = 0;
+    job.tused = (lean & 4) ? tused : NULL;
     // (by default only batches of 6+ tokens: the wide verify windows of a block drafter, whose host experts the read-ahead covers best;
     // at 5 tokens and fewer the sliced form's second barrier cost as much as the read-ahead saved on some hosts)
     job.sliced = n_threads > 1 && (ggml_moe_host_pf_mode() == 1 || (ggml_moe_host_pf_mode() < 0 && !team && n_threads >= 16 && n_tokens >= 6));

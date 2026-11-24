@@ -184,21 +184,25 @@ int main(int argc, char ** argv) {
     if (argc > 1 && strcmp(argv[1], "perf") == 0) {
         return perf_main();
     }
-    struct tc { ggml_type tu, td; int64_t n_embd, n_ff; int n_exp, n_used, n_tokens; bool skip; };
+    // drop: every other token has no host expert and its activations are NaN (the device publishes only the rows of tokens with a host
+    // expert, the other rows hold whatever an earlier batch left), so no output may depend on them
+    struct tc { ggml_type tu, td; int64_t n_embd, n_ff; int n_exp, n_used, n_tokens; bool skip; bool drop; };
     const tc cases[] = {
-        { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 256, 512, 16, 4, 1, false },
-        { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 256, 512, 16, 4, 1, true  },
-        { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, 512, 256, 8,  4, 3, true  },
-        { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 256, 768, 6,  4, 4, false },
-        { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 256, 8,  2, 2, false },
-        { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, 256, 512, 12, 8, 8, true  },
-        { GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, 128, 384, 4,  4, 8, false },
-        { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, 256, 512, 16, 8, 4, false },
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 256, 512, 16, 4, 1, false, false },
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 256, 512, 16, 4, 1, true, false },
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, 512, 256, 8,  4, 3, true, false },
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 256, 768, 6,  4, 4, false, false },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 256, 8,  2, 2, false, false },
+        { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, 256, 512, 12, 8, 8, true, false },
+        { GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, 128, 384, 4,  4, 8, false, false },
+        { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, 256, 512, 16, 8, 4, false, false },
         // Flash-Next's expert types (the AVX-512 IQ3_S kernel where the build has it), experts shared by 2-4 rows
-        { GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, 512, 640, 6,  4, 6, false },
+        { GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, 512, 640, 6,  4, 6, false, false },
         // the IQ3_XXS gate / up and Q5_0 down experts of Flash-Next's 4-bit layers (the Q5_0 multi-column kernel for shared experts)
-        { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, 512, 512, 6,  4, 6, false },
-        { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, 256, 512, 16, 8, 3, true  },
+        { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, 512, 512, 6,  4, 6, false, false },
+        { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, 256, 512, 16, 8, 3, true, false },
+        { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, 256, 512, 16, 8, 7, true, true },
+        { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 256, 512, 16, 4, 8, false, true },
     };
     int fails = 0, runs = 0, unhandled = 0;
     printf("host team: %s\n", ggml_cpu_moe_host_team_on() ? "on" : "off (GGML_MOE_HOST_TEAM=0: OpenMP region)");
@@ -211,6 +215,17 @@ int main(int argc, char ** argv) {
     for (const tc & k : cases) {
         ffn_case c;
         make_case(c, k.tu, k.td, k.n_embd, k.n_ff, k.n_exp, k.n_used, k.n_tokens, seed++, k.skip);
+        if (k.drop) {
+            const int64_t n_embd = c.up->ne[0];
+            for (int t = 1; t < k.n_tokens; t += 2) {
+                for (int u = 0; u < k.n_used; ++u) {
+                    ((int32_t *) c.ids->data)[t*k.n_used + u] = -1;
+                }
+                for (int64_t i = 0; i < n_embd; ++i) {
+                    ((float *) c.x->data)[t*n_embd + i] = NAN;
+                }
+            }
+        }
         const std::vector<float> ref = run_graph(c, 4);
         for (int team = team0; team < 2; ++team)
         // then fewer threads than the team has, and back (the idle workers skip those batches)
@@ -253,7 +268,7 @@ int main(int argc, char ** argv) {
             }
         }
         printf("%s/%s embd %" PRId64 " ff %" PRId64 " experts %d used %d tokens %d%s: done\n", ggml_type_name(k.tu), ggml_type_name(k.td),
-            k.n_embd, k.n_ff, k.n_exp, k.n_used, k.n_tokens, k.skip ? " (with -1 ids)" : "");
+            k.n_embd, k.n_ff, k.n_exp, k.n_used, k.n_tokens, k.drop ? " (tokens without host experts, NaN rows)" : k.skip ? " (with -1 ids)" : "");
     }
     ggml_cpu_moe_host_team_stop();
     printf("%d runs, %d not handled, %d failed\n", runs, unhandled, fails);
