@@ -23,6 +23,13 @@ ggml_metal_op_t ggml_metal_op_init(
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
+// tensors whose reads are bound to other memory for the graphs of one owner (a backend context): the ops read `id` instead of
+// the tensor's own buffer. Set before the owner encodes a graph, cleared by the owner after it encoded it (the caller keeps the
+// Metal buffer of `id` alive until the command buffers that read it have completed)
+void ggml_metal_op_alias_add  (const void * owner, const struct ggml_tensor * t, struct ggml_metal_buffer_id id);
+void ggml_metal_op_alias_clear(const void * owner);
+int  ggml_metal_op_alias_count(const void * owner);
+
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);

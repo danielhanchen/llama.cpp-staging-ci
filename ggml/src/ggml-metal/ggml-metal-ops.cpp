@@ -17,14 +17,85 @@
 #include <limits>
 #include <cmath>
 #include <cstdlib>
+#include <atomic>
+#include <mutex>
+#include <vector>
 
 // threadgroups needed to fill the GPU
 // TODO: dedup
 static constexpr int64_t GGML_METAL_MIN_THREADGROUPS = 128;
 
+// see ggml_metal_op_alias_add. A tensor of a live graph has a unique address, so the owners do not see each other's entries
+struct ggml_metal_op_alias {
+    const void          * owner;
+    const ggml_tensor   * t;
+    ggml_metal_buffer_id  id;
+};
+
+static std::mutex                       g_alias_mutex;
+static std::vector<ggml_metal_op_alias> g_alias;
+static std::atomic<int>                 g_alias_n { 0 };
+
+void ggml_metal_op_alias_add(const void * owner, const ggml_tensor * t, ggml_metal_buffer_id id) {
+    std::lock_guard<std::mutex> lock(g_alias_mutex);
+    for (auto & a : g_alias) {
+        if (a.t == t) {
+            a.owner = owner;
+            a.id    = id;
+            return;
+        }
+    }
+    g_alias.push_back({ owner, t, id });
+    g_alias_n.store((int) g_alias.size());
+}
+
+void ggml_metal_op_alias_clear(const void * owner) {
+    if (g_alias_n.load() == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_alias_mutex);
+    g_alias.erase(std::remove_if(g_alias.begin(), g_alias.end(), [owner](const ggml_metal_op_alias & a) { return a.owner == owner; }), g_alias.end());
+    g_alias_n.store((int) g_alias.size());
+}
+
+int ggml_metal_op_alias_count(const void * owner) {
+    std::lock_guard<std::mutex> lock(g_alias_mutex);
+    int n = 0;
+    for (const auto & a : g_alias) {
+        n += a.owner == owner;
+    }
+    return n;
+}
+
+static bool ggml_metal_op_alias_find(const ggml_tensor * t, ggml_metal_buffer_id * res) {
+    if (g_alias_n.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_alias_mutex);
+    for (const auto & a : g_alias) {
+        if (a.t == t) {
+            *res = a.id;
+            return true;
+        }
+        // a view of a bound tensor: the same offset into the bound memory
+        if (t->view_src == a.t) {
+            *res = a.id;
+            res->offs += (size_t) ((const char *) t->data - (const char *) a.t->data);
+            return true;
+        }
+    }
+    return false;
+}
+
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
         return { nullptr, 0 };
+    }
+
+    // a tensor bound to other memory, or a view of one
+    ggml_metal_buffer_id bid_alias;
+    if (ggml_metal_op_alias_find(t, &bid_alias)) {
+        return bid_alias;
     }
 
     ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;

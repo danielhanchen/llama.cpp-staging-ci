@@ -10434,6 +10434,22 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     if (node == nullptr) {
         return copy_whole();
     }
+
+    // unified memory (Metal): the product reads the host bank in place, no copy and no wait for the ids. Only where nothing else reads
+    // the copy: not on the copy queue (prefetched copies), not an expert tensor of the MoE cache (its seeds and staged copies read dst),
+    // not a tensor the weight store reads from the file. Any refusal copies as before (GGML_METAL_HOST_BANK_BIND=0: always)
+    if (!on_copy_queue && (!lctx->moe_cache || lctx->moe_cache->get_experts(src) == nullptr) && !(lctx->wstore && lctx->wstore->covers(src)) &&
+            src->data != nullptr && src->buffer != nullptr && ggml_backend_buffer_is_host(src->buffer) && src->type == dst->type &&
+            ggml_nbytes(src) == ggml_nbytes(dst)) {
+        using alias_host_t = bool (*)(ggml_backend_t, const ggml_tensor *, const void *, size_t);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto fn = reg != nullptr ? (alias_host_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_alias_host") : nullptr;
+        if (fn != nullptr && fn(backend, dst, src->data, ggml_nbytes(src))) {
+            return true;
+        }
+    }
+
     if (node != ggml_graph_node(graph, 0)) {
         const ggml_tensor * ids_n = node->src[2];
         for (int i = 0; i < n_nodes; i++) {

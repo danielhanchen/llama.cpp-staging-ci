@@ -668,6 +668,11 @@ if (GGML_METAL)
     # the paired-route mat-vec MUL_MAT_ID on Metal (GGML_METAL_MMID_PAIR=1) vs the single-route kernel, byte for byte (SKIP when unsupported)
     llama_build_and_test(test-metal-mmid-pair-exact.cpp LINK ggml)
 endif()
+# Metal host bank binding (the MoE copy callback on unified memory reads host expert banks in place): bound reads return the host
+# bytes, a later graph reads the tensor's own bytes, and GGML_METAL_HOST_BANK_BIND=0 refuses every bind (SKIP without a Metal device)
+llama_build_and_test(test-metal-host-bind.cpp LINK ggml)
+llama_test(test-metal-host-bind NAME test-metal-host-bind-off ARGS --off)
+set_tests_properties(test-metal-host-bind-off PROPERTIES ENVIRONMENT "GGML_METAL_HOST_BANK_BIND=0")
 # the rows-per-block lever of the dense 2..8 column mat-vec vs the launch it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-mmvqcols-exact.cpp LINK ggml)
 # the ported few-row int8 MMQ (GGML_CUDA_MMQ_FEW) on dense K-quant / IQ4_XS / Q8_0 products at 2..8 columns vs mmvq + fp64 reference (NMSE gates,
