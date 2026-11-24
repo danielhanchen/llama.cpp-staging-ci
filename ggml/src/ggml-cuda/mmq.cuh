@@ -2164,19 +2164,6 @@ static bool ggml_cuda_mmq_exact_cvt_env(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE;
 }
 
-static void mmq_exact_cvt_count(const ggml_type type) {
-    static std::atomic<int64_t> n{0};
-    const int64_t c = n.fetch_add(1) + 1;
-    int64_t p = 1;
-    while (p < c) {
-        p *= 10;
-    }
-    if (p == c) {
-        GGML_LOG_INFO("ggml_cuda: MMQ exact int-to-float product: %" PRId64 " launches (last %s; GGML_CUDA_MMQ_EXACT_CVT=0 off)\n",
-            c, ggml_type_name(type));
-    }
-}
-
 // GGML_CUDA_MMQ_DEAD_SKIP / GGML_CUDA_MMQ_KTAIL (unset = on, 0 = off): MMQ_FLAG_DEAD / MMQ_FLAG_KTAIL for the types with those forms
 // (ggml_cuda_mmq_pad_type: the q8_0 mma vec_dot of the exact-product types on NVIDIA). Both bit-identical (see the flag comments).
 // Engagement: launches with the flag where it can act (a tile with dead columns possible / a K tail), logged at 1, 10, 100, ...
@@ -2252,6 +2239,19 @@ static void mmq_fill_log(const mmq_args & args, const int J, const ggml_type typ
             " (%.4f); cols/expert hist [0,1-7,8-15,16-31,32-63,64-127,128-255,256-511,512+]:%s; last-tile live groups [1..16]:%s\n",
             n_prod, ggml_type_name(type), J, args.ncols_x, n_used, n_cols, n_tiles, n_part,
             n_tiles ? double(n_cols)/double(n_tiles*J) : 0.0, g_live, g_all, g_all ? double(g_live)/double(g_all) : 0.0, hs.c_str(), fs.c_str());
+    }
+}
+
+static void mmq_exact_cvt_count(const ggml_type type) {
+    static std::atomic<int64_t> n{0};
+    const int64_t c = n.fetch_add(1) + 1;
+    int64_t p = 1;
+    while (p < c) {
+        p *= 10;
+    }
+    if (p == c) {
+        GGML_LOG_INFO("ggml_cuda: MMQ exact int-to-float product: %" PRId64 " launches (last %s; GGML_CUDA_MMQ_EXACT_CVT=0 off)\n",
+            c, ggml_type_name(type));
     }
 }
 
