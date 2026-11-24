@@ -1,6 +1,6 @@
 // the QSA indexer chain (ggml_lightning_indexer, n_head 4, then ggml_top_k) with the live pool count on the device
 // (ggml_lightning_indexer_set_live_len / ggml_top_k_set_live_len, the padded pools past it: mask -inf for every token) against the
-// same graph without it, and the multi-row vec indexer kernel (GGML_CUDA_LI_VEC_MULTI, default on) against the per-token kernel
+// same graph without it, and the multi-row vec indexer kernel (GGML_CUDA_LI_VEC_MULTI, opt-in) against the per-token kernel
 // (=0): every score byte (the padded columns included, -inf) and every top-k id in order must be equal across the four arms
 // (live on / off x multi on / off). Each multi mode runs in a child process (this binary with --child MODE FILE; the switch is read
 // once per process). Cases: 1..8 tokens (8: the token tile kernel), 1088 / 4160 columns (the 8k bucket), real pools below / at / above

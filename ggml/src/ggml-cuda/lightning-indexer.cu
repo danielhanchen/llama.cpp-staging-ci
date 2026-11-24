@@ -1080,17 +1080,19 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
         dim3 grid(num_kv_blocks, n_batch, n_stream);
 
-        // up to 7 tokens in one block per key tile, the same scores (lightning_indexer_kernel_vec_rows); not with candidates, nor for
-        // a batch-invariant node (each token keeps its own launch, as for one token)
+        // GGML_CUDA_LI_VEC_MULTI=1 (opt-in): up to 7 tokens in one block per key tile, the same scores (lightning_indexer_kernel_vec_rows);
+        // not with candidates, nor for a batch-invariant node (each token keeps its own launch, as for one token). Off by default:
+        // RTX PRO 6000, Qwen3.8-Flash-Next at 4 bits + MTP, full card, 8k, 3 VMs x 3 launches: -0.4..-0.5% tok/s (12.43 vs 12.38 ms
+        // per pass; off = base), one block per key tile for all rows leaves too few blocks at a few thousand keys
         static const bool vec_multi = [] {
             const char * e = getenv("GGML_CUDA_LI_VEC_MULTI");
-            return e == nullptr || atoi(e) != 0;
+            return e != nullptr && atoi(e) != 0;
         }();
         if (vec_multi && !cand.C && !(dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && n_batch >= 1 && n_batch <= 7) {
             static bool logged = false;
             if (!logged && !ggml_cuda_preload_on()) {
                 logged = true;
-                GGML_LOG_INFO("%s: indexer vec multi: %d tokens per key tile in one block (GGML_CUDA_LI_VEC_MULTI=0: off)\n", __func__, n_batch);
+                GGML_LOG_INFO("%s: indexer vec multi: %d tokens per key tile in one block (GGML_CUDA_LI_VEC_MULTI=1, opt-in)\n", __func__, n_batch);
             }
             const dim3 grid_r(num_kv_blocks, 1, n_stream);
             switch (n_batch <= 1 ? 1 : n_batch <= 2 ? 2 : n_batch <= 4 ? 4 : 7) {
