@@ -9,6 +9,8 @@ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
+constant bool FC_mul_mm_id_sgsplit [[function_constant(FC_MUL_MM + 8)]];
+constant bool FC_mul_mm_id_bskip   [[function_constant(FC_MUL_MM + 9)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -709,7 +711,19 @@ kernel void kernel_mul_mm_id(
     }
 
     // simdgroups 2,3 own rows NR1H..NR1-1
-    const bool sg_active = has_hi || sgitg < 2;
+    // sgsplit (GGML_METAL_MMID_SGSPLIT): a tile of at most NR1H rows spreads its 2 x 8 output blocks over all 4
+    // simdgroups (A rows 16*sgitg .. 16*sgitg + 15 each, all B rows) instead of idling simdgroups 2,3; every
+    // output block keeps its own accumulator and the same chain of multiply-accumulates over K, so the result
+    // is identical
+    const bool split4    = FC_mul_mm_id_sgsplit && !has_hi;
+    const bool sg_active = split4 || has_hi || sgitg < 2;
+
+    // first B row of the blocks of this simdgroup
+    const short r1b = split4 ? 0 : NR1H*(sgitg >> 1);
+
+    // bskip (GGML_METAL_MMID_BSKIP): the second 8-row B block of this simdgroup is not loaded and its
+    // multiply-accumulates are not run when all of its rows are >= nr1 (those accumulators are never written to dst)
+    const bool b1_live = !FC_mul_mm_id_bskip || r1b + 8 < nr1;
 #else
     auto cT0 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB0), float>();
     auto cT1 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB1), float>();
@@ -855,7 +869,40 @@ kernel void kernel_mul_mm_id(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
 #ifndef GGML_METAL_HAS_TENSOR
-        if (sg_active) {
+        if (split4) {
+            // A blocks 2*sgitg, 2*sgitg + 1 against B blocks 0 (and 1): mc[2*b + i] = mb[b] x ma[i]
+            threadgroup const S0 * lsma = (sa + 2*64*sgitg);
+            threadgroup const S1 * lsmb = (sb);
+
+            FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                simdgroup_load(mb[0], lsmb, 8, 0, false);
+                if (b1_live) {
+                    simdgroup_load(mb[1], lsmb + 64, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_multiply_accumulate(mc[i], mb[0], ma[i], mc[i]);
+                }
+                if (b1_live) {
+                    FOR_UNROLL (short i = 0; i < 2; i++) {
+                        simdgroup_multiply_accumulate(mc[2 + i], mb[1], ma[i], mc[2 + i]);
+                    }
+                }
+
+                lsma += 8*64;
+                lsmb += 4*64;
+            }
+        } else if (sg_active) {
             // load matrices from threadgroup memory and conduct outer products
             threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
             threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
@@ -869,14 +916,20 @@ kernel void kernel_mul_mm_id(
 
                 simdgroup_barrier(mem_flags::mem_none);
 
-                FOR_UNROLL (short i = 0; i < 2; i++) {
-                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+                simdgroup_load(mb[0], lsmb, 8, 0, false);
+                if (b1_live) {
+                    simdgroup_load(mb[1], lsmb + 64, 8, 0, false);
                 }
 
                 simdgroup_barrier(mem_flags::mem_none);
 
-                FOR_UNROLL (short i = 0; i < 8; i++){
-                    simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+                FOR_UNROLL (short i = 0; i < 4; i++){
+                    simdgroup_multiply_accumulate(mc[i], mb[0], ma[i], mc[i]);
+                }
+                if (b1_live) {
+                    FOR_UNROLL (short i = 4; i < 8; i++){
+                        simdgroup_multiply_accumulate(mc[i], mb[1], ma[i%4], mc[i]);
+                    }
                 }
 
                 lsma += 8*64;
@@ -909,10 +962,17 @@ kernel void kernel_mul_mm_id(
         cT1.store(tC1);
     }
 #else
-    if (sg_active) {
+    if (split4) {
+        // A columns 16*sgitg .., B rows 0 .. 15
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 16*sgitg;
+
+        for (short i = 0; i < (b1_live ? 4 : 2); i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%2) + 8*NR0*(i/2), NR0, 0, false);
+        }
+    } else if (sg_active) {
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
-        for (short i = 0; i < 8; i++) {
+        for (short i = 0; i < (b1_live ? 8 : 4); i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
         }
     }
