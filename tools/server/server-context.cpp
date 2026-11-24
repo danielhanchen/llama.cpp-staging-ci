@@ -563,6 +563,12 @@ struct server_pass_timer {
     int64_t n = 0;
     double  w_sum[32] = {};
     int64_t w_n[32] = {};
+    // coverage of the averages above: a pass is counted when the next draft call closes it, so a request's last pass (and a decode
+    // with no draft call before it, e.g. the first one after the prompt) is not in them; these count every decode and its span
+    int64_t n_dec   = 0;
+    int64_t t_dec_0 = 0; // the first decode of the request
+    double  dec_sum = 0; // decode call + wait of every decode
+    bool    gen     = false; // the decode being timed has no prompt tokens
     server_pass_timer() {
         const char * e = getenv("LLAMA_PASS_TIMING");
         on = e != nullptr && atoi(e) != 0;
@@ -589,15 +595,25 @@ struct server_pass_timer {
             }
         }
         t[k] = now;
+        if (k == DEC0 && gen) {
+            n_dec += 1;
+            if (t_dec_0 == 0) {
+                t_dec_0 = now;
+            }
+        }
+        if (k == DEC2 && t[DEC0] > 0 && gen) {
+            dec_sum += (double) (now - t[DEC0]);
+        }
         if (k == DEC2 && t[DEC0] > 0 && width > 0 && width < 32) {
             w_sum[width] += (double) (now - t[DEC0]);
             w_n[width]   += 1;
         }
     }
-    std::string report() {
+    // t_gen_ms: the request's generation time (prompt end to its last token, as the eval time line)
+    std::string report(double t_gen_ms = 0.0) {
         static const char * names[N_STAMP] = { "draft", "to_dec", "dec_call", "dec_wait", "to_proc", "proc", "to_acc", "acc", "tokens", "to_draft" };
         std::string r;
-        char b[96];
+        char b[192];
         if (n == 0) {
             return r;
         }
@@ -615,6 +631,14 @@ struct server_pass_timer {
                 snprintf(b, sizeof(b), " w%d %.3f (%" PRId64 ")", w, w_sum[w] / w_n[w] / 1e3, w_n[w]); r += b;
             }
         }
+        if (t_gen_ms > 0.0 && t_dec_0 > 0) {
+            // eval time = counted passes + the rest: the decodes outside them, and the host time between the prompt and the first decode
+            const double t_end_ms = (double) (ggml_time_us() - t_dec_0) / 1e3;
+            snprintf(b, sizeof(b), " | coverage: %" PRId64 " decodes (%.3f ms each incl. wait), %" PRId64 " in the passes above;", n_dec,
+                    dec_sum / std::max<int64_t>(1, n_dec) / 1e3, n); r += b;
+            snprintf(b, sizeof(b), " eval %.3f ms = counted %.3f + outside %.3f (first decode to end %.3f)", t_gen_ms, tot / 1e3,
+                    t_gen_ms - tot / 1e3, t_end_ms); r += b;
+        }
         const auto & dg = common_dflash_diag();
         if (dg.n_draft > 0) {
             snprintf(b, sizeof(b), " | dflash call: launch %.3f wait %.3f walk %.3f ms (%" PRId64 ")", dg.t_launch / 1e3 / dg.n_draft,
@@ -630,6 +654,7 @@ struct server_pass_timer {
             w_sum[w] = 0; w_n[w] = 0;
         }
         n = 0;
+        n_dec = 0; t_dec_0 = 0; dec_sum = 0;
         auto & dg = common_dflash_diag();
         dg.t_launch = dg.t_wait = dg.t_walk = dg.n_draft = 0;
     }
@@ -1431,7 +1456,7 @@ struct server_slot {
                     n_fast, n_total);
         }
         if (srv_pass_timer().on) {
-            const std::string r = srv_pass_timer().report();
+            const std::string r = srv_pass_timer().report(stats.t_gen_ms());
             if (!r.empty()) {
                 SLT_INF(*this, "%s\n", r.c_str());
             }
@@ -2454,13 +2479,19 @@ private:
                     // (a model on a memory file system: its experts are in RAM whatever MemAvailable reads)
                     disk_ok = disk_ok || in_ram_fs;
                 }
-                // Where the cache is expected to hold most of the routed experts (at least LLAMA_SPEC_HOSTPATH_OFF_SHARE, default 0.60;
-                // 0: off) on compute capability 12.0 cards, the CPU-miss host path stays off (as LLAMA_MOE_CPU_MISS=0): the few misses of
+                // (LLAMA_SPEC_HOSTPATH_OFF_SHARE=S, default 0 = off): where the cache is expected to hold at least S of the routed experts
+                // on compute capability 12.0 cards, the CPU-miss host path stays off (as LLAMA_MOE_CPU_MISS=0): the few misses of
                 // the deep verify windows are fetched instead of computed on the host. There the host path ran inside the decode call
                 // (6-7 ms of host time in an 18 ms pass) and its trial in the first chat request. RTX PRO 6000, Qwen3.8-Flash-Next at 4 bits +
                 // its MTP drafter, Studio argv, 48 GB (67.7% expected), two VMs x 2 launches: chat 231.9 -> 249.9 tok/s (+7.8%, 17.5 -> 16.3
                 // ms per pass), chat TTFT 0.184 -> 0.150 s, 8k level (210.6 / 210.9), the same text. At 32 GB (39%) the host path is
                 // needed (-15% without it), at 16 GB (11%) more so (-43%). An explicit LLAMA_MOE_CPU_MISS keeps its value.
+                // Off by default since the host experts quantize only the tokens routed to them: the same card and 48 GB cell with the rule
+                // (0.60) vs without, one VM, 3 interleaved launches each: chat 263.4 -> 274.5 tok/s (+4.2%, the same text), 8k 242.3 ->
+                // 243.6 (level; another text, 3.82 -> 3.61 tokens per pass at 15.8 -> 14.8 ms); the host and the device round the misses
+                // differently: long48 server KLD against the rule's text inside the -fa off band (decode mean 0.0019 vs 0.0031, p99 0.015
+                // vs 0.025, top-1 0.975 vs 0.970; first token 0 vs 0.0025). LLAMA_SPEC_HOSTPATH_OFF_SHARE=0.60: the rule as before.
+                // Compute capability 8.0 keeps the rule at 0.60 by default (measured there after that host path change)
                 // Compute capability 8.0 too (LLAMA_SPEC_HOSTPATH_OFF_SM80=0: off there): A100 80 GB (12 vCPU), the same model and
                 // drafter at 48 GB (67.7% expected), 3 launches: chat 112.1 -> 114.6 tok/s (+2.2%), 8k 97.7 -> 105.3 (+7.8%; the host path
                 // ran in the 8k request's decode call, 17 ms of host time in a 39 ms pass), chat TTFT 0.57 -> 0.49 s. There the timed
@@ -2470,16 +2501,19 @@ private:
                     return x == nullptr || atoi(x) != 0;
                 }();
                 const bool hp_cc = (cc_min == 1200 && cc_max == 1200) || (hp_sm80 && cc_min == 800 && cc_max == 800);
-                const double hp_share = [] {
+                const double hp_share = [&] {
                     const char * x = getenv("LLAMA_SPEC_HOSTPATH_OFF_SHARE");
-                    return x != nullptr ? atof(x) : 0.60;
+                    return x != nullptr ? atof(x) : (hp_sm80 && cc_min == 800 && cc_max == 800 ? 0.60 : 0.0);
                 }();
                 spec_chat_deep = def_on && deep_share >= 0.60 && cc_min == 1200 && cc_max == 1200;
                 if (def_on && hp_share > 0.0 && deep_share >= hp_share && hp_cc && getenv("LLAMA_MOE_CPU_MISS") == nullptr) {
                     common_set_env("LLAMA_MOE_CPU_MISS", "0");
                     SRV_INF("MoE cache expected to hold %.1f%% of the routed experts beside the MTP drafter (compute capability %s): the CPU-miss "
-                        "host path is off, misses are fetched (LLAMA_SPEC_HOSTPATH_OFF_SHARE=%.2f; =0: the host path rule as before%s)\n",
+                        "host path is off, misses are fetched (LLAMA_SPEC_HOSTPATH_OFF_SHARE=%.2f; unset / 0 on 12.0: the host path rule as before%s)\n",
                         100.0*deep_share, cc_min == 800 ? "8.0" : "12.0", hp_share, cc_min == 800 ? "; LLAMA_SPEC_HOSTPATH_OFF_SM80=0: off on 8.0" : "");
+                } else if (def_on && hp_share <= 0.0 && deep_share >= 0.60 && cc_min == 1200 && cc_max == 1200 && getenv("LLAMA_MOE_CPU_MISS") == nullptr) {
+                    SRV_INF("MoE cache expected to hold %.1f%% of the routed experts beside the MTP drafter (compute capability 12.0): the CPU-miss "
+                        "host path rule decides as without the drafter (LLAMA_SPEC_HOSTPATH_OFF_SHARE=0.60: off there, as before)\n", 100.0*deep_share);
                 }
                 // In the same band the MTP drafter's restricted head keeps 32768 rows instead of 65536: each draft step's lm head is
                 // the largest kernel of the step there, and the deep windows draft 4-6 steps per pass. RTX PRO 6000, Qwen3.8-Flash-Next
@@ -6924,6 +6958,7 @@ private:
         }
         const bool pt_on = srv_pass_timer().on && batch.view.size() <= 32;
         if (pt_on) {
+            srv_pass_timer().gen = !has_prompt;
             srv_pass_timer().stamp(server_pass_timer::DEC0);
             srv_pass_timer().width = batch.view.size();
         }

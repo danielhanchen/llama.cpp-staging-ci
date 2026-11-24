@@ -10352,6 +10352,17 @@ static int ggml_cuda_graph_chunk_size() {
     }();
     return chunk_size;
 }
+
+// (GGML_CUDA_GRAPH_CHUNK_FIRST=N, default 0 = off): the first chunk of a captured graph of at least 2N nodes ends after about N nodes,
+// the next ones are GGML_CUDA_GRAPH_CHUNK_SIZE as before (also in a graph shorter than that, e.g. a drafter's step). The GPU waits for the
+// launch of the first chunk only, and that launch takes longer with more nodes in it. Same kernels in the same order on one stream
+static int ggml_cuda_graph_chunk_first() {
+    static const int first = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_CHUNK_FIRST");
+        return env != nullptr ? std::max(0, atoi(env)) : 0;
+    }();
+    return first;
+}
 #endif // USE_CUDA_GRAPH
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -10359,8 +10370,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
     // the chunks of this capture before its last one (see ggml_cuda_graph_chunk_size)
-    const int  chunk_size = ggml_cuda_graph_chunk_size();
-    const bool chunking   = use_cuda_graph && cuda_graph_update_required && chunk_size > 0;
+    const int  chunk_size  = ggml_cuda_graph_chunk_size();
+    const bool chunking    = use_cuda_graph && cuda_graph_update_required && chunk_size > 0;
+    const int  chunk_first = chunking && ggml_cuda_graph_chunk_first() > 0 && cgraph->n_nodes >= 2*ggml_cuda_graph_chunk_first() ?
+        std::min(chunk_size, ggml_cuda_graph_chunk_first()) : chunk_size;
     std::vector<cudaGraph_t> chunks_captured;
 #endif // USE_CUDA_GRAPH
 
@@ -10557,7 +10570,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
             ggml_cuda_qsa_sel_plan(cuda_ctx, cgraph);
 #ifdef USE_CUDA_GRAPH
-            int chunk_end = chunk_size;
+            int chunk_end = chunk_first;
 #endif // USE_CUDA_GRAPH
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -10963,8 +10976,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 static int n_chunk_logged = 0;
                 if (n_chunk_logged < chunk_log) {
                     n_chunk_logged++;
-                    GGML_LOG_INFO("CUDA graph of %d ggml nodes captured in %zu chunks (GGML_CUDA_GRAPH_CHUNK_SIZE=%d; =0 off)\n",
-                        cgraph->n_nodes, graph->chunk_graphs.size() + 1, chunk_size);
+                    GGML_LOG_INFO("CUDA graph of %d ggml nodes captured in %zu chunks (GGML_CUDA_GRAPH_CHUNK_SIZE=%d; =0 off; first chunk %d nodes, "
+                        "GGML_CUDA_GRAPH_CHUNK_FIRST)\n", cgraph->n_nodes, graph->chunk_graphs.size() + 1, chunk_size, chunk_first);
                 }
             }
             chunks_captured.clear();
