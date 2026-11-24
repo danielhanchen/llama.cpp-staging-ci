@@ -802,10 +802,13 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block_v2
 // output is the same ids in the same order. GGML_CUDA_TOPK_TWO_STAGE=0: the radix select.
 // k: one round per pick per block, so it pays for small k only (A100, test-topk-twostage-exact: k 1 / 10 at 0.14-0.94x the radix
 // select's time over 32769-262144 columns, k 32 at 1.5-4.1x)
-// k 11..16 (the DFlash2 selector's top-16 of 8 x 69632) also, GGML_CUDA_TOP_K_TWO_STAGE_K16=0: k <= 10 only (before: the multi-block
-// radix select took those)
+// k 11..16 also, on compute capability 12.0 (the only one measured faster) up to TOP_K_TWO_STAGE_K16_MAX_NCOLS columns only (GGML_CUDA_TOP_K_TWO_STAGE_K16=0: k <= 10
+// everywhere; before, the multi-block radix select took those). test-topk-twostage-exact graph medians, k 16: RTX PRO 6000 7-8 rows of
+// 32769-69633 columns 46.5-50.9 us vs radix 49.8-59.8; 131072+ columns no gain (8 x 248320: 73.7 vs 67.0). A100: slower at 7-8 rows
+// for every width (8 x 69632: 114.0 vs 102.9 us; 8 x 248320: 226 vs 120), so the radix select keeps them there
 #define TOP_K_TWO_STAGE_MAX_K    16
 #define TOP_K_TWO_STAGE_MAX_K10  10
+#define TOP_K_TWO_STAGE_K16_MAX_NCOLS 69633
 #define TOP_K_TWO_STAGE_MAX_ROWS 8
 #define TOP_K_TWO_STAGE_NONE     0x7FFFFFFF
 
@@ -973,12 +976,13 @@ static bool ggml_cuda_top_k_two_stage_enabled() {
     return enabled;
 }
 
-static int ggml_cuda_top_k_two_stage_max_k() {
-    static const int max_k = [] {
+static int ggml_cuda_top_k_two_stage_max_k(const int device, const int64_t ncols) {
+    static const bool k16 = [] {
         const char * env = getenv("GGML_CUDA_TOP_K_TWO_STAGE_K16");
-        return env != nullptr && atoi(env) == 0 ? TOP_K_TWO_STAGE_MAX_K10 : TOP_K_TWO_STAGE_MAX_K;
+        return env == nullptr || atoi(env) != 0;
     }();
-    return max_k;
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return k16 && cc == GGML_CUDA_CC_BLACKWELL && ncols <= TOP_K_TWO_STAGE_K16_MAX_NCOLS ? TOP_K_TWO_STAGE_MAX_K : TOP_K_TWO_STAGE_MAX_K10;
 }
 
 static void top_k_two_stage_cuda(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
@@ -1125,7 +1129,7 @@ static void ggml_cuda_op_top_k_deterministic(ggml_cuda_pool & pool, const float 
         return;
     }
 
-    if (ggml_cuda_top_k_two_stage_enabled() && k <= ggml_cuda_top_k_two_stage_max_k() && nrows <= TOP_K_TWO_STAGE_MAX_ROWS && ncols >= 2048) {
+    if (ggml_cuda_top_k_two_stage_enabled() && k <= ggml_cuda_top_k_two_stage_max_k(device, ncols) && nrows <= TOP_K_TWO_STAGE_MAX_ROWS && ncols >= 2048) {
         top_k_two_stage_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }

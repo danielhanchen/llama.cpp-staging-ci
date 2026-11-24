@@ -57,7 +57,10 @@ static std::vector<tcase> cases() {
         v.push_back({ 3, nc, 10, 3 });
         v.push_back({ 8, nc, 32, 2 });
         v.push_back({ 8, nc, 10, 1 });
-        v.push_back({ 8, nc, 16, 1 });   // the DFlash2 selector (8 rows x 69632, k 16; GGML_CUDA_TOP_K_TWO_STAGE_K16)
+        // k 16 (GGML_CUDA_TOP_K_TWO_STAGE_K16: the two-stage kernel on compute capability 12.0 up to 69633 columns, the radix select
+        // elsewhere; both must give the reference order): 2 rows = the DFlash2 verify's draft-head top-k seen in the server, 7 / 8 rows
+        v.push_back({ 2, nc, 16, 0 });
+        v.push_back({ 8, nc, 16, 1 });
         v.push_back({ 7, nc, 16, 3 });
     }
     return v;
