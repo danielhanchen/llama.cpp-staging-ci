@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arm: [head, base]
+        arm: [fix]   # round 3: the fix branch on every leg (round 2 = run 45400582061 holds head and base)
         leg: [mac-metal, mac-cpu, win-shared, win-static]
         include:
           - leg: mac-metal
