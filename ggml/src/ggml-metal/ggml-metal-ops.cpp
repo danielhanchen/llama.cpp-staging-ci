@@ -10,6 +10,7 @@
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-tuning.h"
 #include "ggml-metal-mmid.h"
+#include "ggml-metal-mmid-pair.h"
 
 #include <cassert>
 #include <algorithm>
@@ -2883,6 +2884,52 @@ size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
     return 8 + N_MM_NPART_AMAX*sizeof(float);
 }
 
+// GGML_METAL_MMID_PAIR=1: the mat-vec MUL_MAT_ID of a verify window (2..16 tokens) runs two routes that use the same
+// expert in one threadgroup, which reads and unpacks the expert rows once for both (outputs bit-identical to the
+// single-route kernel). Off by default: the list costs one more dispatch and a barrier per op, and how often the
+// routes of a window collide (what the pairing saves) has not been measured on Apple GPUs yet.
+static bool ggml_metal_op_mul_mat_id_pair_enabled() {
+    static const bool on = getenv("GGML_METAL_MMID_PAIR") != nullptr && atoi(getenv("GGML_METAL_MMID_PAIR")) != 0;
+    return on;
+}
+
+// the op takes the paired path (independent of the device: 2..16 tokens never take the matrix-matrix kernel)
+static bool ggml_metal_op_mul_mat_id_use_pair(const ggml_tensor * op) {
+    if (!ggml_metal_op_mul_mat_id_pair_enabled()) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * ids  = op->src[2];
+
+    switch (src0->type) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return false;
+    }
+
+    const int64_t n_tokens = ids->ne[1];
+    const int64_t n_routes = ids->ne[0]*ids->ne[1];
+
+    return src1->type == GGML_TYPE_F32 && ids->nb[0] == sizeof(int32_t) &&
+           n_tokens >= 2 && n_tokens <= GGML_METAL_MMID_PAIR_MAX_TOKENS && n_routes <= GGML_METAL_MMID_PAIR_MAX_ROUTES;
+}
+
+size_t ggml_metal_op_mul_mat_id_extra_pair(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_MUL_MAT_ID);
+
+    if (!ggml_metal_op_mul_mat_id_use_pair(op)) {
+        return 0;
+    }
+
+    return ggml_type_size(GGML_TYPE_I32)*ggml_metal_mmid_pair_list_len(op->src[2]->ne[0]*op->src[2]->ne[1]);
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3131,15 +3178,69 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             GGML_ASSERT(ne00 >= nsg*nr0);
         }
 
+        const int64_t _ne1 = 1;
+        const int64_t ne123 = ne20*ne21;
+
+        if (ggml_metal_op_mul_mat_id_use_pair(op)) {
+            // the list of paired routes, after the scratch of the matrix-matrix path
+            ggml_metal_buffer_id bid_pair = bid_dst;
+            bid_pair.offs += ggml_nbytes(op) + ggml_metal_op_mul_mat_id_extra_tpe(op) + ggml_metal_op_mul_mat_id_extra_ids(op) +
+                ggml_metal_op_mul_mat_id_extra_amax(op);
+
+            {
+                auto pipeline_map = ggml_metal_library_get_pipeline_mul_mv_id_pair_map(lib, (int) ne123);
+
+                GGML_ASSERT(ne123 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_map));
+                GGML_ASSERT(pipeline_map.smem <= props_dev->max_theadgroup_memory_size);
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline_map);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_pair, 2);
+
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline_map.smem, 0);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, (int) ne123, 1, 1);
+            }
+
+            // the list is read by every threadgroup of the next kernel
+            ggml_metal_op_concurrency_reset(ctx);
+
+            auto pipeline_pair = ggml_metal_library_get_pipeline_mul_mv_id_pair(lib, op);
+
+            GGML_ASSERT(pipeline_pair.nsg == nsg && pipeline_pair.nr0 == nr0);
+
+            static const bool pair_debug = getenv("GGML_METAL_MMID_PAIR_DEBUG") != nullptr && atoi(getenv("GGML_METAL_MMID_PAIR_DEBUG")) != 0;
+            if (pair_debug) {
+                GGML_LOG_INFO("%s: mmid pair: %s %s, routes %d (tokens %d x used %d), dispatches 2 (map + paired, grid z <= %d entries) instead of 1 (grid z %d)\n",
+                    __func__, ggml_get_name(op), ggml_type_name(op->src[0]->type), (int) ne123, (int) ne21, (int) ne20, (int) ne123, (int) ne123);
+            }
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline_pair);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+            ggml_metal_encoder_set_buffer  (enc, bid_pair, 4);
+
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+            // grid z: the most entries (every route single); the threadgroups past the count exit
+            if (op->src[0]->type == GGML_TYPE_Q8_0) {
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0 - 1)/(nr0), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
+            } else {
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
+            }
+
+            return 1;
+        }
+
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer(enc, bid_src0, 1);
         ggml_metal_encoder_set_buffer(enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst,  3);
         ggml_metal_encoder_set_buffer(enc, bid_src2, 4);
-
-        const int64_t _ne1 = 1;
-        const int64_t ne123 = ne20*ne21;
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 

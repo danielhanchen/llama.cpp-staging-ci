@@ -38,6 +38,9 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
 size_t ggml_metal_op_mul_mat_id_extra_amax(const struct ggml_tensor * op);
 
+// list of the paired routes of the mat-vec path (GGML_METAL_MMID_PAIR=1), 0 when the op does not take it
+size_t ggml_metal_op_mul_mat_id_extra_pair(const struct ggml_tensor * op);
+
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
 
