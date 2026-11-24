@@ -3622,6 +3622,11 @@ static int64_t ggml_cpu_get_rows_mt_min(void) {
 // table is a lazily mapped file (the per-layer embedding rows of a decode or verify batch: 16 random rows per token, each on its own
 // page), and one thread took every page fault of the gather in turn before the device part of the graph could start; the threads
 // overlap the faults. Every row is dequantized on its own, so the result does not change
+static bool ggml_cpu_region_runner_set(void);
+
+// (=1, the default, keeps one thread where a region runner is set, i.e. where a MoE host path hands the graph regions to its host
+// thread's team: there the gather's region ran on that team between its host expert batches and slowed them, RTX PRO 6000 48 GB
+// Flash-Next 101 -> 129 us per host batch, more than the gather saved; =2 also there)
 static int ggml_cpu_get_rows_big_threads(const struct ggml_tensor * node, int n_threads) {
     static int on      = -1;
     static int64_t min_rows  = 32;
@@ -3635,9 +3640,9 @@ static int ggml_cpu_get_rows_big_threads(const struct ggml_tensor * node, int n_
         min_rows  = r ? MAX(1, atoll(r)) : 32;
         min_bytes = (int64_t) (g ? MAX(0, atoll(g)) : 4) << 30;
         max_thr   = t ? MAX(1, atoi(t)) : 8;
-        on        = e == NULL || atoi(e) != 0;
+        on        = e == NULL ? 1 : MAX(0, atoi(e));
     }
-    if (!on || node->src[0] == NULL || node->src[1] == NULL || ggml_nelements(node->src[1]) < min_rows ||
+    if (on == 0 || (on == 1 && ggml_cpu_region_runner_set()) || node->src[0] == NULL || node->src[1] == NULL || ggml_nelements(node->src[1]) < min_rows ||
             (int64_t) ggml_nbytes(node->src[0]) < min_bytes) {
         return 1;
     }
@@ -4845,6 +4850,10 @@ static void *                   ggml_cpu_region_runner_user = NULL;
 #endif
 
 void ggml_cpu_set_region_runner(ggml_cpu_region_runner_t runner, void * user);
+
+static bool ggml_cpu_region_runner_set(void) {
+    return GGML_CPU_RUNNER_LOAD(ggml_cpu_region_runner) != NULL;
+}
 
 void ggml_cpu_set_region_runner(ggml_cpu_region_runner_t runner, void * user) {
     // the user pointer first: a caller that sees the runner sees its user pointer
