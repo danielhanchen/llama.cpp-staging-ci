@@ -1,0 +1,230 @@
+name: plat
+
+# Head = this tree (h/), base = the 11-20 tree on branch ci/integration-1a1410c (b/), same legs, same steps.
+# Legs: macOS 15 Apple Silicon Metal, macOS 15 CPU only (BLAS backend in), Windows MSVC shared libs (the shipped layout),
+# Windows MSVC static libs (the model-based tests are only registered when the libraries are static on Windows).
+
+on:
+  push:
+    branches:
+      - 'ci/plat-**'
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: 'ctest -R regex (empty = every test)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.tests }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [head, base]
+        leg: [mac-metal, mac-cpu, win-shared, win-static]
+        include:
+          - leg: mac-metal
+            os: macos-15
+            gpu: metal
+            cmake_extra: ""
+          - leg: mac-cpu
+            os: macos-15
+            gpu: none
+            cmake_extra: "-DGGML_METAL=OFF"
+          - leg: win-shared
+            os: windows-latest
+            gpu: none
+            cmake_extra: "-DBUILD_SHARED_LIBS=ON"
+          - leg: win-static
+            os: windows-latest
+            gpu: none
+            cmake_extra: "-DBUILD_SHARED_LIBS=OFF"
+    name: ${{ matrix.leg }} ${{ matrix.arm }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Clone harness and head
+        uses: actions/checkout@v4
+        with:
+          path: h
+          persist-credentials: false
+
+      - name: Clone base
+        if: matrix.arm == 'base'
+        uses: actions/checkout@v4
+        with:
+          ref: ci/integration-1a1410c
+          path: b
+          persist-credentials: false
+
+      - name: System info
+        run: |
+          if [ "${{ matrix.arm }}" = base ]; then S=b; else S=h; fi
+          echo "SRC=$GITHUB_WORKSPACE/$S" >> "$GITHUB_ENV"
+          mkdir -p ci-logs
+          {
+            echo "arm: ${{ matrix.arm }} leg: ${{ matrix.leg }}"
+            echo "src commit: $(git -C $S rev-parse HEAD) $(git -C $S log -1 --format=%s)"
+            uname -a
+            cmake --version | head -1
+            case "$(uname)" in
+              Darwin) sw_vers; sysctl -n machdep.cpu.brand_string; sysctl -n hw.logicalcpu; xcrun clang --version | head -1
+                      system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Chipset|Metal" || true ;;
+              *) echo "NUMBER_OF_PROCESSORS=$NUMBER_OF_PROCESSORS"; wmic cpu get name 2>/dev/null | head -3 || true ;;
+            esac
+          } 2>&1 | tee ci-logs/sysinfo.txt
+
+      - name: Python test deps
+        run: |
+          if [ "$(uname)" = Darwin ]; then P=python3; else P=python; fi
+          $P -m pip install --user --break-system-packages jinja2 || $P -m pip install --user jinja2 || true
+
+      - name: Configure and build
+        id: build
+        run: |
+          set -o pipefail
+          cd "$SRC"
+          if [ "$(uname)" = Darwin ]; then NJ=$(sysctl -n hw.logicalcpu); else NJ=$NUMBER_OF_PROCESSORS; fi
+          rc=0; L=$GITHUB_WORKSPACE/ci-logs
+          t0=$(date +%s)
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=ON ${{ matrix.cmake_extra }} 2>&1 | tee $L/configure.log || rc=$?
+          if [ "$rc" = 0 ]; then
+            cmake --build build --config Release -j "$NJ" 2>&1 | tee $L/build.log || rc=$?
+          fi
+          echo "build_rc=$rc build_s=$(( $(date +%s) - t0 ))" | tee -a $L/summary.txt
+          grep -n -E "warning( C[0-9]+)?:|error( C[0-9]+| LNK[0-9]+)?:" $L/build.log | sort -u > $L/build_diags.txt 2>/dev/null || true
+          echo "build_warnings=$(grep -c -E 'warning( C[0-9]+)?:' $L/build_diags.txt || true) build_errors=$(grep -c -E 'error( C[0-9]+| LNK[0-9]+)?:' $L/build_diags.txt || true)" | tee -a $L/summary.txt
+          grep -E "error( C[0-9]+| LNK[0-9]+)?:" $L/build_diags.txt | head -40
+          if [ -d build/bin/Release ]; then B=build/bin/Release; else B=build/bin; fi
+          echo "BIN=$SRC/$B" >> "$GITHUB_ENV"
+          echo "binaries: $(ls $B | wc -l)" | tee -a $L/summary.txt
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: ctest
+        if: steps.build.outputs.rc == '0'
+        run: |
+          cd "$SRC/build"
+          rc=0; L=$GITHUB_WORKSPACE/ci-logs
+          CR="${{ inputs.tests }}"; RX=(); [ -n "$CR" ] && RX=(-R "$CR")
+          echo "ctest -C Release -j 3 --timeout 600 ${RX[*]}" | tee -a $L/summary.txt
+          ctest -C Release -j 3 --timeout 600 "${RX[@]}" --output-on-failure > $L/ctest.log 2>&1 || rc=$?
+          tail -40 $L/ctest.log
+          cp Testing/Temporary/LastTestsFailed.log $L/ctest_failed_first.txt 2>/dev/null || true
+          if [ "$rc" != 0 ]; then
+            ctest -C Release --rerun-failed -j 1 --timeout 2400 --output-on-failure > $L/ctest_rerun.log 2>&1 || true
+            cp Testing/Temporary/LastTestsFailed.log $L/ctest_failed_rerun.txt 2>/dev/null || true
+            tail -20 $L/ctest_rerun.log
+          fi
+          grep -E "\*\*\*Timeout" $L/ctest.log | sed 's/^/timeout_first: /' | tee -a $L/summary.txt || true
+          grep -E "\*\*\*Timeout" $L/ctest_rerun.log 2>/dev/null | sed 's/^/timeout_rerun: /' | tee -a $L/summary.txt || true
+          grep -E "tests passed|tests failed" $L/ctest_rerun.log 2>/dev/null | sed 's/^/ctest_rerun: /' | tee -a $L/summary.txt || true
+          grep -E "tests passed|tests failed" $L/ctest.log | sed 's/^/ctest_first: /' | tee -a $L/summary.txt
+          echo "ctest_rc=$rc" | tee -a $L/summary.txt
+          for t in test-llama-context test-mtp-draft-topk; do
+            grep -E "Test +#[0-9]+: $t " $L/ctest.log | sed "s/^/ctest_line: /" | tee -a $L/summary.txt || true
+          done
+
+      - name: test-mtp-draft-topk detail (Metal leg)
+        if: steps.build.outputs.rc == '0' && matrix.leg == 'mac-metal'
+        run: |
+          L=$GITHUB_WORKSPACE/ci-logs
+          if [ -x "$BIN/test-mtp-draft-topk" ]; then
+            grep -n "test-mtp-draft-topk" "$SRC/tests/CMakeLists.txt" | head -3
+            grep -n -E "differ|FAIL|tie" $L/ctest*.log | grep -i -E "topk|candidates|tie" | head -20 | sed 's/^/topk_detail: /' | tee -a $L/summary.txt || true
+          else
+            echo "topk_detail: test-mtp-draft-topk not built" | tee -a $L/summary.txt
+          fi
+
+      - name: test-llama-context without the BLAS backend, and without the realloc abort (macOS CPU leg)
+        if: steps.build.outputs.rc == '0' && matrix.leg == 'mac-cpu'
+        run: |
+          cd "$SRC"; L=$GITHUB_WORKSPACE/ci-logs
+          rc=0
+          cmake -B build-noblas -DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=ON -DGGML_METAL=OFF -DGGML_BLAS=OFF > $L/noblas_configure.log 2>&1 || rc=$?
+          [ "$rc" = 0 ] && { cmake --build build-noblas --config Release -j "$(sysctl -n hw.logicalcpu)" --target test-llama-context test-llama-archs > $L/noblas_build.log 2>&1 || rc=$?; }
+          if [ "$rc" = 0 ]; then
+            (cd build-noblas && ctest -R "test-generate-models|test-llama-context" --timeout 1800 --output-on-failure > $L/noblas_llctx.log 2>&1) || rc=$?
+          fi
+          grep -E "tests passed|tests failed" $L/noblas_llctx.log | sed 's/^/noblas_llctx: /' | tee -a $L/summary.txt || true
+          echo "noblas_llctx_rc=$rc" | tee -a $L/summary.txt
+          rc2=0
+          if [ -x build/bin/test-llama-context ] && [ -d build/tests/test-models ]; then
+            build/bin/test-llama-context --models build/tests/test-models/ > $L/llctx_norealloc.log 2>&1 || rc2=$?
+          else
+            rc2=97
+          fi
+          tail -5 $L/llctx_norealloc.log
+          echo "llctx_blas_no_realloc_abort_rc=$rc2" | tee -a $L/summary.txt
+
+      - name: Smoke (stories15M and a tiny Qwen3 MoE)
+        if: steps.build.outputs.rc == '0'
+        run: |
+          set -u
+          L=$GITHUB_WORKSPACE/ci-logs; M1=$GITHUB_WORKSPACE/models/stories15M-q4_0.gguf
+          mkdir -p $GITHUB_WORKSPACE/models
+          curl -sSfL --retry 5 -o "$M1" https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf
+          gunzip -c $GITHUB_WORKSPACE/h/ci/tiny-qwen3moe-f16.gguf.gz > $GITHUB_WORKSPACE/models/tiny-qwen3moe-f16.gguf
+          if [ "$(uname)" = Darwin ]; then md5c() { md5 -q "$1"; }; PY=python3; else md5c() { md5sum "$1" | cut -d' ' -f1; }; PY=python; fi
+          echo "model_md5 stories=$(md5c "$M1") tinymoe=$(md5c $GITHUB_WORKSPACE/models/tiny-qwen3moe-f16.gguf)" | tee -a $L/summary.txt
+          if [ "${{ matrix.gpu }}" = metal ]; then NGLS="99 0"; else NGLS="0"; fi
+          CLI="$BIN/llama-completion"; [ -x "$CLI" ] || [ -x "$CLI.exe" ] || CLI="$BIN/llama-cli"
+          SRV="$BIN/llama-server"
+          for mm in stories:$M1 tinymoe:$GITHUB_WORKSPACE/models/tiny-qwen3moe-f16.gguf; do
+            mn=${mm%%:*}; M=${mm#*:}
+            for ngl in $NGLS; do
+              tag="${mn}_ngl${ngl}"; rc=0
+              "$CLI" -m "$M" -p "Once upon a time" -n 48 --temp 0 --seed 1 -ngl "$ngl" -t 2 -no-cnv > "$L/smoke_cli_$tag.txt" 2> "$L/smoke_cli_$tag.log" < /dev/null || rc=$?
+              echo "smoke_cli_${tag}_rc=$rc md5=$(md5c $L/smoke_cli_$tag.txt)" | tee -a $L/summary.txt
+              rc=0
+              "$SRV" -m "$M" -ngl "$ngl" -t 2 -c 512 --port 8091 > "$L/server_$tag.log" 2>&1 &
+              SP=$!
+              ok=0
+              for i in $(seq 1 120); do
+                if curl -sf http://127.0.0.1:8091/health > /dev/null 2>&1; then ok=1; break; fi
+                sleep 1
+              done
+              if [ "$ok" = 1 ]; then
+                curl -sf http://127.0.0.1:8091/completion -H 'Content-Type: application/json' \
+                  -d '{"prompt":"Once upon a time","n_predict":48,"temperature":0,"seed":1,"cache_prompt":false}' > "$L/smoke_server_$tag.json" || rc=$?
+              else
+                rc=99
+              fi
+              kill "$SP" 2>/dev/null || true
+              [ "$(uname)" = Darwin ] || taskkill //F //IM llama-server.exe > /dev/null 2>&1 || true
+              wait "$SP" 2>/dev/null || true
+              $PY -c "import json,sys; print(json.load(open(sys.argv[1], encoding='utf-8'))['content'])" "$L/smoke_server_$tag.json" > "$L/smoke_server_$tag.txt" 2>/dev/null || { [ "$rc" = 0 ] && rc=98; }
+              echo "smoke_server_${tag}_rc=$rc md5=$(md5c $L/smoke_server_$tag.txt)" | tee -a $L/summary.txt
+              head -c 300 "$L/smoke_server_$tag.txt"; echo
+            done
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          cat ci-logs/summary.txt || true
+          cat ci-logs/summary.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.leg }}-${{ matrix.arm }}
+          path: ci-logs/
+          retention-days: 30
+
+      - name: Verdict
+        run: |
+          grep -q '^build_rc=0' ci-logs/summary.txt || { echo "build failed"; exit 1; }
+          if ! grep -q '^ctest_rc=0' ci-logs/summary.txt; then echo "ctest failures:"; cat ci-logs/ctest_failed_rerun.txt 2>/dev/null || cat ci-logs/ctest_failed_first.txt; exit 1; fi
+          if grep -E '^smoke_.*_rc=[1-9]' ci-logs/summary.txt; then exit 1; fi
+          echo PASS
