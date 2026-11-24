@@ -1253,10 +1253,34 @@ static __device__ __forceinline__ void mmq_moe_compact_tile(
 }
 
 
+// Output tile index t -> tile indices it (rows of x), wt (sample), zt (channel), jt (columns).
+// jt_outer: jt is the slowest index (ntizw = nty*nchannels*nsamples), so the stream-k blocks that run at the same time work on
+// different column tiles of the same rows of x and share those rows in L2. Else jt is the fastest index.
+template <bool jt_outer>
+static __device__ __forceinline__ void mmq_tile_indices(
+        const int t, const uint3 ntx, const uint3 nchannels_y, const uint3 nsamples_y, const uint3 ntizw,
+        int & it, int & wt, int & zt, int & jt) {
+    uint2 tmp2;
+    if constexpr (jt_outer) {
+        tmp2 = fast_div_modulo(t, ntizw);
+        jt   = tmp2.x;
+        tmp2 = fast_div_modulo(tmp2.y, nchannels_y);
+    } else {
+        GGML_UNUSED(ntizw);
+        tmp2 = fast_div_modulo(t, ntx);
+        jt   = tmp2.y;
+        tmp2 = fast_div_modulo(tmp2.x, nchannels_y);
+    }
+    zt   = tmp2.y;
+    tmp2 = fast_div_modulo(tmp2.x, nsamples_y);
+    wt   = tmp2.y;
+    it   = tmp2.x;
+}
+
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
 // the kernel body, shared by mul_mat_q (pipe 0, the base) and mul_mat_q_pipe
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, int pipe>
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, int pipe, bool jt_outer = false>
 static __device__ __forceinline__ void mul_mat_q_body(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -1377,6 +1401,8 @@ static __device__ __forceinline__ void mul_mat_q_body(
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback, prec_src1);
     constexpr int blocks_per_iter = ITER_K / qk;
 
+    const uint3 ntizw = jt_outer ? mmq_fastdiv_values_dev(nty*nchannels_y.z*nsamples_y.z) : make_uint3(0, 0, 0);
+
     // with exact_nsm the grid is the host's upper bound of the tile count: one tile per block (the blocks past the exact
     // count have nothing), or the base split over exact_nsm blocks (the others have nothing)
     const int nblocks = exact_nsm > 0 ? (exact_tiles ? int(nsamples_y.z*nchannels_y.z*ntx.z*nty) : exact_nsm) : int(gridDim.x);
@@ -1395,16 +1421,8 @@ static __device__ __forceinline__ void mul_mat_q_body(
     int kb0_start = fastmodulo(kbc, blocks_per_ne00);
     int kb0_stop  = min(blocks_per_ne00.z, uint32_t(kb0_start + kbc_stop - kbc));
     while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
-        int tmp = fastdiv(kbc, blocks_per_ne00);
-        uint2 tmp2 = fast_div_modulo(tmp, ntx);
-        int jt = tmp2.y;
-        tmp = tmp2.x;
-        tmp2 = fast_div_modulo(tmp, nchannels_y);
-        int zt = tmp2.y;
-        tmp = tmp2.x;
-        tmp2 = fast_div_modulo(tmp, nsamples_y);
-        const int wt = tmp2.y;
-        const int it = tmp2.x;
+        int it, wt, zt, jt;
+        mmq_tile_indices<jt_outer>(fastdiv(kbc, blocks_per_ne00), ntx, nchannels_y, nsamples_y, ntizw, it, wt, zt, jt);
         if (nexperts_compact > 0) {
             mmq_moe_compact_tile<J>(expert_bounds, nexperts_compact, jt, zt, jt, prefix);
         }
@@ -1487,16 +1505,8 @@ static __device__ __forceinline__ void mul_mat_q_body(
         return;
     }
 
-    int tmp = fastdiv(kbc, blocks_per_ne00);
-    uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    int jt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nchannels_y);
-    int zt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nsamples_y);
-    const int wt = tmp2.y;
-    const int it = tmp2.x;
+    int it, wt, zt, jt;
+    mmq_tile_indices<jt_outer>(fastdiv(kbc, blocks_per_ne00), ntx, nchannels_y, nsamples_y, ntizw, it, wt, zt, jt);
     if (nexperts_compact > 0) {
         mmq_moe_compact_tile<J>(expert_bounds, nexperts_compact, jt, zt, jt, prefix);
     }
@@ -1564,7 +1574,8 @@ static __device__ __forceinline__ void mul_mat_q_body(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, cvt);
 }
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+// jt_outer: the column tiles outermost in the stream-k split (mmq_tile_indices); only for dense products, see launch_mul_mat_q
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool jt_outer = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -1574,7 +1585,7 @@ static __global__ void mul_mat_q(
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix, const int exact_nsm, const int flags) {
-    mul_mat_q_body<type, J, fallback, prec_src1, 0>(
+    mul_mat_q_body<type, J, fallback, prec_src1, 0, jt_outer>(
         x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale,
         blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst,
         channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1616,7 +1627,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
         float * tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
         const int stride_sample_dst, const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix,
-        const int exact_nsm) {
+        const int exact_nsm, const bool jt_outer) {
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
@@ -1694,16 +1705,13 @@ static __global__ void mul_mat_q_stream_k_fixup(
         return;
     }
 
-    int tmp = fastdiv(kbc0, blocks_per_ne00);
-    uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    int jt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nchannels_y);
-    int zt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nsamples_y);
-    const int wt = tmp2.y;
-    const int it = tmp2.x;
+    int it, wt, zt, jt;
+    if (jt_outer) {
+        const uint3 ntizw = mmq_fastdiv_values_dev(nty*nchannels_y.z*nsamples_y.z);
+        mmq_tile_indices<true>(fastdiv(kbc0, blocks_per_ne00), ntx, nchannels_y, nsamples_y, ntizw, it, wt, zt, jt);
+    } else {
+        mmq_tile_indices<false>(fastdiv(kbc0, blocks_per_ne00), ntx, nchannels_y, nsamples_y, make_uint3(0, 0, 0), it, wt, zt, jt);
+    }
     if (nexperts_compact > 0) {
         mmq_moe_compact_tile<J>(expert_bounds, nexperts_compact, jt, zt, jt, tile_prefix);
     }
@@ -2101,6 +2109,34 @@ static void mmq_exact_cvt_count(const ggml_type type) {
     }
 }
 
+// GGML_CUDA_MMQ_JT_OUTER: the column-tile-outermost stream-k order of the dense J = 128 products (mmq_tile_indices).
+// Unset = on for NVIDIA devices with at most 64 SMs (T4 40, L4 58: several tiles per block at prefill ubatches, L2 shared),
+// off on larger ones (A100 108, RTX PRO 6000 188: measured level); 0 = off everywhere, 1 = on for every NVIDIA device.
+// Engagement: the launches in that order, logged at 1, 10, 100, ...
+static bool mmq_jt_outer_on(const int cc, const int nsm) {
+    static const int env = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_JT_OUTER");
+        return e == nullptr || *e == '\0' ? -1 : atoi(e);
+    }();
+    if (env >= 0) {
+        return env != 0;
+    }
+    GGML_UNUSED(cc);
+    return nsm <= 64;
+}
+
+static void mmq_jt_outer_count() {
+    static std::atomic<int64_t> n{0};
+    const int64_t c = n.fetch_add(1) + 1;
+    int64_t p = 1;
+    while (p < c) {
+        p *= 10;
+    }
+    if (p == c) {
+        GGML_LOG_INFO("ggml_cuda: MMQ column tiles outermost: %" PRId64 " launches (GGML_CUDA_MMQ_JT_OUTER=0 off)\n", c);
+    }
+}
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -2201,14 +2237,29 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     if (exact) {
         mmq_exact_tiles_count(exact_likely);
     }
+    bool jt_outer = false;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     mmq_kernel_t kernel = mmq_pipe_kernel<type, J, fallback, prec_src1>(args, cc, nbytes_shared, config.nthreads, one_tile_per_block);
     if (kernel == nullptr) {
         kernel = mul_mat_q<type, J, fallback, prec_src1>;
+        // a dense stream-k split where blocks get several tiles: the column tiles outermost (mmq_tile_indices), so the blocks
+        // that read the same rows of x run together and share them in L2. Other summation grouping of the split tiles than the
+        // default order (not bit-identical). Only J == 128 gets the extra kernel (compile time)
+        if constexpr (J == 128) {
+            if (!use_tiling && args.ids_dst == nullptr && args.expert_bounds == nullptr && nexperts_compact == 0 && !tile_prefix_p &&
+                    !exact && GGML_CUDA_CC_IS_NVIDIA(cc) && ntiles_dst > int(block_nums_stream_k.x) && mmq_jt_outer_on(cc, nsm)) {
+                CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, prec_src1, true>), nbytes_shared);
+                kernel   = mul_mat_q<type, J, fallback, prec_src1, true>;
+                jt_outer = true;
+                mmq_jt_outer_count();
+            }
+        }
     }
 #define MMQ_LAUNCH_KERNEL kernel
 #else
     GGML_UNUSED(one_tile_per_block);
+    GGML_UNUSED(mmq_jt_outer_on);
+    GGML_UNUSED(mmq_jt_outer_count);
 #define MMQ_LAUNCH_KERNEL mul_mat_q<type, J, fallback, prec_src1>
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -2255,14 +2306,14 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             ggml_cuda_kernel_launch_params(block_nums_fixup, block_dims_fixup, 0, stream),
             (const int32_t *) args.ids_dst, (const int32_t *) args.expert_bounds, (float *) args.dst, (float *) tmp_fixup.ptr, blocks_per_ne00_fd,
             (int) args.nrows_x, (int) args.ncols_dst, (int) args.nrows_dst, nchannels_y_fd, (int) args.stride_channel_dst, nsamples_y_fd,
-            (int) args.stride_sample_dst, ntx_fd, (int) nexperts_compact, tile_prefix_p, (int) exact_nsm);
+            (int) args.stride_sample_dst, ntx_fd, (int) nexperts_compact, tile_prefix_p, (int) exact_nsm, jt_outer);
         mmq_exact_tiles_stats(exact, tile_prefix_p, nexperts_compact, stream);
         return;
     }
     mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-         ntx_fd, nexperts_compact, tile_prefix_p, exact_nsm);
+         ntx_fd, nexperts_compact, tile_prefix_p, exact_nsm, jt_outer);
     mmq_exact_tiles_stats(exact, tile_prefix_p, nexperts_compact, stream);
 }
 
