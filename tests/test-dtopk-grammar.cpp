@@ -24,6 +24,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
 #include <thread>
 #include <cmath>
 #include <cstdio>
@@ -381,10 +382,16 @@ static int run_main(int argc, char ** argv) {
 
     // not *.gguf: the copy sits in the shared test-models dir, which test-llama-context scans for *.gguf while ctest -j runs
     // this test beside it (it found the copy half written or already removed)
-    const std::string spm = std::string(argv[1]) + (expect_diff ? ".dtopk-spm-x.tmp" : kill ? ".dtopk-spm-k.tmp" : ".dtopk-spm.tmp");
+    // a name per process: a second run on the same model (a concurrent ctest run, or one started by hand) rewrote the copy this one had
+    // mapped, which killed it with SIGBUS
+    std::random_device rd;
+    char tag[32];
+    snprintf(tag, sizeof(tag), ".%08x%08x", (unsigned) rd(), (unsigned) std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::string spm = std::string(argv[1]) + (expect_diff ? ".dtopk-spm-x" : kill ? ".dtopk-spm-k" : ".dtopk-spm") + tag + ".tmp";
     uint32_t nv = 0;
     if (!write_spm_model(argv[1], spm, &nv) || nv < 1024) {
         fprintf(stderr, "cannot write the SPM copy of %s (vocab %u)\n", argv[1], nv);
+        std::remove(spm.c_str());
         return 1;
     }
     llama_model_params mp = llama_model_default_params();
@@ -392,6 +399,7 @@ static int run_main(int argc, char ** argv) {
     g_model = llama_model_load_from_file(spm.c_str(), mp);
     if (g_model == nullptr) {
         fprintf(stderr, "cannot load %s\n", spm.c_str());
+        std::remove(spm.c_str());
         return 1;
     }
     g_vocab = llama_model_get_vocab(g_model);
