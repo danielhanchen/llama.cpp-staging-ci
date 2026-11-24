@@ -14578,6 +14578,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // sparse attn (qwen4 shape - gqa 12)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+    // long KV with few query tiles: stream-k blocks split the tiles, the multi-stage kernel rotates the KV tile order
+    // (GGML_CUDA_FATTN_KV_ROTATE), also with a masked tail (live length below the cache size) and odd tile counts
+    for (int nb : { 2, 8, 64, 512 }) {
+        for (int kv : { 4096, 12288 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, kv, nb, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 3000));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
     // sparse mask + quantized cache
