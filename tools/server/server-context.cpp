@@ -2479,23 +2479,31 @@ private:
                     // (a model on a memory file system: its experts are in RAM whatever MemAvailable reads)
                     disk_ok = disk_ok || in_ram_fs;
                 }
-                // Where the cache is expected to hold most of the routed experts (at least LLAMA_SPEC_HOSTPATH_OFF_SHARE, default 0.60;
-                // 0: off) on compute capability 12.0 cards, the CPU-miss host path stays off (as LLAMA_MOE_CPU_MISS=0): the few misses of
+                // (LLAMA_SPEC_HOSTPATH_OFF_SHARE=S, default 0 = off): where the cache is expected to hold at least S of the routed experts
+                // on compute capability 12.0 cards, the CPU-miss host path stays off (as LLAMA_MOE_CPU_MISS=0): the few misses of
                 // the deep verify windows are fetched instead of computed on the host. There the host path ran inside the decode call
                 // (6-7 ms of host time in an 18 ms pass) and its trial in the first chat request. RTX PRO 6000, Qwen3.8-Flash-Next at 4 bits +
                 // its MTP drafter, Studio argv, 48 GB (67.7% expected), two VMs x 2 launches: chat 231.9 -> 249.9 tok/s (+7.8%, 17.5 -> 16.3
                 // ms per pass), chat TTFT 0.184 -> 0.150 s, 8k level (210.6 / 210.9), the same text. At 32 GB (39%) the host path is
-                // needed (-15% without it), at 16 GB (11%) more so (-43%). An explicit LLAMA_MOE_CPU_MISS keeps its value
+                // needed (-15% without it), at 16 GB (11%) more so (-43%). An explicit LLAMA_MOE_CPU_MISS keeps its value.
+                // Off by default since the cheaper host path of the deep windows (1f09fc4a8fb): the same card and 48 GB cell with the rule
+                // (0.60) vs without, one VM, 3 interleaved launches each: chat 263.4 -> 274.5 tok/s (+4.2%, the same text), 8k 242.3 ->
+                // 243.6 (level; another text, 3.82 -> 3.61 tokens per pass at 15.8 -> 14.8 ms); the host and the device round the misses
+                // differently: long48 server KLD against the rule's text inside the -fa off band (decode mean 0.0019 vs 0.0031, p99 0.015
+                // vs 0.025, top-1 0.975 vs 0.970; first token 0 vs 0.0025). LLAMA_SPEC_HOSTPATH_OFF_SHARE=0.60: the rule as before
                 const double hp_share = [] {
                     const char * x = getenv("LLAMA_SPEC_HOSTPATH_OFF_SHARE");
-                    return x != nullptr ? atof(x) : 0.60;
+                    return x != nullptr ? atof(x) : 0.0;
                 }();
                 spec_chat_deep = def_on && deep_share >= 0.60 && cc_min == 1200 && cc_max == 1200;
                 if (def_on && hp_share > 0.0 && deep_share >= hp_share && cc_min == 1200 && cc_max == 1200 && getenv("LLAMA_MOE_CPU_MISS") == nullptr) {
                     common_set_env("LLAMA_MOE_CPU_MISS", "0");
                     SRV_INF("MoE cache expected to hold %.1f%% of the routed experts beside the MTP drafter (compute capability 12.0): the CPU-miss "
-                        "host path is off, misses are fetched (LLAMA_SPEC_HOSTPATH_OFF_SHARE=%.2f; =0: the host path rule as before)\n",
+                        "host path is off, misses are fetched (LLAMA_SPEC_HOSTPATH_OFF_SHARE=%.2f; unset / 0: the host path rule as before)\n",
                         100.0*deep_share, hp_share);
+                } else if (def_on && hp_share <= 0.0 && deep_share >= 0.60 && cc_min == 1200 && cc_max == 1200 && getenv("LLAMA_MOE_CPU_MISS") == nullptr) {
+                    SRV_INF("MoE cache expected to hold %.1f%% of the routed experts beside the MTP drafter (compute capability 12.0): the CPU-miss "
+                        "host path rule decides as without the drafter (LLAMA_SPEC_HOSTPATH_OFF_SHARE=0.60: off there, as before)\n", 100.0*deep_share);
                 }
                 // In the same band the MTP drafter's restricted head keeps 32768 rows instead of 65536: each draft step's lm head is
                 // the largest kernel of the step there, and the deep windows draft 4-6 steps per pass. RTX PRO 6000, Qwen3.8-Flash-Next
