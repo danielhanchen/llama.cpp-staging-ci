@@ -8068,6 +8068,7 @@ struct test_topk_moe : public test_case {
     const MoeGatingFunc gating_func;
     const float scale_w;
     const int n_expert_groups;
+    const bool norm_bias; // the weight sum as sum + 1e-20 (SCALE with scale 1, DeepSeek-V4.1) instead of the clamp
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
 
@@ -8077,20 +8078,25 @@ struct test_topk_moe : public test_case {
                   bool                   bias_probs      = false,
                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
                   float                  scale_w         = 0.0f,
-                  int                    n_expert_groups = 1) :
+                  int                    n_expert_groups = 1,
+                  bool                   norm_bias       = false) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
         bias_probs(bias_probs),
         gating_func(gating_func),
         scale_w(scale_w),
-        n_expert_groups(n_expert_groups) {
+        n_expert_groups(n_expert_groups),
+        norm_bias(norm_bias) {
         GGML_ASSERT(n_expert_used <= ne[0]);
         GGML_ASSERT(ne[0] % n_expert_groups == 0);
         GGML_ASSERT(n_expert_used <= ne[0] / n_expert_groups);
     }
 
-    std::string vars() override { return VARS_TO_STR7(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w, n_expert_groups); }
+    std::string vars() override {
+        std::string v = VARS_TO_STR7(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w, n_expert_groups);
+        return norm_bias ? v + ",norm_bias=1" : v;
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -8155,7 +8161,8 @@ struct test_topk_moe : public test_case {
             ggml_tensor * weights_sum = ggml_sum_rows(ctx, weights); // [1, n_tokens]
             ggml_set_name(weights_sum, "weights_sum");
 
-            weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5, INFINITY);
+            weights_sum = norm_bias ? ggml_scale_bias(ctx, weights_sum, 1.0f, 1e-20f) :
+                                      ggml_clamp(ctx, weights_sum, 6.103515625e-5, INFINITY);
             weights = ggml_div(ctx, weights, weights_sum); // [n_expert_used, n_tokens]
             weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
         }
@@ -14959,6 +14966,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({128, 5, 1, 1}, 6, with_norm, bias_probs, gate, scale_w, 8));
                     test_cases.emplace_back(new test_topk_moe({512, 3, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, 4));
                 }
+            }
+        }
+    }
+    // the weight sum with an additive bias (SCALE) instead of the clamp: DeepSeek-V4.1 routing (sqrt(softplus), selection bias,
+    // scale 1.5) and a spread of expert counts / gates
+    for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SQRT_SOFTPLUS}) {
+        for (bool bias_probs : {false, true}) {
+            for (float scale_w : {0.0f, 1.5f}) {
+                test_cases.emplace_back(new test_topk_moe({8, 22, 1, 1}, 4, true, bias_probs, gate, scale_w, 1, true));
+                test_cases.emplace_back(new test_topk_moe({71, 22, 1, 1}, 8, true, bias_probs, gate, scale_w, 1, true));
+                test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, true, bias_probs, gate, scale_w, 1, true));
+                test_cases.emplace_back(new test_topk_moe({384,  1, 1, 1}, 6, true, bias_probs, gate, scale_w, 1, true));
+                test_cases.emplace_back(new test_topk_moe({384,  8, 1, 1}, 6, true, bias_probs, gate, scale_w, 1, true));
+                test_cases.emplace_back(new test_topk_moe({384, 22, 1, 1}, 6, true, bias_probs, gate, scale_w, 1, true));
+                test_cases.emplace_back(new test_topk_moe({256, 7, 1, 1}, 8, true, bias_probs, gate, scale_w, 8, true));
             }
         }
     }
