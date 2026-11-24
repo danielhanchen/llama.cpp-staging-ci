@@ -3036,6 +3036,8 @@ struct llama_moe_cache::impl {
         int64_t  h_pick_min = INT64_MAX;
         int64_t  h_pre_ns   = 0; // pickup -> start of the host compute, end of it -> completed (host steady clock)
         int64_t  h_post_ns  = 0;
+        int64_t  h_last_d1  = 0; // GGML_MOE_MAILBOX_TIMING: the last batch's pickup sample and sequence, paired with its tm2 sample
+        uint32_t h_last_seq = 0;
         single_plan plans[GGML_MOE_MAILBOX_MAX_TOKENS + 1];
         std::array<int32_t, GGML_MOE_MAILBOX_MAX_TOKENS*16> pf_list{}; // GGML_MOE_HOST_PF: the experts read ahead for the next batch
         int pf_n = 0;
@@ -3698,6 +3700,29 @@ struct llama_moe_cache::impl {
         return mboxes[il].get();
     }
 
+    // GGML_MOE_MAILBOX_TIMING: the two one-way samples of the same batch (pickup - publish stamp, end of the merge's wait - completion
+    // stamp; host and device clocks) in windows of 128 batches; each window takes its clock offset from its own batch with the smallest
+    // sum (equal one-way latencies assumed there), so a drift between the clocks over the run does not move the split
+    struct pair_win_t {
+        int64_t n = 0, d1 = 0, d2 = 0, min_s = INT64_MAX, off = 0;
+        double  t1 = 0, t2 = 0;
+        int64_t tn = 0;
+        void add(int64_t a, int64_t b) {
+            n++; d1 += a; d2 += b;
+            if (a + b < min_s) {
+                min_s = a + b;
+                off   = a - (a + b)/2;
+            }
+            if (n == 128) {
+                t1 += (double) (d1 - n*off);
+                t2 += (double) (d2 + n*off);
+                tn += n;
+                n = d1 = d2 = 0;
+                min_s = INT64_MAX;
+            }
+        }
+    } pair_win;
+
     // GGML_MOE_MAILBOX_TIMING=1 (diagnostic): per layer, the device work between the publish and the merge, the merge's wait
     // for the host (device clock, see moe_mailbox_merge) and the host time of the batches (host clock), totals and by bands of layers
     void single_timing_report() {
@@ -3765,7 +3790,9 @@ struct llama_moe_cache::impl {
             "%.2f us\n", tag, (d1 - off)/1e3, (d2 + off)/1e3, off/1e3, min_d1/1e3, min_d2/1e3, pick_n > 0 ? pre/pick_n/1e3 : 0.0,
             pick_n > 0 ? post/pick_n/1e3 : 0.0);
         LLAMA_LOG_INFO("llama_moe_cache%s: GGML_MOE_MAILBOX_TIMING: %.1f polls per wait, %.2f us per poll (issue to value), host row reads "
-            "after the wait %.2f us\n", tag, xp/t[0], xp > 0 ? xpn/xp/1e3 : 0.0, xr/t[0]/1e3);
+            "after the wait %.2f us; paired samples (%" PRId64 " batches, an offset per 128): publish to host pickup %.1f us, host "
+            "completion to the end of the merge's wait %.1f us\n", tag, xp/t[0], xp > 0 ? xpn/xp/1e3 : 0.0, xr/t[0]/1e3, pair_win.tn,
+            pair_win.tn > 0 ? pair_win.t1/pair_win.tn/1e3 : 0.0, pair_win.tn > 0 ? pair_win.t2/pair_win.tn/1e3 : 0.0);
     }
 
     // the plan of n_tokens tokens of a mailbox: the experts of the host ids, reading and writing the mailbox
@@ -3891,6 +3918,12 @@ struct llama_moe_cache::impl {
                 mb.h_pick_ns += d;
                 mb.h_pick_n++;
                 mb.h_pick_min = std::min(mb.h_pick_min, d);
+                const volatile uint64_t * tm2 = hdr->tm2;
+                if (mb.h_last_seq != 0 && (uint32_t) tm2[1] == mb.h_last_seq) {
+                    pair_win.add(mb.h_last_d1, (int64_t) tm2[0]);
+                }
+                mb.h_last_d1  = d;
+                mb.h_last_seq = req;
             }
             // picked up: the merge on the device waits for this batch without a timeout from now on (see moe_mailbox_merge)
             llama_mb_store_rel(&hdr->started, req);

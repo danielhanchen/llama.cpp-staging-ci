@@ -38,6 +38,9 @@ struct ggml_moe_mailbox_hdr {
     // host -> device: completed again, one line each (GGML_MOE_MAILBOX_POLLERS > 1: the merge's pollers read one line each, so their
     // reads are separate requests); stored after completed, only while that switch is set
     uint32_t done_rep[GGML_MOE_MAILBOX_POLL_LINES][32];
+    // GGML_MOE_MAILBOX_TIMING: [0] the last timed batch's (end of the wait - [7]) as int64, [1] its sequence (the host pairs it with the
+    // same batch's pickup sample, see llama_moe_cache single_poll)
+    uint64_t tm2[2];    uint64_t pad7[14];
 };
 
 // device memory of a mailbox (zeroed at allocation)

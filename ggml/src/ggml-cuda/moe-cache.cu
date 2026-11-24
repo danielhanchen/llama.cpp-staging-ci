@@ -2191,17 +2191,20 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
             for (uint32_t it = 1; seen == 0; ++it) {
                 const uint64_t ta = timing ? moe_mailbox_ns() : 0;
                 const uint32_t v = relaxed ? moe_mailbox_load_relaxed(p) : moe_mailbox_load_acquire(p);
-                const bool done = v == seq;
-                if (timing && w == 0) {
-                    n_polls++;
-                    poll_ns += moe_mailbox_ns() - ta;
-                }
-                if (done) {
+                if (v == seq) {
+                    if (timing && w == 0) {
+                        n_polls++;
+                        poll_ns += moe_mailbox_ns() - ta;
+                    }
                     if (relaxed) {
                         moe_mailbox_fence_acquire();
                     }
                     seen = 1;
                     break;
+                }
+                if (timing && w == 0) {
+                    n_polls++;
+                    poll_ns += moe_mailbox_ns() - ta; // (after the branch on v: the value is back)
                 }
                 if (w == 0 && (it & 15) == 0 && moe_mailbox_load_acquire(&hdr->error) != 0) {
                     seen = 2;
@@ -2231,16 +2234,19 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
                     for (uint32_t it = 1; ; ++it) {
                         const uint64_t ta = timing ? moe_mailbox_ns() : 0;
                         const uint32_t v = relaxed ? moe_mailbox_load_relaxed(&hdr->completed) : moe_mailbox_load_acquire(&hdr->completed);
-                        const bool done = v == seq;
-                        if (timing) {
-                            n_polls++;
-                            poll_ns += moe_mailbox_ns() - ta;
-                        }
-                        if (done) {
+                        if (v == seq) {
+                            if (timing) {
+                                n_polls++;
+                                poll_ns += moe_mailbox_ns() - ta;
+                            }
                             if (relaxed) {
                                 moe_mailbox_fence_acquire();
                             }
                             break;
+                        }
+                        if (timing) {
+                            n_polls++;
+                            poll_ns += moe_mailbox_ns() - ta; // (after the branch on v: the value is back)
                         }
                         if ((it & 15) == 0 && moe_mailbox_load_acquire(&hdr->error) != 0) {
                             s = 2;
@@ -2305,6 +2311,9 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
             tm[8]  = (uint64_t) ctl->min_d2;
             tm[9]  = ctl->xs[0];
             tm[10] = ctl->xs[1];
+            volatile uint64_t * tm2 = hdr->tm2;
+            tm2[0] = (uint64_t) d2;
+            tm2[1] = ctl->seq;
             t_in = t_out; // (the start of the row reads, below)
         }
     }
