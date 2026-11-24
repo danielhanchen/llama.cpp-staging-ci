@@ -1065,6 +1065,22 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+        // (LLAMA_MTP_UPLOAD_KERNEL_MIB=N, default 4, 0 = off): an MTP drafter context's host uploads of at least N MiB from pinned memory
+        // (the target's hidden rows of a prompt ubatch, 25 MiB per 512 rows of Qwen3.8-Flash-Next) are read by a copy kernel instead
+        // of a copy-engine transfer: on the engine each waited behind the MoE cache's refill of the lent slots (one 263 MiB transfer
+        // per layer on its upload stream), 16 times per 8k prompt pass on the RTX PRO 6000 at 48 GB. Same bytes, same stream order
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            static const long upk_mib = getenv("LLAMA_MTP_UPLOAD_KERNEL_MIB") ? std::max(0L, atol(getenv("LLAMA_MTP_UPLOAD_KERNEL_MIB"))) : 4L;
+            for (auto * bk : backend_ptrs) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto fn = reg ? (void (*)(ggml_backend_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_kernel_min") : nullptr;
+                if (fn != nullptr && upk_mib > 0) {
+                    fn(bk, (size_t) upk_mib << 20);
+                }
+            }
+        }
+
         // device memory a model or context created after this one takes (e.g. the draft of speculative decoding, see
         // llama_context_params::mem_reserve): kept free by what this context places in the free memory while it is created
         mem_reserve.assign(backend_ptrs.size(), 0);
@@ -3044,6 +3060,9 @@ void llama_context::gf_res_epoch_bump(int line) {
 }
 
 llama_context::~llama_context() {
+    if (lm_trim_thr.joinable()) {
+        lm_trim_thr.join();
+    }
     nextn_join();
     batch_ahead_drop();
     // the refill reads of the RAM tier that did not start are cancelled before the weight store goes (its destructor would
@@ -6299,6 +6318,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // the next batch announced for after this decode (llama_set_batch_ahead): its gathers start when this decode's last ubatch is queued
     const bool batch_ahead_now = batch_ahead.pending;
     batch_ahead.pending = false;
+    next_small = batch_ahead_now && !batch_ahead.tok.empty() && batch_ahead.tok.size() <= 32;
     nextn_host_be    = nullptr;
     nextn_host_multi = false;
     ubatch_breaks_next.clear();
@@ -9011,6 +9031,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (!lm_keep_host) {
         ggml_backend_sched_synchronize(sched.get());
         lm_ids_host_keep();
+        llama_phase("group synced");
+        // (LLAMA_MOE_REFILL_EARLY=0 off): when the batch after this one is small (announced, at most 32 tokens) and this group ends the
+        // decode, the slots lent to its graph come back here: the device is idle and the routing kept, so nothing reads the lent memory
+        // again, and the next small graph's allocation would give them back unchanged (lend() with no copies). The refill of those slots
+        // (5 GiB for the 8k prompt at 48 GB on the RTX PRO 6000, ~100 ms on the upload stream, which the first token waits for) then
+        // starts before the host work below, the return and the next batch's build instead of after them. Same slots, same experts
+        static const bool refill_early = getenv("LLAMA_MOE_REFILL_EARLY") == nullptr || atoi(getenv("LLAMA_MOE_REFILL_EARLY")) != 0;
+        if (refill_early && next_small && !more && !lm_released && moe_cache) {
+            moe_cache->unlend_early();
+            llama_phase("lent slots back");
+        }
         ggml_backend_sched_reset(sched.get());
         // the scheduler's per-tensor table, sized for the merged graph, gives the pages the group touched back (the usual graphs
         // use its small part); LLAMA_MOE_LM_SCHED_TRIM=0 keeps them
@@ -9032,12 +9063,23 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 fn(bk, lm_t_start);
             }
         }
+        llama_phase("host freed");
 #if defined(__GLIBC__)
         // the graph results' metadata are large heap blocks that glibc keeps after free (its mmap threshold grows with the first such free)
         static const bool lm_trim = getenv("LLAMA_MOE_LM_TRIM") == nullptr || atoi(getenv("LLAMA_MOE_LM_TRIM")) != 0;
-        if (lm_trim) {
+        // (LLAMA_MOE_LM_TRIM_BG=0: on this thread, as before): the trim runs on a thread, so the decode returns (and the drafter's
+        // pass and the next batch start) while it hands the pages back; glibc's malloc_trim locks each arena it trims, the
+        // allocations of this thread meanwhile wait on those locks only. Memory only: no output depends on it
+        static const bool lm_trim_bg = getenv("LLAMA_MOE_LM_TRIM_BG") == nullptr || atoi(getenv("LLAMA_MOE_LM_TRIM_BG")) != 0;
+        if (lm_trim && lm_trim_bg) {
+            if (lm_trim_thr.joinable()) {
+                lm_trim_thr.join();
+            }
+            lm_trim_thr = std::thread([]() { malloc_trim(0); });
+        } else if (lm_trim) {
             malloc_trim(0);
         }
+        llama_phase("heap trimmed");
 #endif
     }
 

@@ -12295,6 +12295,31 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // the unlend that lend() with no copies runs when the scheduler allocates the next small graph, run at the end of the prompt's last
+    // graph instead (the caller announces a small next batch, see llama_context::decode_layer_major): the same groups, cleared and
+    // refilled with the same experts on the same upload stream, only queued before the host's work between the two graphs
+    uint64_t n_unlend_early = 0;
+    bool unlend_early() {
+        if (inplace_graph) {
+            return false; // lend() keeps the in-place prompt's slots there
+        }
+        bool any = false;
+        for (group & g : groups) {
+            if (g.lru.n_lent <= 0 || (size_t) g.id >= devices.size() || !devices[g.id].buf_bank || devices[g.id].released) {
+                continue;
+            }
+            rf_allow = true;
+            unlend(g);
+            rf_allow = false;
+            any = true;
+        }
+        if (any && n_unlend_early++ == 0) {
+            LLAMA_LOG_INFO("%s: MoE cache: the lent slots come back at the end of the prompt's last graph, before the small batch after it "
+                "(LLAMA_MOE_REFILL_EARLY=0: at that batch's graph allocation)\n", __func__);
+        }
+        return any;
+    }
+
     // the scheduler places the prefetched copies of a large batch: they go to the last slots of the largest group of the device, which
     // are evicted while lent, so the device does not keep a staging arena that only large batches use; n_copies = 0 takes the slots back
     void lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, int64_t n_tokens) {
@@ -16242,6 +16267,10 @@ void llama_moe_cache::restore() {
     for (size_t id = 0; id < pimpl->devices.size(); ++id) {
         pimpl->restore((int32_t) id);
     }
+}
+
+bool llama_moe_cache::unlend_early() {
+    return pimpl->unlend_early();
 }
 
 void llama_moe_cache::set_restore_soft(bool on) {
