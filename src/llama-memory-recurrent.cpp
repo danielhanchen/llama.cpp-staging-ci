@@ -39,8 +39,9 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // commit by replay for the delta-net models (see llama_memory_recurrent::replay). LLAMA_RS_REPLAY unset / auto: when layer
     // weights spill to host memory while others are on a device (a MoE cache / host experts: the memory the snapshot rows would take
-    // goes to the cache there), and when every layer sits on a device whose delta-net op folds the commit into the next window
-    // (CUDA / ROCm / MUSA): the snapshot rows are 1 + n_rs_seq state rows per sequence, and a verify window writes one state per token
+    // goes to the cache there), and when every layer sits on a CUDA device (its delta-net op folds the commit into the next window;
+    // ROCm / MUSA build the same op but were not measured, so they keep the snapshot rows there): the snapshot rows are
+    // 1 + n_rs_seq state rows per sequence, and a verify window writes one state per token
     // (RTX PRO 6000 / L4 / A100, MTP and DFlash2 drafters: Qwen3.8-27B +0.7..+2.5% decode, Qwen3.8-Flash-Next +0.4..+1.8%, 74-79% less
     // recurrent state). Not for the Qwen3.5 MoE arch with every layer resident: Qwen3.6-35B-A3B measured level to -0.5% there, so it
     // keeps the snapshot rows. With every weight in host memory, or on another device type, the snapshot rows stay.
@@ -71,7 +72,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                 (host ? on_host : on_dev) = true;
                 if (!host) {
                     const char * nm = ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer));
-                    dev_fold = dev_fold && (strncmp(nm, "CUDA", 4) == 0 || strncmp(nm, "ROCm", 4) == 0 || strncmp(nm, "MUSA", 4) == 0);
+                    dev_fold = dev_fold && strncmp(nm, "CUDA", 4) == 0;
                 }
             }
             // several sequences (llama-server --parallel N) keep the snapshot rows. With replay a window waits uncommitted
