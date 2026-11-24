@@ -268,6 +268,12 @@ int main(int argc, char ** argv) {
     cs.push_back({ "fn_dense_q4_0",          GGML_TYPE_Q4_0,   2560, 10240, 1, 0, false, 2048, 0,  0.0f,  0.0f, 14 });
     cs.push_back({ "fn_dense_iq4nl",         GGML_TYPE_IQ4_NL, 2560, 10240, 1, 0, false, 2048, 0,  0.0f,  0.0f, 15 });
     cs.push_back({ "fn_gate_iq2xxs_2048",    GGML_TYPE_IQ2_XXS, 2560, 640, 512, 10, true,  2048, 0,   0.0f,  0.0f, 16 });
+    // k19-mmqpad: partial last column tiles of dense products (dead-column skip) at K 320 / 640 (K tail), a K 320 / 640 MoE product
+    cs.push_back({ "pad_dense_hcup_q8_0_t",  GGML_TYPE_Q8_0,    320, 10240, 1, 0, false, 2044, 0,  0.0f,  0.0f, 17 });
+    cs.push_back({ "pad_dense_hcup_q8_0_n",  GGML_TYPE_Q8_0,    320, 10240, 1, 0, false,  100, 0,  0.0f,  0.0f, 18 });
+    cs.push_back({ "pad_dense_shdown_q5_0_t", GGML_TYPE_Q5_0,   640,  2560, 1, 0, false, 2037, 0,  0.0f,  0.0f, 19 });
+    cs.push_back({ "pad_moe_k320_q8_0",      GGML_TYPE_Q8_0,    320,  640,  64, 8, false,  509, 0,  0.0f,  0.0f, 20 });
+    cs.push_back({ "pad_moe_k640_iq4nl_skew", GGML_TYPE_IQ4_NL, 640, 2560, 512, 10, false, 1229, 0,  0.05f, 1.0f, 21 });
 
     for (const auto & c : cs) {
         if (only && c.name.find(only) == std::string::npos) {
