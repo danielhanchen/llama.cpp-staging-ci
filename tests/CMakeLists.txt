@@ -391,6 +391,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # flash attention with its KV length on the device vs the unpadded node, byte for byte (GPU; SKIP without one)
     llama_build(test-fa-kvlen-exact.cpp)
     llama_build(test-fa-kvlen-rows.cpp)   # small-batch flash attention with the device KV length, finite and against a reference
+    # a broadcast ADD of 2^32 elements on the GPU (size-1 dims with a stride past 32 bits; ~8.3 GiB of device memory, not in ctest)
+    llama_build(test-bin-bcast-large.cpp)
 
     # the SSD prompt-cache namespace covers the --override-kv metadata overrides (a restart with another override restored stale state)
     llama_build(test-server-prompt-ssd-ns.cpp)
