@@ -628,6 +628,8 @@ llama_build_and_test(test-fit-place8-grow.cpp)
 llama_build_and_test(test-fit-placemid-lent.cpp)
 # --fit: the K/V cells of an all-sliding DFlash drafter, with and without --swa-full (common_fit_dflash_draft_bytes)
 llama_build_and_test(test-fit-dflash-swa.cpp)
+# the MoE cache host thread: a kick ends its idle sleep (src/llama-kick-wait.h), wake latency printed
+llama_build_and_test(test-moe-kick-wait.cpp)
 # token-tiled gated delta-net vs the AR kernel, byte for byte on the GPU backend (SKIP without one)
 llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 # CPU GET_ROWS results gathered ahead (the next prompt batch's embedding rows) vs the plain gather, byte for byte
