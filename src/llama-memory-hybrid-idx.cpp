@@ -1027,7 +1027,7 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
 
 void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos, ggml_tensor * allfit_idx) const {
+        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos, ggml_tensor * allfit_idx, ggml_tensor * pool_live, uint32_t n_top_live) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     // a graph that only writes the indexer cache (the qwen4exp MTP drafter's kv_only prompt pass) has no pool cells / idxs,
     // mask or tail inputs (pass all four as nullptr): only the new pools' members, reps and positions are filled
@@ -1311,6 +1311,11 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     }
 
     const uint32_t n_pool_real = (uint32_t) pool_end.size();
+    if (pool_live != nullptr && pool_live->buffer != nullptr) {
+        // every column at and past it is a padded pool (mask -inf for every token below), see the header
+        const int32_t live = (int32_t) std::min(n_pool, std::max(n_pool_real, n_top_live));
+        ggml_backend_tensor_set(pool_live, &live, 0, sizeof(live));
+    }
     for (uint32_t ip = n_pool_real; ip < n_pool; ++ip) {
         pcell[ip] = (int32_t) dummy_cell; // pool_cells always addresses the K storage
         for (uint32_t k = 0; k < kpool; ++k) {
