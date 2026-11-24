@@ -892,7 +892,13 @@ static __global__ void moe_cache_fetch(const int32_t * __restrict__ info, const 
             int4       * d4 = (int4 *) (args.dst[b] + (int64_t) fill_s[j]*nb);
             const int64_t n4 = nb/16; // (staging slots and bank rows are 16-byte multiples, see moe_stg_register)
             for (int64_t i = (int64_t) blockIdx.z*blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.z*blockDim.x) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
                 d4[i] = __ldcg(s4 + i);
+#else
+                // no __ldcg for int4 on HIP / MUSA: volatile loads also skip the non-coherent L1 for the copy engine's bytes
+                const volatile int * sv = (const volatile int *) (s4 + i);
+                d4[i] = make_int4(sv[0], sv[1], sv[2], sv[3]);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             }
             __syncthreads();
             if (threadIdx.x == 0) {
@@ -1452,9 +1458,13 @@ bool ggml_cuda_moe_refill_need(ggml_backend_cuda_context & ctx, const void * sta
     // the need part only: the done part has one writer, the upload stream
     memcpy(r.h_need, r.mirror.data(), MOE_RF_DONE*sizeof(int32_t));
     ggml_cuda_set_device(ctx.device);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     CUDA_CHECK(cudaMemcpyToSymbolAsync(moe_rf_tab, r.h_need, MOE_RF_DONE*sizeof(int32_t), (size_t) r.idx*MOE_RF_ROW*sizeof(int32_t),
         cudaMemcpyHostToDevice, ctx.stream()));
     return true;
+#else
+    return false; // not reached: ggml_cuda_moe_refill_register registers nothing on HIP / MUSA
+#endif
 }
 
 // the uploads queued before this on the stream of ctx (the upload stream) complete layer il (-1: the whole refill) of this epoch
@@ -1469,9 +1479,13 @@ bool ggml_cuda_moe_refill_done(ggml_backend_cuda_context & ctx, const void * sta
     r.mirror[k] = epoch;
     r.h_done[k] = epoch;
     ggml_cuda_set_device(ctx.device);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     CUDA_CHECK(cudaMemcpyToSymbolAsync(moe_rf_tab, r.h_done + k, sizeof(int32_t), ((size_t) r.idx*MOE_RF_ROW + k)*sizeof(int32_t),
         cudaMemcpyHostToDevice, ctx.stream()));
     return true;
+#else
+    return false; // not reached: ggml_cuda_moe_refill_register registers nothing on HIP / MUSA
+#endif
 }
 
 // before a cache op other than a prefetch: the main stream waits for the copies of a prefetch (the next layer's lookup reads its
