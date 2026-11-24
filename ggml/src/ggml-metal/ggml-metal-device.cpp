@@ -1295,11 +1295,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     // src1 prec [TAG_GGML_PREC]
     const bool amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
 
-    // GGML_METAL_MMID_SGSPLIT=0: entry tiles of at most 16 rows leave simdgroups 2,3 idle, as before
-    // GGML_METAL_MMID_BSKIP=0: the 8-row B blocks past the valid rows of a tile are loaded and multiplied, as before
+    // off by default until measured on an Apple GPU (=1 enables):
+    // GGML_METAL_MMID_SGSPLIT=1: entry tiles of at most 16 rows spread over all 4 simdgroups (otherwise simdgroups 2,3 idle)
+    // GGML_METAL_MMID_BSKIP=1: the 8-row B blocks past the valid rows of a tile are not loaded and multiplied
     // (both exact: the same accumulators and K chains, see kernel_mul_mm_id; the tensor-API kernel ignores them)
-    static const bool sgsplit = getenv("GGML_METAL_MMID_SGSPLIT") == nullptr || atoi(getenv("GGML_METAL_MMID_SGSPLIT")) != 0;
-    static const bool bskip   = getenv("GGML_METAL_MMID_BSKIP")   == nullptr || atoi(getenv("GGML_METAL_MMID_BSKIP"))   != 0;
+    static const bool sgsplit = getenv("GGML_METAL_MMID_SGSPLIT") != nullptr && atoi(getenv("GGML_METAL_MMID_SGSPLIT")) != 0;
+    static const bool bskip   = getenv("GGML_METAL_MMID_BSKIP")   != nullptr && atoi(getenv("GGML_METAL_MMID_BSKIP"))   != 0;
 
     snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
     snprintf(name, 256, "%s_bci=%d_amax=%d_sgs=%d_bsk=%d", base, bc_inp, amax, sgsplit, bskip);

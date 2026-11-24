@@ -1,7 +1,8 @@
 // the Metal host bank binding (proc address "ggml_backend_metal_alias_host", used by the MoE copy callback on unified memory): a
 // Metal tensor that holds zeros is bound to host memory at page and non-page offsets, a graph that reads it (the tensor and a view
 // of it) must return the host bytes, the next graph (nothing bound) must read the zeros again, and the tensor itself is never
-// written. With --off (run under GGML_METAL_HOST_BANK_BIND=0) the bind must be refused and every graph reads the zeros.
+// written. The default arm sets GGML_METAL_HOST_BANK_BIND=1 (the bind is off by default);
+// with --off (run under GGML_METAL_HOST_BANK_BIND=0 or unset) the bind must be refused and every graph reads the zeros.
 // SKIP without a Metal device; exit 1 on any difference.
 
 #include "ggml.h"
@@ -50,6 +51,11 @@ static void run_graph(ggml_backend_t be, ggml_tensor * bank, int64_t n, int64_t 
 
 static int run(int argc, char ** argv) {
     const bool off = argc > 1 && strcmp(argv[1], "--off") == 0;
+
+    // the bind is off by default: the default arm enables it, --off keeps whatever the environment says (=0 or unset)
+    if (!off) {
+        setenv("GGML_METAL_HOST_BANK_BIND", "1", 1);
+    }
 
     ggml_backend_load_all();
 

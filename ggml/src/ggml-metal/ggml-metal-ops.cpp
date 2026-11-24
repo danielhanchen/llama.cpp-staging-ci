@@ -3055,10 +3055,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_buffer_id bid_amax = bid_ids;
         bid_amax.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
 
-        // GGML_METAL_MMID_MAP_SHARE=0: every node builds its own map, as before. Otherwise the gate / up / down
+        // GGML_METAL_MMID_MAP_SHARE=1 (off by default until measured on an Apple GPU; otherwise every node builds its own
+        // map, as before): the gate / up / down
         // projections of a layer (same ids) read the map of the first of them: one map0 dispatch and one barrier less
         // per sharing node; the map bytes are identical (they depend on the ids and shapes only)
-        static const bool map_share = getenv("GGML_METAL_MMID_MAP_SHARE") == nullptr || atoi(getenv("GGML_METAL_MMID_MAP_SHARE")) != 0;
+        static const bool map_share = getenv("GGML_METAL_MMID_MAP_SHARE") != nullptr && atoi(getenv("GGML_METAL_MMID_MAP_SHARE")) != 0;
 
         const ggml_tensor * ids_base = op->src[2]->view_src ? op->src[2]->view_src : op->src[2];
 

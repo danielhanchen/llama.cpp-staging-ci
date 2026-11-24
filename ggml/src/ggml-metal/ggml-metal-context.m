@@ -413,14 +413,15 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 }
 
 bool ggml_metal_alias_host(ggml_metal_t ctx, const struct ggml_tensor * tensor, const void * data, size_t size) {
-    // GGML_METAL_HOST_BANK_BIND=0: never bind (the caller copies as before); GGML_METAL_HOST_BANK_BIND_DEBUG=1: count the binds
+    // GGML_METAL_HOST_BANK_BIND=1: bind (off by default until measured on an Apple GPU: the caller copies as before);
+    // GGML_METAL_HOST_BANK_BIND_DEBUG=1: count the binds
     static int enabled = -1;
     static int debug   = 0;
     if (enabled < 0) {
         const char * e = getenv("GGML_METAL_HOST_BANK_BIND");
         const char * d = getenv("GGML_METAL_HOST_BANK_BIND_DEBUG");
         debug   = d != NULL && atoi(d) != 0;
-        enabled = e == NULL || atoi(e) != 0;
+        enabled = e != NULL && atoi(e) != 0;
     }
     if (!enabled || tensor == NULL || data == NULL) {
         return false;
@@ -460,7 +461,7 @@ bool ggml_metal_alias_host(ggml_metal_t ctx, const struct ggml_tensor * tensor, 
     const int n = atomic_fetch_add(&n_bind, 1) + 1;
     const size_t b = atomic_fetch_add(&n_byte, nbytes) + nbytes;
     if (n == 1) {
-        GGML_LOG_INFO("%s: host expert banks are read in place on the GPU (GGML_METAL_HOST_BANK_BIND=0: copies)\n", __func__);
+        GGML_LOG_INFO("%s: host expert banks are read in place on the GPU (GGML_METAL_HOST_BANK_BIND=1)\n", __func__);
     }
     if (debug) {
         GGML_LOG_INFO("%s: bind %d: %s, %zu bytes bound (total %zu bytes not copied)\n", __func__, n, tensor->name, nbytes, b);

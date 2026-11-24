@@ -945,7 +945,7 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
 
 // "ggml_backend_metal_alias_host" (proc address): the next graph_compute of backend reads tensor from the host memory
 // [data, data + size) in place instead of the tensor's own buffer (a copy of those bytes). false: nothing bound (not a Metal backend,
-// no unified memory, GGML_METAL_HOST_BANK_BIND=0, or Metal refuses the range): the caller copies as before
+// no unified memory, GGML_METAL_HOST_BANK_BIND unset / 0, or Metal refuses the range): the caller copies as before
 static bool ggml_backend_metal_alias_host(ggml_backend_t backend, const ggml_tensor * tensor, const void * data, size_t size) {
     if (backend == nullptr || !ggml_backend_is_metal(backend) || tensor == nullptr) {
         return false;

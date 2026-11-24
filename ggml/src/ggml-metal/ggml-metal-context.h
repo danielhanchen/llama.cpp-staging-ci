@@ -24,7 +24,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
 // the next graph_compute of ctx reads tensor from the host memory [data, data + size) in place instead of its own buffer (unified
-// memory only, size >= ggml_nbytes(tensor)); false (nothing bound) when GGML_METAL_HOST_BANK_BIND=0 or Metal refuses the range
+// memory only, size >= ggml_nbytes(tensor)); false (nothing bound) unless GGML_METAL_HOST_BANK_BIND=1, or when Metal refuses the range
 bool ggml_metal_alias_host(ggml_metal_t ctx, const struct ggml_tensor * tensor, const void * data, size_t size);
 
 enum ggml_status ggml_metal_graph_compute (ggml_metal_t ctx, struct ggml_cgraph * gf);

@@ -10437,7 +10437,7 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
 
     // unified memory (Metal): the product reads the host bank in place, no copy and no wait for the ids. Only where nothing else reads
     // the copy: not on the copy queue (prefetched copies), not an expert tensor of the MoE cache (its seeds and staged copies read dst),
-    // not a tensor the weight store reads from the file. Any refusal copies as before (GGML_METAL_HOST_BANK_BIND=0: always)
+    // not a tensor the weight store reads from the file. Any refusal copies as before (always unless GGML_METAL_HOST_BANK_BIND=1)
     if (!on_copy_queue && (!lctx->moe_cache || lctx->moe_cache->get_experts(src) == nullptr) && !(lctx->wstore && lctx->wstore->covers(src)) &&
             src->data != nullptr && src->buffer != nullptr && ggml_backend_buffer_is_host(src->buffer) && src->type == dst->type &&
             ggml_nbytes(src) == ggml_nbytes(dst)) {
