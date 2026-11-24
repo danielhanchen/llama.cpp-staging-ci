@@ -3044,6 +3044,9 @@ void llama_context::gf_res_epoch_bump(int line) {
 }
 
 llama_context::~llama_context() {
+    if (lm_trim_thr.joinable()) {
+        lm_trim_thr.join();
+    }
     nextn_join();
     batch_ahead_drop();
     // the refill reads of the RAM tier that did not start are cancelled before the weight store goes (its destructor would
@@ -6299,6 +6302,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // the next batch announced for after this decode (llama_set_batch_ahead): its gathers start when this decode's last ubatch is queued
     const bool batch_ahead_now = batch_ahead.pending;
     batch_ahead.pending = false;
+    next_small = batch_ahead_now && !batch_ahead.tok.empty() && batch_ahead.tok.size() <= 32;
     nextn_host_be    = nullptr;
     nextn_host_multi = false;
     ubatch_breaks_next.clear();
@@ -9011,6 +9015,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (!lm_keep_host) {
         ggml_backend_sched_synchronize(sched.get());
         lm_ids_host_keep();
+        llama_phase("group synced");
+        // (LLAMA_MOE_REFILL_EARLY=0 off): when the batch after this one is small (announced, at most 32 tokens) and this group ends the
+        // decode, the slots lent to its graph come back here: the device is idle and the routing kept, so nothing reads the lent memory
+        // again, and the next small graph's allocation would give them back unchanged (lend() with no copies). The refill of those slots
+        // (5 GiB for the 8k prompt at 48 GB on the RTX PRO 6000, ~100 ms on the upload stream, which the first token waits for) then
+        // starts before the host work below, the return and the next batch's build instead of after them. Same slots, same experts
+        static const bool refill_early = getenv("LLAMA_MOE_REFILL_EARLY") == nullptr || atoi(getenv("LLAMA_MOE_REFILL_EARLY")) != 0;
+        if (refill_early && next_small && !more && !lm_released && moe_cache) {
+            moe_cache->unlend_early();
+            llama_phase("lent slots back");
+        }
         ggml_backend_sched_reset(sched.get());
         // the scheduler's per-tensor table, sized for the merged graph, gives the pages the group touched back (the usual graphs
         // use its small part); LLAMA_MOE_LM_SCHED_TRIM=0 keeps them
@@ -9032,12 +9047,23 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 fn(bk, lm_t_start);
             }
         }
+        llama_phase("host freed");
 #if defined(__GLIBC__)
         // the graph results' metadata are large heap blocks that glibc keeps after free (its mmap threshold grows with the first such free)
         static const bool lm_trim = getenv("LLAMA_MOE_LM_TRIM") == nullptr || atoi(getenv("LLAMA_MOE_LM_TRIM")) != 0;
-        if (lm_trim) {
+        // (LLAMA_MOE_LM_TRIM_BG=0: on this thread, as before): the trim runs on a thread, so the decode returns (and the drafter's
+        // pass and the next batch start) while it hands the pages back; glibc's malloc_trim locks each arena it trims, the
+        // allocations of this thread meanwhile wait on those locks only. Memory only: no output depends on it
+        static const bool lm_trim_bg = getenv("LLAMA_MOE_LM_TRIM_BG") == nullptr || atoi(getenv("LLAMA_MOE_LM_TRIM_BG")) != 0;
+        if (lm_trim && lm_trim_bg) {
+            if (lm_trim_thr.joinable()) {
+                lm_trim_thr.join();
+            }
+            lm_trim_thr = std::thread([]() { malloc_trim(0); });
+        } else if (lm_trim) {
             malloc_trim(0);
         }
+        llama_phase("heap trimmed");
 #endif
     }
 
@@ -10133,6 +10159,18 @@ void llama_context::vram_watch_sample(bool force) {
 // threadpool, one worker per physical core (the first allowed SMT sibling, at most 32 and the cgroup quota), each pinned to its CPU
 // (strict_cpu), polling LLAMA_MOE_HOST_POLL (default 50) before it sleeps; GGML_CPU_PIN_CALLER=1 also pins the calling thread to
 // worker 0's CPU. Only builds without OpenMP use the pool's CPU masks (GGML_OPENMP=OFF); with OpenMP the team ignores them.
+
+// the scheduler's prefetch copies of a split (a cached expert run from the MoE cache plus the uploads of the rest into the split's staging
+// copy): through the backend's staging variant where it has one (CUDA: no copy-queue fences around the device copies, see
+// ggml_backend_cuda_copy_regions_staging_async), else the plain call
+static bool llama_copy_regions_staging(ggml_backend_t backend, const ggml_backend_copy_region * regions, size_t n_regions) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    using fn_t = bool (*)(ggml_backend_t, const ggml_backend_copy_region *, size_t);
+    auto fn = reg ? (fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_regions_staging_async") : nullptr;
+    return fn != nullptr ? fn(backend, regions, n_regions) : ggml_backend_tensor_copy_regions_async(backend, regions, n_regions);
+}
+
 static const std::vector<int> & host_pin_cpus() {
     static const std::vector<int> cpus = [] {
         const char * e = getenv("LLAMA_MOE_HOST_PIN");
@@ -10592,7 +10630,9 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
                     done = true;
                 }
             }
-        } else if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
+        } else if (ua ? ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size()) :
+                        llama_copy_regions_staging(backend, st.regions.data(), st.regions.size())) {
+            // (uploads ahead write cache slots from another queue: those copies keep the fenced call)
             lctx->moe_cache->count_batch(src, st.regions);
             done = true;
             if (ua) {

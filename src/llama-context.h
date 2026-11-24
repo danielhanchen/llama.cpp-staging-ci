@@ -554,6 +554,11 @@ private:
         int64_t                  n_rows    = 0;
         int64_t                  t_us      = 0;
     } batch_ahead;
+    // the batch announced for after the current decode (llama_set_batch_ahead) has at most 32 tokens: the prompt's lent MoE cache slots
+    // may come back at its last group's end (LLAMA_MOE_REFILL_EARLY)
+    bool next_small = false;
+    // (LLAMA_MOE_LM_TRIM_BG): the heap trim after a layer-major group, on a thread (joined before the next one and at the end)
+    std::thread lm_trim_thr;
     void batch_ahead_start(const llama_memory_context_i * mctx);
     void batch_ahead_drop();
     // the PLE table read-in after the load (LLAMA_PLE_RESIDENT), stopped and joined when the context goes (also from a

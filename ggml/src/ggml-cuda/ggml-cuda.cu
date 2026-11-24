@@ -4015,6 +4015,17 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 // of the process was 0.3 to 0.5 us slower on compute capability 12.0 (the next kernel no longer starts before the previous one
 // ends, PDL included), so generation stayed ~7% slower after the first prompt that used the copy queue; uploads alone do not
 // do it. The copies keep the order of the copy queue: they wait for its earlier work, and its later work waits for them.
+// (proc "ggml_backend_copy_regions_staging_async", the scheduler's prefetch copies of a split's expert weights into its staging slot,
+// GGML_CUDA_COPY_PEER_FENCE=1: fenced as every other call): the device copies of such a call (cached experts -> the staging slot) run
+// on the compute stream without the two fences. The begin fence made the compute stream wait for the whole copy queue, i.e. for the
+// uploads of the splits queued up to depth - 1 ahead, not only for this split's; the end fence made the copy queue wait for the
+// device copies. Neither orders anything the copies need: the slot's last reader is queued on the compute stream before them (the
+// scheduler issues a slot's copies only after that reader, see ggml_backend_sched_prefetch_issue_ex), the split that reads the copies
+// follows them on the same stream, the next uploads into the slot wait for its retire event (recorded after that reader), and the
+// cached experts they read are written on the compute stream (device seeds) or with a wait the caller places (uploads ahead: the
+// caller keeps the fenced call there). Same kernels and bytes, only fewer cross-stream waits
+static thread_local bool ggml_cuda_copy_staging = false;
+
 static cudaStream_t ggml_cuda_copy_peer_begin(ggml_backend_cuda_context * ctx) {
     ggml_backend_cuda_context * peer = ctx->copy_peer;
     if (peer == nullptr || ctx->computes) {
@@ -4029,6 +4040,9 @@ static cudaStream_t ggml_cuda_copy_peer_begin(ggml_backend_cuda_context * ctx) {
     }
 #endif // !defined(GGML_USE_HIP)
     ggml_cuda_set_device(ctx->device);
+    if (ggml_cuda_copy_staging) {
+        return ps;
+    }
     for (cudaEvent_t & ev : ctx->copy_peer_events) {
         if (ev == nullptr) {
             CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
@@ -4040,7 +4054,7 @@ static cudaStream_t ggml_cuda_copy_peer_begin(ggml_backend_cuda_context * ctx) {
 }
 
 static void ggml_cuda_copy_peer_end(ggml_backend_cuda_context * ctx, cudaStream_t stream) {
-    if (stream == ctx->stream()) {
+    if (stream == ctx->stream() || ggml_cuda_copy_staging) {
         return;
     }
     CUDA_CHECK(cudaEventRecord(ctx->copy_peer_events[1], stream));
@@ -13578,6 +13592,21 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
 #endif
 }
 
+static bool ggml_backend_cuda_copy_regions_staging_async(ggml_backend_t backend, const ggml_backend_copy_region * regions, size_t n_regions) {
+    static const bool fence = getenv("GGML_CUDA_COPY_PEER_FENCE") != nullptr && atoi(getenv("GGML_CUDA_COPY_PEER_FENCE")) != 0;
+    if (fence || n_regions == 0) {
+        return ggml_backend_cuda_copy_regions_async(backend, regions, n_regions);
+    }
+    ggml_cuda_copy_staging = true;
+    const bool ok = ggml_backend_cuda_copy_regions_async(backend, regions, n_regions);
+    ggml_cuda_copy_staging = false;
+    static std::atomic<int> n_log { 0 };
+    if (ok && n_log.fetch_add(1) == 0) {
+        GGML_LOG_INFO("%s: staging copies of prefetched splits without the copy-queue fences (GGML_CUDA_COPY_PEER_FENCE=1: fenced)\n", __func__);
+    }
+    return ok;
+}
+
 // asynchronous refill of lent MoE cache slots (see moe_rf_wait): register a group by its state tensor, queue the need row of a refill
 // on the compute stream of backend, mark a layer done on the stream of the upload backend
 static int ggml_backend_cuda_moe_refill_register(ggml_backend_t backend, const ggml_tensor * state) {
@@ -13985,6 +14014,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_copy_regions_async") == 0) {
         return (void *)ggml_backend_cuda_copy_regions_async;
+    }
+    if (strcmp(name, "ggml_backend_copy_regions_staging_async") == 0) {
+        return (void *)ggml_backend_cuda_copy_regions_staging_async;
     }
     if (strcmp(name, "ggml_backend_set_copy_peer") == 0) {
         return (void *)ggml_backend_cuda_set_copy_peer;

@@ -270,6 +270,9 @@ public:
     // them again and refills the slots; nothing may look up or upload experts in between (the layer-major group does neither)
     bool release();
     void restore();
+    // (LLAMA_MOE_REFILL_EARLY): the slots lent to the graph of a prompt that just ended come back now (cleared, then refilled as
+    // lend() with no copies does for the next small graph), when the caller knows that graph is small; false: none were lent
+    bool unlend_early();
     // a restore whose banks do not allocate leaves them released (released() stays true) instead of aborting
     void set_restore_soft(bool on);
     bool released() const;
