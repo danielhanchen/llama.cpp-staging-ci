@@ -1383,6 +1383,15 @@ typedef struct {
     uint64_t nb01;
 } ggml_metal_kargs_argmax;
 
+// ggml_sel_mask (GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL)
+typedef struct {
+     int64_t n_kv;
+     int64_t n_sel;
+    uint64_t nb1_idx;
+    uint64_t nb1_kq;
+    uint64_t nb1_dst;
+} ggml_metal_kargs_sel_mask;
+
 typedef struct {
     int64_t  np;
 } ggml_metal_kargs_opt_step_adamw;

@@ -522,6 +522,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_argmax(ctx, idx);
             } break;
+        case GGML_OP_KQ_MASK:
+            {
+                n_fuse = ggml_metal_op_kq_mask(ctx, idx);
+            } break;
         case GGML_OP_OPT_STEP_ADAMW:
             {
                 n_fuse = ggml_metal_op_opt_step_adamw(ctx, idx);
@@ -5581,6 +5585,51 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+// GGML_OP_KQ_MASK, the selection mask kind only (ggml_sel_mask; supports_op refuses the other kinds): one threadgroup per row
+// fills the row with kq - INFINITY and then writes kq + 0 at the selected cells of the row
+int ggml_metal_op_kq_mask(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_ASSERT(ggml_get_op_params_i32(op, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL);
+
+    const ggml_tensor * idx_t = op->src[0];
+    const ggml_tensor * kq    = op->src[1];
+
+    GGML_ASSERT(ggml_is_contiguous(op) && ggml_is_contiguous(kq) && idx_t->nb[0] == sizeof(int32_t));
+
+    const int64_t n_kv   = op->ne[0];
+    const int64_t n_rows = op->ne[1]*op->ne[2]*op->ne[3];
+
+    if (n_kv == 0 || n_rows == 0) {
+        return 1;
+    }
+
+    ggml_metal_kargs_sel_mask args = {
+        /*.n_kv    =*/ n_kv,
+        /*.n_sel   =*/ idx_t->ne[0],
+        /*.nb1_idx =*/ idx_t->nb[1],
+        /*.nb1_kq  =*/ kq->nb[1],
+        /*.nb1_dst =*/ op->nb[1],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_sel_mask(lib, op);
+
+    const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), 1024);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(idx_t), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kq),    2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),    3);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_rows, 1, 1, nth, 1, 1);
 
     return 1;
 }
