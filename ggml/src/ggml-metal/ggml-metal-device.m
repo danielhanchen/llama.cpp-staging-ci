@@ -1689,6 +1689,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->type == GGML_TYPE_I64;
         case GGML_OP_ARGMAX:
             return has_simdgroup_reduction;
+        case GGML_OP_KQ_MASK:
+            // the selection mask kind only (ggml_sel_mask); the other kinds stay on the CPU
+            return ggml_get_op_params_i32(op, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL &&
+                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F16 &&
+                ggml_is_contiguous(op) && ggml_is_contiguous(op->src[1]) && op->src[0]->nb[0] == sizeof(int32_t) &&
+                op->src[0]->ne[1] == ggml_nrows(op);
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));

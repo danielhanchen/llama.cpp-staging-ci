@@ -23,6 +23,13 @@ ggml_metal_op_t ggml_metal_op_init(
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
+// tensors whose reads are bound to other memory for the graphs of one owner (a backend context): the ops read `id` instead of
+// the tensor's own buffer. Set before the owner encodes a graph, cleared by the owner after it encoded it (the caller keeps the
+// Metal buffer of `id` alive until the command buffers that read it have completed)
+void ggml_metal_op_alias_add  (const void * owner, const struct ggml_tensor * t, struct ggml_metal_buffer_id id);
+void ggml_metal_op_alias_clear(const void * owner);
+int  ggml_metal_op_alias_count(const void * owner);
+
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
@@ -37,6 +44,9 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 // id map [n_tokens, n_expert]
 size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
 size_t ggml_metal_op_mul_mat_id_extra_amax(const struct ggml_tensor * op);
+
+// list of the paired routes of the mat-vec path (GGML_METAL_MMID_PAIR=1), 0 when the op does not take it
+size_t ggml_metal_op_mul_mat_id_extra_pair(const struct ggml_tensor * op);
 
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
@@ -96,6 +106,7 @@ int ggml_metal_op_roll              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_arange            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_kq_mask           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argsort           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_top_k             (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_topk_moe          (ggml_metal_op_t ctx, int idx);

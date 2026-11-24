@@ -14,6 +14,7 @@
 
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #undef MIN
 #undef MAX
@@ -74,6 +75,10 @@ struct ggml_metal {
     // buffers to release after async Metal operations complete
     // if Metal released them, it would do so on a Metal-internal thread without an autorelease pool, which could cause leaks
     NSMutableArray * buf_refs;
+
+    // the host pages bound by ggml_metal_alias_host for the next graph: moved to buf_refs once that graph is encoded (a synchronize
+    // before it, e.g. between the input copies of a split, must not release them)
+    NSMutableArray * alias_refs;
 
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
@@ -186,6 +191,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
         res->cmd_bufs_ext = [[NSMutableArray alloc] init];
         res->buf_refs     = [[NSMutableArray alloc] init];
+        res->alias_refs   = [[NSMutableArray alloc] init];
 
         res->cmd_buf_last = nil;
 
@@ -213,9 +219,13 @@ void ggml_metal_free(ggml_metal_t ctx) {
     [ctx->cmd_bufs_ext removeAllObjects];
     [ctx->cmd_bufs_ext release];
 
+    ggml_metal_op_alias_clear(ctx);
+
     @autoreleasepool {
         [ctx->buf_refs removeAllObjects];
         [ctx->buf_refs release];
+        [ctx->alias_refs removeAllObjects];
+        [ctx->alias_refs release];
     }
 
     if (ctx->pipelines_ext) {
@@ -402,6 +412,64 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
     }
 }
 
+bool ggml_metal_alias_host(ggml_metal_t ctx, const struct ggml_tensor * tensor, const void * data, size_t size) {
+    // GGML_METAL_HOST_BANK_BIND=1: bind (off by default until measured on an Apple GPU: the caller copies as before);
+    // GGML_METAL_HOST_BANK_BIND_DEBUG=1: count the binds
+    static int enabled = -1;
+    static int debug   = 0;
+    if (enabled < 0) {
+        const char * e = getenv("GGML_METAL_HOST_BANK_BIND");
+        const char * d = getenv("GGML_METAL_HOST_BANK_BIND_DEBUG");
+        debug   = d != NULL && atoi(d) != 0;
+        enabled = e != NULL && atoi(e) != 0;
+    }
+    if (!enabled || tensor == NULL || data == NULL) {
+        return false;
+    }
+
+    const struct ggml_metal_device_props * props = ggml_metal_device_get_props(ctx->dev);
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (!props->has_unified_memory || size < nbytes || nbytes == 0) {
+        return false;
+    }
+
+    // the wrapped pages run from the page of data to the page end after data + nbytes
+    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t p0   = (uintptr_t) data & ~(page - 1);
+    const uintptr_t p1   = ((uintptr_t) data + nbytes + page - 1) & ~(page - 1);
+    if (p1 - p0 > props->max_buffer_size) {
+        return false;
+    }
+
+    @autoreleasepool {
+        size_t offs = 0;
+        id<MTLBuffer> buf = ggml_metal_wrap_host_pages(ggml_metal_device_get_obj(ctx->dev), data, nbytes, &offs);
+        if (buf == nil) {
+            return false;
+        }
+
+        // kept until the graph that reads it is encoded, then until the context synchronizes, which waits for its last command buffer
+        [ctx->alias_refs addObject:buf];
+        [buf release];
+
+        struct ggml_metal_buffer_id bid = { (__bridge void *) buf, offs };
+        ggml_metal_op_alias_add(ctx, tensor, bid);
+    }
+
+    static atomic_int    n_bind = 0;
+    static atomic_size_t n_byte = 0;
+    const int n = atomic_fetch_add(&n_bind, 1) + 1;
+    const size_t b = atomic_fetch_add(&n_byte, nbytes) + nbytes;
+    if (n == 1) {
+        GGML_LOG_INFO("%s: host expert banks are read in place on the GPU (GGML_METAL_HOST_BANK_BIND=1)\n", __func__);
+    }
+    if (debug) {
+        GGML_LOG_INFO("%s: bind %d: %s, %zu bytes bound (total %zu bytes not copied)\n", __func__, n, tensor->name, nbytes, b);
+    }
+
+    return true;
+}
+
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     @autoreleasepool {
         // the destination pages wrapped in place (a pointer that is not page aligned, e.g. a later row of the logits, as well)
@@ -510,6 +578,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     }
 
     if (gf->n_nodes == 0) {
+        if (ctx->alias_refs.count > 0) {
+            ggml_metal_op_alias_clear(ctx);
+            [ctx->buf_refs addObjectsFromArray:ctx->alias_refs];
+            [ctx->alias_refs removeAllObjects];
+        }
         return GGML_STATUS_SUCCESS;
     }
 
@@ -625,6 +698,14 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        // every command buffer of the graph is encoded: the bound tensors of this graph are not bound for the next one, and the
+        // bound pages are released with the other buffers once the context synchronizes
+        if (ctx->alias_refs.count > 0) {
+            ggml_metal_op_alias_clear(ctx);
+            [ctx->buf_refs addObjectsFromArray:ctx->alias_refs];
+            [ctx->alias_refs removeAllObjects];
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];

@@ -227,6 +227,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
                 res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
                 res += ggml_metal_op_mul_mat_id_extra_amax(tensor);
+                res += ggml_metal_op_mul_mat_id_extra_pair(tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
@@ -942,9 +943,26 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
 }
 
+// "ggml_backend_metal_alias_host" (proc address): the next graph_compute of backend reads tensor from the host memory
+// [data, data + size) in place instead of the tensor's own buffer (a copy of those bytes). false: nothing bound (not a Metal backend,
+// no unified memory, GGML_METAL_HOST_BANK_BIND unset / 0, or Metal refuses the range): the caller copies as before
+static bool ggml_backend_metal_alias_host(ggml_backend_t backend, const ggml_tensor * tensor, const void * data, size_t size) {
+    if (backend == nullptr || !ggml_backend_is_metal(backend) || tensor == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buf == nullptr || !ggml_backend_buffer_is_metal(buf)) {
+        return false;
+    }
+    return ggml_metal_alias_host((ggml_metal_t) backend->context, tensor, data, size);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_metal_alias_host") == 0) {
+        return (void *)ggml_backend_metal_alias_host;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

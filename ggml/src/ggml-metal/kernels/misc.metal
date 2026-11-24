@@ -776,3 +776,47 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// ggml_sel_mask (GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL): each cell is the f16 sum of the chain it replaces,
+// f16(-INFINITY + kq) everywhere, then f16(0 + kq) at the selected cells. Done on the bits, so fast math cannot fold
+// the infinity: -inf for every kq except +inf / NaN (NaN); kq for 0 + kq, except -0 (+0) and NaN (quieted)
+static inline ushort sel_mask_minus_inf(ushort k) {
+    const bool nan  = (k & 0x7C00) == 0x7C00 && (k & 0x03FF) != 0;
+    const bool pinf = k == 0x7C00;
+    return nan ? (ushort) (k | 0x0200) : (pinf ? (ushort) 0x7E00 : (ushort) 0xFC00);
+}
+
+static inline ushort sel_mask_plus_zero(ushort k) {
+    const bool nan = (k & 0x7C00) == 0x7C00 && (k & 0x03FF) != 0;
+    return nan ? (ushort) (k | 0x0200) : (k == 0x8000 ? (ushort) 0 : k);
+}
+
+kernel void kernel_sel_mask_f16(
+        constant ggml_metal_kargs_sel_mask & args,
+        device const char * idx,
+        device const char * kq,
+        device       char * dst,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    const uint64_t r = tgpig;
+
+    device const ushort  * kq_r  = (device const ushort  *) (kq  + r*args.nb1_kq);
+    device       ushort  * dst_r = (device       ushort  *) (dst + r*args.nb1_dst);
+    device const int32_t * idx_r = (device const int32_t *) (idx + r*args.nb1_idx);
+
+    for (int64_t j = tpitg; j < args.n_kv; j += ntg) {
+        dst_r[j] = sel_mask_minus_inf(kq_r[j]);
+    }
+
+    // the row belongs to this threadgroup alone: its fill stores are ordered before the scatter
+    threadgroup_barrier(mem_flags::mem_device);
+
+    for (int64_t s = tpitg; s < args.n_sel; s += ntg) {
+        const int32_t j = idx_r[s];
+        if (j < 0 || j >= args.n_kv) {
+            continue; // a dead slot
+        }
+        dst_r[j] = sel_mask_plus_zero(kq_r[j]);
+    }
+}

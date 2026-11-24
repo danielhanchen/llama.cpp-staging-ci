@@ -1301,13 +1301,18 @@ struct test_case {
     // the case sets some expert ids to -1 (a skipped slot): only the CPU and ggml-cuda (CUDA, ROCm, MUSA) implement that; Metal and
     // Vulkan read out of bounds or keep stale rows (llama only makes -1 ids for ggml-cuda devices), so elsewhere the case is not run
     virtual bool negative_ids() { return false; }
+    // repeated expert ids within a row of a MUL_MAT_ID: run only on the backends that handle them [TAG_MUL_MAT_ID_DUPLICATE_ID]
+    virtual bool duplicate_ids() { return false; }
     bool ids_supported(ggml_backend_t backend) {
-        if (!negative_ids()) {
+        if (!negative_ids() && !duplicate_ids()) {
             return true;
         }
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         const char * reg = dev != nullptr ? ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) : "";
-        return strcmp(reg, "CPU") == 0 || strcmp(reg, "CUDA") == 0 || strcmp(reg, "ROCm") == 0 || strcmp(reg, "MUSA") == 0;
+        if (duplicate_ids() && !(strcmp(reg, "CPU") == 0 || strcmp(reg, "MTL") == 0)) {
+            return false;
+        }
+        return !negative_ids() || strcmp(reg, "CPU") == 0 || strcmp(reg, "CUDA") == 0 || strcmp(reg, "ROCm") == 0 || strcmp(reg, "MUSA") == 0;
     }
 
     ggml_cgraph * gf = nullptr;
@@ -6159,6 +6164,7 @@ struct test_mul_mat_id_sparse : public test_mul_mat_id {
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
     std::string vars() override { return test_mul_mat_id::vars() + ",dup=1"; }
+    bool duplicate_ids() override { return true; }
     void initialize_tensors(ggml_context * ctx) override {
         std::default_random_engine rng(1234);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -13630,9 +13636,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
 
-    // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
-#if 0
-    // repeated expert ids within a row
+    // repeated expert ids within a row: CPU and Metal only (duplicate_ids), until CUDA support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
     for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
         for (int n : {9, 16, 33, 64}) {
             test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
@@ -13643,7 +13647,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 1025, 10, false, 64, 33, 256, 1.0f, 0, true));
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
     }
-#endif
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
