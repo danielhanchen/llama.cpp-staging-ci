@@ -211,6 +211,9 @@ int main(int argc, char ** argv) {
         set_env("GGML_CUDA_TOPK_ONEBLOCK_V2", mode == 0 ? "1" : "0");
         set_env("GGML_CUDA_TOPK_ONEBLOCK", mode == 2 ? "0" : "1");
         std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
+#if defined(_WIN32)
+        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
+#endif
         const int rc = std::system(cmd.c_str());
         FILE * f = rc == 0 ? fopen(path.c_str(), "rb") : nullptr;
         if (f == nullptr) {

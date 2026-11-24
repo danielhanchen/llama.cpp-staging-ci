@@ -208,6 +208,9 @@ int main(int argc, char ** argv) {
         set_env("GGML_CUDA_TOPK_MOE_384", mode ? "1" : "0");
         set_env("GGML_CUDA_TOPK_MOE_LOG", "1");
         std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
+#if defined(_WIN32)
+        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
+#endif
         const int rc = std::system(cmd.c_str());
         if (rc != 0 || !read_dump(path, outs[mode], logs[mode], cs.size())) {
             printf("FAIL: child mode %d rc %d\n", mode, rc);
