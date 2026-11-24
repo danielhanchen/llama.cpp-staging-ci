@@ -751,6 +751,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-quantize-perf.cpp LINK ggml)
     llama_build_and_test(test-mmid-multi.cpp LINK ggml)
     llama_build_and_test(test-moe-host-ffn.cpp LINK ggml)
+    # the one-token MoE up + gate + SwiGLU fusion vs the unfused nodes, byte for byte
+    llama_build_and_test(test-moe-glu1-exact.cpp LINK ggml)
     llama_build_and_test(test-q8k-exact.cpp LINK ggml)
     llama_build_and_test(test-rope.cpp LINK ggml)
     llama_build_and_test(test-col2im-1d.cpp LINK ggml)
