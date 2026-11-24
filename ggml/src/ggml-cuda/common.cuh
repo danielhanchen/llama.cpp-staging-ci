@@ -1808,9 +1808,6 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
-    // (proc "ggml_backend_upload_kernel_min", 0 = off): host -> device uploads of at least this many bytes from pinned host memory
-    // are read by a copy kernel through the mapping of that memory instead of a copy-engine transfer (see ggml_cuda_upload_zc)
-    size_t      upload_kernel_min = 0;
     cudaEvent_t moe_fork   = nullptr; // overlapped MoE cache fetch (see ggml_moe_cache_fetch)
     cudaEvent_t moe_join   = nullptr;
     bool        moe_join_pending = false; // moe_join was recorded and the main stream has not waited for it yet

@@ -1065,23 +1065,6 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
-        // (LLAMA_MTP_UPLOAD_KERNEL_MIB=N, opt-in, e.g. 4; unset / 0 = off): an MTP drafter context's host uploads of at least N MiB from
-        // pinned memory (the target's hidden rows of a prompt ubatch, 25 MiB per 512 rows of Qwen3.8-Flash-Next) are read by a copy kernel
-        // instead of a copy-engine transfer, which waits behind the MoE cache's refill of the lent slots (one 263 MiB transfer per layer on
-        // its upload stream). Same bytes, same stream order. Not a default: the tail after a long prompt is bound by the link itself
-        // (refill + rows), RTX PRO 6000 Qwen3.8-Flash-Next + MTP 48 GB 8k TTFT -2 ms (in the noise), A100 80 GB full card +21..27 ms
-        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-            static const long upk_mib = getenv("LLAMA_MTP_UPLOAD_KERNEL_MIB") ? std::max(0L, atol(getenv("LLAMA_MTP_UPLOAD_KERNEL_MIB"))) : 0L;
-            for (auto * bk : backend_ptrs) {
-                ggml_backend_dev_t dev = ggml_backend_get_device(bk);
-                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-                auto fn = reg ? (void (*)(ggml_backend_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_kernel_min") : nullptr;
-                if (fn != nullptr && upk_mib > 0) {
-                    fn(bk, (size_t) upk_mib << 20);
-                }
-            }
-        }
-
         // device memory a model or context created after this one takes (e.g. the draft of speculative decoding, see
         // llama_context_params::mem_reserve): kept free by what this context places in the free memory while it is created
         mem_reserve.assign(backend_ptrs.size(), 0);

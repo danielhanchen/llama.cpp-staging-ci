@@ -3909,84 +3909,13 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
-// the bytes of a pinned host range copied by the SMs through its device mapping (16-byte reads, the tail byte by byte)
-static __global__ void k_upload_zc(const int4 * __restrict__ src, int4 * __restrict__ dst, const size_t n16,
-        const char * __restrict__ src_t, char * __restrict__ dst_t, const int n_tail) {
-    const size_t stride = (size_t) gridDim.x*blockDim.x;
-    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n16; i += stride) {
-        dst[i] = src[i];
-    }
-    if (blockIdx.x == 0 && (int) threadIdx.x < n_tail) {
-        dst_t[threadIdx.x] = src_t[threadIdx.x];
-    }
-}
-
-// (upload_kernel_min > 0, set by ggml_backend_cuda_set_upload_kernel_min): an upload of at least that size from pinned host memory is
-// queued as a copy kernel that reads the host memory through its device mapping, in stream order like the cudaMemcpyAsync it replaces.
-// A copy-engine transfer queues behind the transfers of other streams already on the engine (an MTP drafter's 25 MiB prompt-row
-// uploads waited 2.5-4.9 ms each behind the 263 MiB layer refills of the MoE cache on its upload stream); the kernel's reads share the
-// link with them instead. Same bytes at the same place. Returns false (nothing queued) for pageable / unaligned memory or a small size
-static bool ggml_cuda_upload_zc(ggml_backend_cuda_context * ctx, void * dst, const void * src, size_t size) {
-    if (ctx->upload_kernel_min == 0 || size < ctx->upload_kernel_min) {
-        return false;
-    }
-    ggml_cuda_set_device(ctx->device);
-    cudaPointerAttributes a = {};
-    if (cudaPointerGetAttributes(&a, src) != cudaSuccess) {
-        (void) cudaGetLastError();
-        return false;
-    }
-    if (a.type != cudaMemoryTypeHost || a.devicePointer == nullptr) {
-        return false;
-    }
-    const char * dsrc = (const char *) a.devicePointer;
-    if ((((uintptr_t) dsrc) | ((uintptr_t) dst)) % 16 != 0) {
-        return false;
-    }
-    const size_t n16    = size / 16;
-    const int    n_tail = (int) (size - n16*16);
-    const int    nsm    = ggml_cuda_info().devices[ctx->device].nsm;
-    const size_t want   = (n16 + 255) / 256;
-    const int    blocks = (int) std::max<size_t>(1, std::min<size_t>(want, (size_t) 8*nsm));
-    k_upload_zc<<<blocks, 256, 0, ctx->stream()>>>((const int4 *) dsrc, (int4 *) dst, n16, dsrc + n16*16, (char *) dst + n16*16, n_tail);
-    CUDA_CHECK(cudaGetLastError());
-    static std::atomic<int> n_log { 0 };
-    if (n_log.fetch_add(1) == 0) {
-        GGML_LOG_INFO("%s: %s: host uploads of at least %.1f MiB from pinned memory by a copy kernel (first: %.2f MiB; "
-            "LLAMA_MTP_UPLOAD_KERNEL_MIB)\n", __func__, ctx->name.c_str(), ctx->upload_kernel_min/1048576.0, size/1048576.0);
-    }
-    return true;
-}
-
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    if (ggml_cuda_upload_zc(cuda_ctx, (char *) tensor->data + offset, data, size)) {
-        return;
-    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
-}
-
-// (proc "ggml_backend_upload_kernel_min"): see ggml_cuda_upload_zc; 0 = every upload through the copy engine (the default)
-static void ggml_backend_cuda_set_upload_kernel_min(ggml_backend_t backend, size_t min_bytes) {
-    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
-        return;
-    }
-    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
-    ctx->upload_kernel_min = min_bytes;
-    if (min_bytes > 0) {
-        // loaded now (the caller's device is idle): under lazy module loading its first launch would wait for the whole device,
-        // the MoE cache's refill on the upload stream included, which is what the copy kernel is there to not wait for
-        ggml_cuda_set_device(ctx->device);
-        cudaFuncAttributes fa = {};
-        if (cudaFuncGetAttributes(&fa, k_upload_zc) != cudaSuccess) {
-            (void) cudaGetLastError();
-            ctx->upload_kernel_min = 0;
-        }
-    }
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -4021,23 +3950,10 @@ static bool ggml_backend_cuda_set_tensors_batch_async(ggml_backend_t backend, gg
         if (buf == nullptr || buf->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) {
             return false;
         }
+        dsts[i] = tensors[i]->data;
+        srcs[i] = data[i];
+        sz[i]   = sizes[i];
     }
-    // (upload_kernel_min > 0): the large uploads from pinned memory by the copy kernel first, the rest in the batch (independent
-    // tensors, all in stream order before what the caller queues next)
-    int m = 0;
-    for (int i = 0; i < n; ++i) {
-        if (ggml_cuda_upload_zc(cuda_ctx, tensors[i]->data, data[i], sizes[i])) {
-            continue;
-        }
-        dsts[m] = tensors[i]->data;
-        srcs[m] = data[i];
-        sz[m]   = sizes[i];
-        m++;
-    }
-    if (m == 0) {
-        return true;
-    }
-    n = m;
     cudaMemcpyAttributes attr = {};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     attr.srcLocHint.type = cudaMemLocationTypeHost;
@@ -13993,9 +13909,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_graph_evict_since") == 0) {
         return (void *)ggml_backend_cuda_graph_evict_since;
-    }
-    if (strcmp(name, "ggml_backend_upload_kernel_min") == 0) {
-        return (void *)ggml_backend_cuda_set_upload_kernel_min;
     }
     if (strcmp(name, "ggml_backend_graph_skip_records") == 0) {
         return (void *)ggml_backend_cuda_graph_skip_records;
