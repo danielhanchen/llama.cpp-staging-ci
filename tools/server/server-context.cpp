@@ -563,6 +563,12 @@ struct server_pass_timer {
     int64_t n = 0;
     double  w_sum[32] = {};
     int64_t w_n[32] = {};
+    // coverage of the averages above: a pass is counted when the next draft call closes it, so a request's last pass (and a decode
+    // with no draft call before it, e.g. the first one after the prompt) is not in them; these count every decode and its span
+    int64_t n_dec   = 0;
+    int64_t t_dec_0 = 0; // the first decode of the request
+    double  dec_sum = 0; // decode call + wait of every decode
+    bool    gen     = false; // the decode being timed has no prompt tokens
     server_pass_timer() {
         const char * e = getenv("LLAMA_PASS_TIMING");
         on = e != nullptr && atoi(e) != 0;
@@ -589,15 +595,25 @@ struct server_pass_timer {
             }
         }
         t[k] = now;
+        if (k == DEC0 && gen) {
+            n_dec += 1;
+            if (t_dec_0 == 0) {
+                t_dec_0 = now;
+            }
+        }
+        if (k == DEC2 && t[DEC0] > 0 && gen) {
+            dec_sum += (double) (now - t[DEC0]);
+        }
         if (k == DEC2 && t[DEC0] > 0 && width > 0 && width < 32) {
             w_sum[width] += (double) (now - t[DEC0]);
             w_n[width]   += 1;
         }
     }
-    std::string report() {
+    // t_gen_ms: the request's generation time (prompt end to its last token, as the eval time line)
+    std::string report(double t_gen_ms = 0.0) {
         static const char * names[N_STAMP] = { "draft", "to_dec", "dec_call", "dec_wait", "to_proc", "proc", "to_acc", "acc", "tokens", "to_draft" };
         std::string r;
-        char b[96];
+        char b[192];
         if (n == 0) {
             return r;
         }
@@ -615,6 +631,14 @@ struct server_pass_timer {
                 snprintf(b, sizeof(b), " w%d %.3f (%" PRId64 ")", w, w_sum[w] / w_n[w] / 1e3, w_n[w]); r += b;
             }
         }
+        if (t_gen_ms > 0.0 && t_dec_0 > 0) {
+            // eval time = counted passes + the rest: the decodes outside them, and the host time between the prompt and the first decode
+            const double t_end_ms = (double) (ggml_time_us() - t_dec_0) / 1e3;
+            snprintf(b, sizeof(b), " | coverage: %" PRId64 " decodes (%.3f ms each incl. wait), %" PRId64 " in the passes above;", n_dec,
+                    dec_sum / std::max<int64_t>(1, n_dec) / 1e3, n); r += b;
+            snprintf(b, sizeof(b), " eval %.3f ms = counted %.3f + outside %.3f (first decode to end %.3f)", t_gen_ms, tot / 1e3,
+                    t_gen_ms - tot / 1e3, t_end_ms); r += b;
+        }
         const auto & dg = common_dflash_diag();
         if (dg.n_draft > 0) {
             snprintf(b, sizeof(b), " | dflash call: launch %.3f wait %.3f walk %.3f ms (%" PRId64 ")", dg.t_launch / 1e3 / dg.n_draft,
@@ -630,6 +654,7 @@ struct server_pass_timer {
             w_sum[w] = 0; w_n[w] = 0;
         }
         n = 0;
+        n_dec = 0; t_dec_0 = 0; dec_sum = 0;
         auto & dg = common_dflash_diag();
         dg.t_launch = dg.t_wait = dg.t_walk = dg.n_draft = 0;
     }
@@ -1431,7 +1456,7 @@ struct server_slot {
                     n_fast, n_total);
         }
         if (srv_pass_timer().on) {
-            const std::string r = srv_pass_timer().report();
+            const std::string r = srv_pass_timer().report(stats.t_gen_ms());
             if (!r.empty()) {
                 SLT_INF(*this, "%s\n", r.c_str());
             }
@@ -6915,6 +6940,7 @@ private:
         }
         const bool pt_on = srv_pass_timer().on && batch.view.size() <= 32;
         if (pt_on) {
+            srv_pass_timer().gen = !has_prompt;
             srv_pass_timer().stamp(server_pass_timer::DEC0);
             srv_pass_timer().width = batch.view.size();
         }
