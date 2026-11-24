@@ -460,7 +460,14 @@ static int64_t common_fit_moe_margin_impl(int64_t m, int64_t free_dev, int64_t c
         // at 8k / 16k and 1 of 2 L4 a 4-bit MoE + MTP 12 GB launches; the kill switch and base had 0 aborts
         const char * ed = getenv("LLAMA_MOE_FIT_MARGIN_DRAFT");
         const bool draft_ok = ed != nullptr && atoi(ed) != 0;
-        if ((en != nullptr && atoi(en) == 0) || free_dev < mn || (double) cache_want > mr*(double) free_dev || (has_drafter && !draft_ok)) {
+        // and only for host experts of at most LLAMA_MOE_FIT_MARGIN_MAX_HOST_MIB (16384; 0 = any size). RTX PRO 6000, no drafter, 48 long
+        // prompts: Flash-Next at 4 bits 48 GB (1.21) aborted with CUDA out of memory in the first 2100-token prompt (flash attention
+        // pool), a 4-bit MoE 16 GB (1.20) failed to instantiate CUDA graphs (out of memory, run without them); the headless 512 MiB
+        // step-down ran both clean. Kept: LFM2.5 at 4 bits 12 GB (1.12, about 13 GB of host experts)
+        const char * eh = getenv("LLAMA_MOE_FIT_MARGIN_MAX_HOST_MIB");
+        const int64_t mh = (eh != nullptr ? std::max<int64_t>(0, atoll(eh)) : 16384)*MiB_;
+        if ((en != nullptr && atoi(en) == 0) || free_dev < mn || (double) cache_want > mr*(double) free_dev || (has_drafter && !draft_ok) ||
+                (mh > 0 && cache_want > mh)) {
             return m;
         }
         return m - m_default + 256*MiB_;
