@@ -37,14 +37,19 @@ llama_memory_recurrent::llama_memory_recurrent(
     rs_idx.assign(n_seq_max, 0);
     rs_copied.assign(n_seq_max, 0);
 
-    // commit by replay for the delta-net models (see llama_memory_recurrent::replay). LLAMA_RS_REPLAY unset / auto: only
-    // when layer weights spill to host memory while others are on a device (a MoE cache / host experts: the memory the snapshot rows
-    // would take goes to the cache there); with everything resident (or nothing offloaded) the snapshot rows stay, since the commit's
-    // second delta-net pass costs decode (B200, full card: the 1-bit model -1.5%, Qwen3.6-35B-A3B -2.8%). =1 forces replay, =0 the snapshot rows.
+    // commit by replay for the delta-net models (see llama_memory_recurrent::replay). LLAMA_RS_REPLAY unset / auto: when layer
+    // weights spill to host memory while others are on a device (a MoE cache / host experts: the memory the snapshot rows would take
+    // goes to the cache there), and when every layer sits on a CUDA device (its delta-net op folds the commit into the next window;
+    // ROCm / MUSA build the same op but were not measured, so they keep the snapshot rows there): the snapshot rows are
+    // 1 + n_rs_seq state rows per sequence, and a verify window writes one state per token
+    // (RTX PRO 6000 / L4 / A100, MTP and DFlash2 drafters: Qwen3.8-27B +0.7..+2.5% decode, Qwen3.8-Flash-Next +0.4..+1.8%, 74-79% less
+    // recurrent state). Not for the Qwen3.5 MoE arch with every layer resident: Qwen3.6-35B-A3B measured level to -0.5% there, so it
+    // keeps the snapshot rows. With every weight in host memory, or on another device type, the snapshot rows stay.
+    // LLAMA_RS_REPLAY=spill: replay only when the weights spill (the previous auto), =1 forces replay, =0 the snapshot rows.
     // The placement is read from the weights' buffers, which a no_alloc (fit probe) model also sets, so a probe sizes the same rows.
     {
         const char * e = getenv("LLAMA_RS_REPLAY");
-        const int mode = e == nullptr || strcmp(e, "auto") == 0 ? -1 : (atoi(e) != 0 ? 1 : 0);
+        const int mode = e == nullptr || strcmp(e, "auto") == 0 ? -1 : strcmp(e, "spill") == 0 ? -2 : (atoi(e) != 0 ? 1 : 0);
         const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP;
         // not under -sm tensor (a meta device): the commit graph's replay inputs are mirrored while the states are split,
         // and its views abort the meta graph allocation (ggml-backend-meta.cpp split_dim_view_src assert, Meta(CPU,CPU) with
@@ -57,15 +62,19 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
         bool want = mode == 1;
         if (can && mode < 0) {
-            bool on_host = false, on_dev = false;
+            bool on_host = false, on_dev = false, dev_fold = true;
             for (const auto & it : model.tensors_by_name) {
                 const ggml_tensor * t = it.second;
                 if (t == nullptr || t->buffer == nullptr || it.first.compare(0, 4, "blk.") != 0) {
                     continue;
                 }
-                (ggml_backend_buffer_is_host(t->buffer) ? on_host : on_dev) = true;
+                const bool host = ggml_backend_buffer_is_host(t->buffer);
+                (host ? on_host : on_dev) = true;
+                if (!host) {
+                    const char * nm = ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer));
+                    dev_fold = dev_fold && strncmp(nm, "CUDA", 4) == 0;
+                }
             }
-            want = on_host && on_dev;
             // several sequences (llama-server --parallel N) keep the snapshot rows. With replay a window waits uncommitted
             // until the next ubatch of its cell, and find_slot moves cells to gather a multi-sequence ubatch: RTX PRO 6000 Qwen3.8-Flash-Next +
             // MTP -np 4 --kv-unified, four overlapping requests, a later ubatch of the same decode moved the cell of a verify window
@@ -81,12 +90,14 @@ llama_memory_recurrent::llama_memory_recurrent(
             const bool multi_ok = em != nullptr ? atoi(em) != 0 : scoped;
             const bool multi    = n_seq_max > 1 && !multi_ok;
             const bool spill    = on_host && on_dev;
-            want = spill && !multi;
-            LLAMA_LOG_INFO("%s: delta-net rollback: %s (LLAMA_RS_REPLAY auto: layer weights %s%s; =1 / =0 forces replay / snapshot rows)\n",
-                    __func__, want ? "replay" : "snapshot rows", spill ? "spill to host memory" :
+            const bool resident = !on_host && on_dev && dev_fold && mode == -1 && model.arch != LLM_ARCH_QWEN35MOE;
+            want = (spill || resident) && !multi;
+            LLAMA_LOG_INFO("%s: delta-net rollback: %s (LLAMA_RS_REPLAY %s: layer weights %s%s; =1 / =0 forces replay / snapshot rows%s)\n",
+                    __func__, want ? "replay" : "snapshot rows", mode == -2 ? "spill" : "auto", spill ? "spill to host memory" :
                     on_dev ? "all on a device" : "all in host memory",
-                    spill && multi ? ", but several sequences (LLAMA_RS_REPLAY_MULTI=1: replay)" :
-                    spill && n_seq_max > 1 ? ", several sequences replay too (LLAMA_RS_REPLAY_MULTI=0: snapshot rows)" : "");
+                    (spill || resident) && multi ? ", but several sequences (LLAMA_RS_REPLAY_MULTI=1: replay)" :
+                    (spill || resident) && n_seq_max > 1 ? ", several sequences replay too (LLAMA_RS_REPLAY_MULTI=0: snapshot rows)" : "",
+                    resident ? ", =spill: snapshot rows unless they spill" : "");
         }
         replay = can && want;
         const char * es = getenv("LLAMA_RS_REPLAY_SCOPED");
