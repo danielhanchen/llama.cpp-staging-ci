@@ -2027,6 +2027,92 @@ static __global__ void moe_mailbox_publish(const int32_t * hid, const int n_ids,
     GGML_UNUSED(n_embd);
 }
 
+// the same publish with one block per token row (GGML_MOE_MAILBOX_PUB_ROWS, default on; 0 = the one-block kernel above): every block
+// counts the host ids of the whole batch (at most GGML_MOE_MAILBOX_MAX_TOKENS rows of ids), writes its row of ids and, only when that
+// row has a host id, its activations (16 bytes per store where aligned); the last block to finish publishes the next sequence. The
+// host reads the activations of the tokens with a host id only (ggml_cpu_moe_host_ffn and the graph fallback compute every pair from
+// its own token's row), so its results are the same bytes; the mapped writes of a batch shrink to the rows with host experts and run
+// from n_tokens blocks instead of one. A batch with no host id writes nothing, as above
+static __global__ void moe_mailbox_publish_rows(const int32_t * hid, const int n_tokens, const float * x, char * mbox, const int n_used,
+        const int n_embd, ggml_moe_mailbox_ctl * ctl, int32_t * dst, const int timing) {
+    const int t = blockIdx.x;
+    __shared__ int cnt;
+    __shared__ int mine;
+    __shared__ int last;
+    if (threadIdx.x == 0) {
+        cnt  = 0;
+        mine = 0;
+        last = 0;
+    }
+    __syncthreads();
+    const int n_ids = n_used*n_tokens;
+    int local = 0;
+    int lmine = 0;
+    for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+        const int h = hid[i] >= 0;
+        local += h;
+        lmine += h && i/n_used == t;
+    }
+    if (local > 0) {
+        atomicAdd(&cnt, local);
+    }
+    if (lmine > 0) {
+        atomicAdd(&mine, lmine);
+    }
+    __syncthreads();
+    if (cnt == 0) {
+        if (t == 0 && threadIdx.x == 0) {
+            ctl->pending = 0;
+            dst[0] = 0;
+        }
+        return;
+    }
+    int32_t * m_ids = (int32_t *) (mbox + ggml_moe_mailbox_off_ids());
+    float   * m_x   = (float   *) (mbox + ggml_moe_mailbox_off_x(n_used));
+    for (int i = threadIdx.x; i < n_used; i += blockDim.x) {
+        m_ids[t*n_used + i] = hid[t*n_used + i];
+    }
+    if (mine > 0) {
+        const float * xr = x   + (int64_t) t*n_embd;
+        float       * mr = m_x + (int64_t) t*n_embd;
+        if (n_embd % 4 == 0 && ((((uintptr_t) xr) | ((uintptr_t) mr)) & 15) == 0) {
+            const float4 * x4 = (const float4 *) xr;
+            float4       * m4 = (float4 *) mr;
+            for (int i = threadIdx.x; i < n_embd/4; i += blockDim.x) {
+                m4[i] = x4[i];
+            }
+        } else {
+            for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+                mr[i] = xr[i];
+            }
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd_system(&ctl->pub_done, 1u) == (unsigned) gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last || threadIdx.x != 0) {
+        return;
+    }
+    ctl->pub_done = 0;
+    ggml_moe_mailbox_hdr * hdr = (ggml_moe_mailbox_hdr *) mbox;
+    hdr->n_tokens = n_tokens;
+    __threadfence_system();
+    const uint32_t seq = ctl->seq + 1;
+    ctl->seq     = seq;
+    ctl->pending = 1;
+    dst[0]       = 1;
+    if (timing) {
+        ((volatile uint64_t *) hdr->tm)[6] = moe_mailbox_ns();
+    }
+    moe_mailbox_store_release(&hdr->request, seq);
+    if (timing) {
+        ctl->t_pub = moe_mailbox_ns();
+    }
+}
+
 // one block per row [n_embd] of dev: rows on the host wait for the host and add its result
 // (GGML_MOE_MAILBOX_FAST, default on; =0 restores the loop below): with no timeout (what llama_moe_cache passes) only completed is
 // polled, error every 16th poll and no sleep, so a wait costs one mapped read per poll instead of four plus 100 ns; the host rows are
@@ -2153,9 +2239,23 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             const int n_used   = (int) hid->ne[0];
             const int n_tokens = (int) hid->ne[1];
             GGML_ASSERT(n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS && ggml_is_contiguous(hid) && ggml_is_contiguous(x));
-            moe_mailbox_publish<<<1, 256, 0, ctx.stream()>>>((const int32_t *) hid->data, (int) ggml_nelements(hid), n_tokens,
-                (const float *) x->data, (int) ggml_nelements(x), (char *) mbox, n_used, (int) (ggml_nelements(x)/n_tokens),
-                (ggml_moe_mailbox_ctl *) ctl, (int32_t *) dst->data, ggml_moe_mailbox_timing());
+            static const bool pub_rows = [] {
+                const char * e = getenv("GGML_MOE_MAILBOX_PUB_ROWS");
+                const bool on = e == nullptr || atoi(e) != 0;
+                if (!on) {
+                    GGML_LOG_INFO("%s: mailbox publish in one block (GGML_MOE_MAILBOX_PUB_ROWS=0)\n", __func__);
+                }
+                return on;
+            }();
+            if (pub_rows && ggml_nelements(hid) == (int64_t) n_used*n_tokens && ggml_nelements(x) % n_tokens == 0) {
+                moe_mailbox_publish_rows<<<n_tokens, 256, 0, ctx.stream()>>>((const int32_t *) hid->data, n_tokens, (const float *) x->data,
+                    (char *) mbox, n_used, (int) (ggml_nelements(x)/n_tokens), (ggml_moe_mailbox_ctl *) ctl, (int32_t *) dst->data,
+                    ggml_moe_mailbox_timing());
+            } else {
+                moe_mailbox_publish<<<1, 256, 0, ctx.stream()>>>((const int32_t *) hid->data, (int) ggml_nelements(hid), n_tokens,
+                    (const float *) x->data, (int) ggml_nelements(x), (char *) mbox, n_used, (int) (ggml_nelements(x)/n_tokens),
+                    (ggml_moe_mailbox_ctl *) ctl, (int32_t *) dst->data, ggml_moe_mailbox_timing());
+            }
         } else {
             const ggml_tensor * d   = dst->src[0];
             const ggml_tensor * hid = dst->src[2];
