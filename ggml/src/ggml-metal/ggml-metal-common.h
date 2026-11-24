@@ -39,6 +39,9 @@ void ggml_mem_ranges_reset(ggml_mem_ranges_t mrs);
 // add src or dst ranges to track
 bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const struct ggml_tensor * tensor);
 
+// add the whole allocation of tensor (its base tensor) as a src range: a node that reads memory beyond its own srcs
+bool ggml_mem_ranges_add_src_tensor(ggml_mem_ranges_t mrs, const struct ggml_tensor * tensor);
+
 // return false if:
 // - new src range overlaps with any existing dst range
 // - new dst range overlaps with any existing range (src or dst)

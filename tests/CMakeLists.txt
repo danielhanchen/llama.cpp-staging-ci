@@ -660,6 +660,8 @@ llama_build_and_test(test-dflash2-conv-exact.cpp LINK ggml)
 llama_build_and_test(test-moe-reduce-exact.cpp LINK ggml)
 # Metal asynchronous host <-> device copies at page and non-page offsets, round trip byte for byte (SKIP without a Metal device)
 llama_build_and_test(test-metal-async-copy.cpp LINK ggml)
+# host models of the Metal MUL_MAT_ID expert map / simdgroup blocks and of the selection mask scratch (no device needed)
+llama_build_and_test(test-metal-mmid-map.cpp LINK ggml)
 # the rows-per-block lever of the dense 2..8 column mat-vec vs the launch it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-mmvqcols-exact.cpp LINK ggml)
 # the ported few-row int8 MMQ (GGML_CUDA_MMQ_FEW) on dense K-quant / IQ4_XS / Q8_0 products at 2..8 columns vs mmvq + fp64 reference (NMSE gates,

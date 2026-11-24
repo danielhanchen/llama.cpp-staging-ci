@@ -263,6 +263,10 @@ static bool ggml_mem_ranges_add_dst(ggml_mem_ranges_t mrs, const ggml_tensor * t
     return ggml_mem_ranges_add(mrs, mr);
 }
 
+bool ggml_mem_ranges_add_src_tensor(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
+    return ggml_mem_ranges_add_src(mrs, tensor);
+}
+
 bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (tensor->src[i]) {

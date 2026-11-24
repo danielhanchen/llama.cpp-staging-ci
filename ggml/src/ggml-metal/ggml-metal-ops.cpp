@@ -9,6 +9,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-tuning.h"
+#include "ggml-metal-mmid.h"
 
 #include <cassert>
 #include <algorithm>
@@ -68,6 +69,10 @@ struct ggml_metal_op {
     }
 
     ~ggml_metal_op() {
+        static const bool mmid_debug = getenv("GGML_METAL_MMID_MAP_DEBUG") != nullptr && atoi(getenv("GGML_METAL_MMID_MAP_DEBUG")) != 0;
+        if (mmid_debug && (n_mmid_built > 0 || n_mmid_shared > 0)) {
+            GGML_LOG_INFO("ggml_metal_op: mul_mat_id expert maps: %d built, %d shared (nodes %d .. %d)\n", n_mmid_built, n_mmid_shared, idx_start, idx_end);
+        }
         ggml_metal_encoder_end_encoding(this->enc);
         ggml_metal_encoder_free(this->enc);
         ggml_mem_ranges_free(this->mem_ranges);
@@ -109,6 +114,18 @@ struct ggml_metal_op {
 
     // shared fusion debugging context
     ggml_metal_fusion_info * finfo;
+
+    // the kernel_mul_mm_id expert map built last in this encoder (GGML_METAL_MMID_MAP_SHARE): a later MUL_MAT_ID node
+    // routed by the same ids reads it instead of building its own (see ggml_metal_op_mul_mat_id)
+    struct {
+        const ggml_tensor *     op  = nullptr; // the node whose scratch holds the map
+        int                     idx = -1;      // its node index in this encoder
+        ggml_metal_mmid_map_key key;
+    } mmid_map;
+
+    // GGML_METAL_MMID_MAP_DEBUG=1: maps built / shared in this encoder, logged at the end of the encoder
+    int n_mmid_built  = 0;
+    int n_mmid_shared = 0;
 
     bool use_concurrency;
     bool use_capture;
@@ -2780,14 +2797,55 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 // upper bound on the number of entry tiles emitted by kernel_mul_mm_id_map0: the full tiles
 // over all entries plus at most one partial tile per expert
 static int64_t ggml_metal_op_mul_mat_id_max_tiles(const ggml_tensor * op) {
-    const int64_t ne02 = op->src[0]->ne[2]; // n_expert
-    const int64_t ne20 = op->src[2]->ne[0]; // n_expert_used
-    const int64_t ne21 = op->src[2]->ne[1]; // n_token
+    return ggml_metal_mmid_max_tiles(op->src[0]->ne[2], op->src[2]->ne[0], op->src[2]->ne[1]);
+}
 
-    const int64_t n_rows = ne20*ne21;
-    const int64_t tiles  = (n_rows + 31)/32 + (ne02 < n_rows ? ne02 : n_rows) - 1;
+// the byte range [p0, p1) of buffer *pb that the base tensor of t may write (its whole allocation)
+static void ggml_metal_op_alloc_range(const ggml_tensor * t, const void ** pb, uint64_t * p0, uint64_t * p1) {
+    const ggml_tensor * b = t->view_src ? t->view_src : t;
 
-    return n_rows < tiles ? n_rows : tiles;
+    *pb = b->buffer;
+    *p0 = (uint64_t) b->data;
+    *p1 = (uint64_t) b->data + (b->buffer ? ggml_backend_buft_get_alloc_size(b->buffer->buft, b) : ggml_nbytes(b));
+}
+
+// whether node idx may read the expert map that the MUL_MAT_ID node ctx->mmid_map.op built in its scratch: same ids and
+// shapes (key), and no node from there up to and including idx writes the ids or that scratch (a later node of the graph
+// may be placed in the memory of the first node once its consumers are done - e.g. the down projection over the gate's)
+static bool ggml_metal_op_mul_mat_id_map_valid(ggml_metal_op_t ctx, int idx, const ggml_metal_mmid_map_key & key) {
+    const ggml_tensor * a = ctx->mmid_map.op;
+    if (a == nullptr || ctx->mmid_map.idx < 0 || ctx->mmid_map.idx >= idx || !(ctx->mmid_map.key == key)) {
+        return false;
+    }
+
+    const void * ab;
+    uint64_t a0, a1;
+    ggml_metal_op_alloc_range(a, &ab, &a0, &a1);
+    // the map: the tpe + ids part of the scratch after the result
+    const uint64_t m0 = (uint64_t) a->data + ggml_nbytes(a);
+    const uint64_t m1 = m0 + ggml_metal_op_mul_mat_id_extra_tpe(a) + ggml_metal_op_mul_mat_id_extra_ids(a);
+    if (a->view_src != nullptr || m1 > a1) {
+        return false;
+    }
+
+    const void * ib;
+    uint64_t i0, i1;
+    ggml_metal_op_alloc_range(ctx->node(idx)->src[2], &ib, &i0, &i1);
+
+    for (int k = ctx->mmid_map.idx + 1; k <= idx; ++k) {
+        const ggml_tensor * n = ctx->node(k);
+        if (ggml_op_is_empty(n->op)) {
+            continue;
+        }
+        const void * nb;
+        uint64_t n0, n1;
+        ggml_metal_op_alloc_range(n, &nb, &n0, &n1);
+        if (ggml_metal_mmid_ranges_overlap(nb, n0, n1, ab, m0, m1) || ggml_metal_mmid_ranges_overlap(nb, n0, n1, ib, i0, i1)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
@@ -2875,6 +2933,40 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_buffer_id bid_amax = bid_ids;
         bid_amax.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
 
+        // GGML_METAL_MMID_MAP_SHARE=0: every node builds its own map, as before. Otherwise the gate / up / down
+        // projections of a layer (same ids) read the map of the first of them: one map0 dispatch and one barrier less
+        // per sharing node; the map bytes are identical (they depend on the ids and shapes only)
+        static const bool map_share = getenv("GGML_METAL_MMID_MAP_SHARE") == nullptr || atoi(getenv("GGML_METAL_MMID_MAP_SHARE")) != 0;
+
+        const ggml_tensor * ids_base = op->src[2]->view_src ? op->src[2]->view_src : op->src[2];
+
+        ggml_metal_mmid_map_key map_key;
+        map_key.ids_buf  = ids_base->buffer;
+        map_key.ids_data = op->src[2]->data;
+        map_key.ne20     = ne20;
+        map_key.ne21     = ne21;
+        map_key.nb20     = (int64_t) nb20;
+        map_key.nb21     = (int64_t) nb21;
+        map_key.ne02     = ne02;
+
+        const bool map_shared = map_share && ggml_metal_op_mul_mat_id_map_valid(ctx, idx, map_key);
+        if (map_shared) {
+            const ggml_tensor * a = ctx->mmid_map.op;
+
+            bid_tpe = ggml_metal_get_buffer_id(a);
+            bid_tpe.offs += ggml_nbytes(a);
+
+            bid_ids = bid_tpe;
+            bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(a);
+
+            // the map is read beyond the srcs of this node: later nodes must not overwrite it while this one runs
+            if (ctx->mem_ranges) {
+                ggml_mem_ranges_add_src_tensor(ctx->mem_ranges, a);
+            }
+
+            ctx->n_mmid_shared++;
+        }
+
         // src1 prec [TAG_GGML_PREC]
         const bool use_amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
 
@@ -2905,7 +2997,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, N_MM_NPART_AMAX, 1, 1, 256, 1, 1);
         }
 
-        {
+        if (!map_shared) {
             ggml_metal_kargs_mul_mm_id_map0 args = {
                 ne10,
                 ne11, // n_expert_used (bcast)
@@ -2933,9 +3025,19 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
             ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
-        }
 
-        ggml_metal_op_concurrency_reset(ctx);
+            ctx->mmid_map.op  = op;
+            ctx->mmid_map.idx = idx;
+            ctx->mmid_map.key = map_key;
+
+            ctx->n_mmid_built++;
+
+            // the matmul has to wait for the map
+            ggml_metal_op_concurrency_reset(ctx);
+        } else if (use_amax) {
+            // the amax kernel below reads the partial scales of the amax_part dispatch above
+            ggml_metal_op_concurrency_reset(ctx);
+        }
 
         if (use_amax) {
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_amax(lib);
