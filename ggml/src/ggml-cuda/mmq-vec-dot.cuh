@@ -153,10 +153,14 @@ static __device__ __forceinline__ float ggml_cuda_mmq_cvt_mul(const int x, const
 
 // exact_cvt: C.x[l]*dA (int accumulator times x scale) as ggml_cuda_mmq_cvt_mul (NVIDIA mma path; the single-tile k32 accumulator
 // is at most 32*128*128 = 2^19 in magnitude). Same values as the conversion, so the same sums (bit-identical).
-template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout, bool exact_cvt = false>
-static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
-    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+// live (NVIDIA mma path, MMQ_FLAG_DEAD): a warp's 8-column groups that start past j_max (the tile's last column with a destination)
+// are skipped: no B load, no MMA, no sum update. Their sums stay 0 and write_back / the stream-k fixup never store such columns,
+// and every stored column gets the same operations in the same order as without the skip (bit-identical).
+template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout, bool exact_cvt, bool live>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_impl(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    GGML_UNUSED(j_max);
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  8, int, input_layout>        tile_A;
     typedef tile<16,  8, int, input_layout>        tile_B;
@@ -263,6 +267,14 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+        if constexpr (live) {
+            // warp-uniform: this warp's columns of the group are j0 + (threadIdx.y % ntx)*tile_C::J + [0, tile_C::J)
+            if (j0 + (threadIdx.y % ntx)*tile_C::J > j_max) {
+                break;
+            }
+        } else {
+            GGML_UNUSED(j_max);
+        }
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
             tile_B B;
@@ -299,6 +311,18 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
         }
     }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+}
+
+template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout, bool exact_cvt = false>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_impl<type, J, fallback, ds_layout, exact_cvt, false>(x, y, sum, k00, J - 1);
+}
+
+template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout, bool exact_cvt>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_live(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max) {
+    ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_impl<type, J, fallback, ds_layout, exact_cvt, true>(x, y, sum, k00, j_max);
 }
 
 

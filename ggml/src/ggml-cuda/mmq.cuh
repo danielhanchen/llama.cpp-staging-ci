@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <string>
+#include <vector>
 #include <cinttypes>
 #include <climits>
 #include <cstdint>
@@ -905,21 +908,80 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
+// mul_mat_q / mul_mat_q_pipe flags argument (passed down to the tile bodies):
+//   MMQ_FLAG_CVT:   the int-to-float conversion instruction in the q8_0 vec_dot (GGML_CUDA_MMQ_EXACT_CVT=0)
+//   MMQ_FLAG_DEAD:  tiles with fewer live columns than J run the q8_0 vec_dot that skips the 8-column groups past the last live
+//                   column (ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_impl, live; GGML_CUDA_MMQ_DEAD_SKIP=0 off)
+//   MMQ_FLAG_KTAIL: a last k iteration whose blocks all lie in the first half of the y tile skips the second half (the zero padding of
+//                   src1 past ne10: its products are 0 times a finite scale, adding them leaves every sum unchanged; GGML_CUDA_MMQ_KTAIL=0 off)
+#define MMQ_FLAG_CVT   1
+#define MMQ_FLAG_DEAD  2
+#define MMQ_FLAG_KTAIL 4
+
+typedef void (*ggml_cuda_mmq_vec_dot_live_t)(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max);
+
+// the types with the live (dead-column skip) and K-tail forms: the q8_0 mma vec_dot of the exact-product types, NVIDIA only
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+static constexpr __device__ bool ggml_cuda_mmq_pad_type() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    return ggml_cuda_mmq_exact_cvt_type(type) && prec_src1 == GGML_PREC_Q8 &&
+        ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).use_mma_data_layout() &&
+        ggml_cuda_type_traits<type>::qk == QK8_0 && ggml_cuda_mmq_get_K_vram(type, J, fallback, prec_src1) == 2*4*QK8_1;
+#else
+    return false;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+// conv: the vec_dot with the conversion instruction (MMQ_FLAG_CVT), else the one of vec_dot (the exact product where built)
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool conv>
+static constexpr __device__ ggml_cuda_mmq_vec_dot_live_t ggml_cuda_mmq_get_vec_dot_live() {
+    if constexpr (ggml_cuda_mmq_pad_type<type, J, fallback, prec_src1>()) {
+        constexpr mmq_q8_1_ds_layout ds_layout = type == GGML_TYPE_Q4_0 ? MMQ_Q8_1_DS_LAYOUT_DS4 : MMQ_Q8_1_DS_LAYOUT_D4;
+        return ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_live<type, J, fallback, ds_layout, conv ? false : ggml_cuda_mmq_exact_cvt_build>;
+    } else {
+        return nullptr;
+    }
+}
+
 // cvt (GGML_CUDA_MMQ_EXACT_CVT=0): the vec_dot with the int-to-float conversion instruction where the type has the exact product
-// form (same values either way); a uniform branch per call
-#define MMQ_VEC_DOT(k00_)                                       \
-    do {                                                        \
-        if constexpr (vec_dot_cvt != vec_dot) {                 \
-            if (cvt) {                                          \
-                vec_dot_cvt(tile_x, tile_y, sum, (k00_));       \
-            } else {                                            \
-                vec_dot(tile_x, tile_y, sum, (k00_));           \
-            }                                                   \
-        } else {                                                \
-            GGML_UNUSED(cvt);                                   \
-            vec_dot(tile_x, tile_y, sum, (k00_));               \
-        }                                                       \
+// form (same values either way); a uniform branch per call. live (MMQ_FLAG_DEAD on a tile with dead columns): the same vec_dot
+// with the dead 8-column groups skipped
+#define MMQ_VEC_DOT(k00_)                                                        \
+    do {                                                                         \
+        if constexpr (vec_dot_live != nullptr) {                                 \
+            if (live) {                                                          \
+                if (cvt) {                                                       \
+                    vec_dot_live_cvt(tile_x, tile_y, sum, (k00_), tile_y_max_j); \
+                } else {                                                         \
+                    vec_dot_live(tile_x, tile_y, sum, (k00_), tile_y_max_j);     \
+                }                                                                \
+                break;                                                           \
+            }                                                                    \
+        } else {                                                                 \
+            GGML_UNUSED(live);                                                   \
+        }                                                                        \
+        if constexpr (vec_dot_cvt != vec_dot) {                                  \
+            if (cvt) {                                                           \
+                vec_dot_cvt(tile_x, tile_y, sum, (k00_));                        \
+            } else {                                                             \
+                vec_dot(tile_x, tile_y, sum, (k00_));                            \
+            }                                                                    \
+        } else {                                                                 \
+            GGML_UNUSED(cvt);                                                    \
+            vec_dot(tile_x, tile_y, sum, (k00_));                                \
+        }                                                                        \
     } while (0)
+
+// the per-tile switches of the tile bodies (CTA-uniform): cvt, live (MMQ_FLAG_DEAD and the tile has dead columns), ktail_ok (the type
+// has the K-tail form and MMQ_FLAG_KTAIL is set)
+#define MMQ_TILE_FLAGS()                                                                                                              \
+    constexpr ggml_cuda_mmq_vec_dot_live_t vec_dot_live     = ggml_cuda_mmq_get_vec_dot_live<type, J, fallback, prec_src1, false>(); \
+    constexpr ggml_cuda_mmq_vec_dot_live_t vec_dot_live_cvt = ggml_cuda_mmq_get_vec_dot_live<type, J, fallback, prec_src1, true>();  \
+    const bool cvt      = (flags & MMQ_FLAG_CVT) != 0;                                                                                \
+    const bool live     = vec_dot_live != nullptr && (flags & MMQ_FLAG_DEAD) != 0 && tile_y_max_j < J - 1;                            \
+    const bool ktail_ok = ggml_cuda_mmq_pad_type<type, J, fallback, prec_src1>() && (flags & MMQ_FLAG_KTAIL) != 0;                     \
+    GGML_UNUSED(vec_dot_live_cvt)
 
 template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
@@ -927,7 +989,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const bool cvt) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const int flags) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
@@ -958,6 +1020,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+    MMQ_TILE_FLAGS();
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
@@ -975,6 +1039,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         MMQ_VEC_DOT(0);
 
         __syncthreads();
+
+        // K tail: the row's last blocks all lie in the first half (CTA-uniform; only the last iteration of a row)
+        if (ktail_ok && (kb0_stop - kb0)*qk <= 4*QK8_1) {
+            break;
+        }
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
@@ -1011,9 +1080,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 //   MMQ_PIPE_TAB:  IQ3_S only: the 2 KiB grid table is read from a copy in shared memory instead of through L1 (at 2 blocks per SM the
 //                  L1 left beside the tiles does not hold it).
 // The stream-k decomposition, the tile shapes and the grid are those of the base launch.
-// mul_mat_q / mul_mat_q_pipe flags argument: MMQ_FLAG_CVT = the int-to-float conversion instruction in the q8_0 vec_dot
-// (GGML_CUDA_MMQ_EXACT_CVT=0)
-#define MMQ_FLAG_CVT 1
 
 #define MMQ_PIPE_YREG 1
 #define MMQ_PIPE_L2X  2
@@ -1034,7 +1100,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_pipe(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const bool cvt) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const int flags) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nthreads   = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1);
@@ -1072,6 +1138,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_pipe(
     float sum[J*I / nthreads] = {0.0f};
 
     int4 yr[(pipe & MMQ_PIPE_YREG) ? nyr : 1];
+
+    MMQ_TILE_FLAGS();
 
     // the two halves of the y tile of k iteration kb0, as the base addresses them
     auto y_src = [&](const int kb0, const int half) -> const int * {
@@ -1157,12 +1225,20 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_pipe(
 
         __syncthreads();
 
+        // K tail as in mul_mat_q_process_tile: the second half is neither loaded nor used
+        const bool tail = ktail_ok && (kb0_stop - kb0)*qk <= 4*QK8_1;
         if constexpr (pipe & MMQ_PIPE_YREG) {
-            y_load(y_src(kb0, 1));
+            if (!tail) {
+                y_load(y_src(kb0, 1));
+            }
         }
         MMQ_VEC_DOT(0);
 
         __syncthreads();
+
+        if (tail) {
+            break;
+        }
 
         if constexpr (pipe & MMQ_PIPE_YREG) {
             y_store();
@@ -1195,15 +1271,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile_sel(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const bool cvt) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const int flags) {
     if constexpr (pipe == 0) {
         mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1>
             (x, offset_x, y, ids_dst, dst, tmp_fixup, y_scale, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, cvt);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, flags);
     } else {
         mul_mat_q_process_tile_pipe<type, J, fallback, fixup, prec_src1, pipe>
             (x, offset_x, y, ids_dst, dst, tmp_fixup, y_scale, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, cvt);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, flags);
     }
 }
 
@@ -1264,7 +1340,7 @@ static __device__ __forceinline__ void mul_mat_q_body(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix, const int exact_nsm, const bool cvt) {
+        const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix, const int exact_nsm, const int flags) {
     // tile_prefix: the column tile count is known on the device only (mmq_moe_tile_prefix), the stream-k split is over it.
     // exact_nsm > 0 (stream-k kernel, skip_empty): the prefix kernel also wrote the exact prefix and chose the form (see
     // mmq_moe_tile_prefix): one block per non-empty tile over the exact prefix, or the stream-k split over exact_nsm blocks as before
@@ -1370,7 +1446,7 @@ static __device__ __forceinline__ void mul_mat_q_body(
         mul_mat_q_process_tile_sel<type, J, fallback, fixup, prec_src1, pipe>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, cvt);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, flags);
         return;
     }
 
@@ -1474,7 +1550,7 @@ static __device__ __forceinline__ void mul_mat_q_body(
         mul_mat_q_process_tile_sel<type, J, fallback, fixup, prec_src1, pipe>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, cvt);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, flags);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1561,7 +1637,7 @@ static __device__ __forceinline__ void mul_mat_q_body(
     mul_mat_q_process_tile_sel<type, J, fallback, fixup, prec_src1, pipe>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, cvt);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, flags);
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
@@ -1579,7 +1655,7 @@ static __global__ void mul_mat_q(
         blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst,
         channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, nsamples_y, stride_sample_x, stride_sample_y, stride_sample_dst,
-        ntx_host, nexperts_compact, tile_prefix, exact_nsm, (flags & MMQ_FLAG_CVT) != 0);
+        ntx_host, nexperts_compact, tile_prefix, exact_nsm, flags);
 }
 
 // compiled for sm 120 (consumer Blackwell) and sm 80 (A100) and sm 75 (T4); the host launches it
@@ -1602,7 +1678,7 @@ static __global__ void mul_mat_q_pipe(
         blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst,
         channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, nsamples_y, stride_sample_x, stride_sample_y, stride_sample_dst,
-        ntx_host, nexperts_compact, tile_prefix, exact_nsm, (flags & MMQ_FLAG_CVT) != 0);
+        ntx_host, nexperts_compact, tile_prefix, exact_nsm, flags);
 #else
     GGML_UNUSED_VARS(x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale, blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, nsamples_y, stride_sample_x, stride_sample_y, stride_sample_dst, ntx_host, nexperts_compact, tile_prefix, exact_nsm, flags);
     NO_DEVICE_CODE;
@@ -2101,6 +2177,84 @@ static void mmq_exact_cvt_count(const ggml_type type) {
     }
 }
 
+// GGML_CUDA_MMQ_DEAD_SKIP / GGML_CUDA_MMQ_KTAIL (unset = on, 0 = off): MMQ_FLAG_DEAD / MMQ_FLAG_KTAIL for the types with those forms
+// (ggml_cuda_mmq_pad_type: the q8_0 mma vec_dot of the exact-product types on NVIDIA). Both bit-identical (see the flag comments).
+// Engagement: launches with the flag where it can act (a tile with dead columns possible / a K tail), logged at 1, 10, 100, ...
+static bool mmq_pad_env(const char * name) {
+    const char * e = getenv(name);
+    return e == nullptr || *e == '\0' || atoi(e) != 0;
+}
+
+static void mmq_pad_count(std::atomic<int64_t> & n, const char * what, const char * env, const ggml_type type, const int64_t k) {
+    const int64_t c = n.fetch_add(1) + 1;
+    int64_t p = 1;
+    while (p < c) {
+        p *= 10;
+    }
+    if (p == c) {
+        GGML_LOG_INFO("ggml_cuda: MMQ %s: %" PRId64 " launches (last %s K %" PRId64 "; %s=0 off)\n", what, c, ggml_type_name(type), k, env);
+    }
+}
+
+// GGML_CUDA_MMQ_FILL_LOG=1 (diagnostic, synchronizes after reading the expert bounds of each MoE product outside graph capture):
+// the per-expert column counts of the MoE MMQ products, their last-tile fill and the share of 8-column MMA groups with live
+// columns, summed over the products and logged at 1, 10, 100, ... products and every 1000
+static void mmq_fill_log(const mmq_args & args, const int J, const ggml_type type, cudaStream_t stream) {
+    static const bool on = getenv("GGML_CUDA_MMQ_FILL_LOG") != nullptr && atoi(getenv("GGML_CUDA_MMQ_FILL_LOG")) != 0;
+    if (!on || args.expert_bounds == nullptr) {
+        return;
+    }
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    const int ne = (int) args.nchannels_y;
+    std::vector<int32_t> b(ne + 1);
+    CUDA_CHECK(cudaMemcpyAsync(b.data(), args.expert_bounds, (ne + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    static std::mutex mtx;
+    static int64_t n_prod = 0, n_used = 0, n_cols = 0, n_tiles = 0, n_part = 0, g_live = 0, g_all = 0;
+    static int64_t hist[9] = {0}; // columns per expert: 0, 1-7, 8-15, 16-31, 32-63, 64-127, 128-255, 256-511, >= 512
+    static int64_t fill[17] = {0}; // last tile: live 8-column groups of J/8 (index = live groups, J <= 128)
+    std::lock_guard<std::mutex> lock(mtx);
+    n_prod++;
+    for (int e = 0; e < ne; ++e) {
+        const int c = b[e + 1] - b[e];
+        const int h = c == 0 ? 0 : c < 8 ? 1 : c < 16 ? 2 : c < 32 ? 3 : c < 64 ? 4 : c < 128 ? 5 : c < 256 ? 6 : c < 512 ? 7 : 8;
+        hist[h]++;
+        if (c == 0) {
+            continue;
+        }
+        n_used++;
+        n_cols += c;
+        const int nt = (c + J - 1)/J;
+        const int r  = c - (nt - 1)*J; // columns of the last tile, 1..J
+        n_tiles += nt;
+        n_part  += r < J;
+        fill[std::min(16, (r + 7)/8)]++;
+        g_all  += int64_t(nt)*(J/8);
+        g_live += int64_t(nt - 1)*(J/8) + (r + 7)/8;
+    }
+    int64_t p = 1;
+    while (p < n_prod) {
+        p *= 10;
+    }
+    if (p == n_prod || n_prod % 1000 == 0) {
+        std::string hs, fs;
+        for (int i = 0; i < 9; ++i) {
+            hs += " " + std::to_string(hist[i]);
+        }
+        for (int i = 1; i <= 16; ++i) {
+            fs += " " + std::to_string(fill[i]);
+        }
+        GGML_LOG_INFO("ggml_cuda: MMQ fill: %" PRId64 " MoE products (last %s J %d K %" PRId64 "), experts with columns %" PRId64
+            ", columns %" PRId64 ", tiles %" PRId64 " (partial %" PRId64 "), column slots used %.4f, live 8-col groups %" PRId64 " of %" PRId64
+            " (%.4f); cols/expert hist [0,1-7,8-15,16-31,32-63,64-127,128-255,256-511,512+]:%s; last-tile live groups [1..16]:%s\n",
+            n_prod, ggml_type_name(type), J, args.ncols_x, n_used, n_cols, n_tiles, n_part,
+            n_tiles ? double(n_cols)/double(n_tiles*J) : 0.0, g_live, g_all, g_all ? double(g_live)/double(g_all) : 0.0, hs.c_str(), fs.c_str());
+    }
+}
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -2123,6 +2277,28 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             flags |= MMQ_FLAG_CVT;
         }
     }
+    if (ggml_cuda_mmq_exact_cvt_build && ggml_cuda_mmq_exact_cvt_type(type) && config.use_mma_data_layout(cc) && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+            prec_src1 == GGML_PREC_Q8 && ggml_cuda_type_traits<type>::qk == QK8_0 &&
+            ggml_cuda_mmq_get_K_vram(type, J, fallback, cc, prec_src1) == 2*4*QK8_1) {
+        static const bool dead_on  = mmq_pad_env("GGML_CUDA_MMQ_DEAD_SKIP");
+        static const bool ktail_on = mmq_pad_env("GGML_CUDA_MMQ_KTAIL");
+        static std::atomic<int64_t> n_dead{0};
+        static std::atomic<int64_t> n_ktail{0};
+        if (dead_on) {
+            flags |= MMQ_FLAG_DEAD;
+            if (args.ids_dst != nullptr || args.ncols_dst % J != 0) {
+                mmq_pad_count(n_dead, "dead-column skip", "GGML_CUDA_MMQ_DEAD_SKIP", type, args.ncols_x);
+            }
+        }
+        if (ktail_on) {
+            flags |= MMQ_FLAG_KTAIL;
+            const int64_t rem = args.ncols_x % (2*4*QK8_1);
+            if (rem > 0 && rem <= 4*QK8_1) {
+                mmq_pad_count(n_ktail, "K tail", "GGML_CUDA_MMQ_KTAIL", type, args.ncols_x);
+            }
+        }
+    }
+    mmq_fill_log(args, J, type, stream);
 
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, prec_src1>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, prec_src1>), nbytes_shared);
