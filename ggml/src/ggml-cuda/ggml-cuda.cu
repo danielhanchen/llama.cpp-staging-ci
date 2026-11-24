@@ -3953,7 +3953,7 @@ static bool ggml_cuda_upload_zc(ggml_backend_cuda_context * ctx, void * dst, con
     static std::atomic<int> n_log { 0 };
     if (n_log.fetch_add(1) == 0) {
         GGML_LOG_INFO("%s: %s: host uploads of at least %.1f MiB from pinned memory by a copy kernel (first: %.2f MiB; "
-            "LLAMA_MTP_UPLOAD_KERNEL_MIB=0 off)\n", __func__, ctx->name.c_str(), ctx->upload_kernel_min/1048576.0, size/1048576.0);
+            "LLAMA_MTP_UPLOAD_KERNEL_MIB)\n", __func__, ctx->name.c_str(), ctx->upload_kernel_min/1048576.0, size/1048576.0);
     }
     return true;
 }

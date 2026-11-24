@@ -1065,12 +1065,13 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
-        // (LLAMA_MTP_UPLOAD_KERNEL_MIB=N, default 4, 0 = off): an MTP drafter context's host uploads of at least N MiB from pinned memory
-        // (the target's hidden rows of a prompt ubatch, 25 MiB per 512 rows of Qwen3.8-Flash-Next) are read by a copy kernel instead
-        // of a copy-engine transfer: on the engine each waited behind the MoE cache's refill of the lent slots (one 263 MiB transfer
-        // per layer on its upload stream), 16 times per 8k prompt pass on the RTX PRO 6000 at 48 GB. Same bytes, same stream order
+        // (LLAMA_MTP_UPLOAD_KERNEL_MIB=N, opt-in, e.g. 4; unset / 0 = off): an MTP drafter context's host uploads of at least N MiB from
+        // pinned memory (the target's hidden rows of a prompt ubatch, 25 MiB per 512 rows of Qwen3.8-Flash-Next) are read by a copy kernel
+        // instead of a copy-engine transfer, which waits behind the MoE cache's refill of the lent slots (one 263 MiB transfer per layer on
+        // its upload stream). Same bytes, same stream order. Not a default: the tail after a long prompt is bound by the link itself
+        // (refill + rows), RTX PRO 6000 Qwen3.8-Flash-Next + MTP 48 GB 8k TTFT -2 ms (in the noise), A100 80 GB full card +21..27 ms
         if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-            static const long upk_mib = getenv("LLAMA_MTP_UPLOAD_KERNEL_MIB") ? std::max(0L, atol(getenv("LLAMA_MTP_UPLOAD_KERNEL_MIB"))) : 4L;
+            static const long upk_mib = getenv("LLAMA_MTP_UPLOAD_KERNEL_MIB") ? std::max(0L, atol(getenv("LLAMA_MTP_UPLOAD_KERNEL_MIB"))) : 0L;
             for (auto * bk : backend_ptrs) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(bk);
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
