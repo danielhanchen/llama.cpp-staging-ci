@@ -1867,7 +1867,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_kv_loop(
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-    if constexpr (nstages > 1) {
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
+    constexpr bool rot_arch = true;
+#else
+    constexpr bool rot_arch = false;
+#endif
+    if constexpr (nstages > 1 && rot_arch) {
       if (rot) {
         constexpr bool oob_check = false;
         constexpr int  k_VKQ_sup = nbatch_fa;
@@ -2862,7 +2867,15 @@ static __global__ void flash_attn_ext_f16(
     // blocks that run at the same time read the same KV tiles and share them in L2. Only with multi-stage loading (else every block
     // waits for the same KV data) and one KV source. Each block still covers a contiguous (cyclic) run of a tile's KV tiles, so the
     // stream-k fixup is unchanged; the partial sums are grouped differently (not bit-identical to the plain order).
-    constexpr bool rotate_cfg = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse, q8_kv) > 1 && !use_sparse && q8_kv2 < 0;
+    // Ada and newer only: there every launch is stream-k (launch_fattn), so blocks run several whole tiles of long prompts and the
+    // rotation changes their order. On Ampere a stream-k grid is a whole multiple of the tiles (the rotation offset is then always 0)
+    // and the extra loop costs the prompt kernels time, so they keep the plain code.
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
+    constexpr bool rotate_arch = true;
+#else
+    constexpr bool rotate_arch = false;
+#endif
+    constexpr bool rotate_cfg = rotate_arch && ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse, q8_kv) > 1 && !use_sparse && q8_kv2 < 0;
     const bool rotate = rotate_cfg && dev_len.kv_rotate != 0;
     const int kbc0     = kbc;
     int       kbc_tile = kbc;

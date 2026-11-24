@@ -1779,10 +1779,10 @@ void launch_fattn(
         dev_len = src2;
     }
 
-    // GGML_CUDA_FATTN_KV_ROTATE (unset / 1 = on, 0 = off): the stream-k blocks of the multi-stage MMA kernel (cp.async, cc >= 8.0)
+    // GGML_CUDA_FATTN_KV_ROTATE (unset / 1 = on, 0 = off): the stream-k blocks of the multi-stage MMA kernel (NVIDIA Ada and newer)
     // read the KV tiles of an output tile in a rotated order, so the blocks running at the same time share them in L2 (long
     // contexts). IEEE reorder of the partial sums, not bit-identical to 0. One KV source only; the kernel ignores it elsewhere
-    if (K2 == nullptr && use_stream_k && async_kv_preload) {
+    if (K2 == nullptr && use_stream_k && async_kv_preload && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
         static const bool kv_rotate = [] {
             const char * e = getenv("GGML_CUDA_FATTN_KV_ROTATE");
             return e == nullptr || atoi(e) != 0;
