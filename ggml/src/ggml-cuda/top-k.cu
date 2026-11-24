@@ -535,9 +535,16 @@ static __device__ __forceinline__ void top_k_histogram_add(int * hist, const int
 #endif
 }
 
+// the columns a one-launch radix select scans: every column, or with a live length (ggml_top_k_set_live_len: the columns at and past
+// it are -INFINITY padding) the first max(k, min(ncols, live)). The padding sorts after every live column (-inf, then the higher
+// column), so with at least k columns scanned the selection and its order are the same
+static __device__ __forceinline__ int top_k_live_cols(const int ncols, const int k, const int * __restrict__ live) {
+    return live == nullptr ? ncols : max(k, min(ncols, *live));
+}
+
 template<int BLOCK_SIZE>
 static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block(
-        const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+        const float * __restrict__ src, int * __restrict__ dst, const int ncols_row, const int k, const int * __restrict__ live) {
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS      = 1 << RADIX_BITS;
     constexpr int NWARPS     = BLOCK_SIZE / WARP_SIZE;
@@ -547,8 +554,9 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block(
     const int tid  = threadIdx.x;
     const int warp = tid / WARP_SIZE;
     const int lane = tid % WARP_SIZE;
-    const float * row_src = src + (size_t) blockIdx.x * ncols;
+    const float * row_src = src + (size_t) blockIdx.x * ncols_row;
     int *         row_dst = dst + (size_t) blockIdx.x * k;
+    const int     ncols   = top_k_live_cols(ncols_row, k, live);
 
     __shared__ int      histogram[NBINS];
     __shared__ int      warp_counts[NWARPS];
@@ -669,7 +677,7 @@ static __device__ __forceinline__ void top_k_load_ipt(const float * __restrict__
 
 template<int BLOCK_SIZE, int IPT>
 static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block_v2(
-        const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+        const float * __restrict__ src, int * __restrict__ dst, const int ncols_row, const int k, const int * __restrict__ live) {
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS      = 1 << RADIX_BITS;
     constexpr int NWARPS     = BLOCK_SIZE / WARP_SIZE;
@@ -681,9 +689,10 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block_v2
     const int tid  = threadIdx.x;
     const int warp = tid / WARP_SIZE;
     const int lane = tid % WARP_SIZE;
-    const float * row_src = src + (size_t) blockIdx.x * ncols;
+    const float * row_src = src + (size_t) blockIdx.x * ncols_row;
     int *         row_dst = dst + (size_t) blockIdx.x * k;
     const bool    vec     = ((uintptr_t) row_src % 16) == 0;
+    const int     ncols   = top_k_live_cols(ncols_row, k, live);
 
     __shared__ int      histogram[NBINS];
     __shared__ int      warp_counts[NWARPS];
@@ -802,7 +811,13 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block_v2
 // output is the same ids in the same order. GGML_CUDA_TOPK_TWO_STAGE=0: the radix select.
 // k: one round per pick per block, so it pays for small k only (A100, test-topk-twostage-exact: k 1 / 10 at 0.14-0.94x the radix
 // select's time over 32769-262144 columns, k 32 at 1.5-4.1x)
-#define TOP_K_TWO_STAGE_MAX_K    10
+// k 11..16 also, on compute capability 12.0 (the only one measured faster) up to TOP_K_TWO_STAGE_K16_MAX_NCOLS columns only (GGML_CUDA_TOP_K_TWO_STAGE_K16=0: k <= 10
+// everywhere; before, the multi-block radix select took those). test-topk-twostage-exact graph medians, k 16: RTX PRO 6000 7-8 rows of
+// 32769-69633 columns 46.5-50.9 us vs radix 49.8-59.8; 131072+ columns no gain (8 x 248320: 73.7 vs 67.0). A100: slower at 7-8 rows
+// for every width (8 x 69632: 114.0 vs 102.9 us; 8 x 248320: 226 vs 120), so the radix select keeps them there
+#define TOP_K_TWO_STAGE_MAX_K    16
+#define TOP_K_TWO_STAGE_MAX_K10  10
+#define TOP_K_TWO_STAGE_K16_MAX_NCOLS 69633
 #define TOP_K_TWO_STAGE_MAX_ROWS 8
 #define TOP_K_TWO_STAGE_NONE     0x7FFFFFFF
 
@@ -970,6 +985,15 @@ static bool ggml_cuda_top_k_two_stage_enabled() {
     return enabled;
 }
 
+static int ggml_cuda_top_k_two_stage_max_k(const int device, const int64_t ncols) {
+    static const bool k16 = [] {
+        const char * env = getenv("GGML_CUDA_TOP_K_TWO_STAGE_K16");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return k16 && cc == GGML_CUDA_CC_BLACKWELL && ncols <= TOP_K_TWO_STAGE_K16_MAX_NCOLS ? TOP_K_TWO_STAGE_MAX_K : TOP_K_TWO_STAGE_MAX_K10;
+}
+
 static void top_k_two_stage_cuda(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
     if (ggml_cuda_preload_on()) {
         return;
@@ -1006,7 +1030,8 @@ static bool ggml_cuda_top_k_one_block_enabled() {
     return enabled;
 }
 
-static void top_k_radix_one_block_cuda(const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
+static void top_k_radix_one_block_cuda(const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream,
+        const int * live = nullptr) {
     constexpr int BLOCK_SIZE = 1024;
     if (ggml_cuda_preload_on()) {
         ggml_cuda_preload_func(ggml_cuda_top_k_one_block_v2_enabled() ? (const void *) top_k_radix_one_block_v2<BLOCK_SIZE, 8> :
@@ -1014,7 +1039,7 @@ static void top_k_radix_one_block_cuda(const float * src, int * dst, int ncols, 
         return;
     }
     if (ggml_cuda_top_k_one_block_v2_enabled()) {
-        top_k_radix_one_block_v2<BLOCK_SIZE, 8><<<(unsigned int) nrows, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k);
+        top_k_radix_one_block_v2<BLOCK_SIZE, 8><<<(unsigned int) nrows, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k, live);
         static bool logged_v2 = false;
         if (!logged_v2) {
             logged_v2 = true;
@@ -1023,7 +1048,7 @@ static void top_k_radix_one_block_cuda(const float * src, int * dst, int ncols, 
         }
         return;
     }
-    top_k_radix_one_block<BLOCK_SIZE><<<(unsigned int) nrows, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k);
+    top_k_radix_one_block<BLOCK_SIZE><<<(unsigned int) nrows, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k, live);
     static bool logged = false;
     if (!logged) {
         logged = true;
@@ -1080,7 +1105,7 @@ static bool ggml_cuda_top_k_deterministic() {
 
 static void ggml_cuda_op_top_k_deterministic(ggml_cuda_pool & pool, const float * src0_d, int * dst_d,
                                              const int64_t ncols, const int64_t nrows, const int64_t k,
-                                             const int device, cudaStream_t stream) {
+                                             const int device, cudaStream_t stream, const int * live = nullptr) {
     const bool bitonic_short    = ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC;
     const bool bitonic_few_rows = nrows > 1 && ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS &&
                                   nrows <= ggml_cuda_info().devices[device].nsm;
@@ -1110,11 +1135,11 @@ static void ggml_cuda_op_top_k_deterministic(ggml_cuda_pool & pool, const float 
     if (ggml_cuda_top_k_one_block_enabled() && nrows <= ggml_cuda_info().devices[device].nsm &&
             (one_block_v2 ? ncols <= GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS && (ncols <= 32768 || nrows >= 16)
                           : ncols <= GGML_CUDA_TOP_K_ONE_BLOCK_MAX_NCOLS)) {
-        top_k_radix_one_block_cuda(src0_d, dst_d, ncols, nrows, k, stream);
+        top_k_radix_one_block_cuda(src0_d, dst_d, ncols, nrows, k, stream, live);
         return;
     }
 
-    if (ggml_cuda_top_k_two_stage_enabled() && k <= TOP_K_TWO_STAGE_MAX_K && nrows <= TOP_K_TWO_STAGE_MAX_ROWS && ncols >= 2048) {
+    if (ggml_cuda_top_k_two_stage_enabled() && k <= ggml_cuda_top_k_two_stage_max_k(device, ncols) && nrows <= TOP_K_TWO_STAGE_MAX_ROWS && ncols >= 2048) {
         top_k_two_stage_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
@@ -1144,15 +1169,26 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int device = ggml_cuda_get_device();
 
+    // the live column count (ggml_top_k_set_live_len), read on the device by the one-launch radix select; the other selections
+    // read every column (the padding is -INFINITY, so the result is the same)
+    const int * live = dst->src[1] != nullptr ? (const int *) ggml_cuda_preload_ptr(dst->src[1]) : nullptr;
+    if (live != nullptr) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: kpool live: top-k over the live columns only (%lld rows of %lld)\n", __func__, (long long) nrows, (long long) ncols);
+        }
+    }
+
     if (ggml_cuda_top_k_deterministic()) {
         if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && nrows > 1 && nrows <= 16) {
             // batch invariant: each row takes the path (and output order) of a single row
             for (int64_t i = 0; i < nrows; ++i) {
-                ggml_cuda_op_top_k_deterministic(pool, src0_d + i*ncols, dst_d + i*k, ncols, 1, k, device, stream);
+                ggml_cuda_op_top_k_deterministic(pool, src0_d + i*ncols, dst_d + i*k, ncols, 1, k, device, stream, live);
             }
             return;
         }
-        ggml_cuda_op_top_k_deterministic(pool, src0_d, dst_d, ncols, nrows, k, device, stream);
+        ggml_cuda_op_top_k_deterministic(pool, src0_d, dst_d, ncols, nrows, k, device, stream, live);
         return;
     }
 

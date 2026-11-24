@@ -6031,6 +6031,14 @@ struct ggml_tensor * ggml_top_k(
     return result;
 }
 
+void ggml_top_k_set_live_len(
+        struct ggml_tensor * a,
+        struct ggml_tensor * live) {
+    GGML_ASSERT(a->op == GGML_OP_TOP_K);
+    GGML_ASSERT(live == NULL || (live->type == GGML_TYPE_I32 && ggml_nelements(live) == 1));
+    a->src[1] = live;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(
@@ -7094,6 +7102,14 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[3] = mask;
 
     return result;
+}
+
+void ggml_lightning_indexer_set_live_len(
+        struct ggml_tensor * a,
+        struct ggml_tensor * live) {
+    GGML_ASSERT(a->op == GGML_OP_LIGHTNING_INDEXER);
+    GGML_ASSERT(live == NULL || (live->type == GGML_TYPE_I32 && ggml_nelements(live) == 1));
+    a->src[5] = live;
 }
 
 // ggml_dsv4_hc_comb

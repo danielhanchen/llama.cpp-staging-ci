@@ -87,6 +87,7 @@ struct moetc_args {
     int ntok;
     int ids_stride;
     int glu;                    // 0 SWIGLU, 1 GEGLU
+    int iround;                 // IQ3_XXS / IQ2_S scales in mul_mat_vec_q's integer rounding (GGML_CUDA_MOE_TC_IROUND, default 1)
 };
 
 #if defined(MOETC_ENABLED)
@@ -175,7 +176,8 @@ static __device__ __forceinline__ void moetc_add(float (&sum)[4], const int (&c)
 
 // one unit (256 values, or nvb <= 8 blocks of 32) of rows g (x[0]) and g+8 (x[1]) into sum
 template <ggml_type type, typename Y>
-static __device__ __forceinline__ void moetc_dot(const char * const (&x)[2], const Y & yf, float (&sum)[4], const int t, const int nvb) {
+static __device__ __forceinline__ void moetc_dot(const char * const (&x)[2], const Y & yf, float (&sum)[4], const int t, const int nvb,
+        const bool iround) {
     if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
         using block_t = std::conditional_t<type == GGML_TYPE_Q4_K, block_q4_K, block_q5_K>;
         int qh[2][2] = {{0, 0}, {0, 0}};
@@ -322,7 +324,8 @@ static __device__ __forceinline__ void moetc_dot(const char * const (&x)[2], con
         }
     } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
         // a sub-block of 32 = 8 grid entries of 4 values (lane t: entries t and 4 + t), signs per 8 values (7-bit index + parity),
-        // scale (2*ls + 1)/4 (vec_dot_iq3_xxs_q8_1 rounds (ls*sumi + sumi/2)/2 in integers; here the exact product)
+        // scale (2*ls + 1)/4. iround: vec_dot_iq3_xxs_q8_1's integer form (ls*sumi + sumi/2)/2, so every integer term equals
+        // mul_mat_vec_q's and only the f32 summation order differs; else the exact product
         float d[2];
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
@@ -344,15 +347,24 @@ static __device__ __forceinline__ void moetc_dot(const char * const (&x)[2], con
                 const int mh = __vcmpne4(((sh & 0x03) << 7) | ((sh & 0x0C) << 21), 0);
                 lo[r] = __vsub4(gl ^ ml, ml);
                 hi[r] = __vsub4(gh ^ mh, mh);
-                ls[r] = 2*(int) (aux >> 28) + 1;
+                ls[r] = iround ? (int) (aux >> 28) : 2*(int) (aux >> 28) + 1;
             }
             int c[4];
             moetc_mma_k32(c, lo, hi, yf.b(s));
-            moetc_add(sum_d, c, ls, yf.d(s));
+            if (iround) {
+                const float2 dy = yf.d(s);
+                sum_d[0] += dy.x * float((ls[0]*c[0] + c[0]/2)/2);
+                sum_d[1] += dy.y * float((ls[0]*c[1] + c[1]/2)/2);
+                sum_d[2] += dy.x * float((ls[1]*c[2] + c[2]/2)/2);
+                sum_d[3] += dy.y * float((ls[1]*c[3] + c[3]/2)/2);
+            } else {
+                moetc_add(sum_d, c, ls, yf.d(s));
+            }
         }
+        const float f = iround ? 1.0f : 0.25f;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            sum[l] += (0.25f*d[l/2])*sum_d[l];
+            sum[l] += (f*d[l/2])*sum_d[l];
         }
     } else if constexpr (type == GGML_TYPE_IQ2_S) {
         // a sub-block of 32 = 4 grid entries of 8 values (10-bit index: qs byte + 2 qh bits), signs bytes, one scale per 16 values
@@ -383,21 +395,30 @@ static __device__ __forceinline__ void moetc_dot(const char * const (&x)[2], con
                 lo[r] = __vsub4(gl ^ ml, ml);
                 hi[r] = __vsub4(gh ^ mh, mh);
                 const int sc = bx->scales[s];
-                sl_[r] = 2*(sc & 0x0F) + 1;
-                sh_[r] = 2*(sc >> 4) + 1;
+                // iround: vec_dot_iq2_s_q8_1's integer form (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4
+                sl_[r] = iround ? (sc & 0x0F) : 2*(sc & 0x0F) + 1;
+                sh_[r] = iround ? (sc >> 4)   : 2*(sc >> 4) + 1;
             }
             int c_lo[4], c_hi[4];
             moetc_mma_k16(c_lo, lo, yf.b(s).x);
             moetc_mma_k16(c_hi, hi, yf.b(s).y);
             const float2 dy = yf.d(s);
-            sum_d[0] += dy.x * float(c_lo[0]*sl_[0] + c_hi[0]*sh_[0]);
-            sum_d[1] += dy.y * float(c_lo[1]*sl_[0] + c_hi[1]*sh_[0]);
-            sum_d[2] += dy.x * float(c_lo[2]*sl_[1] + c_hi[2]*sh_[1]);
-            sum_d[3] += dy.y * float(c_lo[3]*sl_[1] + c_hi[3]*sh_[1]);
+            if (iround) {
+                sum_d[0] += dy.x * float((c_lo[0]*sl_[0] + c_hi[0]*sh_[0] + (c_lo[0] + c_hi[0])/2)/4);
+                sum_d[1] += dy.y * float((c_lo[1]*sl_[0] + c_hi[1]*sh_[0] + (c_lo[1] + c_hi[1])/2)/4);
+                sum_d[2] += dy.x * float((c_lo[2]*sl_[1] + c_hi[2]*sh_[1] + (c_lo[2] + c_hi[2])/2)/4);
+                sum_d[3] += dy.y * float((c_lo[3]*sl_[1] + c_hi[3]*sh_[1] + (c_lo[3] + c_hi[3])/2)/4);
+            } else {
+                sum_d[0] += dy.x * float(c_lo[0]*sl_[0] + c_hi[0]*sh_[0]);
+                sum_d[1] += dy.y * float(c_lo[1]*sl_[0] + c_hi[1]*sh_[0]);
+                sum_d[2] += dy.x * float(c_lo[2]*sl_[1] + c_hi[2]*sh_[1]);
+                sum_d[3] += dy.y * float(c_lo[3]*sl_[1] + c_hi[3]*sh_[1]);
+            }
         }
+        const float f = iround ? 1.0f : 0.125f;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            sum[l] += (0.125f*d[l/2])*sum_d[l];
+            sum[l] += (f*d[l/2])*sum_d[l];
         }
     } else {
         // Q8_0 / IQ4_NL / Q5_0: a scale per block of 32, nvb <= 8 blocks in this unit (K tail)
@@ -607,7 +628,7 @@ static __global__ void mul_mat_vec_q_moe_tc(const moetc_args args) {
             const int off0 = moetc_unaligned<type>() ? (int) ((uintptr_t) row_src(r0,     u) % 16) : 0;
             const int off1 = moetc_unaligned<type>() ? (int) ((uintptr_t) row_src(r0 + 8, u) % 16) : 0;
             const char * const xr[2] = { sb + r0*wstride + off0, sb + (r0 + 8)*wstride + off1 };
-            moetc_dot<type>(xr, yf, sum[m], t, nvb);
+            moetc_dot<type>(xr, yf, sum[m], t, nvb, args.iround != 0);
         }
         __syncwarp();
     }
@@ -670,6 +691,7 @@ struct moetc_cfg {
     int  kw    = 0;    // 0 = by K
     bool log   = false;
     int  min_tok = 0;   // GGML_CUDA_MOE_TC_MIN (0 = the per-device table)
+    bool iround = true; // GGML_CUDA_MOE_TC_IROUND=0: IQ3_XXS / IQ2_S sub-block scales as the exact product (before: not mmvq's integers)
     bool any   = false; // GGML_CUDA_MOE_TC_ANYARCH=1: also sm_90+ (correctness runs on other hosts; not a tuned path there)
 };
 
@@ -714,6 +736,9 @@ static const moetc_cfg & moetc_config() {
         }
         if (const char * e = getenv("GGML_CUDA_MOE_TC_MIN")) {
             c.min_tok = atoi(e);
+        }
+        if (const char * e = getenv("GGML_CUDA_MOE_TC_IROUND")) {
+            c.iround = atoi(e) != 0;
         }
         if (const char * e = getenv("GGML_CUDA_MOE_TC_ANYARCH")) {
             c.any = atoi(e) != 0;
@@ -875,6 +900,7 @@ bool ggml_cuda_moe_tc_launch(const ggml_type type, const void * vx, const void *
     args.ntok               = (int) ntok;
     args.ids_stride         = (int) ids_stride;
     args.glu                = fused && fusion.glu_op == GGML_GLU_OP_GEGLU ? 1 : 0;
+    args.iround             = moetc_config().iround ? 1 : 0;
 
     // warps splitting K: follows K only (so does the f32 order of a column)
     const int kw = cfg.kw > 0 ? cfg.kw : nunits >= 8 ? 4 : nunits >= 4 ? 2 : 1;

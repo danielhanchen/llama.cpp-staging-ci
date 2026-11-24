@@ -426,6 +426,15 @@ int main(int argc, char ** argv) {
         std::vector<double> rofff(vo.begin(), vo.end());
         const double e_x = nmse(vt, rofff);
         bool ok = std::isfinite(e_tc) && e_tc <= tol*e_off + 1e-9 && e_x <= 4.0*e_off + 1e-6;
+        // IQ3_XXS / IQ2_S take mul_mat_vec_q's integer scale rounding (GGML_CUDA_MOE_TC_IROUND, default on): every integer term is
+        // the same, only the f32 summation order differs, so the two paths agree to f32 rounding (the exact product: ~e_off apart).
+        // Up to 7 tokens only: mul_mat_vec_q's MoE batch limit for these types (Turing and later); at 8 the kill switch's product
+        // is not mul_mat_vec_q (another q8_1 layout and rounding), so only the reference bound above applies
+        const bool iround = getenv("GGML_CUDA_MOE_TC_IROUND") == nullptr || atoi(getenv("GGML_CUDA_MOE_TC_IROUND")) != 0;
+        if (iround && (s.type == GGML_TYPE_IQ3_XXS || s.type == GGML_TYPE_IQ2_S) && c.T <= 7 && !(e_x <= 1e-10)) {
+            printf("FAIL %s T=%d: tensor-core vs mul_mat_vec_q NMSE %.3e > 1e-10 with the integer scale rounding\n", s.name, c.T, e_x);
+            ok = false;
+        }
         // skipped slots are zeros
         for (size_t i = 0; i < n; ++i) {
             if (d.ids[i / s.N] < 0 && vt[i] != 0.0f) {

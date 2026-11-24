@@ -219,9 +219,12 @@ public:
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
     // allfit_idx (I32 [n_sel, n_tokens], only when get_kpool_allfit()): the selection when the top_k keeps every visible pool: the members
     // of the token's visible pools in pool order, then dead slots, then the tail; a dead slot s (padding, missing tail cell) is n_kv + s
+    // pool_live (I32 [1], can be null): max(real pools, n_top) for the indexer and its top_k (ggml_lightning_indexer_set_live_len,
+    // ggml_top_k_set_live_len): the pools at and past the real ones are padding whose mask is -inf in every row
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr, ggml_tensor * allfit_idx = nullptr) const;
+                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr, ggml_tensor * allfit_idx = nullptr,
+                         ggml_tensor * pool_live = nullptr, uint32_t n_top = 0) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;

@@ -2659,6 +2659,13 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // live (I32 [1], optional, src[1]): the columns of a at and past max(k, live) are -INFINITY in every row (padding), so a backend
+    // may select over the first max(k, min(ne0, live)) columns only, read on the device (ggml-cuda: the one-launch radix select).
+    // The selection and its order are unchanged: every padded column sorts after the live ones. The others read every column
+    GGML_API void ggml_top_k_set_live_len(
+            struct ggml_tensor * a,
+            struct ggml_tensor * live);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2902,6 +2909,12 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // live (I32 [1], optional, src[5]): the keys at and past live are padding whose mask is -INFINITY in every row, so their score
+    // is -INFINITY; a backend may write that without reading K / Q there (ggml-cuda), the others score every key
+    GGML_API void ggml_lightning_indexer_set_live_len(
+        struct ggml_tensor * a,
+        struct ggml_tensor * live);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

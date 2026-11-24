@@ -650,6 +650,7 @@ llama_build_and_test(test-k19-p5mmq-exact.cpp LINK ggml)
 llama_build_and_test(test-topk384-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-oneblock-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-twostage-exact.cpp LINK ggml)   # two-stage one-launch top-k == radix select, byte for byte
+llama_build_and_test(test-kpool-live-exact.cpp LINK ggml)       # QSA indexer + top-k with the live pool count / multi-row vec kernel == without, byte for byte
 llama_build_and_test(test-topk-batch-exact.cpp LINK ggml)      # one top-k over a verify window == one per row, byte for byte
 llama_build_and_test(test-fa-sparse-smem-exact.cpp LINK ggml)   # sparse MMA flash attention at its one-stage shared memory == the two-stage launch, byte for byte
 llama_build_and_test(test-fattn-q8-exact.cpp LINK ggml)   # MMA flash attention reading q8_0 K / V in place == the staged f16 copy, byte for byte

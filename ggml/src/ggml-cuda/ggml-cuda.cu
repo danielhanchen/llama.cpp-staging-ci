@@ -5752,6 +5752,13 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
         return 0;
     }
 
+    // a MUL_MAT_ID activation of more than 64 rows (the Flash-Next routed down input, 10 experts x 7..8 verify tokens = 70..80
+    // rows of 640) up to GGML_CUDA_Q8_1_ROWS_MAX rows (128; 64 = only up to 64 rows, as before) while its q8_1 copy stays within
+    // 128 KiB: the gated producer then writes the copy its mul_mat_vec_q reader takes instead of a quantize_q8_1 launch (the same bytes)
+    static const int64_t rows_max = [] {
+        const char * e = getenv("GGML_CUDA_Q8_1_ROWS_MAX");
+        return e != nullptr ? std::max<int64_t>(0, atoll(e)) : (int64_t) 16*MMVQ_MAX_BATCH_SIZE;
+    }();
     auto is_candidate = [](const ggml_tensor * node) {
         if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             return false;
@@ -5763,7 +5770,15 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
         }
         // mul_mat_vec_q batch sizes
         const int64_t ncols = node->op == GGML_OP_MUL_MAT ? src1->ne[1] : src1->ne[2];
-        return ncols <= MMVQ_MAX_BATCH_SIZE && ggml_nrows(src1) <= 8*MMVQ_MAX_BATCH_SIZE;
+        if (ncols > MMVQ_MAX_BATCH_SIZE) {
+            return false;
+        }
+        const int64_t nrows = ggml_nrows(src1);
+        if (nrows <= 8*MMVQ_MAX_BATCH_SIZE) {
+            return true;
+        }
+        const size_t q8_1_bytes = (size_t) nrows*GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING)/QK8_1*sizeof(block_q8_1);
+        return node->op == GGML_OP_MUL_MAT_ID && nrows <= rows_max && q8_1_bytes <= 128*1024;
     };
 
     std::unordered_map<const void *, int> n_readers;
