@@ -114,6 +114,11 @@ bool    common_fit_extra_lent_excluded(bool lent, bool decode_sized);
 // the mid-size placement (LLAMA_FIT_PLACEMID) measures decode-sized, as the small-device placement does: a lent drafter kept with it
 // (common_fit_place8()) is priced with its device weights and compute buffers. LLAMA_FIT_PLACEMID_DECODE_SIZED=0: measured lent as before
 bool    common_fit_placemid_decode_sized();
+// the key the extra model's price is cached under: the context size and the ubatch size (a DFlash draft priced from its GGUF reserves
+// buffers of n_ubatch rows, common_fit_dflash_draft_bytes; the small-device and mid-size placements measure at a smaller n_ubatch for
+// the same context), then `placement` (the main model's placement, for an extra model that shares its weights).
+// LLAMA_FIT_EXTRA_KEY_UB=0: without the ubatch size, as before (the price of the first measurement was reused at every ubatch size)
+std::string common_fit_extra_key(uint32_t n_ctx, uint32_t n_ubatch, const std::string & placement);
 
 // the margin beside a MoE cache without flash attention. The fit may take part of the default margin m for the cache
 // (m_reduced, LLAMA_MOE_FIT_MARGIN); without flash attention (flash_attn = false: -fa off, or auto resolved off at the measured
