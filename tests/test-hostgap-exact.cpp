@@ -16,6 +16,12 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+// the child processes run on POSIX only (main), but the test is built on Windows static builds too
+#define popen  _popen
+#define pclose _pclose
+#endif
+
 static uint64_t fnv1a(const uint8_t * p, size_t n, uint64_t h = 1469598103934665603ull) {
     for (size_t i = 0; i < n; ++i) {
         h = (h ^ p[i]) * 1099511628211ull;
