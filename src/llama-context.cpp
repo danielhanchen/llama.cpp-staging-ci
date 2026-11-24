@@ -7535,46 +7535,6 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     std::vector<std::vector<int>>               cuts(group.size()); // first node of each piece
     std::vector<std::vector<const ggml_tensor *>> cw(group.size());   // the weight that starts each piece (nullptr: the first piece)
     bool aligned = true;
-    // (LLAMA_LM_GLU_WITH_DOWN=0 off): the cut before an expert down product (MUL_MAT_ID of a host weight) whose input is a GLU right
-    // before it (only views between) goes before the GLU, so the GLU runs directly before its down product, as in a graph that is not
-    // cut: the backend's GLU -> down fusion and the routing / input conversion reuse of that product engage again in layer-major prompts.
-    // The GLU and its views move from the gate / up piece to the down piece: the same ops on the same inputs, in another order only
-    static const bool glu_with_down = getenv("LLAMA_LM_GLU_WITH_DOWN") == nullptr || atoi(getenv("LLAMA_LM_GLU_WITH_DOWN")) != 0;
-    int64_t n_glu_moved = 0;
-    auto is_view_op = [](const ggml_tensor * t) {
-        return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
-    };
-    // the first node of the down product's piece: the GLU feeding node i (with the views between), else i
-    auto glu_cut = [&](ggml_cgraph * gf, int i, const ggml_tensor * w, int lo) -> int {
-        const ggml_tensor * node = ggml_graph_node(gf, i);
-        if (!glu_with_down || node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr || node->src[1] == nullptr) {
-            return i;
-        }
-        const ggml_tensor * ws = node->src[0];
-        while (ws->view_src != nullptr) {
-            ws = ws->view_src;
-        }
-        if (ws != w) {
-            return i;
-        }
-        const ggml_tensor * b = node->src[1];
-        while (is_view_op(b) && b->src[0] != nullptr) {
-            b = b->src[0];
-        }
-        if (b->op != GGML_OP_GLU) {
-            return i;
-        }
-        for (int j = i - 1; j > lo && j >= i - 8; --j) {
-            const ggml_tensor * nj = ggml_graph_node(gf, j);
-            if (nj == b) {
-                return j;
-            }
-            if (!is_view_op(nj)) {
-                return i;
-            }
-        }
-        return i;
-    };
     for (size_t k = 0; k < group.size(); ++k) {
         ggml_cgraph * gf = group[k].gf;
         std::unordered_set<const ggml_tensor *> seen;
@@ -7593,9 +7553,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             if (w != nullptr) {
                 if (i > 0) {
-                    const int at = glu_cut(gf, i, w, cuts[k].back());
-                    n_glu_moved += at != i;
-                    cuts[k].push_back(at);
+                    cuts[k].push_back(i);
                     cw[k].push_back(w);
                 } else {
                     cw[k][0] = w;
@@ -7612,13 +7570,6 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 }
                 LLAMA_LOG_INFO("%s: member %zu cut %zu at %d (%s):%s\n", __func__, k, c, at, cw[k][c] ? cw[k][c]->name : "-", sline.c_str());
             }
-        }
-    }
-    {
-        static std::atomic<int> n_log { 0 };
-        if (n_glu_moved > 0 && n_log++ == 0) {
-            LLAMA_LOG_INFO("%s: %lld GLUs of the group run next to their expert down products (LLAMA_LM_GLU_WITH_DOWN=0: cut before the down)\n",
-                __func__, (long long) n_glu_moved);
         }
     }
     // the pieces of all graphs in one order: the cuts of the first graph, a cut of a later graph at the same weight runs with it, a cut
