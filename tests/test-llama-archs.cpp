@@ -1678,7 +1678,7 @@ static int check_qwen35_replay_sched(const size_t seed, const float stdev) {
         }
         rpc_devs.push_back(ggml_backend_reg_dev_get(reg, 0));
     }
-    setenv("LLAMA_RS_REPLAY", "1", 1); // replay rollback (auto picks it only where weights spill to the host)
+    setenv("LLAMA_RS_REPLAY", "1", 1); // replay rollback (auto does not pick it with every weight in host memory)
 
     auto run = [&](const std::vector<ggml_backend_dev_t> & devs, std::vector<std::vector<float>> & out) -> bool {
         gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false);
