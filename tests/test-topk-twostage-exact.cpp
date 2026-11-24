@@ -1,5 +1,5 @@
 // the CUDA deterministic top-k (ggml_top_k) with the two-stage one-launch selection for few rows and a small k
-// (GGML_CUDA_TOPK_TWO_STAGE, default on: rows <= 8, k <= 10 (k 32 cases: the radix select in both modes), columns past the one-block path) vs the radix select
+// (GGML_CUDA_TOPK_TWO_STAGE, default on: rows <= 8, k <= 16 (k 32 cases: the radix select in both modes), columns past the one-block path) vs the radix select
 // (GGML_CUDA_TOPK_TWO_STAGE=0), and vs a host reference of the documented order (keys above the k-th largest in column order, then
 // the first kept ties in column order; -0 == +0). Each mode runs in a child process (the switch is read once per process) that dumps
 // the ids, the median time of 30 graph runs per case and whether the two-stage kernel logged. Rows 1 / 2 / 3 / 8, 32769 .. 262144
@@ -48,7 +48,7 @@ struct tcase {
 static std::vector<tcase> cases() {
     std::vector<tcase> v;
     for (int nc : { 32769, 40000, 69632, 69633, 131072, 248320, 262144 }) {
-        for (int k : { 1, 10, 32 }) {
+        for (int k : { 1, 10, 16, 32 }) {
             for (int d = 0; d < 4; ++d) {
                 v.push_back({ 1, nc, k, d });
             }
@@ -57,6 +57,8 @@ static std::vector<tcase> cases() {
         v.push_back({ 3, nc, 10, 3 });
         v.push_back({ 8, nc, 32, 2 });
         v.push_back({ 8, nc, 10, 1 });
+        v.push_back({ 8, nc, 16, 1 });   // the DFlash2 selector (8 rows x 69632, k 16; GGML_CUDA_TOP_K_TWO_STAGE_K16)
+        v.push_back({ 7, nc, 16, 3 });
     }
     return v;
 }

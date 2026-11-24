@@ -4741,6 +4741,13 @@ void ggml_cuda_mul_mat_vec_q(
                 ggml_cuda_q8_1_cache::key_contiguous(ne10, ne11*ne12*ne13, key);
             }
             src1_q8_1 = ctx.q8_1_cache.get(src1->data, ggml_nbytes(src1), key, q8_1_size, quantized);
+            // engagement proof of the > 64-row admission (ggml_cuda_q8_1_cache_slot_size, GGML_CUDA_Q8_1_ROWS_MAX), once per process
+            static bool logged_rows = false;
+            if (quantized && !logged_rows && ne11*ne12*ne13 > 64) {
+                logged_rows = true;
+                GGML_LOG_INFO("%s: q8_1 cache: %d-row activation (%d x %d x %d) read from its producer's copy\n", __func__,
+                    (int) (ne11*ne12*ne13), (int) ne10, (int) ne11, (int) ne12);
+            }
         }
         if (src1_q8_1 == nullptr) {
             src1_q8_1 = src1_q8_1_alloc.alloc(q8_1_size);

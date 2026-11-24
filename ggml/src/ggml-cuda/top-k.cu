@@ -802,7 +802,10 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block_v2
 // output is the same ids in the same order. GGML_CUDA_TOPK_TWO_STAGE=0: the radix select.
 // k: one round per pick per block, so it pays for small k only (A100, test-topk-twostage-exact: k 1 / 10 at 0.14-0.94x the radix
 // select's time over 32769-262144 columns, k 32 at 1.5-4.1x)
-#define TOP_K_TWO_STAGE_MAX_K    10
+// k 11..16 (the DFlash2 selector's top-16 of 8 x 69632) also, GGML_CUDA_TOP_K_TWO_STAGE_K16=0: k <= 10 only (before: the multi-block
+// radix select took those)
+#define TOP_K_TWO_STAGE_MAX_K    16
+#define TOP_K_TWO_STAGE_MAX_K10  10
 #define TOP_K_TWO_STAGE_MAX_ROWS 8
 #define TOP_K_TWO_STAGE_NONE     0x7FFFFFFF
 
@@ -970,6 +973,14 @@ static bool ggml_cuda_top_k_two_stage_enabled() {
     return enabled;
 }
 
+static int ggml_cuda_top_k_two_stage_max_k() {
+    static const int max_k = [] {
+        const char * env = getenv("GGML_CUDA_TOP_K_TWO_STAGE_K16");
+        return env != nullptr && atoi(env) == 0 ? TOP_K_TWO_STAGE_MAX_K10 : TOP_K_TWO_STAGE_MAX_K;
+    }();
+    return max_k;
+}
+
 static void top_k_two_stage_cuda(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
     if (ggml_cuda_preload_on()) {
         return;
@@ -1114,7 +1125,7 @@ static void ggml_cuda_op_top_k_deterministic(ggml_cuda_pool & pool, const float 
         return;
     }
 
-    if (ggml_cuda_top_k_two_stage_enabled() && k <= TOP_K_TWO_STAGE_MAX_K && nrows <= TOP_K_TWO_STAGE_MAX_ROWS && ncols >= 2048) {
+    if (ggml_cuda_top_k_two_stage_enabled() && k <= ggml_cuda_top_k_two_stage_max_k() && nrows <= TOP_K_TWO_STAGE_MAX_ROWS && ncols >= 2048) {
         top_k_two_stage_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
