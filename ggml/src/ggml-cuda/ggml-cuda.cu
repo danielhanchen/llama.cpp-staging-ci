@@ -3975,7 +3975,18 @@ static void ggml_backend_cuda_set_upload_kernel_min(ggml_backend_t backend, size
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
         return;
     }
-    ((ggml_backend_cuda_context *) backend->context)->upload_kernel_min = min_bytes;
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->upload_kernel_min = min_bytes;
+    if (min_bytes > 0) {
+        // loaded now (the caller's device is idle): under lazy module loading its first launch would wait for the whole device,
+        // the MoE cache's refill on the upload stream included, which is what the copy kernel is there to not wait for
+        ggml_cuda_set_device(ctx->device);
+        cudaFuncAttributes fa = {};
+        if (cudaFuncGetAttributes(&fa, k_upload_zc) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ctx->upload_kernel_min = 0;
+        }
+    }
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
