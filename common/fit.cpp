@@ -329,7 +329,8 @@ bool common_fit_extra_lent_excluded(bool lent, bool decode_sized) {
 }
 
 std::string common_fit_extra_key(uint32_t n_ctx, uint32_t n_ubatch, const std::string & placement) {
-    static const bool with_ub = getenv("LLAMA_FIT_EXTRA_KEY_UB") == nullptr || atoi(getenv("LLAMA_FIT_EXTRA_KEY_UB")) != 0;
+    // off by default until a real small-device launch shows the larger cache it leaves holds (LLAMA_FIT_EXTRA_KEY_UB=1 on)
+    static const bool with_ub = getenv("LLAMA_FIT_EXTRA_KEY_UB") != nullptr && atoi(getenv("LLAMA_FIT_EXTRA_KEY_UB")) != 0;
     return std::to_string(n_ctx) + (with_ub ? " ub " + std::to_string(n_ubatch) : std::string()) + placement;
 }
 
@@ -977,7 +978,7 @@ static void common_params_fit_impl(
         const std::string key = common_fit_extra_key(cparams->n_ctx, cparams->n_ubatch, follow ? placement_key(mp_cur, cp_cur) : std::string());
 
         if (!dmds_extra.empty() && key_extra == key && ub_extra != cparams->n_ubatch) {
-            LOG_INF("%s: the extra model's price measured at n_ubatch %u reused at n_ubatch %u (n_ctx %u; LLAMA_FIT_EXTRA_KEY_UB=0)\n",
+            LOG_INF("%s: the extra model's price measured at n_ubatch %u reused at n_ubatch %u (n_ctx %u; LLAMA_FIT_EXTRA_KEY_UB=1 prices it again)\n",
                 __func__, ub_extra, cparams->n_ubatch, cparams->n_ctx);
         }
         if (dmds_extra.empty() || key_extra != key) {
