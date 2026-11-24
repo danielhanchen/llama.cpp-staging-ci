@@ -1,0 +1,147 @@
+name: macos-metal-ops
+
+on:
+  push:
+    branches:
+      - 'ci/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  metal:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, arm: head }
+          - { os: macos-15, arm: base }
+          - { os: macos-26, arm: head }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Base arm (the lever commits reversed)
+        if: matrix.arm == 'base'
+        shell: bash
+        run: |
+          git apply -R ci-lever.patch
+          echo "base arm: ci-lever.patch reversed" | tee -a summary_pre.txt
+
+      - name: System info
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          [ -f summary_pre.txt ] && cat summary_pre.txt >> ci-logs/summary.txt
+          {
+            echo "leg: ${{ matrix.os }} ${{ matrix.arm }}"
+            echo "sha: ${GITHUB_SHA}"
+            sw_vers
+            sysctl -n machdep.cpu.brand_string
+            sysctl -n hw.logicalcpu
+            xcrun clang --version | head -1
+          } 2>&1 | tee ci-logs/sysinfo.txt
+
+      - name: Build
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          NJ=$(sysctl -n hw.logicalcpu)
+          rc=0
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=ON > ci-logs/configure.log 2>&1 || rc=$?
+          T="test-backend-ops llama-completion llama-server test-moe-reduce-exact test-metal-async-copy"
+          [ "${{ matrix.arm }}" = head ] && T="$T test-metal-mmid-map test-metal-mmid-pair-model test-metal-mmid-pair-exact test-metal-host-bind"
+          [ "$rc" = 0 ] && { cmake --build build --config Release -j "$NJ" --target $T > ci-logs/build.log 2>&1 || rc=$?; }
+          tail -30 ci-logs/build.log
+          grep -n -E "warning:|error:" ci-logs/build.log > ci-logs/build_diags.txt 2>/dev/null || true
+          echo "build_rc=$rc warnings=$(grep -c 'warning:' ci-logs/build_diags.txt || true) errors=$(grep -c 'error:' ci-logs/build_diags.txt || true)" | tee -a ci-logs/summary.txt
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Metal library compile and targeted ops
+        if: steps.build.outputs.rc == '0'
+        shell: bash
+        run: |
+          set +e
+          B=build/bin
+          $B/test-backend-ops -b MTL0 -o SEL_MASK > ci-logs/tbo_sel_mask.log 2>&1; echo "tbo_SEL_MASK_rc=$?" | tee -a ci-logs/summary.txt
+          grep -E "simdgroup|GPU family|GPU name|has tensor|error|failed to|compil" ci-logs/tbo_sel_mask.log | head -16 | sed 's/^/device: /' | tee -a ci-logs/summary.txt
+          for o in SEL_MASK MUL_MAT_ID MUL_MAT FLASH_ATTN_EXT MOE_REDUCE; do
+            log=ci-logs/tbo_$(echo $o | tr A-Z a-z).log
+            [ "$o" != SEL_MASK ] && { $B/test-backend-ops -b MTL0 -o $o > $log 2>&1; echo "tbo_${o}_rc=$?" | tee -a ci-logs/summary.txt; }
+            echo "tbo_${o}: ok=$(grep -c '  OK' $log || true) fail=$(grep -c 'FAIL' $log || true) not_supported=$(grep -c 'not supported' $log || true) $(grep -E 'tests passed' $log | head -1)" | tee -a ci-logs/summary.txt
+          done
+          grep -E "SEL_MASK" ci-logs/tbo_sel_mask.log | head -12 | sed 's/^/sel_mask: /' | tee -a ci-logs/summary.txt
+          grep -E "dup=1" ci-logs/tbo_mul_mat_id.log | head -4 | sed 's/^/mmid_dup: /' | tee -a ci-logs/summary.txt
+          echo "mmid_dup_cases=$(grep -c 'dup=1' ci-logs/tbo_mul_mat_id.log || true)" | tee -a ci-logs/summary.txt
+          LLAMA_QSA_SEL_OP=0 $B/test-backend-ops -b MTL0 -o SEL_MASK > ci-logs/tbo_sel_mask_op0.log 2>&1; echo "tbo_SEL_MASK_qsa_sel_op0_rc=$? $(grep -E 'tests passed' ci-logs/tbo_sel_mask_op0.log | head -1)" | tee -a ci-logs/summary.txt
+
+      - name: Lever tests (head)
+        if: steps.build.outputs.rc == '0' && matrix.arm == 'head'
+        shell: bash
+        run: |
+          set +e
+          B=build/bin
+          for t in test-metal-mmid-map test-metal-mmid-pair-model test-metal-mmid-pair-exact test-metal-host-bind; do
+            $B/$t > ci-logs/$t.log 2>&1; echo "$t: rc=$? $(tail -3 ci-logs/$t.log | tr '\n' ' ')" | tee -a ci-logs/summary.txt
+          done
+          GGML_METAL_HOST_BANK_BIND_DEBUG=1 $B/test-metal-host-bind > ci-logs/host_bind_dbg.log 2>&1; echo "host_bind_debug: rc=$? binds=$(grep -c 'bind [0-9]*:' ci-logs/host_bind_dbg.log || true) $(tail -2 ci-logs/host_bind_dbg.log | tr '\n' ' ')" | tee -a ci-logs/summary.txt
+          GGML_METAL_HOST_BANK_BIND=0 $B/test-metal-host-bind --off > ci-logs/host_bind_off.log 2>&1; echo "host_bind_off: rc=$? $(tail -2 ci-logs/host_bind_off.log | tr '\n' ' ')" | tee -a ci-logs/summary.txt
+          GGML_METAL_MMID_PAIR=1 GGML_METAL_MMID_PAIR_DEBUG=1 $B/test-backend-ops -b MTL0 -o MUL_MAT_ID > ci-logs/tbo_mmid_pair1.log 2>&1; echo "tbo_MUL_MAT_ID_pair1_rc=$? ok=$(grep -c '  OK' ci-logs/tbo_mmid_pair1.log || true) fail=$(grep -c 'FAIL' ci-logs/tbo_mmid_pair1.log || true) ns=$(grep -c 'not supported' ci-logs/tbo_mmid_pair1.log || true) pair_lines=$(grep -c 'mmid pair' ci-logs/tbo_mmid_pair1.log || true)" | tee -a ci-logs/summary.txt
+          GGML_METAL_MMID_MAP_DEBUG=1 $B/test-backend-ops -b MTL0 -o MUL_MAT_ID > ci-logs/tbo_mmid_mapdbg.log 2>&1; echo "tbo_MUL_MAT_ID_mapdebug_rc=$? map_lines=$(grep -c 'expert maps' ci-logs/tbo_mmid_mapdbg.log || true)" | tee -a ci-logs/summary.txt
+
+      - name: Full test-backend-ops on MTL0
+        if: steps.build.outputs.rc == '0'
+        shell: bash
+        run: |
+          set +e
+          perl -e 'alarm shift; exec @ARGV' 3000 build/bin/test-backend-ops -b MTL0 > ci-logs/tbo_full.log 2>&1; echo "tbo_full_rc=$?" | tee -a ci-logs/summary.txt
+          echo "tbo_full: ok=$(grep -c '  OK' ci-logs/tbo_full.log || true) fail=$(grep -c 'FAIL' ci-logs/tbo_full.log || true) not_supported=$(grep -c 'not supported' ci-logs/tbo_full.log || true) $(grep -E 'tests passed' ci-logs/tbo_full.log | head -1)" | tee -a ci-logs/summary.txt
+          grep -E "FAIL" ci-logs/tbo_full.log | head -40 > ci-logs/tbo_full_fail.txt || true
+          head -20 ci-logs/tbo_full_fail.txt | sed 's/^/tbo_full_fail: /' | tee -a ci-logs/summary.txt
+          for o in SEL_MASK FLASH_ATTN_EXT MUL_MAT_ID MUL_MAT ; do
+            echo "tbo_full_$o: ok=$(grep -E "^  $o\(" ci-logs/tbo_full.log | grep -c 'OK' || true) fail=$(grep -E "^  $o\(" ci-logs/tbo_full.log | grep -c 'FAIL' || true) ns=$(grep -E "^  $o\(" ci-logs/tbo_full.log | grep -c 'not supported' || true)" | tee -a ci-logs/summary.txt
+          done
+
+      - name: Tiny model greedy md5
+        if: steps.build.outputs.rc == '0'
+        shell: bash
+        run: |
+          set +e
+          M=models/stories15M-q4_0.gguf
+          mkdir -p models
+          curl -sSfL --retry 5 -o "$M" https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf
+          echo "model_md5=$(md5 -q "$M")" | tee -a ci-logs/summary.txt
+          P="Once upon a time there was a little girl named Lily who lived in a small house near the woods with her mother, her father and her old dog. Every morning she walked to the river to watch the fish, and every evening she told her dog a story about the stars. One day she found a strange blue stone in the water and"
+          printf '%s' "$P" > prompt.txt
+          run() { # name, ngl, env...
+            name=$1; ngl=$2; shift 2
+            env "$@" build/bin/llama-completion -m "$M" -f prompt.txt -n 24 --temp 0 --seed 1 -ngl $ngl -t 2 -c 512 -no-cnv > ci-logs/tm_$name.txt 2> ci-logs/tm_$name.log < /dev/null
+            echo "tm_$name: rc=$? md5=$(md5 -q ci-logs/tm_$name.txt)" | tee -a ci-logs/summary.txt
+          }
+          run default 99
+          run ngl0 0
+          run alloff 99 GGML_METAL_MMID_SGSPLIT=0 GGML_METAL_MMID_BSKIP=0 GGML_METAL_MMID_MAP_SHARE=0 GGML_METAL_MMID_PAIR=0 GGML_METAL_HOST_BANK_BIND=0 LLAMA_QSA_SEL_OP=0
+          head -c 400 ci-logs/tm_default.txt; echo
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          cat ci-logs/summary.txt || true
+          cat ci-logs/summary.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.os }}-${{ matrix.arm }}
+          path: ci-logs/
+          retention-days: 30
