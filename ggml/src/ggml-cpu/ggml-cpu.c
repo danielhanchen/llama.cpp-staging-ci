@@ -4288,6 +4288,12 @@ struct ggml_cplan ggml_graph_plan(
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
+                        // one token: the per-thread quantized x of the fused up+gate+swiglu (ggml_compute_forward_moe_glu1), for
+                        // either weight of the pair (a pair of the same shape has the same row sizes when the types match)
+                        if (ggml_nrows(src1) == 1 && src1->type == GGML_TYPE_F32) {
+                            const size_t per = 2*GGML_PAD(ggml_row_size(vec_dot_type, src1->ne[0]), CACHE_LINE_SIZE);
+                            cur = MAX(cur, (size_t) n_tasks*per + CACHE_LINE_SIZE);
+                        }
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
@@ -4446,6 +4452,177 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+// ---- one token through the up and gate experts and the SwiGLU in one pass (host experts without the MoE cache mailbox) ----------
+// mul_mat_id(up, x, ids), mul_mat_id(gate, x, ids), swiglu_split(gate, up) for a single token (--cpu-moe / -ncmoe / -ot exps=CPU
+// decode): three nodes and their barriers become one node without an internal barrier. Every thread quantizes x itself (the same
+// from_float as the graph's, which splits the row at block boundaries: the same bytes), then takes blocks of 64 rows of the experts:
+// the gate and up value of each row is the same vec_dot of the same quantized row as in the graph (one row per routed expert: the
+// stock vec_dot path), and the SwiGLU of a block is ggml_vec_swiglu_f32 over its 64 values. The blocks start at multiples of 64, so the
+// vector / scalar split of that function falls on the same elements as for the whole row: the output is the graph's bit for bit.
+// Not taken (the graph runs): extra buffer types (repacked weights), the tiled kernels forced, other GLU forms, more than one token,
+// an output that overlaps x or ids. GGML_CPU_MOE_GLU1=0 turns it off (GGML_CPU_DISABLE_FUSION=1 too).
+#define GGML_CPU_MOE_GLU1_BLK 64
+
+static bool ggml_cpu_moe_glu1_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GGML_CPU_MOE_GLU1");
+        on = (e == NULL || atoi(e) != 0) ? 1 : 0;
+    }
+    return on == 1;
+}
+
+static bool ggml_cpu_ranges_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// the scratch of one thread: x quantized for the up and for the gate type
+static size_t ggml_cpu_moe_glu1_thread_size(const struct ggml_tensor * up, const struct ggml_tensor * gate) {
+    const int64_t n_embd = up->ne[0];
+    return GGML_PAD(ggml_row_size(type_traits_cpu[up->type].vec_dot_type, n_embd), CACHE_LINE_SIZE) +
+           GGML_PAD(ggml_row_size(type_traits_cpu[gate->type].vec_dot_type, n_embd), CACHE_LINE_SIZE);
+}
+
+static bool ggml_cpu_moe_glu1_match(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params,
+        struct ggml_tensor ** up_node, struct ggml_tensor ** gate_node) {
+    if (!ggml_cpu_moe_glu1_on()) {
+        return false;
+    }
+    const enum ggml_op ops[3] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+    const int outputs[1] = { node_n + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_n, 3, ops, outputs, 1)) {
+        return false;
+    }
+    struct ggml_tensor * n0  = cgraph->nodes[node_n];
+    struct ggml_tensor * n1  = cgraph->nodes[node_n + 1];
+    struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == NULL || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(glu)) {
+        return false;
+    }
+    struct ggml_tensor * gate = glu->src[0];
+    struct ggml_tensor * up   = glu->src[1];
+    if (!((gate == n0 && up == n1) || (gate == n1 && up == n0))) {
+        return false;
+    }
+    const struct ggml_tensor * x   = n0->src[1];
+    const struct ggml_tensor * ids = n0->src[2];
+    if (n1->src[1] != x || n1->src[2] != ids || x->type != GGML_TYPE_F32 || ggml_nrows(x) != 1 || ids->ne[1] != 1 ||
+        ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    const struct ggml_tensor * wu = up->src[0];
+    const struct ggml_tensor * wg = gate->src[0];
+    if (wu->ne[0] != x->ne[0] || wg->ne[0] != x->ne[0] || wu->ne[1] != wg->ne[1] || wu->ne[2] != wg->ne[2] ||
+        wu->nb[0] != ggml_type_size(wu->type) || wg->nb[0] != ggml_type_size(wg->type) ||
+        up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || glu->ne[0] != wu->ne[1] || glu->ne[1] != ids->ne[0] ||
+        type_traits_cpu[wu->type].vec_dot == NULL || type_traits_cpu[wg->type].vec_dot == NULL) {
+        return false;
+    }
+    if (ggml_cpu_extra_has_op(up) || ggml_cpu_extra_has_op(gate) || ggml_tiled_mm_forced() ||
+        ((up->flags | gate->flags) & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+        return false;
+    }
+    if (ggml_cpu_ranges_overlap(glu, x) || ggml_cpu_ranges_overlap(glu, ids) ||
+        params->wsize < (size_t) params->nth*ggml_cpu_moe_glu1_thread_size(wu, wg) + CACHE_LINE_SIZE) {
+        return false;
+    }
+    *up_node   = up;
+    *gate_node = gate;
+    return true;
+}
+
+static void ggml_compute_forward_moe_glu1(const struct ggml_compute_params * params, struct ggml_tensor * up,
+        struct ggml_tensor * gate, struct ggml_tensor * glu) {
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // the same page-cache read-ahead of the routed host experts as the two nodes would start
+    ggml_moe_prefetch_kernel_hook(up, ith);
+    ggml_moe_prefetch_kernel_hook(gate, ith);
+
+    const struct ggml_tensor * wu  = up->src[0];
+    const struct ggml_tensor * wg  = gate->src[0];
+    const struct ggml_tensor * x   = up->src[1];
+    const struct ggml_tensor * ids = up->src[2];
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t n_ff   = wu->ne[1];
+    const int     n_ids  = (int) ids->ne[0];
+    const int     n_as   = (int) wu->ne[2];
+
+    const enum ggml_type vdt_u = type_traits_cpu[wu->type].vec_dot_type;
+    const enum ggml_type vdt_g = type_traits_cpu[wg->type].vec_dot_type;
+    ggml_vec_dot_t const vec_dot_u = type_traits_cpu[wu->type].vec_dot;
+    ggml_vec_dot_t const vec_dot_g = type_traits_cpu[wg->type].vec_dot;
+
+    char * scratch = (char *) GGML_PAD((uintptr_t) params->wdata, CACHE_LINE_SIZE) + (size_t) ith*ggml_cpu_moe_glu1_thread_size(wu, wg);
+    char * xq_u    = scratch;
+    char * xq_g    = scratch + GGML_PAD(ggml_row_size(vdt_u, n_embd), CACHE_LINE_SIZE);
+
+    const void * xu = x->data;
+    const void * xg = x->data;
+    if (vdt_u != GGML_TYPE_F32) {
+        type_traits_cpu[vdt_u].from_float((const float *) x->data, xq_u, n_embd);
+        xu = xq_u;
+    }
+    if (vdt_g != GGML_TYPE_F32) {
+        if (vdt_g == vdt_u) {
+            xg = xu;
+        } else {
+            type_traits_cpu[vdt_g].from_float((const float *) x->data, xq_g, n_embd);
+            xg = xq_g;
+        }
+    }
+
+    const int64_t nblk   = (n_ff + GGML_CPU_MOE_GLU1_BLK - 1) / GGML_CPU_MOE_GLU1_BLK;
+    const int64_t n_item = (int64_t) n_ids*nblk;
+    // contiguous ranges of (expert, block) items per thread
+    const int64_t i0 = n_item*ith/nth;
+    const int64_t i1 = n_item*(ith + 1)/nth;
+
+    float gv[GGML_CPU_MOE_GLU1_BLK];
+    float uv[GGML_CPU_MOE_GLU1_BLK];
+    for (int64_t item = i0; item < i1; ++item) {
+        const int     id  = (int) (item / nblk);
+        const int64_t r0  = (item % nblk)*GGML_CPU_MOE_GLU1_BLK;
+        const int64_t r1  = MIN(r0 + GGML_CPU_MOE_GLU1_BLK, n_ff);
+        float * out = (float *) ((char *) glu->data + (size_t) id*glu->nb[1]) + r0;
+
+        const int32_t e = *(const int32_t *) ((const char *) ids->data + (size_t) id*ids->nb[0]);
+        assert(e == -1 || (e >= 0 && e < n_as));
+        GGML_UNUSED(n_as);
+        if (e < 0) {
+            // the graph zeroes both rows: swiglu(0, 0) = 0
+            memset(out, 0, (size_t) (r1 - r0)*sizeof(float));
+            continue;
+        }
+        const char * ru = (const char *) wu->data + (size_t) e*wu->nb[2];
+        const char * rg = (const char *) wg->data + (size_t) e*wg->nb[2];
+        for (int64_t r = r0; r < r1; ++r) {
+            vec_dot_g((int) n_embd, &gv[r - r0], 0, rg + (size_t) r*wg->nb[1], 0, xg, 0, 1);
+            vec_dot_u((int) n_embd, &uv[r - r0], 0, ru + (size_t) r*wu->nb[1], 0, xu, 0, 1);
+        }
+        ggml_vec_swiglu_f32((int) (r1 - r0), out, gv, uv);
+    }
+
+    // engagement: logged at 1, 1000 and 10^6 nodes; GGML_CPU_MOE_GLU1_LOG=1: every node (tests)
+    if (ith == 0) {
+        static atomic_int n_calls = 0;
+        static int log_all = -1;
+        if (log_all < 0) {
+            const char * e = getenv("GGML_CPU_MOE_GLU1_LOG");
+            log_all = e != NULL && atoi(e) != 0;
+        }
+        const int c = atomic_fetch_add_explicit(&n_calls, 1, memory_order_relaxed) + 1;
+        if (log_all || c == 1 || c == 1000 || c == 1000000) {
+            GGML_LOG_INFO("ggml_cpu: one-token up+gate+swiglu fused: %d nodes (GGML_CPU_MOE_GLU1=0 off)\n", c);
+        }
+    }
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -4457,6 +4634,15 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        struct ggml_tensor * up   = NULL;
+        struct ggml_tensor * gate = NULL;
+        if (ggml_cpu_moe_glu1_match(cgraph, node_n, params, &up, &gate)) {
+            ggml_compute_forward_moe_glu1(params, up, gate, cgraph->nodes[node_n + 2]);
+            return 2;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion

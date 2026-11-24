@@ -391,6 +391,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # flash attention with its KV length on the device vs the unpadded node, byte for byte (GPU; SKIP without one)
     llama_build(test-fa-kvlen-exact.cpp)
     llama_build(test-fa-kvlen-rows.cpp)   # small-batch flash attention with the device KV length, finite and against a reference
+    # a broadcast ADD of 2^32 elements on the GPU (size-1 dims with a stride past 32 bits; ~8.3 GiB of device memory, not in ctest)
+    llama_build(test-bin-bcast-large.cpp)
 
     # the SSD prompt-cache namespace covers the --override-kv metadata overrides (a restart with another override restored stale state)
     llama_build(test-server-prompt-ssd-ns.cpp)
@@ -765,6 +767,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-quantize-perf.cpp LINK ggml)
     llama_build_and_test(test-mmid-multi.cpp LINK ggml)
     llama_build_and_test(test-moe-host-ffn.cpp LINK ggml)
+    # the one-token MoE up + gate + SwiGLU fusion vs the unfused nodes, byte for byte
+    llama_build_and_test(test-moe-glu1-exact.cpp LINK ggml)
     llama_build_and_test(test-q8k-exact.cpp LINK ggml)
     llama_build_and_test(test-rope.cpp LINK ggml)
     llama_build_and_test(test-col2im-1d.cpp LINK ggml)
