@@ -2110,9 +2110,9 @@ static void mmq_exact_cvt_count(const ggml_type type) {
 }
 
 // GGML_CUDA_MMQ_JT_OUTER: the column-tile-outermost stream-k order of the dense J = 128 products (mmq_tile_indices).
-// Unset = on for NVIDIA devices with at most 64 SMs (T4 40, L4 58: several tiles per block at prefill ubatches, L2 shared),
-// off on larger ones (A100 108, RTX PRO 6000 188: measured level); 0 = off everywhere, 1 = on for every NVIDIA device.
-// Engagement: the launches in that order, logged at 1, 10, 100, ...
+// Unset = on for the A100 (cc 8.0 exactly) only: Qwen3.8-27B prefill at ub 512 +1.7% there, level at ub 2048. Off elsewhere: level on
+// T4 (40 SMs) and L4 (58 SMs), -0.6% on the RTX PRO 6000 at ub 512. 0 = off everywhere, 1 = on for every NVIDIA device.
+// Engagement: the launches in that order, logged at 1, 10, 100, ... (one counter per type)
 static bool mmq_jt_outer_on(const int cc, const int nsm) {
     static const int env = [] {
         const char * e = getenv("GGML_CUDA_MMQ_JT_OUTER");
@@ -2121,8 +2121,8 @@ static bool mmq_jt_outer_on(const int cc, const int nsm) {
     if (env >= 0) {
         return env != 0;
     }
-    GGML_UNUSED(cc);
-    return nsm <= 64;
+    GGML_UNUSED(nsm);
+    return cc == GGML_CUDA_CC_AMPERE;
 }
 
 static void mmq_jt_outer_count() {
