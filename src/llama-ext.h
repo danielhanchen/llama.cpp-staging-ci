@@ -157,6 +157,10 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // output of plain decoding. Prompt batches and single token decodes are not affected.
 LLAMA_API void llama_set_verify(struct llama_context * ctx, bool value);
 
+// The next decodes (until cleared again) run without the backends' CUDA graph bookkeeping: each graph is computed once, the same
+// kernels in the same order, and no graph entry is warmed up or captured for it (for a ubatch shape the caller knows is not repeated)
+LLAMA_API void llama_set_graph_records_skip(struct llama_context * ctx, bool value);
+
 // (LLAMA_LM_CKPT_MERGE): the next llama_decode() of a single sequence batch ends ubatches at these batch indices (each segment is split as
 // a batch of its own would be: the same ubatches as separate decode() calls, in one layer-major group); cleared by that call
 LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t * breaks, int32_t n);
@@ -278,6 +282,8 @@ LLAMA_API int32_t llama_moe_cache_tokens(const struct llama_context * ctx);
 LLAMA_API int64_t llama_moe_cache_trial_batches(const struct llama_context * ctx);
 // the cached share of the MoE cache's host expert bytes (0..1), -1 without a cache or before its slots are sized
 LLAMA_API double llama_moe_cache_frac(const struct llama_context * ctx);
+// the MoE cache's host tier reads its experts from the disk (the mapped host weights exceed the available RAM); false without a cache
+LLAMA_API bool llama_moe_cache_disk_tier(const struct llama_context * ctx);
 // a MoE cache that holds at least LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC (0.6; 0 = off, as before) of its host expert bytes
 // keeps the verify graphs of a no-cache target: the server prewarms every verify width at load (server_spec_prewarm, as
 // LLAMA_SPEC_PREWARM_CACHED=1) and device KV buckets are at least 16384 cells, so a request replays the captured widths

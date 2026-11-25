@@ -191,7 +191,8 @@ static bool server_spec_dflash_mid(const common_params_speculative & sp) {
     return (ew == nullptr || atoi(ew) != 0) && (ecw == nullptr || atoi(ecw) != 0);
 }
 
-static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max, const std::vector<llama_sampler *> & chains_all,
+// returns true when the DFlash2 cached-window prewarm (LLAMA_SPEC_PREWARM_MID) ran
+static bool server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max, const std::vector<llama_sampler *> & chains_all,
         llama_sampler * restore, bool restore_raw, bool varied_widths, bool dflash_mid) {
     const char * e = getenv("LLAMA_SPEC_PREWARM");
     int w_max = e != nullptr ? std::max(0, std::min(8, atoi(e))) : (gpu ? 8 : 0);
@@ -233,7 +234,10 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // its lending headroom (more slots lent, other text, +45 ms TTFT)
     static const bool mid_env = getenv("LLAMA_SPEC_PREWARM_MID") == nullptr || atoi(getenv("LLAMA_SPEC_PREWARM_MID")) != 0;
     const double dflash_mid_lo = getenv("LLAMA_DFLASH_CACHED_FRAC_MIN") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MIN")) : 0.20;
-    const bool mid = mid_env && dflash_mid && !wide_graphs && !band_ok && llama_moe_cache_active(ctx) && cache_frac >= dflash_mid_lo &&
+    // not beside a disk tier (the host experts read from the disk): there the prewarm's windows move the RAM tier's experts, and L4
+    // Flash-Next 4-bit full card (24.8% cached) lost 5..7% of 2k / 8k decode, +2.4 / +8 s of 2k / 8k TTFT and +97 s of load with it
+    const bool mid_disk = llama_moe_cache_disk_tier(ctx);
+    const bool mid = mid_env && dflash_mid && !wide_graphs && !band_ok && !mid_disk && llama_moe_cache_active(ctx) && cache_frac >= dflash_mid_lo &&
         cache_frac < cached_frac_min && w_max >= std::max(cached_min_w, 4) && getenv("LLAMA_SPEC_PREWARM_CACHED") == nullptr &&
         getenv("LLAMA_SPEC_PREWARM_WIDTHS") == nullptr;
     const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0 :
@@ -283,7 +287,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     const int  n_end    = n_pre + n_forms*n_chain*reps*sum_w;
     if (widths.empty() || ctx == nullptr || (llama_moe_cache_active(ctx) && !cached_ok) ||
             llama_n_batch(ctx) < (uint32_t) std::max(w_max, std::min(n_pre, 1)) || (int) llama_n_ctx_seq(ctx) < n_end + 64) {
-        return;
+        return false;
     }
     if (mid) {
         SRV_INF("decode and verify graphs of the DFlash2 cached window (1, 3 and %d rows, greedy chain) prewarmed beside a MoE cache that holds %.1f%% of "
@@ -440,6 +444,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     llama_moe_cache_fingerprint(ctx, "after the prewarm");
     SRV_INF("the decode / verify graphs of 1..%d rows warmed up after a %d-token prompt, %d decodes each, %d sampler chain(s) (%.1f ms; LLAMA_SPEC_PREWARM=0: off)\n",
             n_ok, n_pre, reps, (int) chains.size(), (ggml_time_us() - t0)/1000.0);
+    return mid && ok;
 }
 
 // see server_slot::get_n_draft_max (default on, LLAMA_SPEC_END_FULL_WINDOW=0: the draft is cut to the tokens left as before)
@@ -1820,6 +1825,9 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 
 struct server_context_impl {
     friend struct server_context;
+
+    // the DFlash2 cached-window prewarm ran at load (server_spec_prewarm, LLAMA_SPEC_PREWARM_MID)
+    bool spec_mid_prewarmed = false;
 
 public:
     // only use these pointers outside of this class:
@@ -3397,7 +3405,7 @@ private:
                     }
                 }
             }
-            server_spec_prewarm(ctx_tgt, llama_supports_gpu_offload() && params_base.n_gpu_layers != 0,
+            spec_mid_prewarmed = server_spec_prewarm(ctx_tgt, llama_supports_gpu_offload() && params_base.n_gpu_layers != 0,
                 params_base.n_outputs_max_per_seq > 0 ? params_base.n_outputs_max_per_seq : params_base.n_outputs_max,
                 chains, s0.smpl_dev.get(), true, server_spec_varied_widths(params_base.speculative, ctx_tgt),
                 server_spec_dflash_mid(params_base.speculative));
@@ -7037,8 +7045,33 @@ private:
             srv_pass_timer().stamp(server_pass_timer::DEC0);
             srv_pass_timer().width = batch.view.size();
         }
+        // beside the DFlash2 cached-window prewarm, a prompt's last few tokens (the separate pass before its end checkpoint) run
+        // without CUDA graph bookkeeping: that shape is computed once per prompt, and with the prewarm's graph layout two prompts' tails
+        // could match, so the second one was captured for its only launch (RTX PRO 6000 Flash-Next 4-bit 24 GB, 2k prompt: +10 ms in the
+        // tail's launch, +15 ms TTFT). The same kernels in the same order. LLAMA_SPEC_PREWARM_MID_TAIL=0: bookkeeping as before
+        static const bool mid_tail_env = getenv("LLAMA_SPEC_PREWARM_MID_TAIL") == nullptr || atoi(getenv("LLAMA_SPEC_PREWARM_MID_TAIL")) != 0;
+        bool tail_skip = false;
+        if (mid_tail_env && spec_mid_prewarmed && has_prompt && batch.view.size() <= 4 && off + batch.view.size() == (int) batch.tokens.size() &&
+                batch.tokens[off].pos[0] >= 4) {
+            tail_skip = true;
+            for (int i = off; tail_skip && i < off + batch.view.size(); ++i) {
+                tail_skip = batch.tokens[i].is_prompt && batch.tokens[i].id_slot == batch.tokens[off].id_slot;
+            }
+        }
+        if (tail_skip) {
+            static bool tail_logged = false;
+            if (!tail_logged) {
+                tail_logged = true;
+                SRV_INF("prompt tails of up to 4 tokens run without CUDA graph bookkeeping beside the DFlash2 cached-window prewarm (%d tokens at %d; "
+                        "LLAMA_SPEC_PREWARM_MID_TAIL=0: off)\n", batch.view.size(), (int) batch.tokens[off].pos[0]);
+            }
+            llama_set_graph_records_skip(ctx_tgt, true);
+        }
         srv_yield_or_run(queue_tasks, batch.view.size() <= 32, [&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            if (tail_skip) {
+                llama_set_graph_records_skip(ctx_tgt, false);
+            }
             srv_ph("target returned");
             if (pt_on) {
                 srv_pass_timer().stamp(server_pass_timer::DEC1);

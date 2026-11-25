@@ -5710,7 +5710,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     compute_n_tokens = ubatch.n_tokens;
     const int64_t t_ub2 = ub_timing ? ggml_time_us() : 0;
+    if (graph_records_skip) {
+        backend_graph_skip_records(true);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (graph_records_skip) {
+        backend_graph_skip_records(false);
+    }
     // (debug): LLAMA_KQ_MASK_DUMP=1 counts the kept cells of each device-built KQ mask (marked as an output by the builder)
     static const bool kq_mask_dump = getenv("LLAMA_KQ_MASK_DUMP") != nullptr;
     if (kq_mask_dump) {
@@ -8443,7 +8449,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         const auto st = graph_compute(g, true);
         llama_phase("compute queued");
         if (!lm_graph_records) {
-            lm_graph_skip(false);
+            lm_graph_skip(graph_records_skip);
         }
         if (lm_seed_async && !lm_pending.empty()) {
             // the layers whose copies the graph queued last (their staging slots hold the copies until the next graph)
@@ -13552,6 +13558,21 @@ void llama_set_verify(llama_context * ctx, bool value) {
     ctx->set_verify(value);
 }
 
+void llama_set_graph_records_skip(llama_context * ctx, bool value) {
+    ctx->set_graph_records_skip(value);
+}
+
+void llama_context::backend_graph_skip_records(bool on) {
+    for (auto & bk : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_skip_records") : nullptr;
+        if (fn != nullptr) {
+            fn(bk, on);
+        }
+    }
+}
+
 void llama_context::set_ubatch_breaks(const int32_t * breaks, int32_t n) {
     ubatch_breaks_next.assign(breaks, breaks + std::max(0, n));
 }
@@ -14067,6 +14088,10 @@ double llama_moe_cache_frac(const llama_context * ctx) {
         return -1.0;
     }
     return ctx->get_moe_cache()->cache_frac();
+}
+
+bool llama_moe_cache_disk_tier(const llama_context * ctx) {
+    return ctx != nullptr && ctx->get_moe_cache() != nullptr && ctx->get_moe_cache()->host_disk_tier();
 }
 
 bool llama_prepare_prompt_plan(llama_context * ctx) {

@@ -200,6 +200,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_verify(bool value);
+    void set_graph_records_skip(bool value) { graph_records_skip = value; } // llama_set_graph_records_skip
     void set_verify_exact(bool value);
     bool get_verify_exact() const; //
     bool restore_pp_plan(bool idle = false); // (see the definition); idle: from llama_prepare_prompt_plan
@@ -959,6 +960,8 @@ private:
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;
+    bool graph_records_skip = false; // the next decodes run without CUDA graph bookkeeping (llama_set_graph_records_skip)
+    void backend_graph_skip_records(bool on);
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
     std::vector<size_t>                     backend_lend_freed;   // of a measurement, the compute lending frees (see sched_reserve)
