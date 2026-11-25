@@ -1043,13 +1043,14 @@ bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * 
 
 // GGML_CUDA_MMQ_FEW_MOE: few-row MMQ for MUL_MAT_ID (one column group of up to 8 tokens per expert and CUDA block) from the first
 // token count above the MoE mat-vec kernels (ggml_cuda_mmvq_mmid_max_batch + 1) up to GGML_CUDA_MMQ_FEW_MOE_MAX (default 24) tokens,
-// instead of MMQ. Unset = AUTO: NVIDIA cc 8.0 .. 8.9 and 10.x; off on cc 12.x (the dense few-row MMQ lost there), on other devices
-// and on HIP / MUSA (no kernel). 0 = off (MMQ as before, bit for bit), 1 = on every device the kernel supports (Ampere and newer).
+// instead of MMQ. Unset / 0 = off (MMQ as before, bit for bit): opt-in until its accuracy is gated where it engages (multi-slot
+// decode). -1 = AUTO: NVIDIA cc 8.0 .. 8.9 and 10.x; off on cc 12.x, on other devices and on HIP / MUSA (no kernel).
+// 1 = on every device the kernel supports (Ampere and newer).
 // Not bit-identical to MMQ (another int8 tiling and float summation order of each output).
 struct mmq_few_moe_env_t { int mode; int max_cols; };
 static const mmq_few_moe_env_t & mmq_few_moe_env() {
     static const mmq_few_moe_env_t e = [] {
-        mmq_few_moe_env_t r = { -1, MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS };
+        mmq_few_moe_env_t r = { 0, MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS };
         if (const char * v = getenv("GGML_CUDA_MMQ_FEW_MOE")) {
             r.mode = atoi(v);
         }
