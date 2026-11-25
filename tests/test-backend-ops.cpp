@@ -14872,6 +14872,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+        // verify windows on the few-row MMQ (K >= 2048; A100 default, elsewhere GGML_CUDA_MMQ_FEW=1): its multi-matrix launch of Q / K
+        // (pattern 0, 3) and the src1 pack shared with a product of another type (pattern 2: V is Q6_K)
+        for (int64_t m : { 3, 5, 8 }) {
+            for (int pattern : { 0, 2, 3 }) {
+                test_cases.emplace_back(new test_mul_mat_vec_multi(type, m, 2560, pattern, true));
+            }
+        }
         // a K the small-K single column launch takes, and a long K
         test_cases.emplace_back(new test_mul_mat_vec_multi(type, 1, 256, 0, false));
         test_cases.emplace_back(new test_mul_mat_vec_multi(type, 3, 2560, 1, false));
