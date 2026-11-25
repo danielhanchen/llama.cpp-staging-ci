@@ -365,18 +365,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int ql = get_int_b2(bxi->qs, kqsx);
         const int qh = get_int_b2(bxi->qh, 0) >> (4 * kqsx);
 
-        int qs0 = (ql >>  0)   & 0x0F0F0F0F;
-        qs0    |= (qh <<  4)   & 0x00000010;  // 0 ->  4
-        qs0    |= (qh << 11)   & 0x00001000;  // 1 -> 12
-        qs0    |= (qh << 18)   & 0x00100000;  // 2 -> 20
-        qs0    |= (qh << 25)   & 0x10000000;  // 3 -> 28
+        int qs0 = ((ql >>  0)  & 0x0F0F0F0F) | q5_0_hbits_lo(qh); // qh bits 0..3 -> bits 4 / 12 / 20 / 28
         qs0     = __vsub4(qs0, 0x10101010); // subtract 16
 
-        int qs1 = (ql >>  4)   & 0x0F0F0F0F;
-        qs1    |= (qh >> 12)   & 0x00000010;  // 16 ->  4
-        qs1    |= (qh >>  5)   & 0x00001000;  // 17 -> 12
-        qs1    |= (qh <<  2)   & 0x00100000;  // 18 -> 20
-        qs1    |= (qh <<  9)   & 0x10000000;  // 19 -> 28
+        int qs1 = ((ql >>  4)  & 0x0F0F0F0F) | q5_0_hbits_hi(qh); // qh bits 16..19 -> bits 4 / 12 / 20 / 28
         qs1     = __vsub4(qs1, 0x10101010); // subtract 16
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)

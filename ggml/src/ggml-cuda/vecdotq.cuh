@@ -137,6 +137,30 @@ static __device__ __forceinline__ void iq_apply_ksigns(const uint8_t v, const in
 #endif // GGML_CUDA_IQ_SIGN_MUL
 }
 
+// GGML_CUDA_Q5_0_HMUL=0 at compile time: the per-bit shift / and / or high-bit expansion below instead of the multiply form
+#ifndef GGML_CUDA_Q5_0_HMUL
+#define GGML_CUDA_Q5_0_HMUL 1
+#endif
+
+// Q5_0 5th bits: bit k (k = 0..3) of qh moved to bit 4 of byte k. The 4 partial products of the nibble with 0x02040810 land on
+// distinct single bits (no carries), so after the mask the int is that of the four shift / and / or terms, in fewer instructions
+static __device__ __forceinline__ int q5_0_hbits_lo(const int qh) {
+#if GGML_CUDA_Q5_0_HMUL
+    return (int) (((uint32_t) qh & 0x0Fu) * 0x02040810u) & 0x10101010;
+#else
+    return ((qh << 4) & 0x00000010) | ((qh << 11) & 0x00001000) | ((qh << 18) & 0x00100000) | ((qh << 25) & 0x10000000);
+#endif // GGML_CUDA_Q5_0_HMUL
+}
+
+// the same for bits 16..19 of qh
+static __device__ __forceinline__ int q5_0_hbits_hi(const int qh) {
+#if GGML_CUDA_Q5_0_HMUL
+    return (int) ((((uint32_t) qh >> 16) & 0x0Fu) * 0x02040810u) & 0x10101010;
+#else
+    return ((qh >> 12) & 0x00000010) | ((qh >> 5) & 0x00001000) | ((qh << 2) & 0x00100000) | ((qh << 9) & 0x10000000);
+#endif // GGML_CUDA_Q5_0_HMUL
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -213,18 +237,12 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_imp
 
 #pragma unroll
     for (int i = 0; i < vdr; ++i) {
-        int vi0 = (vl[i] >>  0) & 0x0F0F0F0F; // lower 4 qs bits, still need qh as 5th bits
-        vi0    |= (vh[i] <<  4) & 0x00000010; // 0 ->  4
-        vi0    |= (vh[i] << 11) & 0x00001000; // 1 -> 12
-        vi0    |= (vh[i] << 18) & 0x00100000; // 2 -> 20
-        vi0    |= (vh[i] << 25) & 0x10000000; // 3 -> 28
+        // lower 4 qs bits with qh bits 0..3 as 5th bits
+        const int vi0 = ((vl[i] >>  0) & 0x0F0F0F0F) | q5_0_hbits_lo(vh[i]);
         sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi); // SIMD dot product of quantized values
 
-        int vi1 = (vl[i] >>  4) & 0x0F0F0F0F; // upper 4 qs bits, still need qh as 5th bits
-        vi1    |= (vh[i] >> 12) & 0x00000010; // 16 ->  4
-        vi1    |= (vh[i] >>  5) & 0x00001000; // 17 -> 12
-        vi1    |= (vh[i] <<  2) & 0x00100000; // 18 -> 20
-        vi1    |= (vh[i] <<  9) & 0x10000000; // 19 -> 28
+        // upper 4 qs bits with qh bits 16..19 as 5th bits
+        const int vi1 = ((vl[i] >>  4) & 0x0F0F0F0F) | q5_0_hbits_hi(vh[i]);
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
     }
 
