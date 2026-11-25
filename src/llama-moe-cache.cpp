@@ -9202,6 +9202,17 @@ struct llama_moe_cache::impl {
     // prompt measures the previous request's decode right after its own prompt seeded the cache (0.4-0.7% on RTX PRO 6000, Flash-Next at
     // 4 bits capped at 48 GB, 67% cached), which turned the host path off for every prompt size although the chat prompt then misses
     // about a third of its experts
+    // LLAMA_MOE_CPU_MISS_SHORT_SHARE=f (0 < f < 1; unset: the rule's share, at most 1/4): the fetch share of a short prompt's batches on
+    // the host path. The fetched misses are admitted to the cache, the host-computed ones are not, so the decode after the prompt hits
+    // less at a small share
+    static float short_share() {
+        static const float f = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT_SHARE");
+            const double v = e != nullptr ? atof(e) : -1.0;
+            return v > 0.0 && v < 1.0 ? (float) v : -1.0f;
+        }();
+        return f;
+    }
     static bool short_prior_on() {
         static const bool on = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT_PRIOR");
@@ -9225,7 +9236,7 @@ struct llama_moe_cache::impl {
                 const double  D    = cm_distinct(n_tokens, n_expert);
                 const double  tbar = std::max(1.0, (double) n_tokens*std::min<int64_t>(n_expert_used, n_expert)/std::max(1.0, D));
                 const double  tc   = cm_t1 + (tbar - 1.0)*cm_dt;
-                const double  f    = std::min(cm_share[n_tokens], 0.25f);
+                const double  f    = short_share() > 0.0f ? short_share() : std::min(cm_share[n_tokens], 0.25f);
                 const double  gain = rate*D*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
                 const bool    fits = std::min<int64_t>(n_tokens*n_expert_used, n_expert) <= g.n_slots;
                 return fits && gain > cm_margin_p*(cm_split + n_tokens*cm_act);
@@ -9346,7 +9357,7 @@ struct llama_moe_cache::impl {
             return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
         }
         if (short_eligible(n_tokens) && !cm_prompt_ok()) {
-            return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
+            return short_share() > 0.0f ? short_share() : cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
         }
         if (pt_eligible(n_tokens)) {
             // the fetch share of the earlier prompt path: at most 1/4 (its fetched misses are read by the zero-copy kernel, slower than the DMA
