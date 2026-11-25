@@ -2560,6 +2560,22 @@ static constexpr bool mmvq_moe_unroll_type(const ggml_type type) {
     }
 }
 
+// GGML_CUDA_MOE_Q5_0_RPB (default 1; 0 = off): the Q5_0 experts (the Flash-Next downs) also take the 4 / 8 rows per warp block rules of
+// mul_mat_vec_q_moe_launch, on sm_80 only (mmvq_moe_ampere: elsewhere the old 2-row blocks); a row's sum is its own there (the same
+// lanes, K order and reduction), so every output keeps its bytes
+static bool mmvq_moe_q5_0_rpb_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MOE_Q5_0_RPB");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// the types with the 4 / 8 rows per warp block instances of mul_mat_vec_q_moe
+static constexpr bool mmvq_moe_rpb_type(const ggml_type type) {
+    return mmvq_moe_unroll_type(type) || type == GGML_TYPE_Q5_0;
+}
+
 // GGML_CUDA_MOE_AMPERE (default 1; 0 = the Blackwell-tuned shapes there too): on sm_80 (A100; measured there only, sm_86 /
 // sm_87 keep the old rules) the multi-token MoE mat-vecs pick other shapes of the same kernels, every one bitwise the kernel it replaces
 // (test-moe-bw-exact on A100: rpb8_g0 / bw1 / vl16_4 0 floats differ). A100 microbench (test-moe-bw-exact --bench, Flash-Next shapes,
@@ -2651,24 +2667,35 @@ static void mul_mat_vec_q_moe_launch(
         return e == nullptr ? 0 : atoi(e);
     }();
     int rpb_moe = rpb_env;
-    if constexpr (mmvq_moe_unroll_type(type)) {
+    if constexpr (mmvq_moe_rpb_type(type)) {
         if (rpb_moe == 0) {
             constexpr int qk  = ggml_cuda_type_traits<type>::qk;
             constexpr int qi  = ggml_cuda_type_traits<type>::qi;
             constexpr int vdr = get_vdr_mmvq(type);
             const int bpi   = vdr * warp_size / qi;
             const int iters = (ncols_x / qk + bpi - 1) / bpi;
-            rpb_moe = !has_fusion && iters <= 2 && ncols_dst >= 2 && ncols_dst <= 4 ? 4 : 2;
-            // sm_80, 5..8 tokens: 8 rows per warp block
             const int cc_rpb = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            if (!has_fusion && iters <= 2 && ncols_dst >= 5 && ncols_dst <= 8 && mmvq_moe_ampere(cc_rpb) && nrows_x % 8 == 0 &&
+            // Q5_0: the rules below on sm_80 only
+            const bool rules = mmvq_moe_unroll_type(type) || (mmvq_moe_q5_0_rpb_on() && mmvq_moe_ampere(cc_rpb));
+            rpb_moe = rules && !has_fusion && iters <= 2 && ncols_dst >= 2 && ncols_dst <= 4 ? 4 : 2;
+            // sm_80, 5..8 tokens: 8 rows per warp block
+            if (rules && !has_fusion && iters <= 2 && ncols_dst >= 5 && ncols_dst <= 8 && mmvq_moe_ampere(cc_rpb) && nrows_x % 8 == 0 &&
                     fusion.shared_up == nullptr) {
                 rpb_moe = 8;
                 mmvq_moe_ampere_log("8 rows per warp block", type, (int) ncols_dst);
             }
+            if constexpr (type == GGML_TYPE_Q5_0) {
+                if (rpb_moe != 2) {
+                    static std::once_flag once_q5;
+                    std::call_once(once_q5, [&] {
+                        GGML_LOG_INFO("MoE mat-vec: Q5_0 experts in %d-row warp blocks engaged (first: %d tokens; GGML_CUDA_MOE_Q5_0_RPB=0 off)\n",
+                            rpb_moe, (int) ncols_dst);
+                    });
+                }
+            }
         }
     }
-    if constexpr (mmvq_moe_unroll_type(type)) {
+    if constexpr (mmvq_moe_rpb_type(type)) {
         if ((rpb_moe == 4 || rpb_moe == 8) && nrows_x % rpb_moe == 0 && fusion.shared_up == nullptr) {
             const dim3 block_nums_r(nrows_x / rpb_moe, nchannels_dst);
             const ggml_cuda_kernel_launch_params launch_params_r = ggml_cuda_kernel_launch_params(block_nums_r, block_dims, 0, stream);
