@@ -1128,15 +1128,16 @@ float common_dflash_p_cum_default(const llama_context * ctx_tgt) {
     return common_all_gpus_cc12() ? 0.35f : 0.0f;
 }
 
-// LLAMA_DFLASH_EV_CC12 (default 1; 0 = the rules before: the 0.35 cumulative-probability cut without a MoE cache, the measured EV
-// window beside one): where every GPU is compute capability 12.x, the DFlash2 window that maximises the expected tokens per ms from
-// a fixed table of pass ms by verify width (the drafter and host part included) and the selector calibration of LLAMA_DFLASH_EV. Two
-// tables, measured on an RTX PRO 6000 (Qwen3.8-Flash-Next at 4 bits, DFlash2 n6, every width timed at the same positions of a chat,
-// a 2k and an 8k request): without a MoE cache (whole model on the card) and beside a cache that holds most of the host experts (48 GB).
-// The 4-row verify costs as much as the 5-row one there (its F32 products stay on the 1..4-row kernels), and beside the cache it costs
-// more than 5..7 rows, so the table never prefers it. The measured window instead learned its costs from the passes it ran: a width
-// first measured in its graph-building passes or in a slow stretch kept that cost (the 7-row window priced at 57-69 ms after a 2k
-// request at 48 GB, every later 8k pass then at 3 rows), and the shape prior it falls back to underprices the wide widths there.
+// LLAMA_DFLASH_EV_CC12 (default 1; 0 = off): where every GPU is compute capability 12.x and the target has no MoE cache, the DFlash2
+// window that maximises the expected tokens per ms from a fixed table of pass ms by verify width (the drafter and host part included)
+// and the selector calibration of LLAMA_DFLASH_EV replaces the 0.35 cumulative-probability cut. The table was measured on an RTX PRO
+// 6000 (Qwen3.8-Flash-Next at 4 bits, DFlash2 n6, every width timed at the same positions of a chat, a 2k and an 8k request): the
+// 4-row verify costs as much as the 5-row one (its F32 products stay on the 1..4-row kernels), so the table never prefers it, and a
+// 7-row pass costs ~4.4 ms more than a 3-row one. Same card and request set, 6 interleaved launches: chat 404.7 -> 410.5 tok/s (same
+// text, 4.65 -> 4.74 tokens per pass), 2k 167.7 -> 179.5, 8k 255.7 -> 268.2 (other texts); the 48-prompt long-context KLD check
+// against the -fa off band: decode mean 0.0012 / p99 0.011 / max 0.038 vs 0.0029 / 0.021 / 0.055, paired per-prompt difference
+// -0.0027 [-0.0034, -0.0022]. =2 also beside a MoE cache that holds most of the host experts, in place of the measured EV window, with
+// the second table (opt-in: at 48 GB 8k 212.8 -> 239.3 but chat 320.2 -> 311.6, more 7-row passes for the same tokens).
 // LLAMA_DFLASH_EV_CC12_COST / LLAMA_DFLASH_EV_CC12_COST_CACHED = "c_1,..,c_7" (ms) replace the tables
 static const std::vector<float> & common_dflash_ev_cc12_cost(bool cached) {
     static const auto parse = [](const char * name, std::vector<float> def) {
@@ -1164,12 +1165,14 @@ static const std::vector<float> & common_dflash_ev_cc12_cost(bool cached) {
     return cached ? c_cached : c_full;
 }
 
-static bool common_dflash_ev_cc12_on() {
-    static const bool on = [] {
+// 0 = off, 1 = without a MoE cache (default), 2 = also beside one
+static int common_dflash_ev_cc12_mode() {
+    static const int m = [] {
         const char * e = getenv("LLAMA_DFLASH_EV_CC12");
-        return (e == nullptr || atoi(e) != 0) && common_all_gpus_cc12();
+        const int v = e == nullptr ? 1 : atoi(e);
+        return common_all_gpus_cc12() ? std::max(0, std::min(2, v)) : 0;
     }();
-    return on;
+    return m;
 }
 
 // every GPU is compute capability 8.0 (and there is at least one)
@@ -2044,15 +2047,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         (eva_sm80 || !common_all_gpus_cc80())));
                 // the fixed-table window of compute capability 12.x (common_dflash_ev_cc12_cost) where the 0.35 cut or the measured
                 // EV window would run by default
-                const bool use_evd_full   = p_cum_def > 0.0f && p_cum_min < 0.0f && common_dflash_ev_cc12_on();
-                const bool use_evd_cached = use_eva && !df2_meas && eva_mode() == 2 && common_dflash_ev_cc12_on();
+                const bool use_evd_full   = p_cum_def > 0.0f && p_cum_min < 0.0f && common_dflash_ev_cc12_mode() >= 1;
+                const bool use_evd_cached = use_eva && !df2_meas && eva_mode() == 2 && common_dflash_ev_cc12_mode() == 2;
                 const bool use_evd = is_dflash2 && !use_ev && !use_df2w && (use_evd_full || use_evd_cached);
                 if (use_evd) {
                     use_eva = false;
                     static bool logged_evd = false;
                     if (!logged_evd) {
                         logged_evd = true;
-                        LOG_INF("DFlash2 window by expected tokens per ms from the compute capability 12.x pass costs (%s; LLAMA_DFLASH_EV_CC12=0 off)\n",
+                        LOG_INF("DFlash2 window by expected tokens per ms from the compute capability 12.x pass costs (%s; LLAMA_DFLASH_EV_CC12=0 off, =2 also beside a MoE cache)\n",
                                 use_evd_cached ? "beside the MoE cache" : "no MoE cache");
                     }
                 }
