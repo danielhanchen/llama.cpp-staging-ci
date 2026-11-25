@@ -922,8 +922,8 @@ typedef void (*ggml_cuda_mmq_vec_dot_live_t)(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max);
 
 // the types with the live (dead-column skip) form: the q8_0 mma vec_dot of the exact-product types, NVIDIA only. The skip acts on
-// the 8-column groups of the y tile, whatever the block size of the weights: also the 256-value types that take that vec_dot
-// (IQ2_XXS / IQ3_XXS / IQ3_S / IQ4_XS)
+// the 8-column groups of the y tile, whatever the block size of the weights: also the types without 32-value blocks that take that
+// vec_dot (IQ2_XXS / IQ3_XXS / IQ3_S / IQ4_XS, Q2_0; their host flag is opt-in, GGML_CUDA_MMQ_DEAD_SKIP_QK)
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 static constexpr __device__ bool ggml_cuda_mmq_dead_type() {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -2358,8 +2358,13 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             prec_src1 == GGML_PREC_Q8 && ggml_cuda_mmq_get_K_vram(type, J, fallback, cc, prec_src1) == 2*4*QK8_1) {
         static const bool dead_on  = mmq_pad_env("GGML_CUDA_MMQ_DEAD_SKIP");
         static const bool ktail_on = mmq_pad_env("GGML_CUDA_MMQ_KTAIL");
-        // GGML_CUDA_MMQ_DEAD_SKIP_QK (unset = on, 0 = off): the dead-column skip also for the 256-value types (ggml_cuda_mmq_dead_type)
-        static const bool dead_qk_on = mmq_pad_env("GGML_CUDA_MMQ_DEAD_SKIP_QK");
+        // GGML_CUDA_MMQ_DEAD_SKIP_QK (opt-in, unset / 0 = off, 1 = on): the dead-column skip also for the types whose blocks are not 32
+        // values (ggml_cuda_mmq_dead_type: IQ2_XXS / IQ3_XXS / IQ3_S / IQ4_XS, Q2_0). Bit-identical, but Flash-Next 8k prompts took
+        // 7..9 ms longer with it on the RTX PRO 6000 and were level on the A100 (MoE gate / up loads bound the IQ kernels)
+        static const bool dead_qk_on = [] {
+            const char * e = getenv("GGML_CUDA_MMQ_DEAD_SKIP_QK");
+            return e != nullptr && atoi(e) != 0;
+        }();
         static std::atomic<int64_t> n_dead{0};
         static std::atomic<int64_t> n_dead_qk{0};
         static std::atomic<int64_t> n_ktail{0};
@@ -2372,7 +2377,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             if (qk32) {
                 mmq_pad_count(n_dead, "dead-column skip", "GGML_CUDA_MMQ_DEAD_SKIP", type, args.ncols_x);
             } else {
-                mmq_pad_count(n_dead_qk, "dead-column skip of a 256-value type", "GGML_CUDA_MMQ_DEAD_SKIP_QK", type, args.ncols_x);
+                mmq_pad_count(n_dead_qk, "dead-column skip of a type without 32-value blocks", "GGML_CUDA_MMQ_DEAD_SKIP_QK", type, args.ncols_x);
             }
         }
         const int64_t krem = args.ncols_x % (2*4*QK8_1);
