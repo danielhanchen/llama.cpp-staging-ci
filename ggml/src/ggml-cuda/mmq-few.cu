@@ -1159,12 +1159,12 @@ void ggml_cuda_mul_mat_q_few_id(ggml_backend_cuda_context & ctx, const ggml_tens
 // the src1 quantization of the few-row MMQ
 // Stores the 4 values xi of a thread, values [iu, iu + 4) of column g in a unit of 256 values, in the column group yg of the unit.
 template <mmq_q8_1_ds_layout ds_layout>
-static __device__ __forceinline__ void quantize_mmq_few_store(const float4 xi, int4 * yg, const int iu, const int g) {
+static __device__ __forceinline__ void quantize_mmq_few_store(const float4 xi, int4 * yg, const int iu, const int g, const bool exact) {
     // the 32 values of a sub-block are held by 8 threads
     float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
     amax = warp_reduce_max<8>(amax);
 
-    const float d_inv = 127.0f / amax;
+    const float d_inv = ggml_cuda_q8_1_d_inv(amax, exact, ds_layout != MMQ_Q8_1_DS_LAYOUT_D4);
     char4 q;
     q.x = roundf(xi.x*d_inv);
     q.y = roundf(xi.y*d_inv);
@@ -1172,10 +1172,10 @@ static __device__ __forceinline__ void quantize_mmq_few_store(const float4 xi, i
     q.w = roundf(xi.w*d_inv);
     const float d = 1.0f / d_inv;
 
-    // as in quantize_mmq_q8_1: the sum of the quantized values; the int warp_reduce_sum reduces the whole warp on Ampere+
+    // the sum of the quantized values (times the stored scale when exact); the int warp_reduce_sum reduces the whole warp on Ampere+
     [[maybe_unused]] float sum = 0.0f;
     if constexpr (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
-        sum = d*warp_reduce_sum<8>(float(q.x + q.y + q.z + q.w));
+        sum = (exact ? __half2float(__float2half(d)) : d)*warp_reduce_sum<8>(float(q.x + q.y + q.z + q.w));
     }
 
     const int s = iu / QK8_1; // sub-block
@@ -1195,7 +1195,7 @@ static __device__ __forceinline__ void quantize_mmq_few_store(const float4 xi, i
 template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_few_q8_1(
         const float * x_ptr, void * vy_ptr, const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int ne1, const int ne2) {
+        const int ne1, const int ne2, const bool exact) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT x  = x_ptr;
     int4        * GGML_CUDA_RESTRICT vy = (int4 *) vy_ptr;
@@ -1212,7 +1212,7 @@ static __global__ void quantize_mmq_few_q8_1(
 
     const int g = blockIdx.x % MMQ_FEW_NCOLS; // column in group
     int4 * yg = vy + ((blockIdx.z*(ne00/QK_K) + i0/QK_K)*(gridDim.x/MMQ_FEW_NCOLS) + blockIdx.x/MMQ_FEW_NCOLS)*MMQ_FEW_Q8_1_INT4;
-    quantize_mmq_few_store<ds_layout>(xi, yg, i0 % QK_K, g);
+    quantize_mmq_few_store<ds_layout>(xi, yg, i0 % QK_K, g, exact);
 }
 
 void quantize_mmq_few_q8_1_cuda(
@@ -1227,11 +1227,11 @@ void quantize_mmq_few_q8_1_cuda(
     switch (ds_layout) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             ggml_cuda_kernel_launch(quantize_mmq_few_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>, launch_params,
-                x, vy, ne00, s01, s02, s03, (int) ne1, (int) ne2);
+                x, vy, ne00, s01, s02, s03, (int) ne1, (int) ne2, ggml_cuda_q8_1_exact());
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             ggml_cuda_kernel_launch(quantize_mmq_few_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>, launch_params,
-                x, vy, ne00, s01, s02, s03, (int) ne1, (int) ne2);
+                x, vy, ne00, s01, s02, s03, (int) ne1, (int) ne2, ggml_cuda_q8_1_exact());
             break;
         default:
             GGML_ABORT("fatal error");
@@ -1244,7 +1244,7 @@ void quantize_mmq_few_q8_1_cuda(
 template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_few_id_q8_1(
         const float * x_ptr, const int32_t * ids, void * vy_ptr, int * pairs, const int64_t ne00, const int64_t s11, const int64_t s12,
-        const int ne11, const int n_experts, const int n_expert_used, const int64_t si1, const int npairs_max) {
+        const int ne11, const int n_experts, const int n_expert_used, const int64_t si1, const int npairs_max, const bool exact) {
     // per expert: bit t set if token t uses it and the index of its first pair; then the total number of pairs
     extern __shared__ unsigned int data_mmq_few_id[];
     unsigned int * tokens = data_mmq_few_id;
@@ -1326,7 +1326,7 @@ static __global__ void quantize_mmq_few_id_q8_1(
 
     const int r = rank(blockIdx.x, e);
     int4 * yg = vy + (int64_t(pair0[e] + r/MMQ_FEW_NCOLS)*(ne00/QK_K) + i0/QK_K)*MMQ_FEW_Q8_1_INT4;
-    quantize_mmq_few_store<ds_layout>(xi, yg, i0 % QK_K, r % MMQ_FEW_NCOLS);
+    quantize_mmq_few_store<ds_layout>(xi, yg, i0 % QK_K, r % MMQ_FEW_NCOLS, exact);
 }
 
 void quantize_mmq_few_id_q8_1_cuda(
@@ -1345,11 +1345,11 @@ void quantize_mmq_few_id_q8_1_cuda(
     switch (ds_layout) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             ggml_cuda_kernel_launch(quantize_mmq_few_id_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>, launch_params,
-                x, ids, vy, pairs, ne00, s11, s12, (int) ne11, (int) n_experts, (int) n_expert_used, si1, (int) npairs_max);
+                x, ids, vy, pairs, ne00, s11, s12, (int) ne11, (int) n_experts, (int) n_expert_used, si1, (int) npairs_max, ggml_cuda_q8_1_exact());
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             ggml_cuda_kernel_launch(quantize_mmq_few_id_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>, launch_params,
-                x, ids, vy, pairs, ne00, s11, s12, (int) ne11, (int) n_experts, (int) n_expert_used, si1, (int) npairs_max);
+                x, ids, vy, pairs, ne00, s11, s12, (int) ne11, (int) n_experts, (int) n_expert_used, si1, (int) npairs_max, ggml_cuda_q8_1_exact());
             break;
         default:
             GGML_ABORT("fatal error");

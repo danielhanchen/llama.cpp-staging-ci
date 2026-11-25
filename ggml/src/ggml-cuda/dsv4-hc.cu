@@ -166,7 +166,8 @@ static __global__ void dsv4_hc_pre_q8_1_f32(
         int64_t sw0,
         int64_t sw1,
         int64_t sw2,
-        float   scale) {
+        float   scale,
+        bool    exact) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd_padded * n_tokens;
@@ -197,14 +198,10 @@ static __global__ void dsv4_hc_pre_q8_1_f32(
         dst[it*n_embd + i0] = xi;
     }
 
-    float amax = fabsf(xi);
-    float qsum = xi;
-
-    amax = warp_reduce_max<QK8_1>(amax);
-    qsum = warp_reduce_sum<QK8_1>(qsum);
-
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+    float d;
+    float qsum;
+    const int8_t q = ggml_cuda_q8_1_lane(xi, amax, exact, d, qsum);
 
     block_q8_1 * y = (block_q8_1 *) vq;
     const int64_t ib  = ir / QK8_1;
@@ -359,7 +356,7 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     n_embd, n_embd_padded, hc, n_tokens,
                     nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
                     nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
-                    scale);
+                    scale, ggml_cuda_q8_1_exact());
             return;
         }
     }

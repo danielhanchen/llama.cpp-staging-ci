@@ -341,7 +341,7 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
 // unary_gated_op_kernel + quantize_q8_1 pair. x_split: the strided x of commit 6e134f1f896 (column c at (c / xn0)*xs1 + c % xn0)
 template <float (*op)(float), bool x_split = false>
 static __global__ void unary_gated_q8_1_kernel(const float * x, const float * g, float * dst, void * vq, const int64_t kq, const int64_t n,
-        const int64_t ne10, const int64_t ne10q, const int64_t o0, const int64_t o1, const int64_t xn0 = 0, const int64_t xs1 = 0) {
+        const int64_t ne10, const int64_t ne10q, const int64_t o0, const int64_t o1, const bool exact, const int64_t xn0 = 0, const int64_t xs1 = 0) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
@@ -363,13 +363,10 @@ static __global__ void unary_gated_q8_1_kernel(const float * x, const float * g,
         dst[e] = v;
     }
 
-    float amax = fabsf(v);
-    float sum  = v;
-    amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
-
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    const float amax = warp_reduce_max<QK8_1>(fabsf(v));
+    float d;
+    float sum;
+    const int8_t q = ggml_cuda_q8_1_lane(v, amax, exact, d, sum);
 
     block_q8_1 * y = (block_q8_1 *) vq;
     const int64_t ib  = i / QK8_1;
@@ -422,9 +419,9 @@ static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k,
             const int64_t num_blocks = (kq + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
             if (xn0 > 0) {
-                ggml_cuda_kernel_launch(unary_gated_q8_1_kernel<op, true>, launch_params, x, g, dst, q8_1_out, kq, n, ne10, ne10q, o0, o1, xn0, xs1);
+                ggml_cuda_kernel_launch(unary_gated_q8_1_kernel<op, true>, launch_params, x, g, dst, q8_1_out, kq, n, ne10, ne10q, o0, o1, ggml_cuda_q8_1_exact(), xn0, xs1);
             } else {
-                ggml_cuda_kernel_launch(unary_gated_q8_1_kernel<op>, launch_params, x, g, dst, q8_1_out, kq, n, ne10, ne10q, o0, o1, (int64_t) 0, (int64_t) 0);
+                ggml_cuda_kernel_launch(unary_gated_q8_1_kernel<op>, launch_params, x, g, dst, q8_1_out, kq, n, ne10, ne10q, o0, o1, ggml_cuda_q8_1_exact(), (int64_t) 0, (int64_t) 0);
             }
             return;
         }
@@ -1027,7 +1024,7 @@ static __global__ void ew_chain_f32_kernel(const float * x, float * dst, const i
 // does it (one value per lane, the same 32-lane reductions; CUDA_NEG_BLOCK_SIZE % QK8_1 == 0), padding values are 0
 // rows of ne0 values, their q8_1 copy padded to ne0q per row (ne0q == ne0 or a single row: the layout as before)
 static __global__ void ew_chain_q8_1_f32_kernel(const float * x, float * dst, void * vq, const int64_t ne0, const int64_t ne0q, const int64_t kq,
-        const ggml_cuda_ew_chain chain) {
+        const ggml_cuda_ew_chain chain, const bool exact) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
@@ -1049,14 +1046,10 @@ static __global__ void ew_chain_q8_1_f32_kernel(const float * x, float * dst, vo
         dst[ix] = v;
     }
 
-    float amax = fabsf(v);
-    float sum  = v;
-
-    amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
-
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    const float amax = warp_reduce_max<QK8_1>(fabsf(v));
+    float d;
+    float sum;
+    const int8_t q = ggml_cuda_q8_1_lane(v, amax, exact, d, sum);
 
     block_q8_1 * y = (block_q8_1 *) vq;
     const int64_t ib  = i / QK8_1;
@@ -1083,7 +1076,7 @@ void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         const int64_t kq   = ggml_nrows(dst) * ne0q;
         const int64_t num_blocks = (kq + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
-        ggml_cuda_kernel_launch(ew_chain_q8_1_f32_kernel, launch_params, (const float *) src->data, (float *) dst->data, q8_1_out, ne0, ne0q, kq, chain);
+        ggml_cuda_kernel_launch(ew_chain_q8_1_f32_kernel, launch_params, (const float *) src->data, (float *) dst->data, q8_1_out, ne0, ne0q, kq, chain, ggml_cuda_q8_1_exact());
         return;
     }
     const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
@@ -1096,7 +1089,7 @@ void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 // the row max is order-independent (fmaxf over |x| from -FLT_MAX, as pool1d_nchw_kernel), the chain uses ew_chain_apply
 // (the single-op expressions) and the quotient is op_div's a / b.
 static __global__ void amax_rescale_f32_kernel(const float * x, float * e_out, float * dst, void * vq, const int ne0, const int ne0q,
-        const int64_t nrows, const ggml_cuda_ew_chain chain) {
+        const int64_t nrows, const ggml_cuda_ew_chain chain, const bool exact) {
     ggml_cuda_pdl_lc();
     const int64_t row = int64_t(blockIdx.x)*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
@@ -1134,12 +1127,10 @@ static __global__ void amax_rescale_f32_kernel(const float * x, float * e_out, f
             v = xr[i] / e;
             dr[i] = v;
         }
-        float amax = fabsf(v);
-        float sum  = v;
-        amax = warp_reduce_max<QK8_1>(amax);
-        sum  = warp_reduce_sum<QK8_1>(sum);
-        const float  d = amax / 127.0f;
-        const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+        const float amax = warp_reduce_max<QK8_1>(fabsf(v));
+        float d;
+        float sum;
+        const int8_t q = ggml_cuda_q8_1_lane(v, amax, exact, d, sum);
         y[i/QK8_1].qs[lane] = q;
         if (lane == 0) {
             y[i/QK8_1].ds = make_half2(d, sum);
@@ -1162,7 +1153,7 @@ void ggml_cuda_op_amax_rescale(ggml_backend_cuda_context & ctx, const ggml_tenso
     GGML_ASSERT(q8_1_out == nullptr || nrows == 1 || ne0 % MATRIX_ROW_PADDING == 0);
     const int ne0q = q8_1_out ? (int) GGML_PAD(ne0, MATRIX_ROW_PADDING) : ne0;
     ggml_cuda_kernel_launch(amax_rescale_f32_kernel, launch_params, (const float *) x->data, (float *) e->data, (float *) dst->data,
-        q8_1_out, ne0, ne0q, nrows, chain);
+        q8_1_out, ne0, ne0q, nrows, chain, ggml_cuda_q8_1_exact());
 }
 
 /* elementwise chain -> DSV4_HC_POST (no comb): the chain that turns the injection logits into the post weights (2*sigmoid(x/hc)
