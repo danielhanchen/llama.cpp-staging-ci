@@ -3252,6 +3252,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
+    // few-row MMQ builds its expert pairs on the device (GGML_CUDA_MMQ_FEW_MOE)
+    if (ggml_cuda_should_use_mmq_few_id(src0, src1, dst->src[2], cc)) {
+        return false;
+    }
+
     // MMQ / MMF sort the ids on the device: only where the helper fits the shared memory of the device (see ggml_cuda_mul_mat_id)
     if (!ggml_cuda_mm_ids_helper_supported(src0->ne[2], src1->ne[2], dst->src[2]->ne[0])) {
         return true;
@@ -3301,6 +3306,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             }
+        }
+
+        // above the MoE mat-vec kernels, few-row MMQ instead of MMQ (GGML_CUDA_MMQ_FEW_MOE, see mmq-few.cu)
+        // (not when MMQ's quantize computes src1, see mmq_swiglu_src1)
+        if (ctx.mmq_swiglu_src1 != src1 && ggml_cuda_should_use_mmq_few_id(src0, src1, ids, cc)) {
+            ggml_cuda_mul_mat_q_few_id(ctx, src0, src1, ids, dst);
+            return;
         }
 
         // MMQ / MMF sort the ids with ggml_cuda_launch_mm_ids_helper, which needs either n_experts or n_tokens ids in shared
@@ -9088,6 +9100,7 @@ static int ggml_cuda_try_fuse_swiglu_mmid(ggml_backend_cuda_context * cuda_ctx, 
     if (!ggml_is_quantized(src0->type) || mm->ne[2] <= MMVQ_MAX_BATCH_SIZE ||
             !ggml_cuda_mm_ids_helper_supported(src0->ne[2], glu->ne[2], ids->ne[0]) ||
             !ggml_cuda_should_use_mmq(src0->type, cc, glu->ne[2], /*n_experts=*/src0->ne[2]) ||
+            ggml_cuda_should_use_mmq_few_id(src0, glu, ids, cc) ||
             !ggml_cuda_mmq_id_swiglu_ok(src0, glu, ids, mm, cc)) {
         return 0;
     }
