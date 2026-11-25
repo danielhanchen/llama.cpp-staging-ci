@@ -770,6 +770,15 @@ llama_context::llama_context(
         const char * env_nd = getenv("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT");
         const bool   lm_nd  = env_nd != nullptr && atoi(env_nd) != 0;
         lm_enabled = (lm_auto ? (cparams.spec_draft || lm_nd) && cparams.n_batch >= 2*cparams.n_ubatch : atoi(env) != 0) && cparams.moe_cache_size > 0;
+        // without a MoE cache: a batch of two or more ubatches whose dense host weights the device computes (op offload) runs
+        // layer-major too (each host weight copied once per group). Opt-in: LLAMA_LAYER_MAJOR_DENSE=1 turns it on (unless
+        // LLAMA_MOE_LAYER_MAJOR=0); unset or 0: off, as before
+        {
+            const char * env_d = getenv("LLAMA_LAYER_MAJOR_DENSE");
+            const bool   on_d  = (env_d != nullptr && atoi(env_d) != 0) && (lm_auto || atoi(env) != 0);
+            lm_dense_cand = on_d && cparams.moe_cache_size == 0 && cparams.op_offload && cparams.n_ubatch > 0 &&
+                cparams.n_batch >= 2*cparams.n_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+        }
         if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX")) {
             lm_ub_max = std::max(1, atoi(e));
         }
@@ -1191,7 +1200,28 @@ llama_context::llama_context(
             // nothing on the host is cached: no layer-major prompts, and the scheduler keeps its usual size
             lm_enabled = false;
         }
-        if (lm_enabled && lm_auto && !(moe_cache->cached_frac() >= 0.0 && moe_cache->cached_frac() < 0.98)) {
+        if (!moe_cache && lm_dense_cand && !wstore && !model.hparams.no_alloc && !model.devices.empty()) {
+            // layer weights in host memory that the device computes for prompt batches (op offload): e.g. the FFN tensors --fit moved
+            // to system memory. Each prompt ubatch copies them to the device; a layer-major group copies them once
+            int64_t n_host = 0;
+            size_t  b_host = 0;
+            for (const auto & [name, t] : model.tensors_by_name) {
+                if (t != nullptr && t->buffer != nullptr && strncmp(name.c_str(), "blk.", 4) == 0 &&
+                        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ggml_backend_buffer_is_host(t->buffer) &&
+                        ggml_is_matrix(t)) {
+                    n_host++;
+                    b_host += ggml_nbytes(t);
+                }
+            }
+            if (n_host > 0) {
+                lm_enabled = true;
+                lm_dense   = true;
+                LLAMA_LOG_INFO("%s: layer-major prompts for dense host weights: %" PRId64 " weight tensors (%.2f MiB) in host memory are copied "
+                    "to the device once per group of up to %d ubatches of %u tokens (LLAMA_LAYER_MAJOR_DENSE=0: off)\n", __func__, n_host,
+                    b_host/1048576.0, lm_ub_max, cparams.n_ubatch);
+            }
+        }
+        if (lm_enabled && lm_auto && moe_cache && !(moe_cache->cached_frac() >= 0.0 && moe_cache->cached_frac() < 0.98)) {
             // the cache holds (nearly) every host expert: a prompt uploads (nearly) nothing, nothing to share
             lm_enabled = false;
         }
@@ -1244,7 +1274,7 @@ llama_context::llama_context(
                     held/1048576.0, floor/1048576.0);
             }
         }
-        if (lm_enabled && !model.hparams.no_alloc) {
+        if (lm_enabled && moe_cache && !model.hparams.no_alloc) {
             LLAMA_LOG_INFO("%s: MoE cache: layer-major prompts%s, up to %d ubatches of %u tokens per graph (LLAMA_MOE_LAYER_MAJOR_UB_MAX; "
                 "LLAMA_MOE_LAYER_MAJOR=0 disables)\n", __func__, lm_auto ? (cparams.spec_draft ? " beside speculative decoding" : " without a draft") : "", lm_ub_max, cparams.n_ubatch);
         }
@@ -7195,10 +7225,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // computed them (extract_upto), so such a target runs its prompts layer-major too (before: every ubatch alone, RTX PRO 6000 Flash-Next 12 GB
     // DFlash2 8k / 30k TTFT 2.7x the MTP arm's). LLAMA_MOE_LAYER_MAJOR_LAYER_INP=0: refused, as before
     static const bool lm_layer_inp = getenv("LLAMA_MOE_LAYER_MAJOR_LAYER_INP") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_LAYER_INP")) != 0;
-    if (!moe_cache || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
+    if ((!moe_cache && !lm_dense) || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
             (!lm_layer_inp && std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; })) ||
             n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max || !eligible(mctx->get_ubatch()) ||
-            moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || (moe_cache->hybrid_fixed() && !lm_hybrid_ok()) ||
+            (moe_cache && moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens)) || (moe_cache && moe_cache->hybrid_fixed() && !lm_hybrid_ok()) ||
             (moe_cache_devseed_on && !lm_devseed)) {
         if (lm_verbose && moe_cache && n_tokens_all - n_tokens_prev > (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max) {
             const auto & ub = mctx->get_ubatch();
@@ -7323,7 +7353,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     const bool lm_tail_ctx = sampling.samplers.empty() && (getenv("LLAMA_LM_TAIL_ANY") != nullptr || cparams.embeddings_nextn || true);
     while ((int) group.size() < lm_ub_max) {
         const auto & ub = mctx->get_ubatch();
-        const bool tail = lm_tail_env && lm_tail_ctx && !group.empty() && !eligible(ub) && ub.n_seqs_unq == 1 && ub.n_tokens > 0 &&
+        const bool tail = moe_cache && lm_tail_env && lm_tail_ctx && !group.empty() && !eligible(ub) && ub.n_seqs_unq == 1 && ub.n_tokens > 0 &&
             (int64_t) ub.n_tokens < prefetch_min_batch && n_tokens_prev + n_tokens_group + (int64_t) ub.n_tokens == (int64_t) n_tokens_all;
         if (!group.empty() && !eligible(ub) && !tail) {
             break;
@@ -7366,7 +7396,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // under the tiny-ubatch release are: the narrowed layer reads the host experts. Groups that keep their banks are unchanged
         // Also with the graphs reserved at the decode size (place8_rel: the group releases the banks however large the cache), and
         // while the banks are still released from a ubatch before the group (they have no memory to read; any member)
-        const bool out_large = !tail && n_out > 0 && lm_release_on() &&
+        const bool out_large = moe_cache && !tail && n_out > 0 && lm_release_on() &&
             ((k >= 1 && (lm_tiny_cache(moe_cache->cache_frac()) || place8_rel)) || moe_cache->released());
         if (tail || out_large) {
             moe_cache->set_force_large(true);
@@ -7381,7 +7411,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             const ggml_tensor * node = ggml_graph_node(gf, i);
             lm_out_banks = node->op == GGML_OP_MOE_CACHE_LOOKUP;
             for (int j = 0; j < GGML_MAX_SRC && !lm_out_banks; ++j) {
-                lm_out_banks = node->src[j] != nullptr && moe_cache->is_slot_map(node->src[j]);
+                lm_out_banks = node->src[j] != nullptr && moe_cache && moe_cache->is_slot_map(node->src[j]);
             }
         }
         if (tail) {
@@ -7517,7 +7547,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         group.push_back({ &ub, res, gf, n_out, n_leafs, n_tokens_prev + n_tokens_group });
         n_tokens_group += ub.n_tokens;
         n_outputs_group += n_out;
-        moe_cache->count_large_ubatch();
+        if (moe_cache) {
+            moe_cache->count_large_ubatch();
+        }
 
         if (!mctx->next()) {
             more = false;
@@ -7847,7 +7879,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // a batch of two prompts holds both sequences and runs outside a group) and stay released through it: the release below finds
     // nothing to release, and the group must not seed or replay into banks that have no memory (the seed copied into a bank without
     // a buffer). It runs as the ubatches of a released window do: no seed, the banks come back after it
-    const bool lm_rel_before = moe_cache->released();
+    const bool lm_rel_before = moe_cache && moe_cache->released();
     if (lm_rel_before) {
         static int n_rel_before_log = 0;
         if (n_rel_before_log++ < 4) {
@@ -7866,8 +7898,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // the graphs are reserved at the decode size (LLAMA_MOE_PLACE8_MID), a merged group never fits beside the banks
     // (lazy KV step 2: the share of the cache's own slots, its shrink floor; the slots above it are the KV cache's and the
     // placement of the prompt is that of the cache the fit sized beside the full-context KV)
-    const double lm_cf   = moe_cache->release_frac();
-    bool         lm_tiny = lm_tiny_cache(lm_cf) || place8_rel;
+    const double lm_cf   = moe_cache ? moe_cache->release_frac() : -1.0;
+    bool         lm_tiny = moe_cache && (lm_tiny_cache(lm_cf) || place8_rel);
     if (lm_release_env && lm_rel_split && !lm_tiny && gm != nullptr && group.size() >= 2 && lm_cf >= 0.0 && lm_cf < lm_rel_split_frac) {
         // (LLAMA_MOE_LM_MEASURE_RESTORE=0 off): the measure allocates the merged graph when it fits, which sets the data of its
         // nodes; the graph allocator takes a node with data as preallocated, so the allocation that runs the graph planned only the
@@ -8049,7 +8081,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     lm_ask.clear();
     lm_staged.clear();
     lm_seeded.clear();
-    moe_cache->clear_seed_counts();
+    if (moe_cache) {
+        moe_cache->clear_seed_counts();
+    }
     int seed_k = -1, src_k = -1;
     // LLAMA_MOE_LAYER_MAJOR_SEED=0 (opt-in) turns the seed off. The seed reads the source routing of every layer in an eval callback,
     // which synchronizes the device once per layer, so the next layer's expert copies are queued only after its router has run and the copy
@@ -8070,7 +8104,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     static const bool lm_replay_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY")) != 0;
     size_t rp_k = 0; // members before the break (0: no replay)
     // merge: a group whose cache banks were released seeds nothing, so it replays nothing either
-    if (!lm_released && !lm_rel_before && lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
+    if (moe_cache && !lm_released && !lm_rel_before && lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
         const auto & last = group.back();
         const int64_t b = last.n_tokens_before;
         const auto & brk = balloc->ubatch_breaks;
@@ -8080,7 +8114,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             rp_k = group.size() - 1;
         }
     }
-    if (!lm_released && !lm_rel_before && lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
+    if (moe_cache && !lm_released && !lm_rel_before && lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
         // with the replay: the seed of the batch that ends at the break
         const int64_t n_seed_all = rp_k > 0 ? group[rp_k].n_tokens_before : n_tokens_all;
         for (size_t k = 0; k < (rp_k > 0 ? rp_k : group.size()); ++k) {
@@ -8217,7 +8251,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             const ggml_tensor * w = host_weight(node->src[0]);
             const ggml_tensor * ids = node->src[2];
             // not the empty routing of a layer narrowed to no outputs (it copies nothing, so nothing records it)
-            if (w != nullptr && moe_cache->get_experts(w) != nullptr && (ids->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_nelements(ids) > 0 &&
+            if (w != nullptr && moe_cache && moe_cache->get_experts(w) != nullptr && (ids->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_nelements(ids) > 0 &&
                     std::none_of(lm_record.begin(), lm_record.end(), [&](const auto & r) { return r.second == ids; })) {
                 lm_record.emplace_back(w, ids);
             }
@@ -8365,7 +8399,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             ggml_backend_sched_set_tensor_backend(sched.get(), node, be);
         }
         prefetch_n_tokens = n_tokens_max;
-        moe_cache->set_graph(g);
+        if (moe_cache) {
+            moe_cache->set_graph(g);
+        }
         if (!lm_pending.empty()) {
             lm_seed_resolve_all();
         }
@@ -8413,7 +8449,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             return GGML_STATUS_ALLOC_FAILED;
         }
-        moe_cache->prepare(n_tokens_max);
+        if (moe_cache) {
+            moe_cache->prepare(n_tokens_max);
+        }
         if (lm_check) {
             // the device copies of the indices: where they are, and whether two set_rows of different ubatches share one
             std::unordered_map<const void *, const ggml_tensor *> at;
@@ -8537,7 +8575,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             srcs.emplace_back(node, arr);
         }
         lm_merged_active = true;
-        moe_cache->set_lm_merged(true);
+        if (moe_cache) {
+            moe_cache->set_lm_merged(true);
+        }
         ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
         // (LLAMA_MOE_LM_LEND=0 off): a merged graph whose compute buffers would grow past the free memory borrows its allocation from the
         // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
@@ -8548,7 +8588,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // gemma-4 26B-A4B Q3_K_M + drafter at 8 GB, 2k: 393 instead of 241 slots lent, a different cache after the prompt (another text than
         //) and 287 instead of 325 tok/s decode, prompt 4815 instead of 5014 (LLAMA_MOE_LM_LEND=0). LLAMA_MOE_LM_LEND_FIRST=1: lend at once
         static const bool lm_lend_first = getenv("LLAMA_MOE_LM_LEND_FIRST") != nullptr && atoi(getenv("LLAMA_MOE_LM_LEND_FIRST")) != 0;
-        const bool lend_ok = lm_lend && moe_cache->lends_graph_any();
+        const bool lend_ok = lm_lend && moe_cache && moe_cache->lends_graph_any();
         // the growth-first rule only up to LLAMA_MOE_LM_LEND_FIRST_GROW_MIB (256) of growth (0 = any growth, the original
         // rule) and for groups starting before position LLAMA_MOE_LM_LEND_FIRST_POS (0 = any position); past either the group borrows at once
         //. RTX PRO 6000 run the 4-bit model + MTP 8 GB 30k (its groups grow 346 MiB and more) 247.3 tok/s and 's text with the cap, 225.3 without
@@ -8613,7 +8653,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
         lm_merged_active = false;
-        moe_cache->set_lm_merged(false);
+        if (moe_cache) {
+            moe_cache->set_lm_merged(false);
+        }
         if (st != GGML_STATUS_ALLOC_FAILED) {
             n_sub++;
             if (st == GGML_STATUS_SUCCESS) {
@@ -8676,7 +8718,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             for (auto & bk : backend_ptrs) {
                 int32_t ns = 0;
                 size_t  eb = 0;
-                const int32_t c = moe_cache->graph_lend_capacity(bk, &ns, &eb);
+                const int32_t c = moe_cache ? moe_cache->graph_lend_capacity(bk, &ns, &eb) : 0;
                 if ((size_t) c*eb > (size_t) lc_max*lc_bytes) {
                     lc_max = c; lc_slots = ns; lc_bytes = eb;
                 }
@@ -8732,6 +8774,18 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 break;
             }
             extract_upto(k + 1);
+        }
+    }
+    // engagement of the groups without a MoE cache, logged at 1, 10, 100, ... groups that ran as merged graphs
+    if (lm_dense && gm != nullptr && status == GGML_STATUS_SUCCESS) {
+        lm_n_dense_groups++;
+        int64_t p = 1;
+        while (p < lm_n_dense_groups) {
+            p *= 10;
+        }
+        if (p == lm_n_dense_groups) {
+            LLAMA_LOG_INFO("%s: layer-major dense: %" PRId64 " groups so far (this one %zu ubatches in %d graphs; each host weight copied once per graph; "
+                "LLAMA_LAYER_MAJOR_DENSE=0 off)\n", __func__, lm_n_dense_groups, group.size(), n_sub);
         }
     }
     for (auto & b : backend_ptrs) {
@@ -8810,7 +8864,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 
     // resident prompt fill on the layer-major path: the routing of the group's last member (its ffn routing outputs, read
     // before the compute buffers are freed) for the fill at the end of the prompt, here when the group ends it
-    if (status == GGML_STATUS_SUCCESS && moe_cache->resident_fill_wanted() && !lm_record.empty()) {
+    if (status == GGML_STATUS_SUCCESS && moe_cache && moe_cache->resident_fill_wanted() && !lm_record.empty()) {
         ggml_backend_sched_synchronize(sched.get());
         std::vector<int32_t> ids_data;
         std::vector<int32_t> counts;
@@ -8858,7 +8912,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             moe_cache_seq      = -1;
             moe_cache_pos_next = -1;
             moe_cache_ids.clear();
-            moe_cache->clear_seed_counts();
+            if (moe_cache) {
+                moe_cache->clear_seed_counts();
+            }
         }
     }
 

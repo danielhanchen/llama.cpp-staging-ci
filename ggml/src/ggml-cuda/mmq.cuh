@@ -1699,7 +1699,7 @@ static __global__ void mul_mat_q_pad(
         ntx_host, nexperts_compact, tile_prefix, exact_nsm, (flags & MMQ_FLAG_CVT) != 0, flags);
 }
 
-// compiled for sm 120 (consumer Blackwell) and sm 80 (A100) and sm 75 (T4); the host launches it
+// compiled for sm 120 (consumer Blackwell), sm 89 (Ada), sm 80 (A100) and sm 75 (T4); the host launches it
 // there only (mmq_pipe_kernel)
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, int pipe>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), (pipe & MMQ_PIPE_OCC2) ? 2 : 1)
@@ -1713,7 +1713,7 @@ static __global__ void mul_mat_q_pipe(
         const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix, const int exact_nsm, const int flags) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && \
     ((__CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN) || __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE || \
-     __CUDA_ARCH__ == GGML_CUDA_CC_TURING)
+     __CUDA_ARCH__ == GGML_CUDA_CC_ADA_LOVELACE || __CUDA_ARCH__ == GGML_CUDA_CC_TURING)
     mul_mat_q_body<type, J, fallback, prec_src1, pipe>(
         x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale,
         blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst,
@@ -1723,7 +1723,7 @@ static __global__ void mul_mat_q_pipe(
 #else
     GGML_UNUSED_VARS(x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale, blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, nsamples_y, stride_sample_x, stride_sample_y, stride_sample_dst, ntx_host, nexperts_compact, tile_prefix, exact_nsm, flags);
     NO_DEVICE_CODE;
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (sm 12x || sm 80 || sm 75)
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (sm 12x || sm 89 || sm 80 || sm 75)
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
@@ -1977,7 +1977,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // GGML_CUDA_MMQ_PIPE: unset = the measured choice per type / tile width (mmq_pipe_policy), 0 = off (the base kernel),
-// N > 0 = force the MMQ_PIPE_* bits N where a kernel for them is built (else the base). Only on sm 12x (consumer Blackwell) and sm 80, only for
+// N > 0 = force the MMQ_PIPE_* bits N where a kernel for them is built (else the base). Only on sm 12x (consumer Blackwell), sm 89 and sm 80, only for
 // the MoE products (ids) of the types below at J <= 64 without the out-of-bounds fallback; everything else runs the base kernel.
 static int ggml_cuda_mmq_pipe_env() {
     static const int v = [] {
@@ -2123,7 +2123,15 @@ static mmq_kernel_t mmq_pipe_kernel(const mmq_args & args, const int cc, const i
     }();
     const bool sm75 = sm75_on && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_TURING &&
         ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING;
-    if (!sm12x && !sm80 && !sm75) {
+    // the same kernels on Ada (cc 8.9, sm_89 code: 100 KiB of shared memory per SM, two 45-49 KiB tiles fit; OCC2 drops itself
+    // where they do not). GGML_CUDA_MMQ_PIPE_SM89=0 is the kill switch of this addition (the base kernel there, as before)
+    static const bool sm89_on = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_PIPE_SM89");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool sm89 = sm89_on && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE &&
+        ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_ADA_LOVELACE;
+    if (!sm12x && !sm80 && !sm89 && !sm75) {
         return nullptr;
     }
     mmq_kernel_t k = nullptr;
@@ -2656,3 +2664,4 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
 // see mmq.cu
 bool ggml_cuda_mmq_id_swiglu_ok(const ggml_tensor * src0, const ggml_tensor * glu, const ggml_tensor * ids, const ggml_tensor * dst, int cc);
+bool ggml_cuda_mmq_dense_swiglu_ok(const ggml_tensor * src0, const ggml_tensor * glu, const ggml_tensor * dst, int cc);

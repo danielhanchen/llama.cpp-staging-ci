@@ -618,7 +618,10 @@ void quantize_mmq_q8_1_cuda(
 // expression of unary_gated_op_kernel<op_silu> (silu(gate)*up), then the code of quantize_mmq_q8_1 on it (same thread layout, lanes
 // and reductions), so the q8_1 rows are the bytes of SWIGLU + quantize_mmq_q8_1 with the forward map. The f32 SWIGLU output is not
 // written (its only reader is the product).
-template <mmq_q8_1_ds_layout ds_layout>
+// dense: the down product of a dense FFN (MUL_MAT, no ids): row r is written to row r (the layout of quantize_mmq_q8_1 over one
+// channel), and the product silu(gate)*up is rounded on its own (__fmul_rn: never contracted into the sums below), as the f32 SWIGLU
+// output it replaces was
+template <mmq_q8_1_ds_layout ds_layout, bool dense = false>
 static __global__ void swiglu_quantize_mmq_q8_1(
         const float * __restrict__ gate, const float * __restrict__ up, const int32_t * __restrict__ ids_inv, void * __restrict__ vy,
         const int64_t ne00, const int64_t sg1, const int64_t sg2, const int64_t su1, const int64_t su2,
@@ -636,9 +639,9 @@ static __global__ void swiglu_quantize_mmq_q8_1(
     ggml_cuda_pdl_sync();
 
     const int64_t r   = blockIdx.x;
-    const int64_t it  = r / n_expert_used;
-    const int64_t iex = r % n_expert_used;
-    const int32_t c   = ids_inv[r];
+    const int64_t it  = dense ? r : r / n_expert_used;
+    const int64_t iex = dense ? 0 : r % n_expert_used;
+    const int32_t c   = dense ? (int32_t) r : ids_inv[r];
 
     block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
 
@@ -649,10 +652,17 @@ static __global__ void swiglu_quantize_mmq_q8_1(
     if (i0 < ne00) {
         const float4 g = *(const float4 *) (gate + it*sg2 + iex*sg1 + i0);
         const float4 u = *(const float4 *) (up   + it*su2 + iex*su1 + i0);
-        xi.x = ggml_cuda_op_silu_single(g.x) * u.x;
-        xi.y = ggml_cuda_op_silu_single(g.y) * u.y;
-        xi.z = ggml_cuda_op_silu_single(g.z) * u.z;
-        xi.w = ggml_cuda_op_silu_single(g.w) * u.w;
+        if constexpr (dense) {
+            xi.x = __fmul_rn(ggml_cuda_op_silu_single(g.x), u.x);
+            xi.y = __fmul_rn(ggml_cuda_op_silu_single(g.y), u.y);
+            xi.z = __fmul_rn(ggml_cuda_op_silu_single(g.z), u.z);
+            xi.w = __fmul_rn(ggml_cuda_op_silu_single(g.w), u.w);
+        } else {
+            xi.x = ggml_cuda_op_silu_single(g.x) * u.x;
+            xi.y = ggml_cuda_op_silu_single(g.y) * u.y;
+            xi.z = ggml_cuda_op_silu_single(g.z) * u.z;
+            xi.w = ggml_cuda_op_silu_single(g.w) * u.w;
+        }
     }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
@@ -731,6 +741,33 @@ void swiglu_quantize_mmq_q8_1_cuda(
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             swiglu_quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6><<<num_blocks, block_size, 0, stream>>>(
                 gate, up, ids_inv, vy, ne00, sg1, sg2, su1, su2, ne0, (int) nrows_dst, n_expert_used);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
+void swiglu_quantize_mmq_q8_1_dense_cuda(
+        const float * gate, const float * up, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t sg1, const int64_t su1, const int64_t ne0, const int64_t nrows, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(nrows, block_num_y, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    switch (mmq_get_q8_1_ds_layout(type_src0)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            swiglu_quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true><<<num_blocks, block_size, 0, stream>>>(
+                gate, up, nullptr, vy, ne00, 0, sg1, 0, su1, ne0, (int) nrows, 1);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            swiglu_quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true><<<num_blocks, block_size, 0, stream>>>(
+                gate, up, nullptr, vy, ne00, 0, sg1, 0, su1, ne0, (int) nrows, 1);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            swiglu_quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, true><<<num_blocks, block_size, 0, stream>>>(
+                gate, up, nullptr, vy, ne00, 0, sg1, 0, su1, ne0, (int) nrows, 1);
             break;
         default:
             GGML_ABORT("fatal error");

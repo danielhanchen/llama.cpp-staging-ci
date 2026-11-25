@@ -75,3 +75,9 @@ void swiglu_quantize_mmq_q8_1_cuda(
         const float * gate, const float * up, const int32_t * ids_inv, void * vy, ggml_type type_src0,
         int64_t ne00, int64_t sg1, int64_t sg2, int64_t su1, int64_t su2,
         int64_t ne0, int64_t n_rows_src, int64_t nrows_dst, int n_expert_used, cudaStream_t stream);
+
+// SWIGLU(gate, up) (split, F32) quantized for the dense MUL_MAT that reads it: row r (gate / up row strides sg1 / su1 in floats) in
+// the q8_1 MMQ layout of quantize_mmq_q8_1 over nrows rows, see swiglu_quantize_mmq_q8_1 (dense)
+void swiglu_quantize_mmq_q8_1_dense_cuda(
+        const float * gate, const float * up, void * vy, ggml_type type_src0,
+        int64_t ne00, int64_t sg1, int64_t su1, int64_t ne0, int64_t nrows, cudaStream_t stream);
