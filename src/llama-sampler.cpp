@@ -276,9 +276,14 @@ static void llama_log_softmax(float * array, size_t size) {
 }
 */
 
-// LLAMA_SAMPLER_DISABLE_FAST_DIST (any value) keeps the reference loops of max / temp / dist; read once per process
+// LLAMA_SAMPLER_FAST_DIST=1 (opt-in): the blocked dist pass (8 running maxima, prefix sums, temp 1.0 skip; the vector expf on
+// top with LLAMA_SAMPLER_EXPF4=1). Unset / 0: the reference loops, with the max kept in a register. Measured on server VMs, the
+// blocked pass was slower than the reference loops with scalar expf, and faster only with the vector expf on AMD Zen 5.
 static bool llama_sampler_fast_dist_off() {
-    static const bool off = getenv("LLAMA_SAMPLER_DISABLE_FAST_DIST") != nullptr;
+    static const bool off = [] {
+        const char * e = getenv("LLAMA_SAMPLER_FAST_DIST");
+        return e == nullptr || atoi(e) == 0;
+    }();
     return off;
 }
 
