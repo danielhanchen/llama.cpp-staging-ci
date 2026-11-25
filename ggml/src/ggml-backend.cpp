@@ -6196,7 +6196,7 @@ bool ggml_backend_sched_get_alloc_lend_upgraded(ggml_backend_sched_t sched) {
 }
 
 bool ggml_backend_sched_lend_upgrade_on(void) {
-    static const bool on = getenv("GGML_SCHED_LEND_UPGRADE") == nullptr || atoi(getenv("GGML_SCHED_LEND_UPGRADE")) != 0;
+    static const bool on = getenv("GGML_SCHED_LEND_UPGRADE") != nullptr && atoi(getenv("GGML_SCHED_LEND_UPGRADE")) != 0;
     return on;
 }
 

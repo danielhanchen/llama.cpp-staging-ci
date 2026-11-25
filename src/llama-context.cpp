@@ -8576,7 +8576,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // the scheduler (ggml_backend_sched_set_alloc_lend_upgrade), its split kept. Only on a scheduler holding no backend assignments but
         // the ones run() applies (reset since the member graphs were built, as the retry resets it), so the split is the one the retry
         // makes; the member builds' own assignments stay in the first split otherwise (GGML_SCHED_LEND_UPGRADE=2: kept there too)
-        static const int lend_upgrade_mode = getenv("GGML_SCHED_LEND_UPGRADE") ? atoi(getenv("GGML_SCHED_LEND_UPGRADE")) : 1;
+        // default off (GGML_SCHED_LEND_UPGRADE=1 on): mode 1 never engaged on the lending 8k prompts measured (their first attempt is not on a
+        // clean scheduler) and mode 2 left another cache after the prompt (Flash-Next 4-bit, RTX PRO 6000 32 / 48 GB and A100 80 GB 48 GB, 8k)
+        static const int lend_upgrade_mode = getenv("GGML_SCHED_LEND_UPGRADE") ? atoi(getenv("GGML_SCHED_LEND_UPGRADE")) : 0;
         struct lend_upgrade_ud {
             ggml_backend_sched_t sched;
             llama_moe_cache * mc;
