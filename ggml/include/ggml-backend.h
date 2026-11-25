@@ -497,6 +497,15 @@ extern "C" {
     // lender lends (the graph allocation entries of ggml_backend_sched_lend_copy); the graph is refused (as by the limit) only if the
     // lender does not take it
     GGML_API void                 ggml_backend_sched_set_alloc_lend_graph(ggml_backend_sched_t sched, bool enable);
+    // a graph refused by the measured growth (the first check of ggml_backend_sched_alloc_graph) may go on with the lend settings instead
+    // of being refused: the scheduler calls upgrade(user_data) once, which sets them (ggml_backend_sched_set_alloc_limit,
+    // ggml_backend_sched_set_alloc_lend_graph, the lender's scope) and returns true; the split and its copies are kept, the binding is
+    // measured again with the new settings. NULL turns it off. ggml_backend_sched_get_alloc_lend_upgraded: the last allocation did it
+    // (GGML_SCHED_LEND_UPGRADE=0: never)
+    typedef bool (*ggml_backend_sched_lend_upgrade_t)(void * user_data);
+    GGML_API void                 ggml_backend_sched_set_alloc_lend_upgrade(ggml_backend_sched_t sched, ggml_backend_sched_lend_upgrade_t upgrade, void * user_data);
+    GGML_API bool                 ggml_backend_sched_get_alloc_lend_upgraded(ggml_backend_sched_t sched);
+    GGML_API bool                 ggml_backend_sched_lend_upgrade_on(void);
     // frees the compute buffers of the devices (not the host ones): the next graph allocates them at the size it needs
     GGML_API void                 ggml_backend_sched_free_device_buffers(ggml_backend_sched_t sched);
     // frees the host weight prefetch staging arenas of the device backends (allocated again by the next prefetched graph)

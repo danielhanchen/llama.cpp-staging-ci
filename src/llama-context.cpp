@@ -7274,6 +7274,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     moe_cache_ids.clear();
     ggml_backend_sched_reset(sched.get());
     ggml_backend_sched_use_full_hash(sched.get());
+    // the scheduler holds no backend assignments but the ones run() applies (reset after the member graphs below were built)
+    bool lm_sched_clean = false;
     ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
     // the prompt does not seed the cache and records no routing
@@ -7913,6 +7915,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_use_full_hash(sched.get());
+        lm_sched_clean = true;
         moe_cache->set_graph(nullptr);
         if (!ok && over > 0 && lm_out_banks) {
             // a member reads the banks (a slot map, a device lookup or seed, built before this measure), so the banks stay
@@ -8506,6 +8509,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (!first_run) {
             ggml_backend_sched_reset(sched.get());
             ggml_backend_sched_use_full_hash(sched.get());
+            lm_sched_clean = true;
         }
         first_run = false;
         cap_before(a);
@@ -8568,8 +8572,54 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (lf_capped) {
             ggml_backend_sched_set_alloc_limit(sched.get(), true, lf_grow);
         }
+        // (GGML_SCHED_LEND_UPGRADE=0 off): a graph the retry below would allocate again with the lend settings goes on with them inside
+        // the scheduler (ggml_backend_sched_set_alloc_lend_upgrade), its split kept. Only on a scheduler holding no backend assignments but
+        // the ones run() applies (reset since the member graphs were built, as the retry resets it), so the split is the one the retry
+        // makes; the member builds' own assignments stay in the first split otherwise (GGML_SCHED_LEND_UPGRADE=2: kept there too)
+        static const int lend_upgrade_mode = getenv("GGML_SCHED_LEND_UPGRADE") ? atoi(getenv("GGML_SCHED_LEND_UPGRADE")) : 1;
+        struct lend_upgrade_ud {
+            ggml_backend_sched_t sched;
+            llama_moe_cache * mc;
+            const std::function<size_t()> * limit;
+        };
+        const std::function<size_t()> gl_fn = grow_limit;
+        lend_upgrade_ud lu = { sched.get(), moe_cache.get(), &gl_fn };
+        const bool lend_upgrade = lend_ok && !lend_g && lend_upgrade_mode != 0 && (lm_sched_clean || lend_upgrade_mode == 2);
+        if (lend_upgrade) {
+            // the settings the retry below sets before it allocates again
+            ggml_backend_sched_set_alloc_lend_upgrade(sched.get(), [](void * p) {
+                auto * u = (lend_upgrade_ud *) p;
+                ggml_backend_sched_set_alloc_limit(u->sched, true, (*u->limit)());
+                ggml_backend_sched_set_alloc_lend_graph(u->sched, true);
+                u->mc->set_graph_lend(true);
+                return true;
+            }, &lu);
+        }
         ggml_status st = run(g);
-        if (lend_g) {
+        bool upgraded = false;
+        if (lend_upgrade) {
+            ggml_backend_sched_set_alloc_lend_upgrade(sched.get(), nullptr, nullptr);
+            upgraded = ggml_backend_sched_get_alloc_lend_upgraded(sched.get());
+        }
+        if (upgraded) {
+            // as after the retry below
+            lend_g = true;
+            moe_cache->set_graph_lend(false);
+            if (st != GGML_STATUS_ALLOC_FAILED && lf_capped) {
+                lm_lf_refused_pos = std::min(lm_lf_refused_pos, g_pos);
+                lm_lf_refused_n   = std::min(lm_lf_refused_n, (int64_t) (b - a));
+            }
+            if (st == GGML_STATUS_ALLOC_FAILED && lf_capped) {
+                for (auto & [node, arr] : srcs) {
+                    std::copy(arr.begin(), arr.end(), node->src);
+                }
+                ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_use_full_hash(sched.get());
+                ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
+                st = run(g);
+            }
+        }
+        if (lend_g && !upgraded) {
             moe_cache->set_graph_lend(false);
         }
         if (st == GGML_STATUS_ALLOC_FAILED && lf_known && !lm_lend_first && !(lf_pos > 0 && g_pos >= lf_pos)) {
