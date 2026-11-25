@@ -227,9 +227,9 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // (LLAMA_SPEC_PREWARM_MID=0: off) a DFlash2 target in the cached-window band below the prewarm share (LLAMA_DFLASH_CACHED_FRAC_MIN
     // 0.20 .. LLAMA_SPEC_PREWARM_CACHED_FRAC): its passes verify 3 rows or the whole draft, and the first whole-draft window of the process
     // was built, run eagerly and captured inside a request (RTX PRO 6000 Flash-Next 4-bit 24 GB, 27.9% cached, DFlash2 chat: two passes of
-    // ~132 + ~44 ms in the first request that went wide, +2.5 ms per pass on average). Only those two widths of the greedy device chain
-    // are prewarmed, exactly (the cache is taken back after), so the device memory the request's later prompts see is what those two
-    // graphs take anyway once a request has run them: the full prewarm there (every width, three sampler chains) left an 8k prompt below
+    // ~132 + ~44 ms in the first request that went wide, +2.5 ms per pass on average). Only those two widths and the plain decode of the
+    // greedy device chain are prewarmed, exactly (the cache is taken back after), so the device memory the request's later prompts see is
+    // what those graphs take anyway once a request has run them: the full prewarm there (every width, three sampler chains) left an 8k prompt below
     // its lending headroom (more slots lent, other text, +45 ms TTFT)
     static const bool mid_env = getenv("LLAMA_SPEC_PREWARM_MID") == nullptr || atoi(getenv("LLAMA_SPEC_PREWARM_MID")) != 0;
     const double dflash_mid_lo = getenv("LLAMA_DFLASH_CACHED_FRAC_MIN") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MIN")) : 0.20;
@@ -255,7 +255,8 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         }
         std::sort(widths.begin(), widths.end());
     } else if (mid) {
-        widths = { 3, w_max };
+        // the plain decode too (the single-token decode the band falls back to between windows)
+        widths = { 1, 3, w_max };
     } else {
         for (int w = 1; w <= w_max; ++w) {
             widths.push_back(w);
@@ -285,7 +286,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         return;
     }
     if (mid) {
-        SRV_INF("verify graphs of the DFlash2 cached window (3 and %d rows, greedy chain) prewarmed beside a MoE cache that holds %.1f%% of "
+        SRV_INF("decode and verify graphs of the DFlash2 cached window (1, 3 and %d rows, greedy chain) prewarmed beside a MoE cache that holds %.1f%% of "
                 "the host experts (LLAMA_SPEC_PREWARM_MID=0: off)\n", w_max, 100.0*cache_frac);
     } else if (cached_ok && llama_moe_cache_active(ctx) && !wide_graphs) {
         SRV_INF("verify graphs prewarmed beside a MoE cache that holds %.1f%% of the host experts (LLAMA_SPEC_PREWARM_CACHED_FRAC "
