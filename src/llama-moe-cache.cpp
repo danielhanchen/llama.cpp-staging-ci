@@ -1004,8 +1004,9 @@ struct llama_moe_cache::impl {
     // them again from the host. Before the seed overwrites such a slot, its bytes are copied on the device into a small holding ring
     // (LLAMA_MOE_SEED_RESCUE_MIB, 256), and a copy that misses the expert reads the ring instead of the host. The cache itself (slots,
     // LRU order, scores, admissions) is the one without the ring, and the bytes a copy gets are the same: only where they come from
-    // changes. The ring is allocated once, when the device has LLAMA_MOE_SEED_RESCUE_FREE_MIB (1024) free beyond it, else nothing is
-    // rescued. Every write and read of the ring is a device copy on the stream that also issues the seeds' copies, in host order
+    // changes. The ring is allocated once, at the first such seed, as large as fits beside LLAMA_MOE_SEED_RESCUE_FREE_MIB (256) of
+    // free device memory; it keeps the victims whose layers come soonest. Every write and read of the ring is a device copy on the
+    // stream that also issues the seeds' copies, in host order
     struct rescue_ring {
         bool tried = false;
         int32_t ig = -1;                          // the group it serves
@@ -1035,11 +1036,10 @@ struct llama_moe_cache::impl {
         const char * em = getenv("LLAMA_MOE_SEED_RESCUE_MIB");
         const char * ef = getenv("LLAMA_MOE_SEED_RESCUE_FREE_MIB");
         const size_t want  = (size_t) std::max<int64_t>(0, em != nullptr ? atoll(em) : 256) << 20;
-        const size_t floor = (size_t) std::max<int64_t>(0, ef != nullptr ? atoll(ef) : 1024) << 20;
+        const size_t floor = (size_t) std::max<int64_t>(0, ef != nullptr ? atoll(ef) : 256) << 20;
         if (g.expert_bytes == 0 || want < g.expert_bytes || g.ref.empty() || g.ref.size() > 32) {
             return false;
         }
-        const int32_t cap = (int32_t) (want / g.expert_bytes);
         ggml_backend_t be = devices[g.id].backend;
         // only with batched device copies, whose calls from the device's instances all run on its compute stream in host order
         // (the ring's writes and reads are then ordered without events)
@@ -1051,9 +1051,12 @@ struct llama_moe_cache::impl {
         if (dev != nullptr) {
             ggml_backend_dev_memory(dev, &free, &total);
         }
-        if (dev == nullptr || total == 0 || free < (size_t) cap*g.expert_bytes + floor) {
-            LLAMA_LOG_INFO("llama_moe_cache: seed rescue: off, %.0f MiB free on %s, the %d-entry ring needs %.0f MiB + %.0f MiB\n",
-                free/1048576.0, ggml_backend_name(be), cap, (double) cap*g.expert_bytes/1048576.0, floor/1048576.0);
+        // as large as LLAMA_MOE_SEED_RESCUE_MIB, in the free memory beyond LLAMA_MOE_SEED_RESCUE_FREE_MIB (at least 8 experts)
+        const size_t room = free > floor ? free - floor : 0;
+        const int32_t cap = (int32_t) (std::min(want, room) / g.expert_bytes);
+        if (dev == nullptr || total == 0 || cap < 8) {
+            LLAMA_LOG_INFO("llama_moe_cache: seed rescue: off, %.0f MiB free on %s, %.0f MiB kept free, the ring needs at least 8 experts of %.2f MiB\n",
+                free/1048576.0, ggml_backend_name(be), floor/1048576.0, g.expert_bytes/1048576.0);
             return false;
         }
         ggml_init_params ip = { (g.ref.size() + 1)*ggml_tensor_overhead(), nullptr, true };
@@ -1078,21 +1081,32 @@ struct llama_moe_cache::impl {
             "of the same pass (LLAMA_MOE_SEED_RESCUE=0 to disable)\n", cap, (double) cap*g.expert_bytes/1048576.0, ggml_backend_name(be));
         return true;
     }
-    // an entry for a new victim: from the cursor on, the first one empty or read out by every expert tensor, else the one at the
-    // cursor (the oldest; its expert is then uploaded by its copy as without the ring)
-    int32_t rsr_take(int64_t key, uint32_t all_ip) {
+    // an entry for a new victim of layer kl, seeded at layer il: a free one (never used, read out by every expert tensor, or of a
+    // layer before il, which the pass has copied); else the held one whose layer comes last, if after kl (each victim is read once, when the
+    // pass copies its layer: keeping the ones read soonest keeps the most); else none (-1). Layer il itself is not done: its other
+    // expert tensors may be copied after this seed
+    int32_t rsr_take(int64_t key, uint32_t all_ip, int32_t il, int32_t n_expert) {
+        const int32_t kl = (int32_t) (key / n_expert);
         int32_t e = -1;
-        for (int32_t k = 0; k < rsr.cap && e < 0; ++k) {
-            const int32_t c = (int32_t) ((rsr.fifo_head + k) % rsr.cap);
-            if (rsr.key_at[c] < 0 || (rsr.read[c] & all_ip) == all_ip) {
+        int32_t far = -1;
+        int32_t far_l = kl;
+        for (int32_t c = 0; c < rsr.cap && e < 0; ++c) {
+            const int64_t k = rsr.key_at[c];
+            const int32_t cl = k >= 0 ? (int32_t) (k / n_expert) : -1;
+            if (k < 0 || (rsr.read[c] & all_ip) == all_ip || cl < il) {
                 e = c;
+            } else if (cl > far_l) {
+                far   = c;
+                far_l = cl;
             }
         }
         if (e < 0) {
-            e = (int32_t) (rsr.fifo_head % rsr.cap);
+            if (far < 0) {
+                return -1;
+            }
+            e = far;
             rsr.n_lost++;
         }
-        rsr.fifo_head = (size_t) e + 1;
         if (rsr.key_at[e] >= 0) {
             rsr.where.erase(rsr.key_at[e]);
         }
@@ -15219,7 +15233,7 @@ struct llama_moe_cache::impl {
             }
             rsr.pend.clear();
             if (rsr_on() && !tiered && !sd.fills.empty() && rsr_alloc(g, layers[b.il].ig)) {
-                // the victims of layers ahead, the nearest layers first (their copies come first), at most one ring's worth
+                // the victims of layers ahead, the nearest layers first (their copies come first)
                 rsr.n_seeds++;
                 rsr_vict.clear();
                 for (const auto & f : sd.fills) {
@@ -15232,15 +15246,17 @@ struct llama_moe_cache::impl {
                 std::sort(rsr_vict.begin(), rsr_vict.end());
                 const uint32_t all_ip = (1u << g.ref.size()) - 1;
                 for (const auto & [k, slot] : rsr_vict) {
-                    if (rsr.pend.size() >= (size_t) rsr.cap) {
+                    const auto w_it = rsr.where.find(k);
+                    if (w_it != rsr.where.end() && (rsr.written[w_it->second] & all_ip) == all_ip) {
+                        rsr.read[w_it->second] = 0; // still held from an earlier eviction (expert weights do not change)
+                        continue;
+                    }
+                    const int32_t e = rsr_take(k, all_ip, b.il, n_expert);
+                    if (e < 0) {
                         rsr.n_skip++;
                         continue;
                     }
-                    const auto w_it = rsr.where.find(k);
-                    if (w_it != rsr.where.end() && (rsr.written[w_it->second] & all_ip) == all_ip) {
-                        continue; // still held from an earlier eviction (expert weights do not change)
-                    }
-                    rsr.pend.push_back({ rsr_take(k, all_ip), slot });
+                    rsr.pend.push_back({ e, slot });
                     rsr.n_kept++;
                 }
             }

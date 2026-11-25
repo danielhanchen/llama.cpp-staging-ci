@@ -5631,6 +5631,27 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     const int64_t at0 = at_on ? ggml_time_us() : 0;
     ggml_backend_sched_split_graph(sched, graph);
     const int64_t at1 = at_on ? ggml_time_us() : 0;
+    if (at_on) {
+        // a signature of the split (backends of the nodes, split bounds and their input sources): two allocations of one graph that log
+        // the same one split it alike
+        uint64_t h = 1469598103934665603ULL;
+        auto mix = [&](uint64_t v) { h = (h ^ v)*1099511628211ULL; };
+        for (int i = 0; i < sched->graph.n_nodes; i++) {
+            mix((uint64_t) (int64_t) sched->node_backend_ids[i]);
+        }
+        for (int i = 0; i < sched->graph.n_leafs; i++) {
+            mix((uint64_t) (int64_t) sched->leaf_backend_ids[i]);
+        }
+        for (int i = 0; i < sched->n_splits; i++) {
+            const struct ggml_backend_sched_split * sp = &sched->splits[i];
+            mix((uint64_t) sp->backend_id); mix((uint64_t) sp->i_start); mix((uint64_t) sp->i_end); mix((uint64_t) sp->n_inputs);
+            for (int j = 0; j < sp->n_inputs; j++) {
+                mix((uint64_t) (uintptr_t) sp->inputs[j]);
+            }
+        }
+        GGML_LOG_INFO("ggml_backend_sched_alloc_graph: split signature %016llx (%d nodes, %d leafs, %d splits)\n", (unsigned long long) h,
+            sched->graph.n_nodes, sched->graph.n_leafs, sched->n_splits);
+    }
     struct at_log {
         bool on; int64_t t0, t1; int n_nodes; int n_splits;
         int64_t t_dry = 0, t_bind = 0; // after the dry measure, after the binding (0: not reached)
