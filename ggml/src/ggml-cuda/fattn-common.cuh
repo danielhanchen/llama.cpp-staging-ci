@@ -1779,20 +1779,24 @@ void launch_fattn(
         dev_len = src2;
     }
 
-    // GGML_CUDA_FATTN_KV_ROTATE (unset / 1 = on, 0 = off): the stream-k blocks of the multi-stage MMA kernel (NVIDIA Ada and newer)
-    // read the KV tiles of an output tile in a rotated order, so the blocks running at the same time share them in L2 (long
-    // contexts). IEEE reorder of the partial sums, not bit-identical to 0. One KV source only; the kernel ignores it elsewhere
+    // GGML_CUDA_FATTN_KV_ROTATE: the stream-k blocks of the multi-stage MMA kernel (compiled for NVIDIA Ada and newer) read the KV
+    // tiles of an output tile in a rotated order, so the blocks running at the same time share them in L2 (long contexts). IEEE
+    // reorder of the partial sums, not bit-identical to 0. Unset = on for cc 8.9 (Ada) and cc 12.x (consumer Blackwell), the cards
+    // it is accuracy-checked on; off elsewhere (Hopper, datacenter Blackwell). 1 = on wherever it is compiled, 0 = off.
+    // One KV source only; the kernel ignores it elsewhere
     if (K2 == nullptr && use_stream_k && async_kv_preload && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-        static const bool kv_rotate = [] {
+        static const int kv_rotate_env = [] {
             const char * e = getenv("GGML_CUDA_FATTN_KV_ROTATE");
-            return e == nullptr || atoi(e) != 0;
+            return e == nullptr ? -1 : atoi(e);
         }();
+        const bool kv_rotate_auto = (cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_HOPPER) || cc >= 1200;
+        const bool kv_rotate = kv_rotate_env < 0 ? kv_rotate_auto : kv_rotate_env != 0;
         dev_len.kv_rotate = kv_rotate ? 1 : 0;
         if (kv_rotate && (int) blocks_num.x != ntiles_dst) {
             static bool logged = false;
             if (!logged) {
                 logged = true;
-                GGML_LOG_INFO("%s: FA MMA KV tile order rotated across %d stream-k blocks of %d tiles (GGML_CUDA_FATTN_KV_ROTATE=0: off)\n",
+                GGML_LOG_INFO("%s: FA MMA KV tile order rotated across %d stream-k blocks of %d tiles (GGML_CUDA_FATTN_KV_ROTATE=0: off, 1: on)\n",
                     __func__, (int) blocks_num.x, ntiles_dst);
             }
         }
