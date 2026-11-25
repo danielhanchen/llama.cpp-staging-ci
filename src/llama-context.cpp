@@ -5331,29 +5331,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // graph of the other kind was rebuilt in place instead of taking the kept way of this kind
         const bool dflash_ways = (small_cache_dflash && model.arch == LLM_ARCH_DFLASH) ||
             (n_small == 1 && small_cache_tgt && llama_spec_row_graph_env());
-        // (LLAMA_GRAPH_SMALL_MODE_WAYS=0: off): a kept graph is taken only when it was built with the MoE cache modes of this ubatch (seed,
-        // hybrid, device seed, in-place), which its swap-in requires: a mode that alternates (the host path of a CPU-miss timing trial,
-        // switched on and off by blocks) keeps one way per mode instead of rebuilding the other mode's graph in place each time
-        static const bool mode_ways = getenv("LLAMA_GRAPH_SMALL_MODE_WAYS") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_MODE_WAYS")) != 0;
-        const int hybrid_now = mode_ways && moe_cache ? moe_cache->hybrid_mode() : 0;
-        auto modes_ok = [&](uint32_t i) {
-            if (!mode_ways || !gf_res_small_built[i]) {
-                return true;
-            }
-            const gf_small_modes & km = gf_res_small_modes[i];
-            return km.seed == moe_cache_seed && km.hybrid == hybrid_now && km.devseed == moe_cache_devseed && km.inplace == moe_inplace_ok;
-        };
         for (uint32_t w = 0; w < GF_SMALL_WAYS && way < 0; ++w) {
             const uint32_t i = n_small*GF_SMALL_WAYS + w;
             const auto & r = gf_res_small[i];
-            if (r && r.get() == gf_res_prev_active && modes_ok(i) && (!dflash_ways || (gf_res_small_built[i] && gf_res_small_epoch[i] == gf_res_epoch &&
+            if (r && r.get() == gf_res_prev_active && (!dflash_ways || (gf_res_small_built[i] && gf_res_small_epoch[i] == gf_res_epoch &&
                     r->can_reuse(graph_params(r.get(), ubatch, mctx, gtype))))) {
                 way = (int) w;
             }
         }
         for (uint32_t w = 0; w < GF_SMALL_WAYS && way < 0; ++w) {
             const uint32_t i = n_small*GF_SMALL_WAYS + w;
-            if (gf_res_small[i] && gf_res_small_built[i] && gf_res_small_epoch[i] == gf_res_epoch && modes_ok(i) &&
+            if (gf_res_small[i] && gf_res_small_built[i] && gf_res_small_epoch[i] == gf_res_epoch &&
                     gf_res_small[i]->can_reuse(graph_params(gf_res_small[i].get(), ubatch, mctx, gtype))) {
                 way = (int) w;
             }
@@ -5384,10 +5372,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             for (uint32_t w = 0; w < GF_SMALL_WAYS; ++w) {
                 const uint32_t i = n_small*GF_SMALL_WAYS + w;
                 if (warm_same_smpl && !llm_graph_params::samplers_equal(gf_res_small_smpl[i], smpl_cur)) {
-                    continue;
-                }
-                // (the graph of another mode stays kept for that mode)
-                if (!modes_ok(i)) {
                     continue;
                 }
                 if (gf_res_small[i] && gf_res_small_built[i] && (mru < 0 || gf_res_small_used[i] > gf_res_small_used[n_small*GF_SMALL_WAYS + mru])) {
