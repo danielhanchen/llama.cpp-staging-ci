@@ -9194,29 +9194,34 @@ struct llama_moe_cache::impl {
         }
         return false;
     }
-    // (LLAMA_MOE_CPU_MISS_SHORT_PRIOR, default 1; 0 = off): in the wide-cache band (dec_band: the generation windows already compute
+    // LLAMA_MOE_CPU_MISS_SHORT_SHARE=f (0 < f < 1): the fetch share of a short prompt's batches on the host path. Unset: 0.75 where
+    // such a batch keeps its host path (short_host_on), else the rule's share, at most 1/4. The fetched misses are admitted to the cache,
+    // the host-computed ones are not, so the decode after the prompt hits less at a small share. RTX PRO 6000 (48 vCPU), Flash-Next at 4
+    // bits, 32 / 24 GB, 3 launches (fetch share 0.25 / 0.5 / 0.75): chat TTFT -31 / -27 / -15% and -37 / -31 / -17%, but at 0.25 and 0.5
+    // the decode after it fell beyond the launch ranges (32 GB chat -4.7 / -2.4%, 2k after it -7.9 / -13.8%); at 0.75 no cell slower
+    // beyond its range (chat text the same; 2k / 8k other texts from the other cache contents). 192 short prompts at 24 GB: first-token
+    // and decode KLD against the same bin without it inside the -fa off band (paired, per prompt)
+    static float short_share() {
+        static const float f = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT_SHARE");
+            const double v = e != nullptr ? atof(e) : -1.0;
+            return v > 0.0 && v < 1.0 ? (float) v : (e == nullptr && short_host_on() ? 0.75f : -1.0f);
+        }();
+        return f;
+    }
+    // (LLAMA_MOE_CPU_MISS_SHORT_PRIOR=1, opt-in; default 0 = off): in the wide-cache band (dec_band: the generation windows already compute
     // every miss on the host, decided by the cache share and the host, no trial) the trials cannot finish: every small batch of 1..8
     // tokens is a decode window, which the trials do not count, so no verdict exists before (or after) the first chat prompt and the rule
     // never reached it. There the band is the prior: a short prompt takes the rule as where the trials are skipped. Its per-size decision
     // is also taken at the prompt's own expected miss rate, at least the uncached share of the host experts: the window before a chat
     // prompt measures the previous request's decode right after its own prompt seeded the cache (0.4-0.7% on RTX PRO 6000, Flash-Next at
     // 4 bits capped at 48 GB, 67% cached), which turned the host path off for every prompt size although the chat prompt then misses
-    // about a third of its experts
-    // LLAMA_MOE_CPU_MISS_SHORT_SHARE=f (0 < f < 1; unset: the rule's share, at most 1/4): the fetch share of a short prompt's batches on
-    // the host path. The fetched misses are admitted to the cache, the host-computed ones are not, so the decode after the prompt hits
-    // less at a small share
-    static float short_share() {
-        static const float f = [] {
-            const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT_SHARE");
-            const double v = e != nullptr ? atof(e) : -1.0;
-            return v > 0.0 && v < 1.0 ? (float) v : -1.0f;
-        }();
-        return f;
-    }
+    // about a third of its experts. Off by default: RTX PRO 6000, Flash-Next at 4 bits capped at 48 GB, chat TTFT 0.18 -> 0.21 s (the
+    // prompt's pass on the small-batch lookup is slower than the large-batch copies it replaces, with or without the host share)
     static bool short_prior_on() {
         static const bool on = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT_PRIOR");
-            return e == nullptr || atoi(e) != 0;
+            return e != nullptr && atoi(e) != 0;
         }();
         return on;
     }
@@ -9477,10 +9482,11 @@ struct llama_moe_cache::impl {
     }
     mutable uint64_t n_prompt_fetch = 0; // layer graphs of prompt ubatches built with every miss fetched (engagement)
     mutable uint64_t n_short_host   = 0; // layer graphs of short-prompt batches above max_batch built with the host path (engagement)
+    // default on a many-core host (single_wide_host, the measured RTX PRO 6000 class); =1 on every host, =0 off
     static bool short_host_on() {
         static const bool on = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT_HOST");
-            return e == nullptr || atoi(e) != 0;
+            return e == nullptr ? single_wide_host() : atoi(e) != 0;
         }();
         return on;
     }
@@ -9501,7 +9507,7 @@ struct llama_moe_cache::impl {
             host  = hybrid_active();
             share = host ? hybrid_share : 1.0f;
         }
-        // (LLAMA_MOE_CPU_MISS_SHORT_HOST, default 1; 0 = off): a short prompt's batch above max_batch that the short-prompt rule put on
+        // (LLAMA_MOE_CPU_MISS_SHORT_HOST, default on a many-core host; 0 = off, 1 = every host): a short prompt's batch above max_batch that the short-prompt rule put on
         // the host path keeps its host share here. The refetch below is for the prompt's last few tokens (the first token's own rows); it
         // also caught a chat prompt's [38] pass, which has no outputs, so the rule's host share was dropped and every miss fetched
         // (RTX PRO 6000, Flash-Next at 4 bits capped at 32 / 24 GB). The last ubatch of the prompt still fetches every miss
@@ -15620,7 +15626,7 @@ struct llama_moe_cache::impl {
             }
             if (n_short_host > 0 || short_prior_n > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: short prompts: %llu layer graphs of prompt batches above %" PRId64 " tokens kept the host path, "
-                    "%llu ubatches through the wide-cache prior (LLAMA_MOE_CPU_MISS_SHORT_HOST=0, LLAMA_MOE_CPU_MISS_SHORT_PRIOR=0 off)\n",
+                    "%llu ubatches through the wide-cache prior (LLAMA_MOE_CPU_MISS_SHORT_HOST=0 off, LLAMA_MOE_CPU_MISS_SHORT_PRIOR=1 on)\n",
                     tag, (unsigned long long) n_short_host, max_batch, (unsigned long long) short_prior_n);
             }
         }
