@@ -978,6 +978,64 @@ struct llama_moe_cache::impl {
     bool     lm_merged         = false;     // a merged layer-major graph runs (set_lm_merged)
     int32_t  seed_pass_il      = INT32_MAX; // the layer of the last one
 
+    // diagnostic (LLAMA_MOE_SEED_RESCUE_LOG=1, read only): per prompt pass, the seed victims that belong to layers ahead of the seeded
+    // layer and the copies of the same pass that then miss them (uploaded from the host although the bytes were on the device before
+    // the seed overwrote them). Rings of several sizes are simulated: a victim survives if fewer than ring/expert_bytes victims came after it
+    struct rescue_ctr {
+        std::unordered_map<int64_t, uint64_t> ahead; // (group << 32 | key) -> victim sequence number
+        uint64_t n_seq        = 0;  // victims ahead recorded in this pass
+        uint64_t n_fills      = 0;  // seed fills
+        uint64_t n_ahead      = 0;  // victims of layers ahead
+        uint64_t n_behind     = 0;  // victims of this or finished layers
+        uint64_t n_reread     = 0;  // copies (per expert tensor) that missed a victim ahead
+        uint64_t n_reread_x   = 0;  // distinct victims missed again
+        uint64_t b_reread     = 0;  // bytes of those copies
+        uint64_t b_ring[5]    = { 0, 0, 0, 0, 0 }; // of them, within a ring of 128 / 256 / 512 / 1024 / 2048 MiB
+        uint64_t n_dist[4]    = { 0, 0, 0, 0 };    // layer distance victim - seeded layer: 1-2, 3-8, 9-24, 25+
+        int32_t  last_copy_il = -1;
+        int32_t  pass         = 0;
+        size_t   e_bytes      = 0;  // bytes of one expert (all tensors)
+        std::unordered_map<int64_t, int32_t> seen;   // victims already counted as missed (distinct count)
+    } rsc;
+    bool rsc_after_large = false;
+    static bool rsc_log_on() {
+        static const bool on = getenv("LLAMA_MOE_SEED_RESCUE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_SEED_RESCUE_LOG")) != 0;
+        return on;
+    }
+    void rsc_flush(const char * why) {
+        if (rsc.n_fills > 0 || rsc.n_reread > 0) {
+            const double mib = 1.0/1048576.0;
+            LLAMA_LOG_INFO("llama_moe_cache: seed rescue counter (%s): pass %d: %" PRIu64 " seed fills, victims %" PRIu64 " of layers ahead (%.1f MiB) "
+                "and %" PRIu64 " of this or finished layers; layer distance 1-2 / 3-8 / 9-24 / 25+: %" PRIu64 " / %" PRIu64 " / %" PRIu64 " / %" PRIu64 "; "
+                "copies that missed a victim ahead later in the pass: %" PRIu64 " tensor copies, %" PRIu64 " experts, %.1f MiB; within a ring of "
+                "128 / 256 / 512 / 1024 / 2048 MiB: %.1f / %.1f / %.1f / %.1f / %.1f MiB\n", why, rsc.pass, rsc.n_fills, rsc.n_ahead,
+                rsc.n_ahead*rsc.e_bytes*mib, rsc.n_behind, rsc.n_dist[0], rsc.n_dist[1], rsc.n_dist[2], rsc.n_dist[3], rsc.n_reread, rsc.n_reread_x,
+                rsc.b_reread*mib, rsc.b_ring[0]*mib, rsc.b_ring[1]*mib, rsc.b_ring[2]*mib, rsc.b_ring[3]*mib, rsc.b_ring[4]*mib);
+        }
+        const int32_t p = rsc.pass + 1;
+        rsc = rescue_ctr();
+        rsc.pass = p;
+    }
+    void rsc_on_copy_miss(int32_t ig, int32_t il, int32_t e, int32_t n_expert, size_t nb) {
+        const int64_t k = ((int64_t) ig << 32) | ((int64_t) il*n_expert + e);
+        const auto it = rsc.ahead.find(k);
+        if (it == rsc.ahead.end()) {
+            return;
+        }
+        rsc.n_reread++;
+        rsc.b_reread += nb;
+        if (rsc.seen.emplace(k, 1).second) {
+            rsc.n_reread_x++;
+        }
+        const uint64_t d = rsc.n_seq - it->second; // victims recorded after this one
+        static const uint64_t ring_mib[5] = { 128, 256, 512, 1024, 2048 };
+        for (int r = 0; r < 5; ++r) {
+            if (rsc.e_bytes > 0 && d < (ring_mib[r] << 20)/rsc.e_bytes) {
+                rsc.b_ring[r] += nb;
+            }
+        }
+    }
+
     static constexpr int64_t max_batch = 32;
 
     // large batches copy runs of cached experts of at least this size from the cache
@@ -12278,6 +12336,14 @@ struct llama_moe_cache::impl {
         // experts this text routes, and evicting them for guesses costs more than the overlap gains (RTX PRO 6000 with the 4-bit Qwen3.6 12 GB multi-turn tails +8%)
         ua_skip = ua_prev_tokens > ua_max_tokens;
         ua_prev_tokens = n_tokens;
+        if (rsc_log_on()) {
+            if (n_tokens > n_small_max) {
+                rsc_after_large = true;
+            } else if (rsc_after_large) {
+                rsc_after_large = false;
+                rsc_flush("prompt end");
+            }
+        }
         static const bool st_log = getenv("LLAMA_MOE_CACHE_STATE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_STATE_LOG")) != 0;
         if (st_log) {
             if (n_tokens > n_small_max) {
@@ -14243,6 +14309,15 @@ struct llama_moe_cache::impl {
         // large batches only read the cache, so the experts used in generation stay in it
         // while a layer is seeded, its slots are filled after its copies, so the copies read the slots it had before
         const int32_t * slots = b.il == g.sd.il ? g.sd.old_slots.data() : g.lru.slot_map[b.il];
+        if (rsc_log_on()) {
+            if (b.il < rsc.last_copy_il) {
+                rsc_flush("next pass");
+            }
+            rsc.last_copy_il = b.il;
+            if (slots != nullptr && slots[e] < 0) {
+                rsc_on_copy_miss(layers[b.il].ig, b.il, (int32_t) e, g.lru.n_expert, w->nb[2]);
+            }
+        }
         if (slots == nullptr || slots[e] < 0) {
             ua_dbg[slots == nullptr ? 2 : 3]++;
             return 0;
@@ -14969,6 +15044,25 @@ struct llama_moe_cache::impl {
                 keep_ahead ? b.il : INT32_MAX);
             GGML_ASSERT(ok);
             sd.gen = g.lru.gen;
+            if (rsc_log_on()) {
+                rsc.e_bytes = g.expert_bytes;
+                rsc.n_fills += sd.fills.size();
+                for (const auto & f : sd.fills) {
+                    const int32_t k = sd.old_key_of[f.slot];
+                    if (k < 0) {
+                        continue;
+                    }
+                    const int32_t kl = k / n_expert;
+                    if (kl > b.il) {
+                        rsc.n_ahead++;
+                        rsc.ahead[((int64_t) layers[b.il].ig << 32) | k] = rsc.n_seq++;
+                        const int32_t dl = kl - b.il;
+                        rsc.n_dist[dl <= 2 ? 0 : dl <= 8 ? 1 : dl <= 24 ? 2 : 3]++;
+                    } else {
+                        rsc.n_behind++;
+                    }
+                }
+            }
             if (tiered) {
                 // exclusive: the experts the seed evicts move to RAM before any of their device slots is overwritten
                 // a large batch seeds layer b.il after its experts were staged, so the RAM slots they need make room in the
