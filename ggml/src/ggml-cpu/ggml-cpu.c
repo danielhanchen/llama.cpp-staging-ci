@@ -3617,6 +3617,41 @@ static int64_t ggml_cpu_get_rows_mt_min(void) {
     return v;
 }
 
+// a small GET_ROWS from a very large table (GGML_CPU_GET_ROWS_BIG, default on; 0 = off): at least GGML_CPU_GET_ROWS_BIG_ROWS (32)
+// rows from a source of at least GGML_CPU_GET_ROWS_BIG_GIB (4) GiB run on up to GGML_CPU_GET_ROWS_BIG_THREADS (8) threads. Such a
+// table is a lazily mapped file (the per-layer embedding rows of a decode or verify batch: 16 random rows per token, each on its own
+// page), and one thread took every page fault of the gather in turn before the device part of the graph could start; the threads
+// overlap the faults. Every row is dequantized on its own, so the result does not change
+static bool ggml_cpu_region_runner_set(void);
+
+// (=1, the default, keeps one thread where a region runner is set, i.e. where a MoE host path hands the graph regions to its host
+// thread's team: there the gather's region ran on that team between its host expert batches and slowed them, RTX PRO 6000 48 GB
+// Flash-Next 101 -> 129 us per host batch, more than the gather saved; =2 also there)
+static int ggml_cpu_get_rows_big_threads(const struct ggml_tensor * node, int n_threads) {
+    static int on      = -1;
+    static int64_t min_rows  = 32;
+    static int64_t min_bytes = 0;
+    static int max_thr = 8;
+    if (on < 0) {
+        const char * e = getenv("GGML_CPU_GET_ROWS_BIG");
+        const char * r = getenv("GGML_CPU_GET_ROWS_BIG_ROWS");
+        const char * g = getenv("GGML_CPU_GET_ROWS_BIG_GIB");
+        const char * t = getenv("GGML_CPU_GET_ROWS_BIG_THREADS");
+        min_rows  = r ? MAX(1, atoll(r)) : 32;
+        min_bytes = (int64_t) (g ? MAX(0, atoll(g)) : 4) << 30;
+        max_thr   = t ? MAX(1, atoi(t)) : 8;
+        on        = e == NULL ? 1 : MAX(0, atoi(e));
+    }
+    if (on == 0 || (on == 1 && ggml_cpu_region_runner_set()) || node->src[0] == NULL || node->src[1] == NULL || ggml_nelements(node->src[1]) < min_rows ||
+            (int64_t) ggml_nbytes(node->src[0]) < min_bytes) {
+        return 1;
+    }
+    return MIN(n_threads, max_thr);
+}
+
+// gathers that took the form above (counted by ggml_graph_plan, reported once and then at every power of two)
+static atomic_int ggml_cpu_get_rows_big_n;
+
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
 
@@ -3746,7 +3781,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 // but a large one (e.g. the per-layer embedding rows of a whole prompt, read from a mapped file) is
                 // bound by its page faults and cache misses, which threads overlap
                 // every row is dequantized on its own, so splitting the rows does not change the result
-                n_tasks = ggml_nelements(node->src[1]) >= ggml_cpu_get_rows_mt_min() ? n_threads : 1;
+                n_tasks = ggml_nelements(node->src[1]) >= ggml_cpu_get_rows_mt_min() ? n_threads : ggml_cpu_get_rows_big_threads(node, n_threads);
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:
@@ -4221,6 +4256,15 @@ struct ggml_cplan ggml_graph_plan(
         const int n_tasks = ggml_get_n_tasks(node, n_threads);
 
         max_tasks = MAX(max_tasks, n_tasks);
+
+        if (node->op == GGML_OP_GET_ROWS && n_tasks > 1 && ggml_nelements(node->src[1]) < ggml_cpu_get_rows_mt_min()) {
+            const int k = atomic_fetch_add(&ggml_cpu_get_rows_big_n, 1) + 1;
+            if ((k & (k - 1)) == 0) {
+                GGML_LOG_INFO("%s: %d gathers of a large table so far on %d threads (this one: %" PRId64 " rows of a %.1f GiB table; "
+                    "GGML_CPU_GET_ROWS_BIG=0 off)\n", __func__, k, n_tasks, ggml_nelements(node->src[1]),
+                    ggml_nbytes(node->src[0])/1073741824.0);
+            }
+        }
 
         size_t cur = 0;
 
@@ -4992,6 +5036,10 @@ static void *                   ggml_cpu_region_runner_user = NULL;
 #endif
 
 void ggml_cpu_set_region_runner(ggml_cpu_region_runner_t runner, void * user);
+
+static bool ggml_cpu_region_runner_set(void) {
+    return GGML_CPU_RUNNER_LOAD(ggml_cpu_region_runner) != NULL;
+}
 
 void ggml_cpu_set_region_runner(ggml_cpu_region_runner_t runner, void * user) {
     // the user pointer first: a caller that sees the runner sees its user pointer
