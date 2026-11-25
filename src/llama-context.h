@@ -774,11 +774,6 @@ private:
     // (LLAMA_LM_CKPT_MERGE): ubatch breaks of the next decode() (batch indices), see llama_set_ubatch_breaks
     std::vector<int32_t> ubatch_breaks_next;
     bool lm_auto    = false;  // LLAMA_MOE_LAYER_MAJOR unset: on beside speculative decoding with a model
-    // layer-major prompts without a MoE cache: dense host weights the device computes (op offload) are copied once per group
-    // instead of once per ubatch [LLAMA_LAYER_MAJOR_DENSE=0: off]
-    bool    lm_dense          = false;
-    bool    lm_dense_cand     = false; // the context's parameters allow it (decided once the model's placement is known)
-    int64_t lm_n_dense_groups = 0;
     int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
     int64_t lm_n_tail = 0;    // short last ubatches run as the last member of a group (LLAMA_LM_TAIL)
     bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]
