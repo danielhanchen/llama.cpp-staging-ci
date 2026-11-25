@@ -179,8 +179,20 @@ static bool server_spec_varied_widths(const common_params_speculative & sp, cons
 // (widths up to the outputs the context takes per sequence, the server's widest window)
 // (the graphs carry the slot's device sampler: each chain of `chains` is swapped in for its own windows, raw logits off as for a request
 // it serves; `restore` / `restore_raw` are put back after. No chain: the windows run once with the context's sampler state)
-static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max, const std::vector<llama_sampler *> & chains,
-        llama_sampler * restore, bool restore_raw, bool varied_widths) {
+// a DFlash2 drafter whose cached-window band can engage (common/speculative.cpp: the 3-row or the whole draft per pass beside a MoE
+// cache that holds LLAMA_DFLASH_CACHED_FRAC_MIN .. LLAMA_DFLASH_CACHED_FRAC_MAX of the host experts; off with LLAMA_DFLASH_WINDOW=0 or
+// LLAMA_DFLASH_CACHED_WINDOW=0)
+static bool server_spec_dflash_mid(const common_params_speculative & sp) {
+    if (std::find(sp.types.begin(), sp.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) == sp.types.end()) {
+        return false;
+    }
+    const char * ew  = getenv("LLAMA_DFLASH_WINDOW");
+    const char * ecw = getenv("LLAMA_DFLASH_CACHED_WINDOW");
+    return (ew == nullptr || atoi(ew) != 0) && (ecw == nullptr || atoi(ecw) != 0);
+}
+
+static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max, const std::vector<llama_sampler *> & chains_all,
+        llama_sampler * restore, bool restore_raw, bool varied_widths, bool dflash_mid) {
     const char * e = getenv("LLAMA_SPEC_PREWARM");
     int w_max = e != nullptr ? std::max(0, std::min(8, atoi(e))) : (gpu ? 8 : 0);
     if (n_out_max > 0) {
@@ -212,8 +224,24 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     const double cache_frac = llama_moe_cache_frac(ctx);
     const bool wide_graphs  = llama_moe_cache_wide_graphs(ctx);
     const bool band_ok      = !wide_graphs && cached_frac_min > 0.0 && cache_frac >= cached_frac_min && w_max >= cached_min_w;
+    // (LLAMA_SPEC_PREWARM_MID=0: off) a DFlash2 target in the cached-window band below the prewarm share (LLAMA_DFLASH_CACHED_FRAC_MIN
+    // 0.20 .. LLAMA_SPEC_PREWARM_CACHED_FRAC): its passes verify 3 rows or the whole draft, and the first whole-draft window of the process
+    // was built, run eagerly and captured inside a request (RTX PRO 6000 Flash-Next 4-bit 24 GB, 27.9% cached, DFlash2 chat: two passes of
+    // ~132 + ~44 ms in the first request that went wide, +2.5 ms per pass on average). Only those two widths and the plain decode of the
+    // greedy device chain are prewarmed, exactly (the cache is taken back after), so the device memory the request's later prompts see is
+    // what those graphs take anyway once a request has run them: the full prewarm there (every width, three sampler chains) left an 8k prompt below
+    // its lending headroom (more slots lent, other text, +45 ms TTFT)
+    static const bool mid_env = getenv("LLAMA_SPEC_PREWARM_MID") == nullptr || atoi(getenv("LLAMA_SPEC_PREWARM_MID")) != 0;
+    const double dflash_mid_lo = getenv("LLAMA_DFLASH_CACHED_FRAC_MIN") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MIN")) : 0.20;
+    const bool mid = mid_env && dflash_mid && !wide_graphs && !band_ok && llama_moe_cache_active(ctx) && cache_frac >= dflash_mid_lo &&
+        cache_frac < cached_frac_min && w_max >= std::max(cached_min_w, 4) && getenv("LLAMA_SPEC_PREWARM_CACHED") == nullptr &&
+        getenv("LLAMA_SPEC_PREWARM_WIDTHS") == nullptr;
     const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0 :
-        (wide_graphs || band_ok);
+        (wide_graphs || band_ok || mid);
+    std::vector<llama_sampler *> chains = chains_all;
+    if (mid && chains.size() > 1) {
+        chains.resize(1);
+    }
     static const bool mem_log   = getenv("LLAMA_SPEC_PREWARM_MEM") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_MEM")) != 0;
     std::vector<int> widths;
     if (const char * ew = getenv("LLAMA_SPEC_PREWARM_WIDTHS")) {
@@ -226,6 +254,9 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
             if (*q == ',') { ++q; }
         }
         std::sort(widths.begin(), widths.end());
+    } else if (mid) {
+        // the plain decode too (the single-token decode the band falls back to between windows)
+        widths = { 1, 3, w_max };
     } else {
         for (int w = 1; w <= w_max; ++w) {
             widths.push_back(w);
@@ -254,7 +285,10 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
             llama_n_batch(ctx) < (uint32_t) std::max(w_max, std::min(n_pre, 1)) || (int) llama_n_ctx_seq(ctx) < n_end + 64) {
         return;
     }
-    if (cached_ok && llama_moe_cache_active(ctx) && !wide_graphs) {
+    if (mid) {
+        SRV_INF("decode and verify graphs of the DFlash2 cached window (1, 3 and %d rows, greedy chain) prewarmed beside a MoE cache that holds %.1f%% of "
+                "the host experts (LLAMA_SPEC_PREWARM_MID=0: off)\n", w_max, 100.0*cache_frac);
+    } else if (cached_ok && llama_moe_cache_active(ctx) && !wide_graphs) {
         SRV_INF("verify graphs prewarmed beside a MoE cache that holds %.1f%% of the host experts (LLAMA_SPEC_PREWARM_CACHED_FRAC "
                 "%.2f)\n", 100.0*cache_frac, cached_frac_min);
     }
@@ -569,9 +603,17 @@ struct server_pass_timer {
     int64_t t_dec_0 = 0; // the first decode of the request
     double  dec_sum = 0; // decode call + wait of every decode
     bool    gen     = false; // the decode being timed has no prompt tokens
+    // by (previous pass width, this pass width): pass time and decode time (call + wait) of the counted passes;
+    // LLAMA_PASS_TIMING=2 also logs one line per counted pass (widths and every step)
+    int     level      = 0;
+    int32_t width_prev = 0;
+    double  pw_sum[32][32] = {};
+    double  pw_dec[32][32] = {};
+    int64_t pw_n[32][32]   = {};
     server_pass_timer() {
         const char * e = getenv("LLAMA_PASS_TIMING");
-        on = e != nullptr && atoi(e) != 0;
+        level = e != nullptr ? atoi(e) : 0;
+        on = level != 0;
     }
     void stamp(int k) {
         if (!on) {
@@ -589,6 +631,23 @@ struct server_pass_timer {
                 }
                 sum[N_STAMP - 1] += (double) (now - t[TOK1]);
                 n += 1;
+                const int wc = width > 0 && width < 32 ? width : 0;
+                const int wp = width_prev > 0 && width_prev < 32 ? width_prev : 0;
+                pw_sum[wp][wc] += (double) (now - t[DRAFT0]);
+                pw_dec[wp][wc] += (double) (t[DEC2] - t[DEC0]);
+                pw_n[wp][wc]   += 1;
+                if (level >= 2) {
+                    char b[320];
+                    int  o = snprintf(b, sizeof(b), "pass trace: w %d prev %d total %.3f", wc, wp, (now - t[DRAFT0])/1e3);
+                    for (int i = 0; i + 1 < N_STAMP && o > 0 && o < (int) sizeof(b); ++i) {
+                        o += snprintf(b + o, sizeof(b) - o, " %.3f", (t[i + 1] - t[i])/1e3);
+                    }
+                    if (o > 0 && o < (int) sizeof(b)) {
+                        snprintf(b + o, sizeof(b) - o, " %.3f", (now - t[TOK1])/1e3);
+                    }
+                    LOG_INF("%s\n", b);
+                }
+                width_prev = width;
             }
             for (int i = 0; i < N_STAMP; ++i) {
                 t[i] = 0;
@@ -631,6 +690,15 @@ struct server_pass_timer {
                 snprintf(b, sizeof(b), " w%d %.3f (%" PRId64 ")", w, w_sum[w] / w_n[w] / 1e3, w_n[w]); r += b;
             }
         }
+        r += " | by previous -> this width (ms/pass, decode ms, n):";
+        for (int a = 0; a < 32; ++a) {
+            for (int c = 0; c < 32; ++c) {
+                if (pw_n[a][c] > 0) {
+                    snprintf(b, sizeof(b), " %d->%d %.3f %.3f (%" PRId64 ")", a, c, pw_sum[a][c] / pw_n[a][c] / 1e3, pw_dec[a][c] / pw_n[a][c] / 1e3,
+                        pw_n[a][c]); r += b;
+                }
+            }
+        }
         if (t_gen_ms > 0.0 && t_dec_0 > 0) {
             // eval time = counted passes + the rest: the decodes outside them, and the host time between the prompt and the first decode
             const double t_end_ms = (double) (ggml_time_us() - t_dec_0) / 1e3;
@@ -655,6 +723,12 @@ struct server_pass_timer {
         }
         n = 0;
         n_dec = 0; t_dec_0 = 0; dec_sum = 0;
+        width_prev = 0;
+        for (int a = 0; a < 32; ++a) {
+            for (int c = 0; c < 32; ++c) {
+                pw_sum[a][c] = 0; pw_dec[a][c] = 0; pw_n[a][c] = 0;
+            }
+        }
         auto & dg = common_dflash_diag();
         dg.t_launch = dg.t_wait = dg.t_walk = dg.n_draft = 0;
     }
@@ -3325,7 +3399,8 @@ private:
             }
             server_spec_prewarm(ctx_tgt, llama_supports_gpu_offload() && params_base.n_gpu_layers != 0,
                 params_base.n_outputs_max_per_seq > 0 ? params_base.n_outputs_max_per_seq : params_base.n_outputs_max,
-                chains, s0.smpl_dev.get(), true, server_spec_varied_widths(params_base.speculative, ctx_tgt));
+                chains, s0.smpl_dev.get(), true, server_spec_varied_widths(params_base.speculative, ctx_tgt),
+                server_spec_dflash_mid(params_base.speculative));
         }
 
         // the load is over (target, drafter, warm-ups): read back the PLE table pages the page cache gave up since the
