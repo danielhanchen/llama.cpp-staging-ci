@@ -234,7 +234,10 @@ static bool server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // its lending headroom (more slots lent, other text, +45 ms TTFT)
     static const bool mid_env = getenv("LLAMA_SPEC_PREWARM_MID") == nullptr || atoi(getenv("LLAMA_SPEC_PREWARM_MID")) != 0;
     const double dflash_mid_lo = getenv("LLAMA_DFLASH_CACHED_FRAC_MIN") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MIN")) : 0.20;
-    const bool mid = mid_env && dflash_mid && !wide_graphs && !band_ok && llama_moe_cache_active(ctx) && cache_frac >= dflash_mid_lo &&
+    // not beside a disk tier (the host experts read from the disk): there the prewarm's windows move the RAM tier's experts, and L4
+    // Flash-Next 4-bit full card (24.8% cached) lost 5..7% of 2k / 8k decode, +2.4 / +8 s of 2k / 8k TTFT and +97 s of load with it
+    const bool mid_disk = llama_moe_cache_disk_tier(ctx);
+    const bool mid = mid_env && dflash_mid && !wide_graphs && !band_ok && !mid_disk && llama_moe_cache_active(ctx) && cache_frac >= dflash_mid_lo &&
         cache_frac < cached_frac_min && w_max >= std::max(cached_min_w, 4) && getenv("LLAMA_SPEC_PREWARM_CACHED") == nullptr &&
         getenv("LLAMA_SPEC_PREWARM_WIDTHS") == nullptr;
     const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0 :

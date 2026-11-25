@@ -14090,6 +14090,10 @@ double llama_moe_cache_frac(const llama_context * ctx) {
     return ctx->get_moe_cache()->cache_frac();
 }
 
+bool llama_moe_cache_disk_tier(const llama_context * ctx) {
+    return ctx != nullptr && ctx->get_moe_cache() != nullptr && ctx->get_moe_cache()->host_disk_tier();
+}
+
 bool llama_prepare_prompt_plan(llama_context * ctx) {
     return ctx->restore_pp_plan(true);
 }
