@@ -179,8 +179,20 @@ static bool server_spec_varied_widths(const common_params_speculative & sp, cons
 // (widths up to the outputs the context takes per sequence, the server's widest window)
 // (the graphs carry the slot's device sampler: each chain of `chains` is swapped in for its own windows, raw logits off as for a request
 // it serves; `restore` / `restore_raw` are put back after. No chain: the windows run once with the context's sampler state)
-static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max, const std::vector<llama_sampler *> & chains,
-        llama_sampler * restore, bool restore_raw, bool varied_widths) {
+// a DFlash2 drafter whose cached-window band can engage (common/speculative.cpp: the 3-row or the whole draft per pass beside a MoE
+// cache that holds LLAMA_DFLASH_CACHED_FRAC_MIN .. LLAMA_DFLASH_CACHED_FRAC_MAX of the host experts; off with LLAMA_DFLASH_WINDOW=0 or
+// LLAMA_DFLASH_CACHED_WINDOW=0)
+static bool server_spec_dflash_mid(const common_params_speculative & sp) {
+    if (std::find(sp.types.begin(), sp.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) == sp.types.end()) {
+        return false;
+    }
+    const char * ew  = getenv("LLAMA_DFLASH_WINDOW");
+    const char * ecw = getenv("LLAMA_DFLASH_CACHED_WINDOW");
+    return (ew == nullptr || atoi(ew) != 0) && (ecw == nullptr || atoi(ecw) != 0);
+}
+
+static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max, const std::vector<llama_sampler *> & chains_all,
+        llama_sampler * restore, bool restore_raw, bool varied_widths, bool dflash_mid) {
     const char * e = getenv("LLAMA_SPEC_PREWARM");
     int w_max = e != nullptr ? std::max(0, std::min(8, atoi(e))) : (gpu ? 8 : 0);
     if (n_out_max > 0) {
@@ -212,8 +224,24 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     const double cache_frac = llama_moe_cache_frac(ctx);
     const bool wide_graphs  = llama_moe_cache_wide_graphs(ctx);
     const bool band_ok      = !wide_graphs && cached_frac_min > 0.0 && cache_frac >= cached_frac_min && w_max >= cached_min_w;
+    // (LLAMA_SPEC_PREWARM_MID=0: off) a DFlash2 target in the cached-window band below the prewarm share (LLAMA_DFLASH_CACHED_FRAC_MIN
+    // 0.20 .. LLAMA_SPEC_PREWARM_CACHED_FRAC): its passes verify 3 rows or the whole draft, and the first whole-draft window of the process
+    // was built, run eagerly and captured inside a request (RTX PRO 6000 Flash-Next 4-bit 24 GB, 27.9% cached, DFlash2 chat: two passes of
+    // ~132 + ~44 ms in the first request that went wide, +2.5 ms per pass on average). Only those two widths of the greedy device chain
+    // are prewarmed, exactly (the cache is taken back after), so the device memory the request's later prompts see is what those two
+    // graphs take anyway once a request has run them: the full prewarm there (every width, three sampler chains) left an 8k prompt below
+    // its lending headroom (more slots lent, other text, +45 ms TTFT)
+    static const bool mid_env = getenv("LLAMA_SPEC_PREWARM_MID") == nullptr || atoi(getenv("LLAMA_SPEC_PREWARM_MID")) != 0;
+    const double dflash_mid_lo = getenv("LLAMA_DFLASH_CACHED_FRAC_MIN") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MIN")) : 0.20;
+    const bool mid = mid_env && dflash_mid && !wide_graphs && !band_ok && llama_moe_cache_active(ctx) && cache_frac >= dflash_mid_lo &&
+        cache_frac < cached_frac_min && w_max >= std::max(cached_min_w, 4) && getenv("LLAMA_SPEC_PREWARM_CACHED") == nullptr &&
+        getenv("LLAMA_SPEC_PREWARM_WIDTHS") == nullptr;
     const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0 :
-        (wide_graphs || band_ok);
+        (wide_graphs || band_ok || mid);
+    std::vector<llama_sampler *> chains = chains_all;
+    if (mid && chains.size() > 1) {
+        chains.resize(1);
+    }
     static const bool mem_log   = getenv("LLAMA_SPEC_PREWARM_MEM") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_MEM")) != 0;
     std::vector<int> widths;
     if (const char * ew = getenv("LLAMA_SPEC_PREWARM_WIDTHS")) {
@@ -226,6 +254,8 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
             if (*q == ',') { ++q; }
         }
         std::sort(widths.begin(), widths.end());
+    } else if (mid) {
+        widths = { 3, w_max };
     } else {
         for (int w = 1; w <= w_max; ++w) {
             widths.push_back(w);
@@ -254,7 +284,10 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
             llama_n_batch(ctx) < (uint32_t) std::max(w_max, std::min(n_pre, 1)) || (int) llama_n_ctx_seq(ctx) < n_end + 64) {
         return;
     }
-    if (cached_ok && llama_moe_cache_active(ctx) && !wide_graphs) {
+    if (mid) {
+        SRV_INF("verify graphs of the DFlash2 cached window (3 and %d rows, greedy chain) prewarmed beside a MoE cache that holds %.1f%% of "
+                "the host experts (LLAMA_SPEC_PREWARM_MID=0: off)\n", w_max, 100.0*cache_frac);
+    } else if (cached_ok && llama_moe_cache_active(ctx) && !wide_graphs) {
         SRV_INF("verify graphs prewarmed beside a MoE cache that holds %.1f%% of the host experts (LLAMA_SPEC_PREWARM_CACHED_FRAC "
                 "%.2f)\n", 100.0*cache_frac, cached_frac_min);
     }
@@ -3365,7 +3398,8 @@ private:
             }
             server_spec_prewarm(ctx_tgt, llama_supports_gpu_offload() && params_base.n_gpu_layers != 0,
                 params_base.n_outputs_max_per_seq > 0 ? params_base.n_outputs_max_per_seq : params_base.n_outputs_max,
-                chains, s0.smpl_dev.get(), true, server_spec_varied_widths(params_base.speculative, ctx_tgt));
+                chains, s0.smpl_dev.get(), true, server_spec_varied_widths(params_base.speculative, ctx_tgt),
+                server_spec_dflash_mid(params_base.speculative));
         }
 
         // the load is over (target, drafter, warm-ups): read back the PLE table pages the page cache gave up since the
