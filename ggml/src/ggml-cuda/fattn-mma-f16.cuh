@@ -1079,6 +1079,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     }
 }
 
+// the rotated KV tile order (flash_attn_ext_f16, GGML_CUDA_FATTN_KV_ROTATE) is compiled for NVIDIA Ada and newer only; below that
+// the multi-stage kernels are the plain code
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
+#define GGML_CUDA_FATTN_KV_ROTATE_ARCH 1
+#else
+#define GGML_CUDA_FATTN_KV_ROTATE_ARCH 0
+#endif
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check, int q8_kv,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
@@ -1131,6 +1139,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
+    // the KV tile the multi-stage pipeline preloads for the next iteration (kb0 + 1 unless the order is rotated)
+#if GGML_CUDA_FATTN_KV_ROTATE_ARCH
+    const int k_VKQ_next = kb0_next * nbatch_fa;
+#else
+    const int k_VKQ_next = k_VKQ_0 + nbatch_fa;
+    GGML_UNUSED(kb0_next);
+#endif // GGML_CUDA_FATTN_KV_ROTATE_ARCH
+    GGML_UNUSED(k_VKQ_next);
     // the int8 K tile and its scales over the f16 K tile (smaller: D + 16 + D/8 bytes per row instead of >= 2 D)
     constexpr bool i8  = fattn_kvq_i8(q8_kv);
     constexpr bool i8r = fattn_kvq_i8r(q8_kv); // staged int8 rows: loaded straight into the int8 tile, scales inside the rows
@@ -1558,18 +1574,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (!last_iter) {
             if (ncols2 > 1 || mask_h) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (mask_h, tile_mask, stride_mask, kb0_next*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+                    (mask_h, tile_mask, stride_mask, k_VKQ_next, k_VKQ_sup, jt*ncols1, ne01, nullptr);
             }
             if constexpr (fattn_kvq_mode(q8_kv) == 2) {
-                flash_attn_ext_q8_load_raw<nwarps, nbatch_fa, fattn_kvq_row_bytes(DKQ, fattn_kvq_k4(q8_kv))>((const char *) K_h2, raw_K, stride_K, kb0_next*nbatch_fa);
+                flash_attn_ext_q8_load_raw<nwarps, nbatch_fa, fattn_kvq_row_bytes(DKQ, fattn_kvq_k4(q8_kv))>((const char *) K_h2, raw_K, stride_K, k_VKQ_next);
             } else if constexpr (i8r) {
                 flash_attn_ext_i8r_load_tile<nwarps, nbatch_fa, DKQ, false, true>
-                    ((const char *) K_h2, tile_K8, stride_K, kb0_next*nbatch_fa, nbatch_fa);
+                    ((const char *) K_h2, tile_K8, stride_K, k_VKQ_next, nbatch_fa);
             } else if constexpr (i8) {
-                flash_attn_ext_i8_load_raw<nwarps, nbatch_fa, DKQ>((const char *) K_h2, raw_K, stride_K, kb0_next*nbatch_fa);
+                flash_attn_ext_i8_load_raw<nwarps, nbatch_fa, DKQ>((const char *) K_h2, raw_K, stride_K, k_VKQ_next);
             } else {
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (K_h2, tile_K, nbatch_K2, stride_K, kb0_next*nbatch_fa, k_VKQ_sup, nullptr);
+                    (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_next, k_VKQ_sup, nullptr);
             }
         }
         if constexpr (fattn_kvq_mode(q8_kv) == 2) {
@@ -1867,11 +1883,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_kv_loop(
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
-    constexpr bool rot_arch = true;
-#else
-    constexpr bool rot_arch = false;
-#endif
+    constexpr bool rot_arch = GGML_CUDA_FATTN_KV_ROTATE_ARCH;
     if constexpr (nstages > 1 && rot_arch) {
       if (rot) {
         constexpr bool oob_check = false;
@@ -2867,14 +2879,10 @@ static __global__ void flash_attn_ext_f16(
     // blocks that run at the same time read the same KV tiles and share them in L2. Only with multi-stage loading (else every block
     // waits for the same KV data) and one KV source. Each block still covers a contiguous (cyclic) run of a tile's KV tiles, so the
     // stream-k fixup is unchanged; the partial sums are grouped differently (not bit-identical to the plain order).
-    // Ada and newer only: there every launch is stream-k (launch_fattn), so blocks run several whole tiles of long prompts and the
-    // rotation changes their order. On Ampere a stream-k grid is a whole multiple of the tiles (the rotation offset is then always 0)
-    // and the extra loop costs the prompt kernels time, so they keep the plain code.
-#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
-    constexpr bool rotate_arch = true;
-#else
-    constexpr bool rotate_arch = false;
-#endif
+    // Ada and newer only (GGML_CUDA_FATTN_KV_ROTATE_ARCH): there every launch is stream-k (launch_fattn), so blocks run several whole
+    // tiles of long prompts and the rotation changes their order. On Ampere a stream-k grid is a whole multiple of the tiles (the
+    // rotation offset is then always 0) and the rotated code costs the prompt kernels time, so they keep the plain code.
+    constexpr bool rotate_arch = GGML_CUDA_FATTN_KV_ROTATE_ARCH;
     constexpr bool rotate_cfg = rotate_arch && ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse, q8_kv) > 1 && !use_sparse && q8_kv2 < 0;
     const bool rotate = rotate_cfg && dev_len.kv_rotate != 0;
     const int kbc0     = kbc;
