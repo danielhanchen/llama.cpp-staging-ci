@@ -4597,16 +4597,7 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         }
     }
 #endif
-    // an exec instantiated from this capture just before needs no update (GGML_CUDA_GRAPH_FRESH_NOUPDATE=0: updated as before):
-    // cudaGraphExecUpdate of an exec against the graph it was instantiated from changes nothing and costs host time
-    static const bool fresh_noupdate = getenv("GGML_CUDA_GRAPH_FRESH_NOUPDATE") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_FRESH_NOUPDATE")) != 0;
-    if (fresh && fresh_noupdate && graph->instance != nullptr) {
-        static bool logged = false;
-        if (!logged) {
-            logged = true;
-            GGML_LOG_INFO("%s: a newly instantiated CUDA graph exec is not updated again (GGML_CUDA_GRAPH_FRESH_NOUPDATE=0: updated)\n", __func__);
-        }
-    } else if (!ggml_cuda_graph_update_chunk(graph, graph->instance, graph->graph, reinstantiate && !fresh)) {
+    if (!ggml_cuda_graph_update_chunk(graph, graph->instance, graph->graph, reinstantiate && !fresh)) {
         return false;
     }
     while (graph->chunk_instances.size() > graph->chunk_graphs.size()) {
