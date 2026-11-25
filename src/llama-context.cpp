@@ -3043,12 +3043,43 @@ void llama_context::gf_res_epoch_bump(int line) {
     }
 }
 
+static void llama_prompt_pad_log(llama_context::copy_experts_info & st, const char * when) {
+    static const bool diag = getenv("LLAMA_MOE_PROMPT_DIAG") != nullptr && atoi(getenv("LLAMA_MOE_PROMPT_DIAG")) != 0;
+    if (diag && st.n_pad_dev0 + st.n_pad_host > 0) {
+        LLAMA_LOG_INFO("llama_context: prompt diag (%s): padding after cached runs of short prompt ubatches: %llu from the device zero block, "
+            "%llu uploaded\n", when, (unsigned long long) st.n_pad_dev0, (unsigned long long) st.n_pad_host);
+    }
+    st.n_pad_dev0 = 0;
+    st.n_pad_host = 0;
+}
+
 llama_context::~llama_context() {
     if (lm_trim_thr.joinable()) {
         lm_trim_thr.join();
     }
     nextn_join();
     batch_ahead_drop();
+    {
+        auto & st = copy_experts;
+        llama_prompt_pad_log(st, "exit");
+        if (st.ids_event != nullptr) {
+            ggml_backend_event_free(st.ids_event);
+            st.ids_event = nullptr;
+        }
+        if (st.ids_pinned != nullptr) {
+            ggml_backend_buffer_free(st.ids_pinned);
+            st.ids_pinned = nullptr;
+        }
+        for (ggml_backend_buffer_t b : st.pad_bufs) {
+            ggml_backend_buffer_free(b);
+        }
+        st.pad_bufs.clear();
+        st.pad_zero.clear();
+        if (st.pad_ctx != nullptr) {
+            ggml_free(st.pad_ctx);
+            st.pad_ctx = nullptr;
+        }
+    }
     // the refill reads of the RAM tier that did not start are cancelled before the weight store goes (its destructor would
     // read every queued one)
     if (moe_cache) {
@@ -10455,6 +10486,103 @@ bool llama_context::sched_copy_all_experts(const ggml_tensor * src, const ggml_t
 
 // the seeds of the layer-major group whose routing the eval callback reads asynchronously are issued here, on the copy queue
 // behind the layer's expert copies (as the synchronous seed issues them), see lm_seed_resolve_due
+// short prompt ubatches on one GPU (more than the small-batch limit, fewer than the prefetch minimum, e.g. a chat prompt's main pass)
+// whose expert copies are planned from their own routing (LLAMA_MOE_PROMPT_OVERLAP=0 / LLAMA_MOE_PROMPT_PAD_DEV0=0 off)
+static bool llama_prompt_overlap_on() {
+    static const bool on = getenv("LLAMA_MOE_PROMPT_OVERLAP") == nullptr || atoi(getenv("LLAMA_MOE_PROMPT_OVERLAP")) != 0;
+    return on;
+}
+static bool llama_prompt_pad_dev0_on() {
+    static const bool on = getenv("LLAMA_MOE_PROMPT_PAD_DEV0") == nullptr || atoi(getenv("LLAMA_MOE_PROMPT_PAD_DEV0")) != 0;
+    return on;
+}
+
+// the routing read of a short prompt ubatch: into pinned memory, then a wait for an event recorded after it on the stream of the read,
+// instead of a pageable read and a synchronize of the backend. Same bytes, same wait point (the router's split); false: not available
+static bool llama_prompt_ids_read(llama_context::copy_experts_info & st, ggml_backend_t backend_ids, const ggml_tensor * ids, int32_t * out) {
+    if (st.ids_pinned_fail) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend_ids);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+    const size_t need = ggml_nbytes(ids);
+    if (st.ids_event_dev != dev) {
+        if (st.ids_event != nullptr) {
+            ggml_backend_event_free(st.ids_event);
+        }
+        if (st.ids_pinned != nullptr) {
+            ggml_backend_buffer_free(st.ids_pinned);
+            st.ids_pinned = nullptr;
+        }
+        st.ids_event     = ggml_backend_event_new(dev);
+        st.ids_event_dev = dev;
+        if (st.ids_event == nullptr) {
+            st.ids_pinned_fail = true;
+            return false;
+        }
+    }
+    if (st.ids_pinned == nullptr || ggml_backend_buffer_get_size(st.ids_pinned) < need) {
+        if (st.ids_pinned != nullptr) {
+            ggml_backend_buffer_free(st.ids_pinned);
+        }
+        ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev);
+        st.ids_pinned = hb != nullptr ? ggml_backend_buft_alloc_buffer(hb, std::max<size_t>(need, 64*1024)) : nullptr;
+        if (st.ids_pinned == nullptr) {
+            st.ids_pinned_fail = true;
+            return false;
+        }
+    }
+    void * p = ggml_backend_buffer_get_base(st.ids_pinned);
+    ggml_backend_tensor_get_async(backend_ids, ids, p, 0, need);
+    ggml_backend_event_record(st.ids_event, backend_ids);
+    ggml_backend_event_synchronize(st.ids_event);
+    memcpy(out, p, need);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LLAMA_LOG_INFO("%s: prompt overlap: the routing of short prompt ubatches is read into pinned memory and waited for with an event "
+            "(LLAMA_MOE_PROMPT_OVERLAP=0 off)\n", __func__);
+    }
+    return true;
+}
+
+// a zeroed device block on the device of backend (at least 512 bytes), nullptr if it cannot be allocated
+static ggml_tensor * llama_prompt_pad_zero(llama_context::copy_experts_info & st, ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return nullptr;
+    }
+    for (const auto & [d, t] : st.pad_zero) {
+        if (d == dev) {
+            return t;
+        }
+    }
+    ggml_tensor * t = nullptr;
+    if (st.pad_ctx == nullptr) {
+        ggml_init_params ip = { 16*ggml_tensor_overhead(), nullptr, true };
+        st.pad_ctx = ggml_init(ip);
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    ggml_backend_buffer_t buf = st.pad_ctx != nullptr && st.pad_zero.size() < 16 && buft != nullptr ? ggml_backend_buft_alloc_buffer(buft, 4096) : nullptr;
+    if (buf != nullptr) {
+        t = ggml_new_tensor_1d(st.pad_ctx, GGML_TYPE_I8, 4096);
+        if (ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf)) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buf);
+            buf = nullptr;
+            t   = nullptr;
+        } else {
+            ggml_backend_buffer_clear(buf, 0);
+            st.pad_bufs.push_back(buf);
+            LLAMA_LOG_INFO("%s: pad from a device zero block: the padding after a cached run of a short prompt ubatch's experts is copied from "
+                "zeroed device memory on %s instead of uploaded (LLAMA_MOE_PROMPT_PAD_DEV0=0 off)\n", __func__, ggml_backend_dev_name(dev));
+        }
+    }
+    st.pad_zero.emplace_back(dev, t); // a failure is remembered too
+    return t;
+}
+
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
     if (!lctx->lm_seed_async || !lctx->lm_seed_active) {
@@ -10570,6 +10698,12 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     // a graph of several ubatches (decode_layer_major) reads the copy for all of them, the product found routes only the first: copy all
     const bool all = on_copy_queue || lctx->lm_merged_active;
 
+    // a short prompt ubatch on one GPU (see llama_prompt_overlap_on): more than the small-batch limit, fewer than the prefetch minimum
+    const bool short_prompt = !all && lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr && ids->ne[1] > llama_moe_cache::n_small_max &&
+        ids->ne[1] < 256 && std::count_if(lctx->backends.begin(), lctx->backends.end(), [](const ggml_backend_ptr & b) {
+            ggml_backend_dev_t d = ggml_backend_get_device(b.get());
+            return d != nullptr && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU; }) == 1;
+
     if (ids != st.ids || (int64_t) st.used.size() != n_expert || (seed && st.counts.empty()) || all != st.all) {
         st.all = all;
         if (all) {
@@ -10583,8 +10717,10 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
             }
             st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
             const int64_t t_ids0 = ggml_time_us();
-            ggml_backend_tensor_get_async(backend_ids, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
-            ggml_backend_synchronize(backend_ids);
+            if (!(short_prompt && llama_prompt_overlap_on() && llama_prompt_ids_read(st, backend_ids, ids, st.ids_data.data()))) {
+                ggml_backend_tensor_get_async(backend_ids, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+                ggml_backend_synchronize(backend_ids);
+            }
             st.sync_us = ggml_time_us() - t_ids0;
 
             st.used.assign(n_expert, false);
@@ -10622,9 +10758,17 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     // otherwise only long cached runs are copied from the cache (many small copies cost more than they save), before the uploads
     const bool batch = lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr && ggml_backend_tensor_copy_regions_async(backend, nullptr, 0);
 
+    // batched copies of a short prompt ubatch: a run whose experts all come from the cache takes the padding after it from a zeroed
+    // device block (a device copy beside the cached runs) instead of uploading the next expert's bytes on its own. The padding is only
+    // read by the quantized products past the last row of the run's last expert (rows are read up to a multiple of MATRIX_ROW_PADDING),
+    // against activations whose padding is zero (quantize.cu: values past ne00 are 0): any finite bytes give the same result, zero
+    // bytes are finite for every type. Never the next slot of the bank: what follows a slot need not be finite
+    ggml_tensor * pad_zero = batch && short_prompt && llama_prompt_pad_dev0_on() ? llama_prompt_pad_zero(st, backend) : nullptr;
+
     auto plan = [&](bool batched) {
         st.uploads.clear();
         st.regions.clear();
+        st.pad_regions.clear();
         for (int64_t first = 0; first < n_expert; ) {
             if (!st.used[first]) {
                 first++;
@@ -10657,7 +10801,11 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
             const size_t offset  = next*expert_size;
             const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
             const size_t size    = (last + 1 - next)*expert_size + padding;
-            if (size > 0) {
+            if (batched && pad_zero != nullptr && next == last + 1 && padding > 0 && padding <= ggml_nbytes(pad_zero)) {
+                st.pad_regions.push_back({ pad_zero, 0, dst, offset, padding });
+                st.n_pad_dev0++;
+            } else if (size > 0) {
+                st.n_pad_host += padding > 0 && next == last + 1;
                 st.uploads.push_back({ offset, size });
                 if (lctx->moe_cache && !batched) {
                     lctx->moe_cache->count_upload(src, last + 1 - next, size);
@@ -10675,6 +10823,8 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         for (const auto & [offset, size] : st.uploads) {
             st.regions.push_back({ src, offset, dst, offset, size });
         }
+        // the zero padding reads no slot: issued with the uploads
+        st.regions.insert(st.regions.end(), st.pad_regions.begin(), st.pad_regions.end());
         // fails (nothing copied) e.g. when the host weights are not pinned
         if (ua && lctx->moe_cache->upload_ahead_pending(src)) {
             // the uploads of the misses first, they do not read the slots uploaded ahead; then the cached runs after the wait
@@ -14225,6 +14375,7 @@ bool llama_moe_pin_small_set(llama_context * ctx, bool on) {
 static bool llama_moe_cache_fp_log();
 
 void llama_context::moe_request_begin() {
+    llama_prompt_pad_log(copy_experts, "previous request");
     // diagnostic: the state each request starts from (LLAMA_MOE_CACHE_FP_LOG=1)
     if (moe_cache != nullptr && llama_moe_cache_fp_log()) {
         llama_synchronize(this);
