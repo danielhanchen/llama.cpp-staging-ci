@@ -373,7 +373,8 @@ static void llama_expf4_logits(const llama_token_data * data, size_t n, float ma
             _mm_store_ps(xs, x);
             for (int j = 0; j < 4; ++j) {
                 if (special & (1 << j)) {
-                    p[i + j] = expf(xs[j]);
+                    // below the underflow threshold expf is +0 (checked by the probe): no libm call for the far tail of a peaked distribution
+                    p[i + j] = xs[j] < -0x1.9fe368p6f ? 0.0f : expf(xs[j]);
                 }
             }
         }
@@ -393,7 +394,7 @@ static bool llama_sampler_expf4_probe() {
         memcpy(&x, &u, sizeof(x));
         d.push_back({0, x, 0.0f});
     }
-    for (float x : { 0.0f, -0.0f, -87.99f, -88.0f, -88.72f, -103.0f, -103.97f, -104.0f, -1e-30f, -INFINITY }) {
+    for (float x : { 0.0f, -0.0f, -87.99f, -88.0f, -88.72f, -103.0f, -103.97f, -0x1.9fe368p6f, -0x1.9fe366p6f, -0x1.9fe36ap6f, -104.0f, -150.0f, -1e10f, -FLT_MAX, -1e-30f, -INFINITY }) {
         d.push_back({0, x, 0.0f});
     }
     std::vector<float> p(d.size());
