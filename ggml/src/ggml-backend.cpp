@@ -1164,18 +1164,6 @@ struct ggml_backend_sched {
     bool   alloc_limit_on;
     size_t alloc_limit;
     bool   alloc_lend_graph; // growth past the free memory may be lent (ggml_backend_sched_set_alloc_lend_graph)
-    // a refusal by the measured growth goes on with the lend settings (ggml_backend_sched_set_alloc_lend_upgrade)
-    ggml_backend_sched_lend_upgrade_t lend_upgrade;
-    void * lend_upgrade_ud;
-    bool   lend_upgraded;       // the last allocation went on with the lend settings
-    int64_t n_lend_upgrade;     // allocations that did (GGML_SCHED_ALLOC_TIMING=1 logs the counts)
-    // the dry measure of ggml_backend_sched_alloc_graph, reused by the binding right after it when it binds the same copies
-    // (GGML_SCHED_PLAN_REUSE=0: measured again)
-    bool   dm_valid;
-    size_t dm_sizes[GGML_SCHED_MAX_BACKENDS];
-    int    dm_n_bound[GGML_SCHED_MAX_BACKENDS];
-    int    dm_n_ph[GGML_SCHED_MAX_BACKENDS];   // copies the dry binding held with placeholders
-    int64_t n_plan_reuse, n_plan_measure;
     ggml_backend_sched_upload_batch * upload_batch; // the graph-input uploads of the split being prepared (GGML_SCHED_UPLOAD_BATCH)
     size_t alloc_over; // growth the last refused allocation needed, 0 if it was not refused
     int    n_sync_refused; // graphs refused by their unplaced SYNC copies (the first two are logged)
@@ -3246,9 +3234,6 @@ static char ggml_backend_sched_dry_placeholder;
 
 // dry: only measure (no device memory is allocated), the copies get a placeholder address so that the graph allocator skips them
 static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dry) {
-    // the dry measure of the allocation is only good for the binding right after it
-    const bool dm_ok = !dry && sched->dm_valid;
-    sched->dm_valid = false;
     sched->pf_active = false;
     sched->pf_gen++;
     if (!dry) {
@@ -3503,7 +3488,6 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         // the prefetched copies are not allocated by the graph allocator
         static char measure_placeholder;
         std::vector<ggml_tensor *> bound;
-        int n_ph[GGML_SCHED_MAX_BACKENDS] = { 0 };
         for (int b = 0; b < sched->n_backends; b++) {
             const struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
             for (int k = 0; k < pf->n_bound; k++) {
@@ -3513,37 +3497,12 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                     if (is_split_copy(input_cpy, pf->split_ids[k]) && input_cpy->data == NULL) {
                         input_cpy->data = &measure_placeholder;
                         bound.push_back(input_cpy);
-                        n_ph[b]++;
                     }
                 }
             }
         }
         size_t sizes[GGML_SCHED_MAX_BACKENDS] = { 0 };
-        // the dry measure just made by ggml_backend_sched_alloc_graph held the same copies out of the graph allocation (the same
-        // bound splits per backend, every copy of them a placeholder there and here) with the graph allocator unchanged since:
-        // its sizes are what this measure finds (GGML_SCHED_PLAN_REUSE=0: measured again)
-        bool reused = false;
-        if (dm_ok) {
-            bool same = true;
-            for (int b = 0; b < sched->n_backends && same; b++) {
-                same = sched->pf[b].n_bound == sched->dm_n_bound[b] && n_ph[b] == sched->dm_n_ph[b];
-            }
-            if (same) {
-                memcpy(sizes, sched->dm_sizes, sizeof(sizes));
-                reused = true;
-            }
-        }
-        if (!reused) {
-            ggml_gallocr_measure_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
-        }
-        if (dm_ok) {
-            static bool logged = false;
-            if (reused && !logged) {
-                logged = true;
-                GGML_LOG_INFO("%s: plan reuse: the binding of a measured graph takes the sizes of its dry measure (GGML_SCHED_PLAN_REUSE=0 to disable)\n", __func__);
-            }
-            (reused ? sched->n_plan_reuse : sched->n_plan_measure)++;
-        }
+        ggml_gallocr_measure_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
         for (ggml_tensor * t : bound) {
             t->data = NULL;
         }
@@ -5631,52 +5590,19 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     const int64_t at0 = at_on ? ggml_time_us() : 0;
     ggml_backend_sched_split_graph(sched, graph);
     const int64_t at1 = at_on ? ggml_time_us() : 0;
-    if (at_on) {
-        // a signature of the split (backends of the nodes, split bounds and their input sources): two allocations of one graph that log
-        // the same one split it alike
-        uint64_t h = 1469598103934665603ULL;
-        auto mix = [&](uint64_t v) { h = (h ^ v)*1099511628211ULL; };
-        for (int i = 0; i < sched->graph.n_nodes; i++) {
-            mix((uint64_t) (int64_t) sched->node_backend_ids[i]);
-        }
-        for (int i = 0; i < sched->graph.n_leafs; i++) {
-            mix((uint64_t) (int64_t) sched->leaf_backend_ids[i]);
-        }
-        for (int i = 0; i < sched->n_splits; i++) {
-            const struct ggml_backend_sched_split * sp = &sched->splits[i];
-            mix((uint64_t) sp->backend_id); mix((uint64_t) sp->i_start); mix((uint64_t) sp->i_end); mix((uint64_t) sp->n_inputs);
-            for (int j = 0; j < sp->n_inputs; j++) {
-                mix((uint64_t) (uintptr_t) sp->inputs[j]);
-            }
-        }
-        GGML_LOG_INFO("ggml_backend_sched_alloc_graph: split signature %016llx (%d nodes, %d leafs, %d splits)\n", (unsigned long long) h,
-            sched->graph.n_nodes, sched->graph.n_leafs, sched->n_splits);
-    }
     struct at_log {
         bool on; int64_t t0, t1; int n_nodes; int n_splits;
-        int64_t t_dry = 0, t_bind = 0; // after the dry measure, after the binding (0: not reached)
         ~at_log() {
             if (on) {
                 const int64_t t2 = ggml_time_us();
-                GGML_LOG_INFO("ggml_backend_sched_alloc_graph: %d nodes, %d splits: split %.3f ms, measure + bind + alloc %.3f ms "
-                    "(dry measure %.3f, bind %.3f, alloc %.3f)\n", n_nodes, n_splits, (t1 - t0)/1000.0, (t2 - t1)/1000.0,
-                    t_dry > 0 ? (t_dry - t1)/1000.0 : 0.0, t_bind > 0 ? (t_bind - (t_dry > 0 ? t_dry : t1))/1000.0 : 0.0,
-                    t_bind > 0 ? (t2 - t_bind)/1000.0 : 0.0);
+                GGML_LOG_INFO("ggml_backend_sched_alloc_graph: %d nodes, %d splits: split %.3f ms, measure + bind + alloc %.3f ms\n", n_nodes, n_splits,
+                    (t1 - t0)/1000.0, (t2 - t1)/1000.0);
             }
         }
     } at_l = { at_on, at0, at1, graph->n_nodes, sched->n_splits };
 
-    // (GGML_SCHED_LEND_UPGRADE=0 off): a graph refused by its measured growth that its caller would allocate again with the lend
-    // settings (decode_layer_major: undo the scheduler's copies, reset, split the same graph again, measure, bind) goes on with them here:
-    // the caller's upgrade callback applies the same settings, the split and its copies are kept, the dry binding and the measure run again
-    // under the new settings as they would after the second split. Only the second split and the undo are saved
-    sched->lend_upgraded = false;
-    bool lend_upgrade_tried = false;
-    static const bool plan_reuse_on = getenv("GGML_SCHED_PLAN_REUSE") == nullptr || atoi(getenv("GGML_SCHED_PLAN_REUSE")) != 0;
-lend_upgrade_again:
     sched->alloc_over = 0;
     sched->pf_depth_scope_eff = 0;
-    sched->dm_valid = false;
     size_t lend_need[GGML_SCHED_MAX_BACKENDS] = { 0 };
     // (GGML_SCHED_LEND_GUARD=0 off): a graph the lender may take is measured like one under the limit, so that a growth neither
     // lent nor fitting next to the staging arena is refused below (alloc_over, prefetch kept) instead of failing in cudaMalloc, which
@@ -5694,10 +5620,6 @@ lend_upgrade_again:
         ggml_backend_sched_prefetch_bind(sched, /*dry =*/ true);
         size_t sizes[GGML_SCHED_MAX_BACKENDS] = { 0 };
         ggml_gallocr_measure_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
-        if (at_on) {
-            at_l.t_dry = ggml_time_us();
-        }
-        int dm_n_ph[GGML_SCHED_MAX_BACKENDS] = { 0 };
         for (int i = 0; i < sched->n_splits; i++) {
             struct ggml_backend_sched_split * split = &sched->splits[i];
             for (int j = 0; j < split->n_inputs; j++) {
@@ -5705,17 +5627,8 @@ lend_upgrade_again:
                 if (input_cpy != NULL && input_cpy->data == &ggml_backend_sched_dry_placeholder) {
                     input_cpy->data   = NULL;
                     input_cpy->buffer = NULL;
-                    dm_n_ph[split->backend_id]++;
                 }
             }
-        }
-        if (plan_reuse_on) {
-            memcpy(sched->dm_sizes, sizes, sizeof(sched->dm_sizes));
-            memcpy(sched->dm_n_ph, dm_n_ph, sizeof(sched->dm_n_ph));
-            for (int b = 0; b < sched->n_backends; b++) {
-                sched->dm_n_bound[b] = sched->pf[b].n_bound;
-            }
-            sched->dm_valid = true;
         }
         // the free memory left: the prefetch headroom (at least 512 MiB), as ggml_backend_sched_alloc_splits checks after a reallocation;
         // with a lender set that check is skipped (the lender keeps its own reserve): GGML_SCHED_ALLOC_LIMIT_FREE_MIB (64;
@@ -5749,19 +5662,6 @@ lend_upgrade_again:
             }
         }
         if (over > 0) {
-            if (!lend_upgrade_tried && sched->lend_upgrade != NULL && !sched->alloc_lend_graph && sched->callback_lend != NULL &&
-                    ggml_backend_sched_lend_upgrade_on()) {
-                lend_upgrade_tried = true;
-                if (sched->lend_upgrade(sched->lend_upgrade_ud)) {
-                    sched->lend_upgraded = true;
-                    if (sched->n_lend_upgrade++ == 0) {
-                        GGML_LOG_INFO("%s: lend upgrade in place: a graph refused by %.2f MiB of growth goes on with the lend settings, "
-                            "its split kept (GGML_SCHED_LEND_UPGRADE=0 to disable)\n", __func__, over/1024.0/1024.0);
-                    }
-                    goto lend_upgrade_again;
-                }
-            }
-            sched->dm_valid   = false;
             sched->alloc_over = over;
             sched->next_copy  = sched->cur_copy;
             sched->cur_copy   = cur_copy_prev;
@@ -5797,17 +5697,7 @@ lend_upgrade_again:
         }
     }
 
-    // the dry measure holds for this binding only at the depth the dry binding used (the binding may take a scoped depth)
-    if (sched->pf_depth_scope_eff != 0 && sched->pf_depth_scope_eff != sched->pf_depth) {
-        sched->dm_valid = false;
-    }
     ggml_backend_sched_prefetch_bind(sched, /*dry =*/ false);
-    if (at_on) {
-        at_l.t_bind = ggml_time_us();
-        GGML_LOG_INFO("ggml_backend_sched_alloc_graph: %s, lend upgrades in place %lld, binding measures reused %lld / measured %lld\n",
-            sched->lend_upgraded ? "lend upgrade in place" : "no lend upgrade", (long long) sched->n_lend_upgrade, (long long) sched->n_plan_reuse,
-            (long long) sched->n_plan_measure);
-    }
 
     // a growth past the free memory that the lender did not take is refused as by the limit (the caller splits the graph)
     {
@@ -6182,22 +6072,6 @@ void ggml_backend_sched_set_alloc_limit(ggml_backend_sched_t sched, bool enable,
     if (!enable) {
         sched->alloc_lend_graph = false;
     }
-}
-
-void ggml_backend_sched_set_alloc_lend_upgrade(ggml_backend_sched_t sched, ggml_backend_sched_lend_upgrade_t upgrade, void * user_data) {
-    GGML_ASSERT(sched);
-    sched->lend_upgrade    = upgrade;
-    sched->lend_upgrade_ud = user_data;
-}
-
-bool ggml_backend_sched_get_alloc_lend_upgraded(ggml_backend_sched_t sched) {
-    GGML_ASSERT(sched);
-    return sched->lend_upgraded;
-}
-
-bool ggml_backend_sched_lend_upgrade_on(void) {
-    static const bool on = getenv("GGML_SCHED_LEND_UPGRADE") != nullptr && atoi(getenv("GGML_SCHED_LEND_UPGRADE")) != 0;
-    return on;
 }
 
 void ggml_backend_sched_set_alloc_lend_graph(ggml_backend_sched_t sched, bool enable) {
