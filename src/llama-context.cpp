@@ -6461,6 +6461,48 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // with 16384 (host input fill beside the host's expert work)
         // (also beside a MoE cache that holds most of the experts, llama_moe_cache_wide_graphs)
         mem_idx->set_n_kv_bucket_dev_wide(moe_cache == nullptr || llama_moe_cache_wide_graphs(this));
+    } else if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        // (LLAMA_KV_BUCKET_DEV_HYBRID=0 or LLAMA_KV_BUCKET_DEV=0: off): the device KV length buckets of llama_memory_hybrid_idx
+        // also for a plain hybrid memory (attention + recurrent layers): its decode and verify graphs, and their CUDA graphs, keep
+        // their shape while the context grows past 256 cells. Only the device length form (the flash attention computes the bits of
+        // the live cells), never the padded buckets
+        static const bool hyb_dev = [] {
+            const char * e  = getenv("LLAMA_KV_BUCKET_DEV_HYBRID");
+            const char * ed = getenv("LLAMA_KV_BUCKET_DEV");
+            const char * eb = getenv("LLAMA_KV_BUCKET");
+            return !(e != nullptr && atoi(e) == 0) && !(ed != nullptr && atoi(ed) == 0) && !(eb != nullptr && atoi(eb) == 0);
+        }();
+        llama_kv_cache * kv = mh->get_mem_attn();
+        if (hyb_dev && kv != nullptr) {
+            if (!kv_bucket_hybrid_set) {
+                kv_bucket_hybrid_set = true;
+                if (kv->fa_kv_len_supported()) {
+                    llama_kv_cache::n_kv_bucket_params bp;
+                    bp.dev_len = true;
+                    if (const char * e = getenv("LLAMA_KV_BUCKET_DEV_MAX_TOKENS")) {
+                        bp.dev_n_tokens_max = (uint32_t) std::max(1, atoi(e));
+                    }
+                    if (const char * e = getenv("LLAMA_KV_BUCKET_DEV_DIV")) {
+                        bp.dev_div = (uint32_t) std::max(1, atoi(e));
+                    }
+                    kv_bucket_hybrid_step_env = getenv("LLAMA_KV_BUCKET_DEV_STEP_MIN") != nullptr;
+                    if (kv_bucket_hybrid_step_env) {
+                        bp.dev_step_min = (uint32_t) std::max(256, atoi(getenv("LLAMA_KV_BUCKET_DEV_STEP_MIN")));
+                    }
+                    kv->set_n_kv_bucket(bp);
+                    kv_bucket_hybrid_on = true;
+                    LLAMA_LOG_INFO("%s: hybrid memory: n_kv buckets with flash attention reading the KV length on the device, ubatches of up "
+                        "to %u tokens, %u per octave (LLAMA_KV_BUCKET_DEV_HYBRID=0: off)\n", __func__, bp.dev_n_tokens_max, bp.dev_div);
+                }
+            }
+            if (kv_bucket_hybrid_on) {
+                kv->set_n_kv_bucket_allowed(!(llama_exact_verify_env() || cparams.verify_exact));
+                kv->set_n_kv_bucket_dev_allowed(cparams.flash_attn);
+                if (!kv_bucket_hybrid_step_env) {
+                    kv->set_n_kv_bucket_dev_step_min(moe_cache == nullptr || llama_moe_cache_wide_graphs(this) ? 16384 : 2048);
+                }
+            }
+        }
     }
 
     // (LLAMA_MOE_PLACE8_CHUNK_MAX=N; default 64 on a mid-size device, 0 = off, at 8 GB opt-in): a short prompt of at most N

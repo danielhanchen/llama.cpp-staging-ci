@@ -474,6 +474,19 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
+    // the slot rows of the state seen with the tail's 3D shape (LLAMA_DELTANET_CONV_STATE_3D=0: as 2D rows): the same bytes at the same
+    // addresses, and a destination of the tail's shape lets a backend fuse the copy into the convolution that reads the same columns
+    static const bool conv_3d = getenv("LLAMA_DELTANET_CONV_STATE_3D") == nullptr || atoi(getenv("LLAMA_DELTANET_CONV_STATE_3D")) != 0;
+    auto conv_state_view = [&](int64_t s_slot) -> ggml_tensor * {
+        const size_t offs = (s_slot * mem_size + kv_head) * row_size;
+        if (conv_3d) {
+            return ggml_view_3d(ctx0, conv_states_all,
+                    conv_kernel_size - 1, conv_channels, n_seqs,
+                    ggml_row_size(conv_states_all->type, conv_kernel_size - 1), conv_states_all->nb[1], offs);
+        }
+        return ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs, conv_states_all->nb[1], offs);
+    };
+
     if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
@@ -485,10 +498,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                     ggml_row_size(conv_input->type, s_idx));
         cb(conv_state_last, "conv_state_last", il);
 
-        ggml_tensor * conv_state_update =
-            ggml_view_2d(ctx0, conv_states_all,
-                    row_count, n_seqs, conv_states_all->nb[1],
-                    (s_slot * mem_size + kv_head) * row_size);
+        ggml_tensor * conv_state_update = conv_state_view(s_slot);
         cb(conv_state_update, "conv_state_update", il);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
@@ -509,11 +519,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                         conv_input->nb[1], conv_input->nb[2],
                         ggml_row_size(conv_input->type, s_idx));
 
-            ggml_tensor * conv_state_update =
-                ggml_view_2d(ctx0,
-                        conv_states_all, row_count, n_seqs,
-                        conv_states_all->nb[1],
-                        (s_slot * mem_size + kv_head) * row_size);
+            ggml_tensor * conv_state_update = conv_state_view(s_slot);
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
         }

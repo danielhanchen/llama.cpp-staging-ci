@@ -11870,6 +11870,10 @@ struct llama_moe_cache::impl {
             const bool flat = cmw_prev >= 0.0 && cm_rate >= cmw_flat*cmw_prev;
             if (flat || cmw_n >= cmw_max) {
                 cmw_on        = false;
+                if (cm_tiny_skip(n_tokens)) {
+                    cmw_prev = cm_rate;
+                    return;
+                }
                 cmt_done      = 0;
                 cmt_t_prev    = -1;
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: warm phase over after %d small batches (miss rate %.1f%%, before %.1f%%), "
@@ -11879,6 +11883,57 @@ struct llama_moe_cache::impl {
             }
             cmw_prev = cm_rate;
         }
+    }
+
+    // (LLAMA_MOE_CPU_MISS_TINY, default 2.0 expected misses per layer; 0 = off): on a host whose trials decide by marginal timings
+    // (cmt_trust_marginal: a 12..31-CPU mailbox host) a cache whose measured miss rate at the end of the warm phase leaves fewer than
+    // this many missing experts per layer for a small batch of the size just run runs no timing trials: the host path could save at
+    // most that many expert fetches per layer, less than the trials cost (each times its small batches synchronized, so the draft
+    // and the next verify no longer overlap), and small batches and short prompts stay on the plain cache, every miss fetched, as in the
+    // warm phase (the computation of LLAMA_MOE_CPU_MISS=0). L4 (12 vCPU), Qwen3.6-35B-A3B at 4 bits with its MTP head, launches without
+    // a calibration file: whole card (93.7% cached, 2.1% missed, 0.6 per layer of a 4-token window) trials "off" in both, 8k decode
+    // 101.0 -> 108.8 tok/s with LLAMA_MOE_CPU_MISS=0 at the same text; 20 GB (81.8%, 4.6%, 1.4 per layer) marginal "on", 111.4 -> 118.2
+    // (the device-only text of the whole card)
+    uint64_t n_tiny_skips = 0;
+    bool cm_tiny_skip(int64_t n_tokens) {
+        static const double tiny_max = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TINY");
+            return e != nullptr ? std::max(0.0, atof(e)) : 2.0;
+        }();
+        const char * e_frac = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC");
+        if (tiny_max <= 0.0 || e_frac != nullptr || cm_force || cmt_n > 0 || !cm_measured || !cmt_trust_marginal() ||
+                !(single_weigh() && single_usable(1))) {
+            return false;
+        }
+        int64_t n_expert = 0;
+        for (const group & g : groups) {
+            if (g.dev_lookup && g.n_slots > 0 && !g.ref.empty() && g.ref[0] != nullptr) {
+                n_expert = g.ref[0]->ne[2];
+                break;
+            }
+        }
+        if (n_expert <= 0) {
+            return false;
+        }
+        const int64_t n_w  = std::max<int64_t>(1, std::min<int64_t>(n_tokens, max_batch));
+        const double  miss = cm_rate*cm_distinct(n_w, n_expert);
+        if (miss >= tiny_max) {
+            return false;
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached: the warm phase measured a miss "
+            "rate of %.1f%%, %.2f missing experts per layer for a batch of %" PRId64 " tokens (below %.2f), small batches and short prompts "
+            "stay on the plain cache (LLAMA_MOE_CPU_MISS_TINY=0: the trials run)\n", tag, 100.0*cache_frac, 100.0*cm_rate, miss, n_w, tiny_max);
+        cm_trials_skipped = true;
+        cmt_done      = -1;
+        cmt_wait      = -1;
+        cmt_t_prev    = -1;
+        cmw_on        = false;
+        cm_small_ok   = false;
+        cm_small_live = false;
+        cmt_host_ok   = false;
+        cm_gen++;
+        n_tiny_skips++;
+        return true;
     }
 
     // per batch size: on where the expected time saved per layer beats the cost of the host split

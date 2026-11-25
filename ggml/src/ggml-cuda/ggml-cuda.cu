@@ -7184,6 +7184,18 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
             }
         }
     }
+    // GGML_CUDA_FUSION_TRACE=1: where the convolution of the input is (-1: not in this split), when it is past the lookahead
+    static const bool trace = ggml_cuda_env_flag("GGML_CUDA_FUSION_TRACE");
+    if (trace) {
+        int jc = -1;
+        for (int j = 0; j < cgraph->n_nodes && jc < 0; ++j) {
+            if (cgraph->nodes[j]->op == GGML_OP_SSM_CONV && cgraph->nodes[j]->src[0] == input) {
+                jc = j;
+            }
+        }
+        GGML_LOG_INFO("conv cat elide: %s: its convolution is node %d, %d nodes after the copy (lookahead %d, %d nodes in the split)\n", cpy->name, jc,
+            jc < 0 ? 0 : jc - i, GGML_CUDA_CONV_CAT_LOOKAHEAD, cgraph->n_nodes);
+    }
     return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 9);
 }
 
