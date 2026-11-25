@@ -1218,12 +1218,10 @@ static __global__ void mul_mat_vec_q(
                     v = fusion.ew_op[o] == 0 ? fusion.ew_p0[o] * v + fusion.ew_p1[o] : ggml_cuda_op_silu_single(v);
                 }
             }
-            float amax = fabsf(v);
-            float sum  = v;
-            amax = warp_reduce_max<QK8_1>(amax);
-            sum  = warp_reduce_sum<QK8_1>(sum);
-            const float  d = amax / 127.0f;
-            const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+            const float amax = warp_reduce_max<QK8_1>(fabsf(v));
+            float d;
+            float sum;
+            const int8_t q = ggml_cuda_q8_1_lane(v, amax, fusion.ew_q8_1_exact, d, sum);
             y_ew[e/QK8_1].qs[e % QK8_1] = q;
             if (e % QK8_1 == 0) {
                 y_ew[e/QK8_1].ds = make_half2(d, sum);
@@ -4892,6 +4890,7 @@ void ggml_cuda_mul_mat_vec_q_ew(ggml_backend_cuda_context & ctx, const ggml_tens
     fusion.ew_src        = (const float *) ew_src->data;
     fusion.ew_stride_col = ew_src->nb[1] / sizeof(float);
     fusion.ew_n          = n_ops;
+    fusion.ew_q8_1_exact = ggml_cuda_q8_1_exact();
     for (int o = 0; o < n_ops; ++o) {
         fusion.ew_op[o] = ops[o];
         fusion.ew_p0[o] = p0[o];
@@ -5130,7 +5129,8 @@ __launch_bounds__(MMVQ_HC_NWARPS*32, 1)
 static __global__ void mul_mat_vec_q8_0_hc_pre(
         const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ gate, const float * __restrict__ x,
         float * __restrict__ mixed, void * __restrict__ vq, unsigned int * __restrict__ cnt, const int ncols_x, const int stride_row_x,
-        const int stride_col_y, const int stride_col_gate, const int n_embd, const int64_t sx1, const int64_t sx2, const float scale) {
+        const int stride_col_y, const int stride_col_gate, const int n_embd, const int64_t sx1, const int64_t sx2, const float scale,
+        const bool exact) {
     static_assert(ncols_dst <= MMVQ_HC_NWARPS, "one warp per column in the epilogue");
     constexpr ggml_type type = GGML_TYPE_Q8_0;
     constexpr int qk        = ggml_cuda_type_traits<type>::qk;
@@ -5234,12 +5234,10 @@ static __global__ void mul_mat_vec_q8_0_hc_pre(
     if (vq == nullptr) {
         return;
     }
-    float amax = fabsf(xi);
-    float qsum = xi;
-    amax = warp_reduce_max<QK8_1>(amax);
-    qsum = warp_reduce_sum<QK8_1>(qsum);
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+    float d;
+    float qsum;
+    const int8_t q = ggml_cuda_q8_1_lane(xi, amax, exact, d, qsum);
     block_q8_1 * yq = (block_q8_1 *) vq;
     const int64_t ir  = it*n_embd + i0;
     const int64_t ib  = ir / QK8_1;
@@ -5275,7 +5273,7 @@ void ggml_cuda_mul_mat_vec_q_hc_pre(ggml_backend_cuda_context & ctx, const ggml_
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
         dim3((unsigned int) (src0->ne[1] / rpb), 1, 1), dim3(32, MMVQ_HC_NWARPS, 1), 0, ctx.stream());
 #define MMVQ_HC_PRE_LAUNCH(NC) ggml_cuda_kernel_launch_pl(mul_mat_vec_q8_0_hc_pre<NC, rpb>, launch_params, src0->data, (const void *) vy, \
-        (float *) gate->data, x, mixed, q8_1_out, cnt, ncols_x, stride_row_x, stride_col_y, stride_col_gate, (int) n_embd, sx1, sx2, scale)
+        (float *) gate->data, x, mixed, q8_1_out, cnt, ncols_x, stride_row_x, stride_col_y, stride_col_gate, (int) n_embd, sx1, sx2, scale, ggml_cuda_q8_1_exact())
     switch (ncols_dst) {
         case 1: MMVQ_HC_PRE_LAUNCH(1); break;
         case 2: MMVQ_HC_PRE_LAUNCH(2); break;

@@ -2092,6 +2092,7 @@ struct ggml_cuda_mm_fusion_args_device {
     int   ew_op[GGML_CUDA_MMVQ_EW_MAX] = {};
     float ew_p0[GGML_CUDA_MMVQ_EW_MAX] = {};
     float ew_p1[GGML_CUDA_MMVQ_EW_MAX] = {};
+    bool  ew_q8_1_exact = false; // ggml_cuda_q8_1_exact() for the quantize of the chain output
 };
 
 struct ggml_cuda_kernel_launch_params {
@@ -2211,4 +2212,60 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
+}
+
+// q8_1 activation quantization shared by quantize_q8_1 and every kernel that writes a q8_1 copy of its output.
+// GGML_CUDA_Q8_1_EXACT=1 (opt-in; unset / 0 = the previous arithmetic): the block sums are fp16(d) times the sum of the
+// quantized values (as quantize_row_q8_1_ref), and an fp16-subnormal scale is rounded up to its stored value before quantizing.
+static bool ggml_cuda_q8_1_exact() {
+    static const bool exact = [] {
+        const char * e = getenv("GGML_CUDA_Q8_1_EXACT");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return exact;
+}
+
+#define GGML_CUDA_FP16_MIN_NORMAL 6.103515625e-05f
+
+// one value per lane of a QK8_1-lane group whose absmax is amax: returns q, sets d and the block sum
+static __device__ __forceinline__ int8_t ggml_cuda_q8_1_lane(const float x, const float amax, const bool exact, float & d, float & sum) {
+    d = amax / 127.0f;
+    if (exact) {
+        if (d < GGML_CUDA_FP16_MIN_NORMAL) {
+            d = __half2float(__float2half_ru(d));
+        }
+        const int8_t q = d == 0.0f ? 0 : roundf(x / d);
+        sum = __half2float(__float2half(d)) * warp_reduce_sum<QK8_1>((int) q);
+        return q;
+    }
+    sum = warp_reduce_sum<QK8_1>(x);
+    return amax == 0.0f ? 0 : roundf(x / d);
+}
+
+// 4 values per lane: 127 / scale; half_scale = the scale is stored as fp16 (not the D4 layout)
+static __device__ __forceinline__ float ggml_cuda_q8_1_d_inv(const float amax, const bool exact, const bool half_scale) {
+    if (exact && half_scale && amax < 127.0f*GGML_CUDA_FP16_MIN_NORMAL) {
+        const float d_h = __half2float(__float2half_ru(amax / 127.0f));
+        return d_h > 0.0f ? 1.0f / d_h : INFINITY;
+    }
+    return 127.0f / amax;
+}
+
+// 4 values per lane: the sum over the group of lanes that xor offsets offset0, offset0/2, .., 1 span
+template <int offset0>
+static __device__ __forceinline__ float ggml_cuda_q8_1_sum4(const float4 x, const char4 q, const float d, const bool exact) {
+    if (exact) {
+        int isum = q.x + q.y + q.z + q.w;
+#pragma unroll
+        for (int offset = offset0; offset > 0; offset >>= 1) {
+            isum += __shfl_xor_sync(0xFFFFFFFF, isum, offset, WARP_SIZE);
+        }
+        return __half2float(__float2half(d)) * isum;
+    }
+    float sum = x.x + x.y + x.z + x.w;
+#pragma unroll
+    for (int offset = offset0; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+    }
+    return sum;
 }

@@ -461,7 +461,8 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
                                              const uint3   mul_nsamples_packed,
                                              const float * ra = nullptr,
                                              const float * rb = nullptr,
-                                             const ggml_cuda_hc_post_args hcp = {}) {
+                                             const ggml_cuda_hc_post_args hcp = {},
+                                             const bool    exact = false) {
     // ra / rb (both or neither): x = ra + rb is computed here (the ADD before the norm, a residual add) and stored to x, with the
     // same float add as k_bin_bcast's op_add; the norm reads the same values, so every output is bit-identical to ADD + RMS_NORM + MUL
     static_assert(block_size % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
@@ -587,14 +588,10 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
                         xi       = scale * xv[u] * mv[u];
                         dstc[i0] = xi;
                     }
-                    float amax = fabsf(xi);
-                    float sum  = xi;
-
-                    amax = warp_reduce_max<QK8_1>(amax);
-                    sum  = warp_reduce_sum<QK8_1>(sum);
-
-                    const float  d = amax / 127.0f;
-                    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+                    float d;
+                    float sum;
+                    const int8_t q = ggml_cuda_q8_1_lane(xi, amax, exact, d, sum);
 
                     const int64_t ib  = i0 / QK8_1;
                     const int     iqs = i0 % QK8_1;
@@ -892,7 +889,8 @@ static __global__ void rms_norm_mul_conv_f32(const float * x,
                                              const uint3   mul_nchannels_packed,
                                              const uint3   mul_nsamples_packed,
                                              const int64_t K_out,
-                                             const int64_t N_out) {
+                                             const int64_t N_out,
+                                             const bool    exact) {
     ggml_cuda_pdl_lc();
     const int nrows = gridDim.x;
     const int row   = blockIdx.x;
@@ -955,21 +953,17 @@ static __global__ void rms_norm_mul_conv_f32(const float * x,
                     for (int offset = 4; offset > 0; offset >>= 1) {
                         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
                     }
-                    float sum = 0.0f;
-                    if constexpr (mode == 1) {
-                        sum = r.x + r.y + r.z + r.w;
-#pragma unroll
-                        for (int offset = 4; offset > 0; offset >>= 1) {
-                            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
-                        }
-                    }
-                    const float d_inv = 127.0f / amax;
+                    const float d_inv = ggml_cuda_q8_1_d_inv(amax, exact, mode == 1);
                     char4 q;
                     q.x = roundf(r.x*d_inv);
                     q.y = roundf(r.y*d_inv);
                     q.z = roundf(r.z*d_inv);
                     q.w = roundf(r.w*d_inv);
                     const float d = 1.0f / d_inv;
+                    float sum = 0.0f;
+                    if constexpr (mode == 1) {
+                        sum = ggml_cuda_q8_1_sum4<4>(r, q, d, exact);
+                    }
 
                     const int64_t ib  = (k / 128)*N_out + tok;
                     const int     iqs = k % 128;
@@ -1019,17 +1013,17 @@ static bool rms_norm_mul_conv_launch(ggml_backend_cuda_context & ctx, const ggml
             ggml_cuda_kernel_launch(rms_norm_mul_conv_f32<BS, 0>, lp, x, dst_d, out, (int) ne00, (int) ne02, (int) ne03, \
                 (int64_t) (x_t->nb[1]/ts0), (int64_t) (x_t->nb[2]/ts0), (int64_t) (x_t->nb[3]/ts0), eps, mul, \
                 (int64_t) (mul_t->nb[1]/tsm), (int64_t) (mul_t->nb[2]/tsm), (int64_t) (mul_t->nb[3]/tsm), \
-                mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, K_out, N_out); \
+                mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, K_out, N_out, ggml_cuda_q8_1_exact()); \
         } else if (mode == 1) { \
             ggml_cuda_kernel_launch(rms_norm_mul_conv_f32<BS, 1>, lp, x, dst_d, out, (int) ne00, (int) ne02, (int) ne03, \
                 (int64_t) (x_t->nb[1]/ts0), (int64_t) (x_t->nb[2]/ts0), (int64_t) (x_t->nb[3]/ts0), eps, mul, \
                 (int64_t) (mul_t->nb[1]/tsm), (int64_t) (mul_t->nb[2]/tsm), (int64_t) (mul_t->nb[3]/tsm), \
-                mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, K_out, N_out); \
+                mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, K_out, N_out, ggml_cuda_q8_1_exact()); \
         } else { \
             ggml_cuda_kernel_launch(rms_norm_mul_conv_f32<BS, 2>, lp, x, dst_d, out, (int) ne00, (int) ne02, (int) ne03, \
                 (int64_t) (x_t->nb[1]/ts0), (int64_t) (x_t->nb[2]/ts0), (int64_t) (x_t->nb[3]/ts0), eps, mul, \
                 (int64_t) (mul_t->nb[1]/tsm), (int64_t) (mul_t->nb[2]/tsm), (int64_t) (mul_t->nb[3]/tsm), \
-                mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, K_out, N_out); \
+                mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, K_out, N_out, ggml_cuda_q8_1_exact()); \
         } \
     } while (0)
     if (n4 <= 32) {
@@ -1075,7 +1069,8 @@ static __global__ void hc_post_rms_norm_mul_conv_f32(const float * bo,
                                                      const uint3   mul_nrows_packed,
                                                      const uint3   mul_nchannels_packed,
                                                      const int64_t K_out,
-                                                     const int64_t N_out) {
+                                                     const int64_t N_out,
+                                                     const bool    exact) {
     ggml_cuda_pdl_lc();
     const int nrows = gridDim.x;
     const int row   = blockIdx.x; // the stream
@@ -1147,21 +1142,17 @@ static __global__ void hc_post_rms_norm_mul_conv_f32(const float * bo,
                 for (int offset = 4; offset > 0; offset >>= 1) {
                     amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
                 }
-                float sum = 0.0f;
-                if constexpr (mode == 1) {
-                    sum = r.x + r.y + r.z + r.w;
-#pragma unroll
-                    for (int offset = 4; offset > 0; offset >>= 1) {
-                        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
-                    }
-                }
-                const float d_inv = 127.0f / amax;
+                const float d_inv = ggml_cuda_q8_1_d_inv(amax, exact, mode == 1);
                 char4 q;
                 q.x = roundf(r.x*d_inv);
                 q.y = roundf(r.y*d_inv);
                 q.z = roundf(r.z*d_inv);
                 q.w = roundf(r.w*d_inv);
                 const float d = 1.0f / d_inv;
+                float sum = 0.0f;
+                if constexpr (mode == 1) {
+                    sum = ggml_cuda_q8_1_sum4<4>(r, q, d, exact);
+                }
 
                 const int64_t ib  = (k / 128)*N_out + tok;
                 const int     iqs = k % 128;
@@ -1237,15 +1228,15 @@ bool ggml_cuda_op_hc_post_rms_norm_conv(ggml_backend_cuda_context & ctx, const g
         if (mode == 0) { \
             ggml_cuda_kernel_launch(hc_post_rms_norm_mul_conv_f32<BS, 0>, lp, bo, res, post, hpo, dst_d, memo.ptr, (int) ne00, (int) n_tokens, \
                 sbo1, sr1, sr2, (int64_t) 1, (int64_t) hc, gate_scale_in, gate_scale_out, eps, mul, msr, msc, mul_nrows_packed, \
-                mul_nchannels_packed, memo.K_out, memo.N_out); \
+                mul_nchannels_packed, memo.K_out, memo.N_out, ggml_cuda_q8_1_exact()); \
         } else if (mode == 1) { \
             ggml_cuda_kernel_launch(hc_post_rms_norm_mul_conv_f32<BS, 1>, lp, bo, res, post, hpo, dst_d, memo.ptr, (int) ne00, (int) n_tokens, \
                 sbo1, sr1, sr2, (int64_t) 1, (int64_t) hc, gate_scale_in, gate_scale_out, eps, mul, msr, msc, mul_nrows_packed, \
-                mul_nchannels_packed, memo.K_out, memo.N_out); \
+                mul_nchannels_packed, memo.K_out, memo.N_out, ggml_cuda_q8_1_exact()); \
         } else { \
             ggml_cuda_kernel_launch(hc_post_rms_norm_mul_conv_f32<BS, 2>, lp, bo, res, post, hpo, dst_d, memo.ptr, (int) ne00, (int) n_tokens, \
                 sbo1, sr1, sr2, (int64_t) 1, (int64_t) hc, gate_scale_in, gate_scale_out, eps, mul, msr, msc, mul_nrows_packed, \
-                mul_nchannels_packed, memo.K_out, memo.N_out); \
+                mul_nchannels_packed, memo.K_out, memo.N_out, ggml_cuda_q8_1_exact()); \
         } \
     } while (0)
     // the block size rms_norm_mul_conv_launch picks for this row width (the norm's reduction tree)
@@ -1356,7 +1347,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                                       (rms_q8_1_batch ? rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC, 4> : rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC, 1>); \
             ggml_cuda_kernel_launch(kernel, launch_params, src0_d, dst_d, q8_1_out, (int) ne00, ncols_padded, \
                 (int) ne02, (int) ne03, s01, s02, s03, eps, mul_d, mul_s01, mul_s02, mul_s03, \
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, ra_d, rb_d, hc_args); \
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, ra_d, rb_d, hc_args, ggml_cuda_q8_1_exact()); \
         } while (0)
         if (vec) {
             if (n4 <= 32) {
@@ -1780,7 +1771,8 @@ static __global__ void rms_norm_mul_sigmoid_gate_f32(const float * x,
                                                      const float * gate,
                                                      const int64_t gate_stride_row,
                                                      const int64_t ne10,
-                                                     const int64_t ne10q) {
+                                                     const int64_t ne10q,
+                                                     const bool    exact) {
     static_assert(block_size % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
     ggml_cuda_pdl_lc();
     const int nrows = gridDim.x;
@@ -1834,13 +1826,10 @@ static __global__ void rms_norm_mul_sigmoid_gate_f32(const float * x,
                 if (vq == nullptr) {
                     continue; // uniform
                 }
-                float amax = fabsf(v);
-                float sum  = v;
-                amax = warp_reduce_max<QK8_1>(amax);
-                sum  = warp_reduce_sum<QK8_1>(sum);
-
-                const float  d = amax / 127.0f;
-                const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+                const float amax = warp_reduce_max<QK8_1>(fabsf(v));
+                float d;
+                float sum;
+                const int8_t q = ggml_cuda_q8_1_lane(v, amax, exact, d, sum);
 
                 const int64_t e   = irow*ncols + i0;
                 const int64_t iq  = (e / ne10)*ne10q + e % ne10;
@@ -2136,12 +2125,12 @@ bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, con
         if (silu) { \
             ggml_cuda_kernel_launch(rms_norm_mul_sigmoid_gate_f32<BLOCK_SIZE, VPT, VEC, true>, launch_params, x_d, dst_d, q8_1_out, (int) ne00, \
                 (int) ne02, (int) ne03, s01, s02, s03, eps, w_d, mul_s01, mul_s02, mul_s03, mul_nrows_packed, mul_nchannels_packed, \
-                mul_nsamples_packed, z_d, gate_s1, ne10, ne10q); \
+                mul_nsamples_packed, z_d, gate_s1, ne10, ne10q, ggml_cuda_q8_1_exact()); \
             break; \
         } \
         ggml_cuda_kernel_launch(rms_norm_mul_sigmoid_gate_f32<BLOCK_SIZE, VPT, VEC>, launch_params, x_d, dst_d, q8_1_out, (int) ne00, \
             (int) ne02, (int) ne03, s01, s02, s03, eps, w_d, mul_s01, mul_s02, mul_s03, mul_nrows_packed, mul_nchannels_packed, \
-            mul_nsamples_packed, z_d, gate_s1, ne10, ne10q); \
+            mul_nsamples_packed, z_d, gate_s1, ne10, ne10q, ggml_cuda_q8_1_exact()); \
     } while (0)
     if (vec) {
         if (n4 <= 32) {

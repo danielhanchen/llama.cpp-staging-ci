@@ -5908,6 +5908,41 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT with one +-outlier per 32 activations, as in LLM hidden states. Every block then has the same
+// absmax, so q8_0/q8_1/q8_K quantize src1 identically and a strict threshold catches inconsistent src1 sums.
+struct test_mul_mat_outlier : public test_mul_mat {
+    const float outlier;
+
+    // strict only with the exact q8_1 sums on (CUDA GGML_CUDA_Q8_1_EXACT=1); the default float sums reach ~8e-4 here
+    double max_nmse_err() override {
+        const char * e = getenv("GGML_CUDA_Q8_1_EXACT");
+        return e != nullptr && atoi(e) != 0 ? 1e-5 : 2e-3;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, outlier);
+    }
+
+    test_mul_mat_outlier(ggml_type type_a, int64_t m, int64_t n, int64_t k, float outlier)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}), outlier(outlier) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+            if (strcmp(t->name, "b") != 0) {
+                continue;
+            }
+            std::vector<float> data(ggml_nelements(t));
+            ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+            for (size_t i = 0; i < data.size(); i += 32) {
+                const size_t j = i + (i/32*7) % 32;
+                data[j] = (i/32) % 2 ? outlier : -outlier;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -13251,6 +13286,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // sides of that boundary, including an odd row count above it for the row-pair tail.
     for (int64_t m : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
+    }
+
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+                             GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_XS}) {
+        for (int64_t n : {1, 8, 64}) {
+            test_cases.emplace_back(new test_mul_mat_outlier(type_a, 1024, n, 4096, 64.0f));
+        }
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
