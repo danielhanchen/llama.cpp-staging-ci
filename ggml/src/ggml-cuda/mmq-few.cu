@@ -584,9 +584,10 @@ static __device__ __forceinline__ void mmq_few_vec_dot(const char * const (&x)[2
 // the matrices of a multi-matrix launch (dense, one channel and sample each, one src1): blockIdx.y picks the matrix
 #define MMQ_FEW_MULTI_MAX 4
 struct mmq_few_multi_args {
-    const char * x[MMQ_FEW_MULTI_MAX]     = {};
-    float *      dst[MMQ_FEW_MULTI_MAX]   = {};
-    int          nrows[MMQ_FEW_MULTI_MAX] = {};
+    const char * x[MMQ_FEW_MULTI_MAX]              = {};
+    float *      dst[MMQ_FEW_MULTI_MAX]            = {};
+    int          nrows[MMQ_FEW_MULTI_MAX]          = {};
+    int          stride_col_dst[MMQ_FEW_MULTI_MAX] = {};
 };
 
 // has_ids: MUL_MAT_ID, blockIdx.y is a pair of quantize_mmq_few_id_q8_1, its expert is the src0 channel and dst dims 1 and 2 are slot
@@ -597,7 +598,7 @@ template <ggml_type type, int ncg, int nmt, bool has_ids = false, bool multi = f
 __launch_bounds__(MMQ_FEW_NWARPS*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_q_few(
         const char * x, const int4 * y_ptr, float * dst,
-        const int nunits, const int nrows_x_arg, const int ncols_dst, const int64_t stride_row_x, const int stride_col_dst,
+        const int nunits, const int nrows_x_arg, const int ncols_dst, const int64_t stride_row_x, const int stride_col_dst_arg,
         const int channel_ratio, const int64_t stride_channel_x, const int stride_channel_dst,
         const int sample_ratio, const int64_t stride_sample_x, const int stride_sample_dst, const bool x_is_constant, const int * pairs,
         const mmq_few_multi_args margs) {
@@ -628,11 +629,13 @@ static __global__ void mul_mat_q_few(
     const int  iu_step  = ksplit ? nunits_stage*nwarps : nunits_stage;
 
     static_assert(!multi || !has_ids, "unsupported multi-matrix config");
-    int nrows_x = nrows_x_arg;
+    int nrows_x        = nrows_x_arg;
+    int stride_col_dst = stride_col_dst_arg;
     if constexpr (multi) {
-        x       = margs.x[blockIdx.y];
-        dst     = margs.dst[blockIdx.y];
-        nrows_x = margs.nrows[blockIdx.y];
+        x              = margs.x[blockIdx.y];
+        dst            = margs.dst[blockIdx.y];
+        nrows_x        = margs.nrows[blockIdx.y];
+        stride_col_dst = margs.stride_col_dst[blockIdx.y];
         if (row0_blk >= nrows_x) {
             return;
         }
@@ -827,7 +830,7 @@ static __global__ void mul_mat_q_few(
         }
     }
 #else
-    GGML_UNUSED_VARS(x, y_ptr, dst, nunits, nrows_x_arg, ncols_dst, stride_row_x, stride_col_dst,
+    GGML_UNUSED_VARS(x, y_ptr, dst, nunits, nrows_x_arg, ncols_dst, stride_row_x, stride_col_dst_arg,
         channel_ratio, stride_channel_x, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_dst, x_is_constant, pairs, margs);
     NO_DEVICE_CODE;
@@ -886,6 +889,7 @@ static void launch_mul_mat_q_few_multi(const int n, const ggml_tensor * const * 
         margs.x[m]     = (const char *) src0[m]->data;
         margs.dst[m]   = (float *) dst[m]->data;
         margs.nrows[m] = (int) src0[m]->ne[1];
+        margs.stride_col_dst[m] = (int) (dst[m]->nb[1]/sizeof(float));
         nrows_max      = std::max(nrows_max, src0[m]->ne[1]);
         x_is_constant  = x_is_constant && mmq_few_is_constant(src0[m]);
     }
@@ -896,7 +900,7 @@ static void launch_mul_mat_q_few_multi(const int n, const ggml_tensor * const * 
     const ggml_cuda_kernel_launch_params params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_q_few<type, ncg, nmt, false, true>, params,
         (const char *) nullptr, src1_q, (float *) nullptr,
-        nunits, 0, (int) src1->ne[1], (int64_t) src0[0]->nb[1], (int) (dst[0]->nb[1]/sizeof(float)),
+        nunits, 0, (int) src1->ne[1], (int64_t) src0[0]->nb[1], 0,
         1, (int64_t) 0, 0, 1, (int64_t) 0, 0, x_is_constant, (const int *) nullptr, margs);
 }
 
@@ -1060,8 +1064,7 @@ bool ggml_cuda_mmq_few_multi_on(const int cc) {
 bool ggml_cuda_mmq_few_multi_pair(const ggml_tensor * a, const ggml_tensor * b) {
     const ggml_tensor * a0 = a->src[0];
     const ggml_tensor * b0 = b->src[0];
-    if (a->src[1] != b->src[1] || a0->type != b0->type || a0->ne[0] != b0->ne[0] || a0->nb[1] != b0->nb[1] ||
-            a->nb[1] != b->nb[1] || a->ne[1] != b->ne[1]) {
+    if (a->src[1] != b->src[1] || a0->type != b0->type || a0->ne[0] != b0->ne[0] || a0->nb[1] != b0->nb[1] || a->ne[1] != b->ne[1]) {
         return false;
     }
     const int ncg = mmq_few_ncg(a->src[1]->ne[1]);
@@ -1102,7 +1105,7 @@ void ggml_cuda_mul_mat_q_few_multi(ggml_backend_cuda_context & ctx, const int n,
     GGML_ASSERT(ne11 <= MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS && ne10 % QK_K == 0);
     for (int m = 0; m < n; ++m) {
         GGML_ASSERT(src0[m]->type == type && src0[m]->ne[0] == ne10 && src0[m]->nb[1] == src0[0]->nb[1] && ggml_is_matrix(src0[m]));
-        GGML_ASSERT(dst[m]->type == GGML_TYPE_F32 && dst[m]->nb[0] == sizeof(float) && dst[m]->nb[1] == dst[0]->nb[1] && dst[m]->ne[1] == ne11);
+        GGML_ASSERT(dst[m]->type == GGML_TYPE_F32 && dst[m]->nb[0] == sizeof(float) && dst[m]->ne[1] == ne11);
     }
 
     cudaStream_t stream = ctx.stream();
