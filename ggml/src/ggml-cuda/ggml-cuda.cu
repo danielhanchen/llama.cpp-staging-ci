@@ -6914,7 +6914,67 @@ static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, co
     }
 }
 
+// GGML_CUDA_MMVQ_MULTI_WHY=1 (diagnostic, off by default; changes nothing): every pair of quantized products of 2..8 columns over one
+// activation within the lookahead, counted once at the earlier one by the reason a multi-matrix mmvq launch does not take both
+// ("paired" when it can), with the weight types; the histogram is logged at 10, 100, 1000, ... pairs (graph builds, not replays)
+static void ggml_cuda_mmvq_multi_why(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!ggml_cuda_mmvq_multi_candidate(node) || node->src[1]->ne[1] < 2 || node->src[1]->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+        return;
+    }
+    static std::mutex mtx;
+    static std::map<std::string, int64_t> hist;
+    static int64_t n_pairs = 0;
+    const int j_last = std::min(i + GGML_CUDA_MMVQ_MULTI_LOOKAHEAD, cgraph->n_nodes - 1);
+    const bool lead_ok = ggml_cuda_mmvq_multi_runtime_ok(cuda_ctx, node);
+    const bool lead_partner = ggml_cuda_mmvq_multi_has_partner(cgraph, i);
+    for (int j = i + 1; j <= j_last; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op != GGML_OP_MUL_MAT || t->src[1] != node->src[1] || !ggml_cuda_mmvq_multi_candidate(t)) {
+            continue;
+        }
+        const char * why = nullptr;
+        if (!lead_ok) {
+            why = "first not on the batched mmvq";
+        } else if (lead_partner) {
+            why = "first has a fusion partner";
+        } else if (t->src[0]->type != node->src[0]->type) {
+            why = "weight types differ";
+        } else if (t->src[0]->ne[0] != node->src[0]->ne[0] || t->src[0]->nb[1] != node->src[0]->nb[1]) {
+            why = "K or row stride differs";
+        } else if ((t->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) != (node->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+            why = "batch invariant flags differ";
+        } else if (!ggml_cuda_mmvq_multi_runtime_ok(cuda_ctx, t)) {
+            why = "second not on the batched mmvq";
+        } else if (ggml_cuda_mmvq_multi_has_partner(cgraph, j)) {
+            why = "second has a fusion partner";
+        } else {
+            why = "paired (or overlap / group full)";
+        }
+        char key[256];
+        snprintf(key, sizeof(key), "%s: %s + %s, %lld columns", why, ggml_type_name(node->src[0]->type), ggml_type_name(t->src[0]->type),
+            (long long) node->src[1]->ne[1]);
+        std::lock_guard<std::mutex> lock(mtx);
+        hist[key]++;
+        n_pairs++;
+        int64_t p = 10;
+        while (p < n_pairs) {
+            p *= 10;
+        }
+        if (p == n_pairs) {
+            GGML_LOG_INFO("mmvq multi why: %lld pairs\n", (long long) n_pairs);
+            for (const auto & kv : hist) {
+                GGML_LOG_INFO("mmvq multi why:   %8lld  %s\n", (long long) kv.second, kv.first.c_str());
+            }
+        }
+    }
+}
+
 static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool why = ggml_cuda_env_flag("GGML_CUDA_MMVQ_MULTI_WHY");
+    if (why) {
+        ggml_cuda_mmvq_multi_why(cuda_ctx, cgraph, i);
+    }
     if (ggml_cuda_mmvq_multi_disabled() || ggml_cuda_fusion_disabled() || !cuda_ctx->stream_context().concurrent_events.empty() ||
             !cuda_ctx->q8_1_stream_ok()) {
         return -1;
