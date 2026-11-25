@@ -1212,6 +1212,7 @@ struct llama_moe_cache::impl {
     // (deterministic share) instead of the CPU-miss rule [LLAMA_MOE_CPU_MISS_GATE=0: the rule there too]
     bool    cm_gate  = false;
     size_t  cm_n_prompt = 0;  // batches above max_batch served by the host path
+    size_t  short_prior_n = 0; // of them, short prompts served through the wide-cache prior (short_prior)
     size_t  cm_n_small  = 0;  // batches of at most max_batch tokens with the host path on
     bool    cm_cal  = false;  // calibrated
     int64_t cm_max  = 128;    // LLAMA_MOE_CPU_MISS_MAX_TOKENS: largest batch the host path may serve (> 32: short prompts)
@@ -9153,7 +9154,7 @@ struct llama_moe_cache::impl {
     bool cm_prompt_now = false; // set by the context around each decode (set_prompt_batch)
     int64_t cm_prompt_all = 0;  // tokens of that prompt batch (0 outside prompt batches)
 
-    // short prompts (LLAMA_MOE_CPU_MISS_SHORT, default 128; 0 = off, the default): a prompt batch of max_batch + 1 ..
+    // short prompts (LLAMA_MOE_CPU_MISS_SHORT, default 128 = on; 0 = off): a prompt batch of max_batch + 1 ..
     // cm_short_max tokens in all (a chat turn, not the tail of a long prompt: RTX PRO 6000 gemma-4 2k decode -18% after its last partial
     // ubatch took the host path and admitted less) takes the host path in each ubatch the cost model turns on (cm_on: calibrated host
     // us per expert and per further token, upload us, the split and the activations at cm_margin_p, the measured miss rate), at the
@@ -9193,10 +9194,51 @@ struct llama_moe_cache::impl {
         }
         return false;
     }
+    // (LLAMA_MOE_CPU_MISS_SHORT_PRIOR, default 1; 0 = off): in the wide-cache band (dec_band: the generation windows already compute
+    // every miss on the host, decided by the cache share and the host, no trial) the trials cannot finish: every small batch of 1..8
+    // tokens is a decode window, which the trials do not count, so no verdict exists before (or after) the first chat prompt and the rule
+    // never reached it. There the band is the prior: a short prompt takes the rule as where the trials are skipped. Its per-size decision
+    // is also taken at the prompt's own expected miss rate, at least the uncached share of the host experts: the window before a chat
+    // prompt measures the previous request's decode right after its own prompt seeded the cache (0.4-0.7% on RTX PRO 6000, Flash-Next at
+    // 4 bits capped at 48 GB, 67% cached), which turned the host path off for every prompt size although the chat prompt then misses
+    // about a third of its experts
+    static bool short_prior_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT_PRIOR");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
+    }
+    bool short_prior() const {
+        // the band as cm_dec_init takes it (no explicit LLAMA_MOE_CPU_MISS_DECODE), also before the first generation window
+        static const bool dec_env = getenv("LLAMA_MOE_CPU_MISS_DECODE") != nullptr;
+        return short_prior_on() && !cm_trials_skipped && (cm_dec_band || (!dec_env && dec_band()));
+    }
+    // the cost model's decision for a prompt batch of n_tokens (n_tokens > max_batch) at miss rate rate (cm_decide's rule)
+    bool short_on_at(int64_t n_tokens, double rate) const {
+        if (n_tokens <= max_batch || n_tokens > cm_max || cm_share[n_tokens] >= 1.0f) {
+            return false;
+        }
+        for (const group & g : groups) {
+            if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr) {
+                const int64_t n_expert = g.ref[0]->ne[2];
+                const double  D    = cm_distinct(n_tokens, n_expert);
+                const double  tbar = std::max(1.0, (double) n_tokens*std::min<int64_t>(n_expert_used, n_expert)/std::max(1.0, D));
+                const double  tc   = cm_t1 + (tbar - 1.0)*cm_dt;
+                const double  f    = std::min(cm_share[n_tokens], 0.25f);
+                const double  gain = rate*D*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
+                const bool    fits = std::min<int64_t>(n_tokens*n_expert_used, n_expert) <= g.n_slots;
+                return fits && gain > cm_margin_p*(cm_split + n_tokens*cm_act);
+            }
+        }
+        return false;
+    }
     bool short_eligible(int64_t n_tokens) const {
-        return short_live() && cm_trials_skipped && cm && cm_cal && !cm_force && n_tokens > max_batch && n_tokens <= std::min(cm_max, cm_short_max) &&
+        const bool prior = !cm_trials_skipped && short_prior();
+        return short_live() && (cm_trials_skipped || prior) && cm && cm_cal && !cm_force && n_tokens > max_batch && n_tokens <= std::min(cm_max, cm_short_max) &&
             short_fast(n_tokens) &&
-            n_tokens > cm_prompt_force && cm_on[n_tokens] != 0 && cmt_host_ok && !cm_prompt_off();
+            n_tokens > cm_prompt_force && (cm_on[n_tokens] != 0 || (prior && short_on_at(n_tokens, std::max(cm_rate, 1.0 - cache_frac)))) &&
+            cmt_host_ok && !cm_prompt_off();
     }
     // only where the cache holds at most LLAMA_MOE_PIN_PROMPT_SHORT_MAX_FRAC (0.25) of the host experts: the 192-prompt short KLD check against the
     // base, LFM2.5 4 GB (14.6% cached) first-token KLD mean / p99 / top-1 0.099 / 0.84 / 0.885 inside the -fa off band
@@ -9423,6 +9465,14 @@ struct llama_moe_cache::impl {
         return on;
     }
     mutable uint64_t n_prompt_fetch = 0; // layer graphs of prompt ubatches built with every miss fetched (engagement)
+    mutable uint64_t n_short_host   = 0; // layer graphs of short-prompt batches above max_batch built with the host path (engagement)
+    static bool short_host_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT_HOST");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
+    }
 
     ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host, bool prompt) const {
         host = false;
@@ -9440,10 +9490,20 @@ struct llama_moe_cache::impl {
             host  = hybrid_active();
             share = host ? hybrid_share : 1.0f;
         }
-        if (prompt && host && hybrid_prompt_fetch_on()) {
+        // (LLAMA_MOE_CPU_MISS_SHORT_HOST, default 1; 0 = off): a short prompt's batch above max_batch that the short-prompt rule put on
+        // the host path keeps its host share here. The refetch below is for the prompt's last few tokens (the first token's own rows); it
+        // also caught a chat prompt's [38] pass, which has no outputs, so the rule's host share was dropped and every miss fetched
+        // (RTX PRO 6000, Flash-Next at 4 bits capped at 32 / 24 GB). The last ubatch of the prompt still fetches every miss
+        if (prompt && host && hybrid_prompt_fetch_on() && !(short_host_on() && n_ubatch > max_batch && short_eligible(n_ubatch))) {
             share = 1.0f;
             host  = false;
             n_prompt_fetch++;
+        } else if (prompt && host && n_ubatch > max_batch) {
+            if (n_short_host++ == 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: short prompts: a prompt batch of %" PRId64 " tokens (%" PRId64 " in all) takes the host path at "
+                    "fetch share %.3f%s (LLAMA_MOE_CPU_MISS_SHORT_HOST=0: every miss fetched)\n", tag, n_ubatch, cm_prompt_all, share,
+                    short_prior() ? ", wide-cache prior" : "");
+            }
         }
         const group & g = groups[layers[il].ig];
         if (il == g.layers[0] && n_ubatch <= max_batch && cm_batch_log_max() > 0 && n_bl_graph < cm_batch_log_max()) {
@@ -11830,6 +11890,9 @@ struct llama_moe_cache::impl {
         }
         if (cm_share_of(n_tokens) < 1.0f) {
             (n_tokens > max_batch ? cm_n_prompt : cm_n_small)++;
+            if (n_tokens > max_batch && short_prior() && short_eligible(n_tokens)) {
+                short_prior_n++;
+            }
         }
         if (cm_recal_wait > 0 && n_tokens <= max_batch && --cm_recal_wait == 0) {
             cm_recal_pending = true; // served when the server goes idle (llama_context::restore_pp_plan): cm_calibrate re-times the host
@@ -15543,6 +15606,11 @@ struct llama_moe_cache::impl {
             if (n_prompt_fetch > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: hybrid: %llu layer graphs of prompt ubatches fetched every missing expert (LLAMA_MOE_HYBRID_PROMPT_FETCH=0 off)\n",
                     tag, (unsigned long long) n_prompt_fetch);
+            }
+            if (n_short_host > 0 || short_prior_n > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: short prompts: %llu layer graphs of prompt batches above %" PRId64 " tokens kept the host path, "
+                    "%llu ubatches through the wide-cache prior (LLAMA_MOE_CPU_MISS_SHORT_HOST=0, LLAMA_MOE_CPU_MISS_SHORT_PRIOR=0 off)\n",
+                    tag, (unsigned long long) n_short_host, max_batch, (unsigned long long) short_prior_n);
             }
         }
         if (stats_copy.hits > 0) {
