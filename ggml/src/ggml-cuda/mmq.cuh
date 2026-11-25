@@ -2358,13 +2358,14 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             prec_src1 == GGML_PREC_Q8 && ggml_cuda_mmq_get_K_vram(type, J, fallback, cc, prec_src1) == 2*4*QK8_1) {
         static const bool dead_on  = mmq_pad_env("GGML_CUDA_MMQ_DEAD_SKIP");
         static const bool ktail_on = mmq_pad_env("GGML_CUDA_MMQ_KTAIL");
-        // GGML_CUDA_MMQ_DEAD_SKIP_QK (opt-in, unset / 0 = off, 1 = on): the dead-column skip also for the types whose blocks are not 32
-        // values (ggml_cuda_mmq_dead_type: IQ2_XXS / IQ3_XXS / IQ3_S / IQ4_XS, Q2_0). Bit-identical, but Flash-Next 8k prompts took
-        // 7..9 ms longer with it on the RTX PRO 6000 and were level on the A100 (MoE gate / up loads bound the IQ kernels)
-        static const bool dead_qk_on = [] {
+        // GGML_CUDA_MMQ_DEAD_SKIP_QK (unset = compute capability 8.0 only, 0 = off, 1 = on): the dead-column skip also for the types
+        // whose blocks are not 32 values (ggml_cuda_mmq_dead_type: IQ2_XXS / IQ3_XXS / IQ3_S / IQ4_XS, Q2_0). Bit-identical; Flash-Next
+        // 8k prompts: A100 full card ~30 ms faster with it, RTX PRO 6000 7..9 ms slower
+        static const int dead_qk_env = [] {
             const char * e = getenv("GGML_CUDA_MMQ_DEAD_SKIP_QK");
-            return e != nullptr && atoi(e) != 0;
+            return e == nullptr ? -1 : atoi(e);
         }();
+        const bool dead_qk_on = dead_qk_env >= 0 ? dead_qk_env != 0 : cc == GGML_CUDA_CC_AMPERE;
         static std::atomic<int64_t> n_dead{0};
         static std::atomic<int64_t> n_dead_qk{0};
         static std::atomic<int64_t> n_ktail{0};

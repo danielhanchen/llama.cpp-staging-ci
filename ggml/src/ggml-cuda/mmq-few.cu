@@ -1045,18 +1045,17 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
 }
 
-// GGML_CUDA_MMQ_FEW_MULTI (unset = on on compute capability 8.0, 0 = off, 1 = wherever the few-row MMQ runs): dense verify products of one
-// weight type, K and row stride over one src1 (Q / K / V, gate / up) in one launch of the same kernel (grid y = the matrix), each
-// output computed as by its own launch (bit-identical), src1 packed once
+// GGML_CUDA_MMQ_FEW_MULTI (opt-in, unset / 0 = off, 1 = wherever the few-row MMQ runs): dense verify products of one weight type, K and
+// row stride over one src1 (Q / K / V, gate / up) in one launch of the same kernel (grid y = the matrix), each output computed as by its
+// own launch (bit-identical), src1 packed once. Off by default: Qwen3.8-Flash-Next on the A100 has no such group on this kernel (0
+// launches; its few-row siblings differ in type), so it has no measurement
 bool ggml_cuda_mmq_few_multi_on(const int cc) {
-    static const int env = [] {
+    static const bool on = [] {
         const char * e = getenv("GGML_CUDA_MMQ_FEW_MULTI");
-        return e == nullptr ? -1 : atoi(e);
+        return e != nullptr && atoi(e) != 0;
     }();
-    if (env >= 0) {
-        return env != 0;
-    }
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE;
+    GGML_UNUSED(cc);
+    return on;
 }
 
 // a and b (each taken by the few-row MMQ alone) can share one multi-matrix launch: the same kernel instance (type, column groups,

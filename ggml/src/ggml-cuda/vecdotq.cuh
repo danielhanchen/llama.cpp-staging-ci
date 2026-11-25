@@ -104,13 +104,18 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 }
 
 // GGML_CUDA_IQ_SIGN_MUL=0 at compile time: the __vcmpne4 / __vsub4 sign code below instead of the multiply form (mat-vec kernels).
-// GGML_CUDA_IQ_SIGN_MUL_MMQ (default 0): the same for the MMQ tile loaders, where the multiply form made 8k prompts slower on the
-// RTX PRO 6000 (Flash-Next, +15..25 ms per 8k prompt)
+// GGML_CUDA_IQ_SIGN_MUL_MMQ (unset = sm_80 device code only, 0 = nowhere, 1 = every arch): the multiply form in the MMQ tile loaders,
+// with GGML_CUDA_Q5_0_HMUL_MMQ the same for the Q5_0 loader. Flash-Next 8k prompts: A100 full card 25..30 ms faster with them,
+// RTX PRO 6000 15..25 ms slower
 #ifndef GGML_CUDA_IQ_SIGN_MUL
 #define GGML_CUDA_IQ_SIGN_MUL 1
 #endif
-#ifndef GGML_CUDA_IQ_SIGN_MUL_MMQ
-#define GGML_CUDA_IQ_SIGN_MUL_MMQ 0
+#if defined(GGML_CUDA_IQ_SIGN_MUL_MMQ)
+#define GGML_CUDA_IQ_SIGN_MUL_MMQ_ON GGML_CUDA_IQ_SIGN_MUL_MMQ
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 800
+#define GGML_CUDA_IQ_SIGN_MUL_MMQ_ON 1
+#else
+#define GGML_CUDA_IQ_SIGN_MUL_MMQ_ON 0
 #endif
 
 // the 4 grid bytes g with the signs of the low 4 bits of s4 applied (bit k negates byte k). Every byte of g must be nonzero (the
@@ -145,12 +150,16 @@ static __device__ __forceinline__ void iq_apply_ksigns(const uint8_t v, const in
 }
 
 // GGML_CUDA_Q5_0_HMUL=0 at compile time: the per-bit shift / and / or high-bit expansion below instead of the multiply form (mat-vec
-// kernels); GGML_CUDA_Q5_0_HMUL_MMQ (default 0): the multiply form in the MMQ tile loader too (not measured as a prompt gain)
+// kernels); GGML_CUDA_Q5_0_HMUL_MMQ: the multiply form in the MMQ tile loader (unset = sm_80 device code only, as GGML_CUDA_IQ_SIGN_MUL_MMQ)
 #ifndef GGML_CUDA_Q5_0_HMUL
 #define GGML_CUDA_Q5_0_HMUL 1
 #endif
-#ifndef GGML_CUDA_Q5_0_HMUL_MMQ
-#define GGML_CUDA_Q5_0_HMUL_MMQ 0
+#if defined(GGML_CUDA_Q5_0_HMUL_MMQ)
+#define GGML_CUDA_Q5_0_HMUL_MMQ_ON GGML_CUDA_Q5_0_HMUL_MMQ
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 800
+#define GGML_CUDA_Q5_0_HMUL_MMQ_ON 1
+#else
+#define GGML_CUDA_Q5_0_HMUL_MMQ_ON 0
 #endif
 
 // Q5_0 5th bits: bit k (k = 0..3) of qh moved to bit 4 of byte k. The 4 partial products of the nibble with 0x02040810 land on
