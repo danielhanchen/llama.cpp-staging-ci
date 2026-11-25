@@ -978,6 +978,182 @@ struct llama_moe_cache::impl {
     bool     lm_merged         = false;     // a merged layer-major graph runs (set_lm_merged)
     int32_t  seed_pass_il      = INT32_MAX; // the layer of the last one
 
+    // diagnostic (LLAMA_MOE_SEED_RESCUE_LOG=1, read only): per prompt pass, the seed victims that belong to layers ahead of the seeded
+    // layer and the copies of the same pass that then miss them (uploaded from the host although the bytes were on the device before
+    // the seed overwrote them). Rings of several sizes are simulated: a victim survives if fewer than ring/expert_bytes victims came after it
+    struct rescue_ctr {
+        std::unordered_map<int64_t, uint64_t> ahead; // (group << 32 | key) -> victim sequence number
+        uint64_t n_seq        = 0;  // victims ahead recorded in this pass
+        uint64_t n_fills      = 0;  // seed fills
+        uint64_t n_ahead      = 0;  // victims of layers ahead
+        uint64_t n_behind     = 0;  // victims of this or finished layers
+        uint64_t n_reread     = 0;  // copies (per expert tensor) that missed a victim ahead
+        uint64_t n_reread_x   = 0;  // distinct victims missed again
+        uint64_t b_reread     = 0;  // bytes of those copies
+        uint64_t b_ring[5]    = { 0, 0, 0, 0, 0 }; // of them, within a ring of 128 / 256 / 512 / 1024 / 2048 MiB
+        uint64_t n_dist[4]    = { 0, 0, 0, 0 };    // layer distance victim - seeded layer: 1-2, 3-8, 9-24, 25+
+        int32_t  last_copy_il = -1;
+        int32_t  pass         = 0;
+        size_t   e_bytes      = 0;  // bytes of one expert (all tensors)
+        std::unordered_map<int64_t, int32_t> seen;   // victims already counted as missed (distinct count)
+    } rsc;
+    bool rsc_after_large = false;
+    std::vector<std::pair<int32_t, int32_t>> rsr_vict; // (key, slot) of the victims ahead of one seed
+
+    // (LLAMA_MOE_SEED_RESCUE=0 off): a prompt seed evicts experts of layers the same pass has not copied yet, which then upload
+    // them again from the host. Before the seed overwrites such a slot, its bytes are copied on the device into a small holding ring
+    // (LLAMA_MOE_SEED_RESCUE_MIB, 256), and a copy that misses the expert reads the ring instead of the host. The cache itself (slots,
+    // LRU order, scores, admissions) is the one without the ring, and the bytes a copy gets are the same: only where they come from
+    // changes. The ring is allocated once, at the first such seed, as large as fits beside LLAMA_MOE_SEED_RESCUE_FREE_MIB (256) of
+    // free device memory; it keeps the victims whose layers come soonest. Every write and read of the ring is a device copy on the
+    // stream that also issues the seeds' copies, in host order
+    struct rescue_ring {
+        bool tried = false;
+        int32_t ig = -1;                          // the group it serves
+        int32_t cap = 0;                          // entries (one expert each, every expert tensor)
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        std::vector<ggml_tensor *> t;             // [ip] [ne0, ne1, cap]
+        std::vector<int64_t>  key_at;             // [cap] the key held, -1 none
+        std::vector<uint32_t> written;            // [cap] the expert tensors already copied in (bit ip)
+        std::vector<uint32_t> read;               // [cap] the expert tensors already read out (bit ip)
+        std::unordered_map<int64_t, int32_t> where; // key (layer*n_expert + expert) -> entry
+        size_t   fifo_head = 0;                   // the cursor: the entry after the last one taken
+        std::vector<std::pair<int32_t, int32_t>> pend; // (entry, bank slot) of the seed being issued, per layer
+        std::vector<ggml_backend_copy_region> regions;
+        uint64_t n_kept = 0, n_hits = 0, b_hits = 0, n_lost = 0, n_skip = 0, n_seeds = 0;
+        bool logged = false;
+    } rsr;
+    static bool rsr_on() {
+        static const bool on = getenv("LLAMA_MOE_SEED_RESCUE") == nullptr || atoi(getenv("LLAMA_MOE_SEED_RESCUE")) != 0;
+        return on;
+    }
+    bool rsr_alloc(const group & g, int32_t ig) {
+        if (rsr.tried) {
+            return rsr.buf != nullptr && rsr.ig == ig;
+        }
+        rsr.tried = true;
+        const char * em = getenv("LLAMA_MOE_SEED_RESCUE_MIB");
+        const char * ef = getenv("LLAMA_MOE_SEED_RESCUE_FREE_MIB");
+        const size_t want  = (size_t) std::max<int64_t>(0, em != nullptr ? atoll(em) : 256) << 20;
+        const size_t floor = (size_t) std::max<int64_t>(0, ef != nullptr ? atoll(ef) : 256) << 20;
+        if (g.expert_bytes == 0 || want < g.expert_bytes || g.ref.empty() || g.ref.size() > 32) {
+            return false;
+        }
+        ggml_backend_t be = devices[g.id].backend;
+        // only with batched device copies, whose calls from the device's instances all run on its compute stream in host order
+        // (the ring's writes and reads are then ordered without events)
+        if (!ggml_backend_tensor_copy_regions_async(be, nullptr, 0)) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(be);
+        size_t free = 0, total = 0;
+        if (dev != nullptr) {
+            ggml_backend_dev_memory(dev, &free, &total);
+        }
+        // as large as LLAMA_MOE_SEED_RESCUE_MIB, in the free memory beyond LLAMA_MOE_SEED_RESCUE_FREE_MIB (at least 8 experts)
+        const size_t room = free > floor ? free - floor : 0;
+        const int32_t cap = (int32_t) (std::min(want, room) / g.expert_bytes);
+        if (dev == nullptr || total == 0 || cap < 8) {
+            LLAMA_LOG_INFO("llama_moe_cache: seed rescue: off, %.0f MiB free on %s, %.0f MiB kept free, the ring needs at least 8 experts of %.2f MiB\n",
+                free/1048576.0, ggml_backend_name(be), floor/1048576.0, g.expert_bytes/1048576.0);
+            return false;
+        }
+        ggml_init_params ip = { (g.ref.size() + 1)*ggml_tensor_overhead(), nullptr, true };
+        rsr.ctx.reset(ggml_init(ip));
+        for (const ggml_tensor * t : g.ref) {
+            ggml_tensor * r = ggml_new_tensor_3d(rsr.ctx.get(), t->type, t->ne[0], t->ne[1], cap);
+            GGML_ASSERT(r->nb[2] == t->nb[2]);
+            rsr.t.push_back(r);
+        }
+        rsr.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rsr.ctx.get(), ggml_backend_get_default_buffer_type(be)));
+        if (rsr.buf == nullptr) {
+            rsr.t.clear();
+            rsr.ctx.reset();
+            return false;
+        }
+        rsr.ig  = ig;
+        rsr.cap = cap;
+        rsr.key_at.assign(cap, -1);
+        rsr.written.assign(cap, 0);
+        rsr.read.assign(cap, 0);
+        LLAMA_LOG_INFO("llama_moe_cache: seed rescue: the victims of layers ahead are kept in a %d-expert ring (%.0f MiB on %s) for the copies "
+            "of the same pass (LLAMA_MOE_SEED_RESCUE=0 to disable)\n", cap, (double) cap*g.expert_bytes/1048576.0, ggml_backend_name(be));
+        return true;
+    }
+    // an entry for a new victim of layer kl, seeded at layer il: a free one (never used, read out by every expert tensor, or of a
+    // layer before il, which the pass has copied); else the held one whose layer comes last, if after kl (each victim is read once, when the
+    // pass copies its layer: keeping the ones read soonest keeps the most); else none (-1). Layer il itself is not done: its other
+    // expert tensors may be copied after this seed
+    int32_t rsr_take(int64_t key, uint32_t all_ip, int32_t il, int32_t n_expert) {
+        const int32_t kl = (int32_t) (key / n_expert);
+        int32_t e = -1;
+        int32_t far = -1;
+        int32_t far_l = kl;
+        for (int32_t c = 0; c < rsr.cap && e < 0; ++c) {
+            const int64_t k = rsr.key_at[c];
+            const int32_t cl = k >= 0 ? (int32_t) (k / n_expert) : -1;
+            if (k < 0 || (rsr.read[c] & all_ip) == all_ip || cl < il) {
+                e = c;
+            } else if (cl > far_l) {
+                far   = c;
+                far_l = cl;
+            }
+        }
+        if (e < 0) {
+            if (far < 0) {
+                return -1;
+            }
+            e = far;
+            rsr.n_lost++;
+        }
+        if (rsr.key_at[e] >= 0) {
+            rsr.where.erase(rsr.key_at[e]);
+        }
+        rsr.key_at[e]  = key;
+        rsr.written[e] = 0;
+        rsr.read[e]    = 0;
+        rsr.where[key] = e;
+        return e;
+    }
+    static bool rsc_log_on() {
+        static const bool on = getenv("LLAMA_MOE_SEED_RESCUE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_SEED_RESCUE_LOG")) != 0;
+        return on;
+    }
+    void rsc_flush(const char * why) {
+        if (rsc.n_fills > 0 || rsc.n_reread > 0) {
+            const double mib = 1.0/1048576.0;
+            LLAMA_LOG_INFO("llama_moe_cache: seed rescue counter (%s): pass %d: %" PRIu64 " seed fills, victims %" PRIu64 " of layers ahead (%.1f MiB) "
+                "and %" PRIu64 " of this or finished layers; layer distance 1-2 / 3-8 / 9-24 / 25+: %" PRIu64 " / %" PRIu64 " / %" PRIu64 " / %" PRIu64 "; "
+                "copies that missed a victim ahead later in the pass: %" PRIu64 " tensor copies, %" PRIu64 " experts, %.1f MiB; within a ring of "
+                "128 / 256 / 512 / 1024 / 2048 MiB: %.1f / %.1f / %.1f / %.1f / %.1f MiB\n", why, rsc.pass, rsc.n_fills, rsc.n_ahead,
+                rsc.n_ahead*rsc.e_bytes*mib, rsc.n_behind, rsc.n_dist[0], rsc.n_dist[1], rsc.n_dist[2], rsc.n_dist[3], rsc.n_reread, rsc.n_reread_x,
+                rsc.b_reread*mib, rsc.b_ring[0]*mib, rsc.b_ring[1]*mib, rsc.b_ring[2]*mib, rsc.b_ring[3]*mib, rsc.b_ring[4]*mib);
+        }
+        const int32_t p = rsc.pass + 1;
+        rsc = rescue_ctr();
+        rsc.pass = p;
+    }
+    void rsc_on_copy_miss(int32_t ig, int32_t il, int32_t e, int32_t n_expert, size_t nb) {
+        const int64_t k = ((int64_t) ig << 32) | ((int64_t) il*n_expert + e);
+        const auto it = rsc.ahead.find(k);
+        if (it == rsc.ahead.end()) {
+            return;
+        }
+        rsc.n_reread++;
+        rsc.b_reread += nb;
+        if (rsc.seen.emplace(k, 1).second) {
+            rsc.n_reread_x++;
+        }
+        const uint64_t d = rsc.n_seq - it->second; // victims recorded after this one
+        static const uint64_t ring_mib[5] = { 128, 256, 512, 1024, 2048 };
+        for (int r = 0; r < 5; ++r) {
+            if (rsc.e_bytes > 0 && d < (ring_mib[r] << 20)/rsc.e_bytes) {
+                rsc.b_ring[r] += nb;
+            }
+        }
+    }
+
     static constexpr int64_t max_batch = 32;
 
     // large batches copy runs of cached experts of at least this size from the cache
@@ -12333,6 +12509,14 @@ struct llama_moe_cache::impl {
         // experts this text routes, and evicting them for guesses costs more than the overlap gains (RTX PRO 6000 with the 4-bit Qwen3.6 12 GB multi-turn tails +8%)
         ua_skip = ua_prev_tokens > ua_max_tokens;
         ua_prev_tokens = n_tokens;
+        if (rsc_log_on()) {
+            if (n_tokens > n_small_max) {
+                rsc_after_large = true;
+            } else if (rsc_after_large) {
+                rsc_after_large = false;
+                rsc_flush("prompt end");
+            }
+        }
         static const bool st_log = getenv("LLAMA_MOE_CACHE_STATE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_STATE_LOG")) != 0;
         if (st_log) {
             if (n_tokens > n_small_max) {
@@ -14242,6 +14426,50 @@ struct llama_moe_cache::impl {
         return it != bindings.end() ? it->second.cached : nullptr;
     }
 
+    // copy_experts for experts the cache does not hold that the ring does (see rescue_ring): a run of experts in consecutive entries;
+    // 0 = not held (uploaded), < 0 = a short run left to the uploads (as for the cache's own runs)
+    int64_t rsr_copy(ggml_backend_t backend, const binding & b, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last,
+            const int32_t * slots, std::vector<ggml_backend_copy_region> * regions) {
+        const int32_t n_expert = (int32_t) w->ne[2];
+        auto entry_of = [&](int64_t x) -> int32_t {
+            const auto it = rsr.where.find((int64_t) b.il*n_expert + x);
+            return it != rsr.where.end() && (rsr.written[it->second] >> b.ip & 1u) ? it->second : -1;
+        };
+        const int32_t e0 = entry_of(e);
+        if (e0 < 0) {
+            return 0;
+        }
+        int64_t n = 1;
+        while (e + n <= last && slots[e + n] < 0 && e0 + n < rsr.cap && entry_of(e + n) == e0 + (int32_t) n) {
+            n++;
+        }
+        ggml_tensor * rt = rsr.t[b.ip];
+        GGML_ASSERT(rt->nb[2] == dst->nb[2]);
+        if (regions == nullptr && n*w->nb[2] < min_copy_bytes && !host_layer(b.il)) {
+            return -n;
+        }
+        for (int64_t i = 0; i < n; ++i) {
+            rsr.read[e0 + i] |= 1u << b.ip;
+        }
+        rsr.n_hits += n;
+        rsr.b_hits += (uint64_t) n*w->nb[2];
+        if (!rsr.logged) {
+            rsr.logged = true;
+            LLAMA_LOG_INFO("llama_moe_cache: seed rescue: a copy of layer %d read %" PRId64 " experts from the ring instead of the host\n", b.il, n);
+        }
+        if (regions != nullptr) {
+            regions->push_back({ rt, (size_t) e0*rt->nb[2], dst, (size_t) e*dst->nb[2], (size_t) n*rt->nb[2] });
+            return n;
+        }
+        ggml_reset(ctx_views.get());
+        ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), rt,  rt->ne[0],  rt->ne[1],  n, rt->nb[1],  rt->nb[2],  e0*rt->nb[2]);
+        ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst, dst->ne[0], dst->ne[1], n, dst->nb[1], dst->nb[2], e*dst->nb[2]);
+        ggml_backend_view_init(src_view);
+        ggml_backend_view_init(dst_view);
+        ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+        return n;
+    }
+
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions) {
         rf_join_all(); // asynchronous refill (see rf_on)
         const auto it = bindings.find(w);
@@ -14298,6 +14526,21 @@ struct llama_moe_cache::impl {
         // large batches only read the cache, so the experts used in generation stay in it
         // while a layer is seeded, its slots are filled after its copies, so the copies read the slots it had before
         const int32_t * slots = b.il == g.sd.il ? g.sd.old_slots.data() : g.lru.slot_map[b.il];
+        if (rsc_log_on()) {
+            if (b.il < rsc.last_copy_il) {
+                rsc_flush("next pass");
+            }
+            rsc.last_copy_il = b.il;
+            if (slots != nullptr && slots[e] < 0) {
+                rsc_on_copy_miss(layers[b.il].ig, b.il, (int32_t) e, g.lru.n_expert, w->nb[2]);
+            }
+        }
+        if (slots != nullptr && slots[e] < 0 && rsr.buf != nullptr && layers[b.il].ig == rsr.ig && (size_t) b.ip < rsr.t.size()) {
+            const int64_t n_rs = rsr_copy(backend, b, w, dst, e, last, slots, regions);
+            if (n_rs != 0) {
+                return n_rs;
+            }
+        }
         if (slots == nullptr || slots[e] < 0) {
             ua_dbg[slots == nullptr ? 2 : 3]++;
             return 0;
@@ -15024,6 +15267,54 @@ struct llama_moe_cache::impl {
                 keep_ahead ? b.il : INT32_MAX);
             GGML_ASSERT(ok);
             sd.gen = g.lru.gen;
+            if (rsc_log_on()) {
+                rsc.e_bytes = g.expert_bytes;
+                rsc.n_fills += sd.fills.size();
+                for (const auto & f : sd.fills) {
+                    const int32_t k = sd.old_key_of[f.slot];
+                    if (k < 0) {
+                        continue;
+                    }
+                    const int32_t kl = k / n_expert;
+                    if (kl > b.il) {
+                        rsc.n_ahead++;
+                        rsc.ahead[((int64_t) layers[b.il].ig << 32) | k] = rsc.n_seq++;
+                        const int32_t dl = kl - b.il;
+                        rsc.n_dist[dl <= 2 ? 0 : dl <= 8 ? 1 : dl <= 24 ? 2 : 3]++;
+                    } else {
+                        rsc.n_behind++;
+                    }
+                }
+            }
+            rsr.pend.clear();
+            if (rsr_on() && !tiered && !sd.fills.empty() && rsr_alloc(g, layers[b.il].ig)) {
+                // the victims of layers ahead, the nearest layers first (their copies come first)
+                rsr.n_seeds++;
+                rsr_vict.clear();
+                for (const auto & f : sd.fills) {
+                    const int32_t k = sd.old_key_of[f.slot];
+                    if (k < 0 || k / n_expert <= b.il || (host_layer(k / n_expert) && host->exclusive())) {
+                        continue;
+                    }
+                    rsr_vict.push_back({ k, f.slot });
+                }
+                std::sort(rsr_vict.begin(), rsr_vict.end());
+                const uint32_t all_ip = (1u << g.ref.size()) - 1;
+                for (const auto & [k, slot] : rsr_vict) {
+                    const auto w_it = rsr.where.find(k);
+                    if (w_it != rsr.where.end() && (rsr.written[w_it->second] & all_ip) == all_ip) {
+                        rsr.read[w_it->second] = 0; // still held from an earlier eviction (expert weights do not change)
+                        continue;
+                    }
+                    const int32_t e = rsr_take(k, all_ip, b.il, n_expert);
+                    if (e < 0) {
+                        rsr.n_skip++;
+                        continue;
+                    }
+                    rsr.pend.push_back({ e, slot });
+                    rsr.n_kept++;
+                }
+            }
             if (tiered) {
                 // exclusive: the experts the seed evicts move to RAM before any of their device slots is overwritten
                 // a large batch seeds layer b.il after its experts were staged, so the RAM slots they need make room in the
@@ -15050,6 +15341,40 @@ struct llama_moe_cache::impl {
         if (seed_check) {
             for (const auto & f : fills) {
                 sd.pending.push_back({ w, bank, f.expert, f.slot });
+            }
+        }
+        // the victims of layers ahead into the ring, before this tensor's seed copies overwrite their slots (a separate call: the
+        // copies of one batched call are not ordered among themselves)
+        if (!rsr.pend.empty() && (size_t) b.ip < rsr.t.size()) {
+            ggml_tensor * rt = rsr.t[b.ip];
+            GGML_ASSERT(rt->nb[2] == bank->nb[2]);
+            rsr.regions.clear();
+            for (const auto & [entry, slot] : rsr.pend) {
+                const int64_t k = rsr.key_at[entry];
+                if (k < 0 || !ua_readable((int32_t) (k / g.lru.n_expert), (int32_t) b.ip)) {
+                    continue;
+                }
+                if (!rsr.regions.empty()) {
+                    auto & r = rsr.regions.back();
+                    if (r.src_offset + r.size == (size_t) slot*bank->nb[2] && r.dst_offset + r.size == (size_t) entry*rt->nb[2]) {
+                        r.size += bank->nb[2];
+                        rsr.written[entry] |= 1u << b.ip;
+                        continue;
+                    }
+                }
+                rsr.regions.push_back({ bank, (size_t) slot*bank->nb[2], rt, (size_t) entry*rt->nb[2], bank->nb[2] });
+                rsr.written[entry] |= 1u << b.ip;
+            }
+            if (!rsr.regions.empty() && !ggml_backend_tensor_copy_regions_async(backend, rsr.regions.data(), rsr.regions.size())) {
+                for (const auto & r : rsr.regions) {
+                    ggml_reset(ctx_views.get());
+                    const int64_t n = (int64_t) (r.size/bank->nb[2]);
+                    ggml_tensor * sv = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], r.src_offset);
+                    ggml_tensor * dv = ggml_view_3d(ctx_views.get(), rt, rt->ne[0], rt->ne[1], n, rt->nb[1], rt->nb[2], r.dst_offset);
+                    ggml_backend_view_init(sv);
+                    ggml_backend_view_init(dv);
+                    ggml_backend_tensor_copy_async(backend, backend, sv, dv);
+                }
             }
         }
 
@@ -15608,6 +15933,11 @@ struct llama_moe_cache::impl {
         }
         if (n_large_ubatches > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu ubatches, copies per ubatch: %.1f from the cache, %.1f uploads, in %.1f batched calls\n", tag, n_large_ubatches, (double) stats_copy.calls/n_large_ubatches, (double) stats_upload.calls/n_large_ubatches, (double) n_batches/n_large_ubatches);
+        }
+        if (rsr.n_kept > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: seed rescue: %" PRIu64 " seeds kept %" PRIu64 " victims of layers ahead in the ring (%" PRIu64 " past its size, "
+                "%" PRIu64 " overwritten unread), copies read %" PRIu64 " expert tensors from it, %.2f MiB not uploaded\n", tag, rsr.n_seeds, rsr.n_kept,
+                rsr.n_skip, rsr.n_lost, rsr.n_hits, rsr.b_hits/1048576.0);
         }
         if (stats_seed.misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu experts admitted to the cache, %.2f MiB\n", tag, stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
