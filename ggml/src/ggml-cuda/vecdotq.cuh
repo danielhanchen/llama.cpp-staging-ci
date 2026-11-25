@@ -103,62 +103,75 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 
-// GGML_CUDA_IQ_SIGN_MUL=0 at compile time: the __vcmpne4 / __vsub4 sign code below instead of the multiply form
+// GGML_CUDA_IQ_SIGN_MUL=0 at compile time: the __vcmpne4 / __vsub4 sign code below instead of the multiply form (mat-vec kernels).
+// GGML_CUDA_IQ_SIGN_MUL_MMQ (default 0): the same for the MMQ tile loaders, where the multiply form made 8k prompts slower on the
+// RTX PRO 6000 (Flash-Next, +15..25 ms per 8k prompt)
 #ifndef GGML_CUDA_IQ_SIGN_MUL
 #define GGML_CUDA_IQ_SIGN_MUL 1
+#endif
+#ifndef GGML_CUDA_IQ_SIGN_MUL_MMQ
+#define GGML_CUDA_IQ_SIGN_MUL_MMQ 0
 #endif
 
 // the 4 grid bytes g with the signs of the low 4 bits of s4 applied (bit k negates byte k). Every byte of g must be nonzero (the
 // iq2s / iq3xxs grids: 0x08 / 0x19 / 0x2b and 4..62): then bit k -> 0x01 in byte k by one multiply (the partial products do not
 // overlap), and -g = (g ^ 0xFF) + 1 in each such byte carries into no other byte, so the int is that of __vsub4(g ^ m, m) with the
 // __vcmpne4 byte masks m, in fewer instructions
+template <bool mul = GGML_CUDA_IQ_SIGN_MUL>
 static __device__ __forceinline__ int iq_apply_signs4(const int g, const uint32_t s4) {
-#if GGML_CUDA_IQ_SIGN_MUL
-    const int sb = (int) (((s4 & 0x0F) * 0x00204081u) & 0x01010101u);
-    return (g ^ (sb * 0xFF)) + sb;
-#else
-    const int m = __vcmpne4(((s4 & 0x03) << 7) | ((s4 & 0x0C) << 21), 0x00000000);
-    return __vsub4(g ^ m, m);
-#endif // GGML_CUDA_IQ_SIGN_MUL
+    if constexpr (mul) {
+        const int sb = (int) (((s4 & 0x0F) * 0x00204081u) & 0x01010101u);
+        return (g ^ (sb * 0xFF)) + sb;
+    } else {
+        const int m = __vcmpne4(((s4 & 0x03) << 7) | ((s4 & 0x0C) << 21), 0x00000000);
+        return __vsub4(g ^ m, m);
+    }
 }
 
 // the 8 signs of a 7-bit ksigns value v (the 8th = the parity of the 7, as unpack_ksigns) applied to the 8 nonzero grid bytes gl / gh
+template <bool mul = GGML_CUDA_IQ_SIGN_MUL>
 static __device__ __forceinline__ void iq_apply_ksigns(const uint8_t v, const int gl, const int gh, int & l, int & h) {
-#if GGML_CUDA_IQ_SIGN_MUL
-    const uint32_t s = v ^ (__popc(v) & 1) << 7;
-    l = iq_apply_signs4(gl, s);
-    h = iq_apply_signs4(gh, s >> 4);
-#else
-    const uint32_t signs = unpack_ksigns(v);
-    const int m0 = __vcmpne4(signs & 0x08040201, 0);
-    const int m1 = __vcmpne4(signs & 0x80402010, 0);
-    l = __vsub4(gl ^ m0, m0);
-    h = __vsub4(gh ^ m1, m1);
-#endif // GGML_CUDA_IQ_SIGN_MUL
+    if constexpr (mul) {
+        const uint32_t s = v ^ (__popc(v) & 1) << 7;
+        l = iq_apply_signs4<true>(gl, s);
+        h = iq_apply_signs4<true>(gh, s >> 4);
+    } else {
+        const uint32_t signs = unpack_ksigns(v);
+        const int m0 = __vcmpne4(signs & 0x08040201, 0);
+        const int m1 = __vcmpne4(signs & 0x80402010, 0);
+        l = __vsub4(gl ^ m0, m0);
+        h = __vsub4(gh ^ m1, m1);
+    }
 }
 
-// GGML_CUDA_Q5_0_HMUL=0 at compile time: the per-bit shift / and / or high-bit expansion below instead of the multiply form
+// GGML_CUDA_Q5_0_HMUL=0 at compile time: the per-bit shift / and / or high-bit expansion below instead of the multiply form (mat-vec
+// kernels); GGML_CUDA_Q5_0_HMUL_MMQ (default 0): the multiply form in the MMQ tile loader too (not measured as a prompt gain)
 #ifndef GGML_CUDA_Q5_0_HMUL
 #define GGML_CUDA_Q5_0_HMUL 1
+#endif
+#ifndef GGML_CUDA_Q5_0_HMUL_MMQ
+#define GGML_CUDA_Q5_0_HMUL_MMQ 0
 #endif
 
 // Q5_0 5th bits: bit k (k = 0..3) of qh moved to bit 4 of byte k. The 4 partial products of the nibble with 0x02040810 land on
 // distinct single bits (no carries), so after the mask the int is that of the four shift / and / or terms, in fewer instructions
+template <bool mul = GGML_CUDA_Q5_0_HMUL>
 static __device__ __forceinline__ int q5_0_hbits_lo(const int qh) {
-#if GGML_CUDA_Q5_0_HMUL
-    return (int) (((uint32_t) qh & 0x0Fu) * 0x02040810u) & 0x10101010;
-#else
-    return ((qh << 4) & 0x00000010) | ((qh << 11) & 0x00001000) | ((qh << 18) & 0x00100000) | ((qh << 25) & 0x10000000);
-#endif // GGML_CUDA_Q5_0_HMUL
+    if constexpr (mul) {
+        return (int) (((uint32_t) qh & 0x0Fu) * 0x02040810u) & 0x10101010;
+    } else {
+        return ((qh << 4) & 0x00000010) | ((qh << 11) & 0x00001000) | ((qh << 18) & 0x00100000) | ((qh << 25) & 0x10000000);
+    }
 }
 
 // the same for bits 16..19 of qh
+template <bool mul = GGML_CUDA_Q5_0_HMUL>
 static __device__ __forceinline__ int q5_0_hbits_hi(const int qh) {
-#if GGML_CUDA_Q5_0_HMUL
-    return (int) ((((uint32_t) qh >> 16) & 0x0Fu) * 0x02040810u) & 0x10101010;
-#else
-    return ((qh >> 12) & 0x00000010) | ((qh >> 5) & 0x00001000) | ((qh << 2) & 0x00100000) | ((qh << 9) & 0x10000000);
-#endif // GGML_CUDA_Q5_0_HMUL
+    if constexpr (mul) {
+        return (int) ((((uint32_t) qh >> 16) & 0x0Fu) * 0x02040810u) & 0x10101010;
+    } else {
+        return ((qh >> 12) & 0x00000010) | ((qh >> 5) & 0x00001000) | ((qh << 2) & 0x00100000) | ((qh << 9) & 0x10000000);
+    }
 }
 
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
