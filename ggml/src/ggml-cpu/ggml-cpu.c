@@ -2056,6 +2056,7 @@ struct ggml_moe_team {
 
 static struct ggml_moe_team ggml_moe_team_g;
 static atomic_int ggml_moe_team_init = 0; // 0: not yet, 1: ready
+static atomic_int ggml_moe_team_live = 0; // workers started (t->n), read without t->call
 
 // GGML_MOE_HOST_PF (the team form opt-in with =1, the OpenMP form below on by default, =0 off): a read-ahead of the row slices of experts
 // a later batch is expected to compute, run by the team's workers while the caller goes on (ggml_cpu_moe_host_team_prefetch). Worker i reads the slices it computes in the sliced form of a batch
@@ -2273,6 +2274,7 @@ void ggml_cpu_moe_host_team_stop(void) {
             ggml_thread_join(t->thr[i], NULL);
         }
         t->n = 0;
+        atomic_store_explicit(&ggml_moe_team_live, 0, memory_order_relaxed);
         atomic_store(&t->stop, false);
     }
     ggml_mutex_unlock(&t->call);
@@ -2303,6 +2305,7 @@ static bool ggml_moe_team_run(struct ggml_moe_host_job * j, int n_threads) {
         }
         t->n = i;
     }
+    atomic_store_explicit(&ggml_moe_team_live, t->n, memory_order_relaxed);
     if (t->n < n_threads - 1) {
         ggml_mutex_unlock(&t->call);
         return false;
@@ -3624,9 +3627,16 @@ static int64_t ggml_cpu_get_rows_mt_min(void) {
 // overlap the faults. Every row is dequantized on its own, so the result does not change
 static bool ggml_cpu_region_runner_set(void);
 
+// true once the MoE host team has started its workers: they spin between host expert batches, so a many-thread gather beside them
+// oversubscribes the cores
+static bool ggml_cpu_moe_team_live(void) {
+    return atomic_load_explicit(&ggml_moe_team_live, memory_order_relaxed) > 0;
+}
+
 // (=1, the default, keeps one thread where a region runner is set, i.e. where a MoE host path hands the graph regions to its host
 // thread's team: there the gather's region ran on that team between its host expert batches and slowed them, RTX PRO 6000 48 GB
-// Flash-Next 101 -> 129 us per host batch, more than the gather saved; =2 also there)
+// Flash-Next 101 -> 129 us per host batch, more than the gather saved; also where the host team runs its own workers: A100 40 GB
+// Flash-Next, 12 cores, 612-878 vs 406-496 us per host batch; =2 also there)
 static int ggml_cpu_get_rows_big_threads(const struct ggml_tensor * node, int n_threads) {
     static int on      = -1;
     static int64_t min_rows  = 32;
@@ -3642,7 +3652,7 @@ static int ggml_cpu_get_rows_big_threads(const struct ggml_tensor * node, int n_
         max_thr   = t ? MAX(1, atoi(t)) : 8;
         on        = e == NULL ? 1 : MAX(0, atoi(e));
     }
-    if (on == 0 || (on == 1 && ggml_cpu_region_runner_set()) || node->src[0] == NULL || node->src[1] == NULL || ggml_nelements(node->src[1]) < min_rows ||
+    if (on == 0 || (on == 1 && (ggml_cpu_region_runner_set() || ggml_cpu_moe_team_live())) || node->src[0] == NULL || node->src[1] == NULL || ggml_nelements(node->src[1]) < min_rows ||
             (int64_t) ggml_nbytes(node->src[0]) < min_bytes) {
         return 1;
     }
