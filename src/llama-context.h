@@ -693,8 +693,7 @@ private:
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;
 
-public:
-    // state of sched_copy_experts, reset before each graph compute (public: the copy helpers of llama-context.cpp take it)
+    // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
@@ -706,18 +705,6 @@ public:
         std::vector<std::pair<size_t, size_t>> uploads; // offset and size of the uploads of the current copy
         std::vector<ggml_backend_copy_region>   regions; // the copies of the current copy, when the backend batches them
 
-        // short prompt ubatches (LLAMA_MOE_PROMPT_OVERLAP): the routing read into pinned memory, waited for with an event
-        ggml_backend_buffer_t ids_pinned      = nullptr;
-        ggml_backend_event_t  ids_event       = nullptr;
-        ggml_backend_dev_t    ids_event_dev   = nullptr;
-        bool                  ids_pinned_fail = false;
-        // the run-end padding from a zeroed device block (LLAMA_MOE_PROMPT_PAD_DEV0), one per device
-        std::vector<std::pair<ggml_backend_dev_t, ggml_tensor *>> pad_zero;
-        ggml_context *        pad_ctx = nullptr;
-        std::vector<ggml_backend_buffer_t> pad_bufs;
-        std::vector<ggml_backend_copy_region> pad_regions; // the padding copies of the current copy
-        uint64_t n_pad_dev0 = 0, n_pad_host = 0;          // padding copies from the zero block / with an upload (per request)
-
         void reset() {
             ids = nullptr;
             ids_data.clear();
@@ -726,7 +713,6 @@ public:
             all = false;
         }
     };
-private:
 
     copy_experts_info copy_experts;
 
