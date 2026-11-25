@@ -1128,6 +1128,53 @@ float common_dflash_p_cum_default(const llama_context * ctx_tgt) {
     return common_all_gpus_cc12() ? 0.35f : 0.0f;
 }
 
+// LLAMA_DFLASH_EV_CC12 (default 1; 0 = off): where every GPU is compute capability 12.x and the target has no MoE cache, the DFlash2
+// window that maximises the expected tokens per ms from a fixed table of pass ms by verify width (the drafter and host part included)
+// and the selector calibration of LLAMA_DFLASH_EV replaces the 0.35 cumulative-probability cut. The table was measured on an RTX PRO
+// 6000 (Qwen3.8-Flash-Next at 4 bits, DFlash2 n6, every width timed at the same positions of a chat, a 2k and an 8k request): the
+// 4-row verify costs as much as the 5-row one (its F32 products stay on the 1..4-row kernels), so the table never prefers it, and a
+// 7-row pass costs ~4.4 ms more than a 3-row one. Same card and request set, 6 interleaved launches: chat 404.7 -> 410.5 tok/s (same
+// text, 4.65 -> 4.74 tokens per pass), 2k 167.7 -> 179.5, 8k 255.7 -> 268.2 (other texts); the 48-prompt long-context KLD check
+// against the -fa off band: decode mean 0.0012 / p99 0.011 / max 0.038 vs 0.0029 / 0.021 / 0.055, paired per-prompt difference
+// -0.0027 [-0.0034, -0.0022]. =2 also beside a MoE cache that holds most of the host experts, in place of the measured EV window, with
+// the second table (opt-in: at 48 GB 8k 212.8 -> 239.3 but chat 320.2 -> 311.6, more 7-row passes for the same tokens).
+// LLAMA_DFLASH_EV_CC12_COST / LLAMA_DFLASH_EV_CC12_COST_CACHED = "c_1,..,c_7" (ms) replace the tables
+static const std::vector<float> & common_dflash_ev_cc12_cost(bool cached) {
+    static const auto parse = [](const char * name, std::vector<float> def) {
+        const char * e = getenv(name);
+        if (e == nullptr) {
+            return def;
+        }
+        std::vector<float> v;
+        for (const char * q = e; *q != '\0';) {
+            char * end = nullptr;
+            const float x = strtof(q, &end);
+            if (end == q || !(x > 0.0f)) {
+                return def;
+            }
+            v.push_back(x);
+            q = *end == ',' ? end + 1 : end;
+            if (*end != ',' && *end != '\0') {
+                return def;
+            }
+        }
+        return v.size() >= 2 ? v : def;
+    };
+    static const std::vector<float> c_full   = parse("LLAMA_DFLASH_EV_CC12_COST",        { 8.6f, 9.3f, 9.8f, 11.6f, 11.6f, 12.5f, 13.2f });
+    static const std::vector<float> c_cached = parse("LLAMA_DFLASH_EV_CC12_COST_CACHED", { 10.8f, 11.3f, 11.8f, 16.5f, 15.5f, 16.3f, 16.3f });
+    return cached ? c_cached : c_full;
+}
+
+// 0 = off, 1 = without a MoE cache (default), 2 = also beside one
+static int common_dflash_ev_cc12_mode() {
+    static const int m = [] {
+        const char * e = getenv("LLAMA_DFLASH_EV_CC12");
+        const int v = e == nullptr ? 1 : atoi(e);
+        return common_all_gpus_cc12() ? std::max(0, std::min(2, v)) : 0;
+    }();
+    return m;
+}
+
 // every GPU is compute capability 8.0 (and there is at least one)
 static bool common_all_gpus_cc80() {
     static const bool v = [] {
@@ -1995,9 +2042,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const char * e = getenv("LLAMA_DFLASH_EV_AUTO_SM80");
                     return e != nullptr && atoi(e) != 0;
                 }();
-                const bool use_eva = is_dflash2 && !use_ev && !use_df2w && eva_mode() != 0 && (df2_meas ||
+                bool use_eva = is_dflash2 && !use_ev && !use_df2w && eva_mode() != 0 && (df2_meas ||
                     eva_mode() == 1 || (n_seq == 1 && df2_cache_on && !df2_cached && df2_frac >= df2_mid_hi && !llama_exact_verify_enabled() &&
                         (eva_sm80 || !common_all_gpus_cc80())));
+                // the fixed-table window of compute capability 12.x (common_dflash_ev_cc12_cost) where the 0.35 cut or the measured
+                // EV window would run by default
+                const bool use_evd_full   = p_cum_def > 0.0f && p_cum_min < 0.0f && common_dflash_ev_cc12_mode() >= 1;
+                const bool use_evd_cached = use_eva && !df2_meas && eva_mode() == 2 && common_dflash_ev_cc12_mode() == 2;
+                const bool use_evd = is_dflash2 && !use_ev && !use_df2w && (use_evd_full || use_evd_cached);
+                if (use_evd) {
+                    use_eva = false;
+                    static bool logged_evd = false;
+                    if (!logged_evd) {
+                        logged_evd = true;
+                        LOG_INF("DFlash2 window by expected tokens per ms from the compute capability 12.x pass costs (%s; LLAMA_DFLASH_EV_CC12=0 off, =2 also beside a MoE cache)\n",
+                                use_evd_cached ? "beside the MoE cache" : "no MoE cache");
+                    }
+                }
+                const float p_cum_walk = use_evd ? 0.0f : p_cum_thr;
                 if (use_eva) {
                     eva_init();
                     eva.small = eva.small || df2_meas;
@@ -2088,17 +2150,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         dg.p[seq_id].push_back(1.0f / sum);
                         dg.m[seq_id].push_back(scores[predecessor] - second);
                     }
-                    if (params.p_min > 0.0f || p_cum_thr > 0.0f || use_ev || use_df2w || use_eva) {
+                    if (params.p_min > 0.0f || p_cum_walk > 0.0f || use_ev || use_df2w || use_eva || use_evd) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < top_k; ++k) {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
-                        if (use_ev || use_df2w || use_eva) {
+                        if (use_ev || use_df2w || use_eva || use_evd) {
                             step_p.push_back(1.0f / sum);
                         }
                         p_cum *= p_cum_exp == 1.0f ? 1.0f / sum : std::pow(1.0f / sum, p_cum_exp);
-                        if (1.0f / sum < params.p_min || p_cum < p_cum_thr) {
+                        if (1.0f / sum < params.p_min || p_cum < p_cum_walk) {
                             break;
                         }
                     }
@@ -2155,6 +2217,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             best   = v;
                             best_k = k;
                         }
+                    }
+                    result.resize(best_k);
+                }
+                if (use_evd && !result.empty()) {
+                    static const float evd_cal[20] = { 0.141f, 0.141f, 0.141f, 0.141f, 0.203f, 0.264f, 0.278f, 0.339f, 0.363f, 0.423f,
+                                                       0.460f, 0.492f, 0.583f, 0.614f, 0.614f, 0.619f, 0.657f, 0.748f, 0.814f, 0.929f };
+                    const auto & c = common_dflash_ev_cc12_cost(use_evd_cached);
+                    size_t best_k = 0;
+                    double best   = 1.0 / c[0];
+                    double e_tok  = 1.0;
+                    double reach  = 1.0;
+                    for (size_t k = 1; k <= result.size() && k < c.size(); ++k) {
+                        reach *= evd_cal[std::min(19, std::max(0, (int) (step_p[k - 1] * 20)))];
+                        e_tok += reach;
+                        const double v = e_tok / c[k];
+                        if (v > best) {
+                            best   = v;
+                            best_k = k;
+                        }
+                    }
+                    static int64_t n_evd = 0, n_evd_rows = 0;
+                    n_evd++;
+                    n_evd_rows += (int64_t) best_k + 1;
+                    if ((n_evd & (n_evd - 1)) == 0) {
+                        LOG_INF("DFlash2 cc 12.x window: %" PRId64 " drafts, %.2f rows verified on average\n", n_evd, (double) n_evd_rows / n_evd);
                     }
                     result.resize(best_k);
                 }
