@@ -169,6 +169,8 @@ static void test_dist_fp_traps() {
     self[len] = 0;
     const std::string fast = run_self(self, "env -u LLAMA_SAMPLER_DISABLE_FAST_DIST");
     const std::string ref  = run_self(self, "env LLAMA_SAMPLER_DISABLE_FAST_DIST=1");
+    const std::string vec  = run_self(self, "env -u LLAMA_SAMPLER_DISABLE_FAST_DIST LLAMA_SAMPLER_EXPF4=1");
+    GGML_ASSERT(vec == ref);
     GGML_ASSERT(!fast.empty());
     GGML_ASSERT(fast == ref);
     if (getenv("LLAMA_SAMPLER_DISABLE_FAST_DIST") == nullptr) {
@@ -178,6 +180,8 @@ static void test_dist_fp_traps() {
     // with FE_UNDERFLOW traps on, dist on logits whose expf does not underflow must not raise SIGFPE either
     const std::string uf_fast = run_self(self, "env -u LLAMA_SAMPLER_DISABLE_FAST_DIST", "--dist-underflow");
     const std::string uf_ref  = run_self(self, "env LLAMA_SAMPLER_DISABLE_FAST_DIST=1", "--dist-underflow");
+    const std::string uf_vec  = run_self(self, "env -u LLAMA_SAMPLER_DISABLE_FAST_DIST LLAMA_SAMPLER_EXPF4=1", "--dist-underflow");
+    GGML_ASSERT(uf_vec == uf_ref);
     GGML_ASSERT(!uf_fast.empty());
     GGML_ASSERT(uf_fast == uf_ref);
     printf("%s: OK\n", __func__);

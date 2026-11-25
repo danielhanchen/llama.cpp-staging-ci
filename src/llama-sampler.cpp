@@ -409,8 +409,13 @@ static bool llama_sampler_expf4_probe() {
     return memcmp(ref.data(), p.data(), p.size()*sizeof(float)) == 0;
 }
 
+// LLAMA_SAMPLER_EXPF4=1 (opt-in): the vector expf. Faster than glibc expf on some CPUs and slower on others (measured: AMD
+// Zen 5 faster, 2.0-2.2 GHz Xeon server parts slower), so the default dist path calls expf
 static bool llama_sampler_expf4_ok() {
-    static const bool ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && llama_sampler_expf4_probe();
+    static const bool ok = [] {
+        const char * e = getenv("LLAMA_SAMPLER_EXPF4");
+        return e != nullptr && atoi(e) != 0;
+    }() && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && llama_sampler_expf4_probe();
     return ok;
 }
 #endif
