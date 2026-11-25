@@ -978,6 +978,11 @@ private:
     // four kept graphs per size: after a recurrent rollback the state cells and the restore copy differ for a few decodes
     static constexpr uint32_t GF_SMALL_MAX  = 8;
     static constexpr uint32_t GF_SMALL_WAYS = 4;
+
+    // device KV length buckets of a plain hybrid memory (see decode)
+    bool kv_bucket_hybrid_set      = false;
+    bool kv_bucket_hybrid_on       = false;
+    bool kv_bucket_hybrid_step_env = false;
     static constexpr uint32_t GF_SMALL_N    = (GF_SMALL_MAX + 1)*GF_SMALL_WAYS;
     std::array<llm_graph_result_ptr, GF_SMALL_N> gf_res_small;
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_epoch{};
