@@ -5592,11 +5592,14 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     const int64_t at1 = at_on ? ggml_time_us() : 0;
     struct at_log {
         bool on; int64_t t0, t1; int n_nodes; int n_splits;
+        int64_t t_dry = 0, t_bind = 0; // after the dry measure, after the binding (0: not reached)
         ~at_log() {
             if (on) {
                 const int64_t t2 = ggml_time_us();
-                GGML_LOG_INFO("ggml_backend_sched_alloc_graph: %d nodes, %d splits: split %.3f ms, measure + bind + alloc %.3f ms\n", n_nodes, n_splits,
-                    (t1 - t0)/1000.0, (t2 - t1)/1000.0);
+                GGML_LOG_INFO("ggml_backend_sched_alloc_graph: %d nodes, %d splits: split %.3f ms, measure + bind + alloc %.3f ms "
+                    "(dry measure %.3f, bind %.3f, alloc %.3f)\n", n_nodes, n_splits, (t1 - t0)/1000.0, (t2 - t1)/1000.0,
+                    t_dry > 0 ? (t_dry - t1)/1000.0 : 0.0, t_bind > 0 ? (t_bind - (t_dry > 0 ? t_dry : t1))/1000.0 : 0.0,
+                    t_bind > 0 ? (t2 - t_bind)/1000.0 : 0.0);
             }
         }
     } at_l = { at_on, at0, at1, graph->n_nodes, sched->n_splits };
@@ -5620,6 +5623,9 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
         ggml_backend_sched_prefetch_bind(sched, /*dry =*/ true);
         size_t sizes[GGML_SCHED_MAX_BACKENDS] = { 0 };
         ggml_gallocr_measure_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+        if (at_on) {
+            at_l.t_dry = ggml_time_us();
+        }
         for (int i = 0; i < sched->n_splits; i++) {
             struct ggml_backend_sched_split * split = &sched->splits[i];
             for (int j = 0; j < split->n_inputs; j++) {
@@ -5698,6 +5704,9 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     ggml_backend_sched_prefetch_bind(sched, /*dry =*/ false);
+    if (at_on) {
+        at_l.t_bind = ggml_time_us();
+    }
 
     // a growth past the free memory that the lender did not take is refused as by the limit (the caller splits the graph)
     {
