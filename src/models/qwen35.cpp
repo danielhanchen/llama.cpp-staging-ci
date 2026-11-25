@@ -1,6 +1,8 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "models.h"
 #include "llama-impl.h"
+
+#include <atomic>
 #include "llama-memory-recurrent.h"
 #include "llama-kv-cache.h"
 
@@ -247,12 +249,24 @@ static bool qwen35_proj_adjacent(int64_t n_tokens) {
     static const bool on = [] {
         const char * a = getenv("LLAMA_QWEN35_PROJ_ADJACENT");
         const char * d = getenv("LLAMA_QWEN35_DENSE_PROJ_ADJACENT");
-        const bool r = (a == nullptr || atoi(a) != 0) && (d == nullptr || atoi(d) != 0);
-        LLAMA_LOG_INFO("%s: dense qwen35 adjacent projections in prompt graphs: %s (LLAMA_QWEN35_DENSE_PROJ_ADJACENT=0: off)\n",
-            __func__, r ? "on" : "off");
-        return r;
+        return (a == nullptr || atoi(a) != 0) && (d == nullptr || atoi(d) != 0);
     }();
     return on && n_tokens > 8;
+}
+
+// engagement: prompt graphs built with the adjacent order, logged at 1, 2, 3, 4, then 10, 100, ... (the first builds can fall in
+// a phase that does not log)
+static void qwen35_proj_adjacent_count() {
+    static std::atomic<int64_t> n{0};
+    const int64_t c = n.fetch_add(1) + 1;
+    int64_t p = 1;
+    while (p < c) {
+        p *= 10;
+    }
+    if (p == c || c <= 4) {
+        LLAMA_LOG_INFO("qwen35: dense adjacent projections in prompt graphs: %lld graphs built (LLAMA_QWEN35_DENSE_PROJ_ADJACENT=0: off)\n",
+            (long long) c);
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
@@ -264,6 +278,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     if (qwen35_proj_adjacent(n_tokens)) {
         ggml_build_forward_expand(gf, qkv_mixed);
+        if (il == 0) {
+            qwen35_proj_adjacent_count();
+        }
     }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
