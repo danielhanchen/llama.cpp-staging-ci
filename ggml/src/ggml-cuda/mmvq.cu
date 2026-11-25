@@ -1696,6 +1696,47 @@ struct mmvq_moe_wdec<GGML_TYPE_IQ3_S, true> {
     }
 };
 
+// vec_dot_iq3_xxs_q8_1
+template <>
+struct mmvq_moe_wdec<GGML_TYPE_IQ3_XXS, true> {
+    int   grid[8];
+    int   ls;
+    float d;
+    int   iqs;
+    __device__ __forceinline__ void load(const void * vbq, const int kbx, const int iqs_) {
+        const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+        iqs = iqs_;
+
+        const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
+        const uint8_t * q3 = (const uint8_t *) &q3_packed;
+        const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+            iq_apply_ksigns(aux32 >> (7*l0/2), grid_pos.x, grid_pos.y, grid[l0 + 0], grid[l0 + 1]);
+        }
+
+        ls = aux32 >> 28;
+        d  = __half2float(bq3->d);
+    }
+    __device__ __forceinline__ float apply(const block_q8_1 * bq8_1) const {
+        int sumi = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+            const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+            sumi = ggml_cuda_dp4a(grid[l0 + 0], u0, sumi);
+            sumi = ggml_cuda_dp4a(grid[l0 + 1], u1, sumi);
+        }
+
+        sumi = (ls*sumi + sumi/2)/2;
+        const float dd = d * __low2float(bq8_1[iqs/2].ds);
+        return dd * sumi;
+    }
+};
+
 // vec_dot_iq4_nl_q8_1
 template <>
 struct mmvq_moe_wdec<GGML_TYPE_IQ4_NL, true> {
@@ -2267,7 +2308,7 @@ static __global__ void mul_mat_vec_q_moe_vl(
     constexpr int lpb       = qi/vdr;               // virtual lanes per weight block
     constexpr int bpi       = vdr*warp_size/qi;     // weight blocks per K iteration of a virtual lane
     constexpr int c_vl      = warp_size/c_tpr;      // virtual lanes per thread = rows per warp
-    constexpr bool c_dec    = type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL;
+    constexpr bool c_dec    = type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ3_XXS;
     static_assert(warp_size % c_tpr == 0 && c_tpr >= 1, "threads per row");
 
     bool use_gate = false;
@@ -3021,7 +3062,11 @@ static bool mul_mat_vec_q_moe_bw_launch(
 // same values; NVIDIA Turing and newer (not GB10), no shared expert, at most 128 entries. Auto: Ampere and newer at 3..8 tokens,
 // 16 threads per row, 2 entries per decode up to 5 tokens and 4 above (Flash-Next on the RTX PRO 6000, the time of the grouped / staged kernels it
 // replaces: 0.92 / 0.90 / 0.88 / 0.90 / 0.90 / 0.91 at 3..8 tokens). The IQ4_NL / Q8_0 downs and the IQ4_XS gate / up measured slower
-// with it at every width (1.04-1.25x), so it has no instances for them
+// with it at every width (1.04-1.25x), so it has no instances for them.
+// IQ3_XXS experts with a fused gate (Qwen3.8-Flash-Next UD-IQ4_XS gate / up) take the same kernel on compute capability 8.0 with the
+// IQ3_S shape there (16 threads per row, 4 entries per decode: their decode is the same kind, grid lookups and signs, done once per
+// expert); on 12.0 it was level or slower in real passes, other archs not measured: off.
+// GGML_CUDA_MOE_VL_IQ3XXS=0: off on 8.0 too, =1: on wherever IQ3_S takes it
 struct mmvq_moe_vl_cfg {
     int tpr = 0;
     int g   = 0;
@@ -3042,8 +3087,14 @@ static mmvq_moe_vl_cfg mmvq_moe_vl_config(const ggml_type type, const bool fused
     if (env.tpr >= 0) {
         return env;
     }
+    static const int iq3xxs_env = [] {
+        const char * e = getenv("GGML_CUDA_MOE_VL_IQ3XXS");
+        return e == nullptr ? -1 : atoi(e);
+    }();
+    const bool iq3xxs = type == GGML_TYPE_IQ3_XXS &&
+        (iq3xxs_env >= 0 ? iq3xxs_env != 0 : mmvq_moe_ampere(cc));
     mmvq_moe_vl_cfg c;
-    if (cc >= GGML_CUDA_CC_AMPERE && type == GGML_TYPE_IQ3_S && fused && ntok >= 3) {
+    if (cc >= GGML_CUDA_CC_AMPERE && (type == GGML_TYPE_IQ3_S || iq3xxs) && fused && ntok >= 3) {
         c.tpr = 16;
         c.g   = ntok <= 5 ? 2 : 4;
         // sm_80, 4 entries per decode from 3 tokens
@@ -3082,8 +3133,8 @@ static bool mul_mat_vec_q_moe_vl_launch(
         stride_channel_x, stride_channel_y, stride_channel_dst, ntok, ids_stride, nchannels_dst, cc, warp_size, stream);
     return false;
 #else
-    constexpr bool c_fused = true;   // the instances: the IQ3_S gate / up with a fused gate
-    if constexpr (type != GGML_TYPE_IQ3_S) {
+    constexpr bool c_fused = true;   // the instances: the IQ3_S / IQ3_XXS gate / up with a fused gate
+    if constexpr (type != GGML_TYPE_IQ3_S && type != GGML_TYPE_IQ3_XXS) {
         GGML_UNUSED_VARS(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst, ntok, ids_stride, nchannels_dst, cc, warp_size, stream);
         return false;

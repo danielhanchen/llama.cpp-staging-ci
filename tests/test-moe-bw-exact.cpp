@@ -397,6 +397,7 @@ static std::vector<moe_case> make_cases() {
     const moe_shape shapes[] = {
         { "iq3s_gu",  GGML_TYPE_IQ3_S,  2560,  640, 24, 10, true  },
         { "iq4xs_gu", GGML_TYPE_IQ4_XS, 2560,  640, 24, 10, true  },
+        { "iq3xxs_gu", GGML_TYPE_IQ3_XXS, 2560, 640, 24, 10, true  },   // Qwen3.8-Flash-Next UD-IQ4_XS gate / up
         { "iq4nl_dn", GGML_TYPE_IQ4_NL,  640, 2560, 24, 10, false },
         { "q8_0_dn",  GGML_TYPE_Q8_0,    640, 2560, 24, 10, false },
         { "q8_0_gu",  GGML_TYPE_Q8_0,   2560,  640, 24, 10, true  },
@@ -571,6 +572,8 @@ int main(int argc, char ** argv) {
         { "vl16_4",      self, { off }, { "GGML_CUDA_MOE_VL=16,4 MOE_BW_LOG_MATCH=vl16,4" } },
         { "vl16_2",      self, { off }, { "GGML_CUDA_MOE_VL=16,2 MOE_BW_LOG_MATCH=vl16,2" } },
         { "reassoc0_vl", self, { off, "GGML_CUDA_VERIFY_REASSOC=0" }, { "GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MOE_VL=8,4" }, false, -1 },
+        // the IQ3_XXS gate / up on that kernel at its auto shape (GGML_CUDA_MOE_VL_IQ3XXS=1: on any arch that has it), only its launches counted
+        { "vl_iq3xxs",   self, { off }, { "GGML_CUDA_MOE_VL_IQ3XXS=1 MOE_BW_LOG_MATCH=iq3_xxs" } },
     };
     if (const char * b = getenv("MOE_BW_BASE_EXE")) {   // the base build (no such switches there): its default vs this build's
         modes.push_back({ "xbin_default",  b, {}, {}, false, -1 });   // the defaults of this GPU vs the base build
