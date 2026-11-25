@@ -447,36 +447,28 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
     }
 
     float amax = fabsf(vals[0]);
+    float sum  = vals[0];
 #pragma unroll
     for (int l = 1; l < int(sizeof(int)); ++l) {
         amax = fmaxf(amax, fabsf(vals[l]));
+        sum += vals[l];
     }
 #pragma unroll
     for (int mask = QI8_1/2; mask > 0; mask >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 32));
+        sum +=             __shfl_xor_sync(0xFFFFFFFF, sum,  mask, 32);
     }
 
-    float d = amax / 127;
-    if (std::is_same<Tds, half2>::value && d < 6.103515625e-05f) {
-        d = __half2float(__float2half_ru(d));
-    }
+    const float d = amax / 127;
     int q32 = 0;
     int8_t * q8 = (int8_t *) &q32;
 
-    int isum = 0;
     if (d != 0.0f) {
 #pragma unroll
         for (int l = 0; l < int(sizeof(int)); ++l) {
             q8[l] = roundf(vals[l] / d);
-            isum += q8[l];
         }
     }
-
-#pragma unroll
-    for (int mask = QI8_1/2; mask > 0; mask >>= 1) {
-        isum += __shfl_xor_sync(0xFFFFFFFF, isum, mask, 32);
-    }
-    const float sum = (std::is_same<Tds, half2>::value ? __half2float(__float2half(d)) : d) * isum;
 
     yq32[threadIdx.x] = q32;
     if (threadIdx.x % QI8_1 == 0 && (ni == WARP_SIZE || threadIdx.x < ni)) {

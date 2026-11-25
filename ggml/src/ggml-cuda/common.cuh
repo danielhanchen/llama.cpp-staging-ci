@@ -2215,12 +2215,12 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 }
 
 // q8_1 activation quantization shared by quantize_q8_1 and every kernel that writes a q8_1 copy of its output.
-// GGML_CUDA_Q8_1_EXACT (unset = on, 0 = off): the block sums are fp16(d) times the sum of the quantized values
-// (as quantize_row_q8_1_ref), and an fp16-subnormal scale is rounded up to its stored value before quantizing.
+// GGML_CUDA_Q8_1_EXACT=1 (opt-in; unset / 0 = the previous arithmetic): the block sums are fp16(d) times the sum of the
+// quantized values (as quantize_row_q8_1_ref), and an fp16-subnormal scale is rounded up to its stored value before quantizing.
 static bool ggml_cuda_q8_1_exact() {
     static const bool exact = [] {
         const char * e = getenv("GGML_CUDA_Q8_1_EXACT");
-        return e == nullptr || atoi(e) != 0;
+        return e != nullptr && atoi(e) != 0;
     }();
     return exact;
 }
