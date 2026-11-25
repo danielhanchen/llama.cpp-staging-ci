@@ -157,6 +157,10 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // output of plain decoding. Prompt batches and single token decodes are not affected.
 LLAMA_API void llama_set_verify(struct llama_context * ctx, bool value);
 
+// The next decodes (until cleared again) run without the backends' CUDA graph bookkeeping: each graph is computed once, the same
+// kernels in the same order, and no graph entry is warmed up or captured for it (for a ubatch shape the caller knows is not repeated)
+LLAMA_API void llama_set_graph_records_skip(struct llama_context * ctx, bool value);
+
 // (LLAMA_LM_CKPT_MERGE): the next llama_decode() of a single sequence batch ends ubatches at these batch indices (each segment is split as
 // a batch of its own would be: the same ubatches as separate decode() calls, in one layer-major group); cleared by that call
 LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t * breaks, int32_t n);
