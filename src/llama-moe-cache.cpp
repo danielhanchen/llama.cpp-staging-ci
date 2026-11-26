@@ -1140,7 +1140,8 @@ struct llama_moe_cache::impl {
         std::vector<int32_t>  vic;     // [n_slots] the victim parked in it that not every bank has read yet, -1 none
         std::vector<uint32_t> rd;      // [n_slots] the banks of vic read
         std::vector<int32_t>  order;   // the slots of the list in their predicted eviction order, at the first seed of the pass
-        std::vector<int32_t>  pos;     // [n_slots] index in order, -1 none
+        std::vector<int64_t>  pos;     // [n_slots] the slot's place in the sequence order + back, -1 none
+        std::vector<int32_t>  back;    // the slots the seeds of the pass used (hits and fills), in use order: they go to the end
         std::unordered_map<int32_t, int32_t> where; // victim key -> slot
         std::vector<int32_t>  dirty;   // slots with a bank holding another key (may repeat)
         int64_t front = -1;            // the largest order index a seed of the pass filled (diagnostic)
@@ -1214,10 +1215,12 @@ struct llama_moe_cache::impl {
             pk.vic.assign(g.n_slots, -1);
             pk.rd.assign(g.n_slots, 0);
             pk.pos.assign(g.n_slots, -1);
+            pk.back.clear();
         } else {
             std::fill(pk.vic.begin(), pk.vic.end(), -1);
             std::fill(pk.pos.begin(), pk.pos.end(), -1);
         }
+        pk.back.clear();
         pk.where.clear();
         pk.ig = ig;
         pk.copy_il = -1;
@@ -1236,7 +1239,7 @@ struct llama_moe_cache::impl {
         pk.order.resize(pk.sk.size());
         for (size_t i = 0; i < pk.sk.size(); ++i) {
             pk.order[i] = pk.sk[i].second;
-            pk.pos[pk.sk[i].second] = (int32_t) i;
+            pk.pos[pk.sk[i].second] = (int64_t) i;
         }
     }
     // at the plan of a seed of layer il (fills planned, sd.old_key_of = the keys before): the unread victims in slots this seed takes
@@ -1269,6 +1272,28 @@ struct llama_moe_cache::impl {
             }
         }
         pk.n_pass_fills += (int64_t) fills.size();
+        // the slots this seed used go to the end of the eviction order: its hits (touched first by the plan), then its fills
+        {
+            const int32_t * sm = g.lru.slot_map[il];
+            for (int32_t e : seed_ids) {
+                const int32_t s = sm != nullptr && e >= 0 && e < n_expert ? sm[e] : -1;
+                if (s < 0 || s >= pk.n_slots) {
+                    continue;
+                }
+                bool fill = false;
+                for (const auto & f : fills) {
+                    fill = fill || f.slot == s;
+                }
+                if (!fill) {
+                    pk.pos[s] = (int64_t) (pk.order.size() + pk.back.size());
+                    pk.back.push_back(s);
+                }
+            }
+            for (const auto & f : fills) {
+                pk.pos[f.slot] = (int64_t) (pk.order.size() + pk.back.size());
+                pk.back.push_back(f.slot);
+            }
+        }
         pk.cand.clear();
         for (const auto & f : fills) {
             const int32_t x = pk.vic[f.slot];
@@ -1298,35 +1323,47 @@ struct llama_moe_cache::impl {
         const size_t n_pend0 = pk.pend.size();
         const uint64_t n_nodst0 = pk.n_nodst;
         int64_t lo0 = -1;
-        int64_t j = 0;
+        int64_t j = 0;   // place in order + back
+        int64_t n_v = 0; // valid places before j (the evictions take the first valid places)
+        const int64_t n_seq = (int64_t) (pk.order.size() + pk.back.size());
+        auto seq_at = [&](int64_t x) -> int32_t {
+            return x < (int64_t) pk.order.size() ? pk.order[x] : pk.back[x - pk.order.size()];
+        };
         // (LLAMA_MOE_SEED_PARK_REACH=N >= 0): only slots expected to be evicted by the seeds of the pass, up to N layers of seeds past
         // its last one; the others would be restored after the pass (default -1: any slot)
         static const double reach = getenv("LLAMA_MOE_SEED_PARK_REACH") != nullptr ? atof(getenv("LLAMA_MOE_SEED_PARK_REACH")) : -1.0;
-        int64_t j_end = (int64_t) pk.order.size();
+        int64_t v_end = INT64_MAX;
         if (reach >= 0.0) {
             const int64_t n_left = std::count_if(g.layers.begin(), g.layers.end(), [&](int32_t l) { return l > il; });
-            j_end = std::min<int64_t>(j_end, pk.n_pass_fills + (int64_t) (rate*(n_left + reach)));
+            v_end = (int64_t) (rate*(n_left + reach));
         }
         for (auto & c : pk.cand) {
             const int32_t kl = c.key / n_expert;
-            const int64_t lo = pk.n_pass_fills + (int64_t) (rate*std::max(0.0, kl - il - 1 + pk_margin()));
+            // the valid places the seeds before the victim's copy are expected to evict
+            const int64_t need = (int64_t) (rate*std::max(0.0, kl - il - 1 + pk_margin()));
             if (lo0 < 0) {
-                lo0 = lo;
+                lo0 = need;
             }
-            j = std::max(j, lo);
-            while (j < j_end) {
-                const int32_t s = pk.order[j];
+            int32_t d = -1;
+            while (j < n_seq && n_v < v_end) {
+                const int32_t s = seq_at(j);
+                if (pk.pos[s] != j) {
+                    j++;
+                    continue;
+                }
                 const int32_t k = g.lru.key_of[s];
-                if (k >= 0 && k / n_expert < il && s >= g.lru.n_core && s < lim && pk.vic[s] < 0) {
+                const bool ok = n_v >= need && k >= 0 && k / n_expert < il && s >= g.lru.n_core && s < lim && pk.vic[s] < 0;
+                j++;
+                n_v++;
+                if (ok) {
+                    d = s;
                     break;
                 }
-                j++;
             }
-            if (j >= j_end) {
+            if (d < 0) {
                 pk.n_nodst++;
                 continue;
             }
-            const int32_t d = pk.order[j++];
             c.dst = d;
             pk.vic[d]  = c.key;
             pk.rd[d]   = 0;
@@ -1340,18 +1377,22 @@ struct llama_moe_cache::impl {
             }
         }
         if (rsc_log_on() && (pk.n_pass_seeds <= 4 || pk.n_pass_seeds % 8 == 0)) {
-            int64_t n_el = 0, n_el_lo = 0;
-            for (size_t i = 0; i < pk.order.size(); ++i) {
-                const int32_t s = pk.order[i];
+            int64_t n_el = 0, n_el_lo = 0, n_val = 0;
+            for (int64_t i = 0; i < n_seq; ++i) {
+                const int32_t s = seq_at(i);
+                if (pk.pos[s] != i) {
+                    continue;
+                }
                 const int32_t k = g.lru.key_of[s];
                 if (k >= 0 && k / n_expert < il && s >= g.lru.n_core && s < lim) {
                     n_el++;
-                    n_el_lo += (int64_t) i >= lo0;
+                    n_el_lo += n_val >= lo0;
                 }
+                n_val++;
             }
-            LLAMA_LOG_INFO("llama_moe_cache: seed park: seed %d layer %d: %zu fills, filled %" PRId64 " (largest order index %" PRId64 " of %zu), "
-                "%zu candidates from order index %" PRId64 ", %" PRId64 " slots of finished layers (%" PRId64 " from there), %zu parked, %" PRIu64 " without a slot\n",
-                pk.n_pass_seeds, il, fills.size(), pk.n_pass_fills, pk.front, pk.order.size(), pk.cand.size(), lo0, n_el, n_el_lo,
+            LLAMA_LOG_INFO("llama_moe_cache: seed park: seed %d layer %d: %zu fills, filled %" PRId64 " (largest place %" PRId64 "), %" PRId64 " places valid, "
+                "%zu candidates from valid place %" PRId64 ", %" PRId64 " slots of finished layers (%" PRId64 " from there), %zu parked, %" PRIu64 " without a slot\n",
+                pk.n_pass_seeds, il, fills.size(), pk.n_pass_fills, pk.front, n_val, pk.cand.size(), lo0, n_el, n_el_lo,
                 pk.pend.size() - n_pend0, pk.n_nodst - n_nodst0);
         }
     }
