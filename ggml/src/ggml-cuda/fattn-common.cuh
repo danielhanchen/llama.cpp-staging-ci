@@ -1789,7 +1789,8 @@ void launch_fattn(
             const char * e = getenv("GGML_CUDA_FATTN_KV_ROTATE");
             return e == nullptr ? -1 : atoi(e);
         }();
-        const bool kv_rotate_auto = (cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_HOPPER) || cc >= 1200;
+        const bool kv_rotate_auto = (cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_HOPPER) ||
+            (cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN);
         const bool kv_rotate = kv_rotate_env < 0 ? kv_rotate_auto : kv_rotate_env != 0;
         dev_len.kv_rotate = kv_rotate ? 1 : 0;
         if (kv_rotate && (int) blocks_num.x != ntiles_dst) {
