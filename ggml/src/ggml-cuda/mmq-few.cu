@@ -1570,4 +1570,20 @@ bool ggml_cuda_should_use_mmq_few_id(const ggml_tensor * src0, const ggml_tensor
     return false;
 }
 
+bool ggml_cuda_mmq_few_multi_on(const int cc) {
+    GGML_UNUSED(cc);
+    return false;
+}
+
+bool ggml_cuda_mmq_few_multi_pair(const ggml_tensor * a, const ggml_tensor * b) {
+    GGML_UNUSED_VARS(a, b);
+    return false;
+}
+
+void ggml_cuda_mul_mat_q_few_multi(ggml_backend_cuda_context & ctx, const int n, const ggml_tensor * const * src0, const ggml_tensor * src1,
+        ggml_tensor * const * dst) {
+    GGML_UNUSED_VARS(ctx, n, src0, src1, dst);
+    GGML_ABORT("few-row MMQ is not supported on HIP or MUSA");
+}
+
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
