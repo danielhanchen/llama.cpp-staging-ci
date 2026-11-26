@@ -1,0 +1,125 @@
+name: cpupanel
+
+# tiled CPU MUL_MAT_ID window sharing: base (ci-cpupanel/pair.patch reverted) vs head on the same runner.
+# exactness (dump cmp), kernel bench interleaved, pp8192 interleaved.
+
+on:
+  push:
+    branches:
+      - 'ci/cpupanel-**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  M_MOE_URL: https://huggingface.co/bartowski/granite-3.1-1b-a400m-instruct-GGUF/resolve/main/granite-3.1-1b-a400m-instruct-Q4_K_M.gguf
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: ubuntu-x64-a, os: ubuntu-latest, model: 1 }
+          - { leg: ubuntu-x64-b, os: ubuntu-latest, model: 1 }
+          - { leg: ubuntu-arm, os: ubuntu-24.04-arm, model: 0 }
+    name: ${{ matrix.leg }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: h
+          persist-credentials: false
+
+      - name: Base tree
+        run: |
+          cp -r h b
+          (cd b && patch -R -p1 < ../h/ci-cpupanel/pair.patch)
+          diff -r -q h/ggml b/ggml || true
+          mkdir -p ci-logs
+          { nproc; lscpu | grep -E "Model name|^CPU\(s\)|Flags" | cut -c1-600; gcc --version | head -1; } | tee ci-logs/sysinfo.txt
+          echo "NT=$(nproc)" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          for t in base head; do
+            if [ $t = base ]; then S=b; else S=h; fi
+            cmake -S $S -B $S/build -DCMAKE_BUILD_TYPE=Release -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON > ci-logs/configure_$t.log 2>&1
+            cmake --build $S/build --config Release -j "$NT" --target llama-bench test-tiled-mmid-window test-tiled-mulmat > ci-logs/build_$t.log 2>&1
+            echo "build_$t rc=$?" | tee -a ci-logs/summary.txt
+            echo "BIN_$t=$GITHUB_WORKSPACE/$S/build/bin" >> "$GITHUB_ENV"
+          done
+
+      - name: Exactness
+        run: |
+          set +e
+          mkdir -p exact
+          for th in $NT 3; do
+            for arm in base head head0 head4; do
+              case $arm in base) B=$BIN_base; E=;; head) B=$BIN_head; E=;; head0) B=$BIN_head; E=0;; head4) B=$BIN_head; E=4;; esac
+              GGML_CPU_TILED_PAIR=$E $B/test-tiled-mmid-window --threads $th --dump exact/$arm.t$th.bin > ci-logs/exact_$arm.t$th.txt 2> ci-logs/exact_$arm.t$th.log
+              echo "exact $arm t$th rc=$?" >> ci-logs/summary.txt
+            done
+            for arm in head head0 head4; do
+              if cmp -s exact/base.t$th.bin exact/$arm.t$th.bin; then r=IDENTICAL; else r=DIFFER; fi
+              echo "memcmp base vs $arm t$th: $r $(stat -c%s exact/$arm.t$th.bin) bytes" | tee -a ci-logs/summary.txt
+            done
+          done
+          GGML_CPU_TILED_MM=0 $BIN_head/test-tiled-mmid-window --threads $NT > ci-logs/exact_notiled.txt 2>/dev/null
+          echo "cases whose hash changes with tiled off: $(paste <(awk '{print $NF}' ci-logs/exact_base.t$NT.txt) <(awk '{print $NF}' ci-logs/exact_notiled.txt) | awk '$1!=$2' | wc -l) of $(wc -l < ci-logs/exact_notiled.txt)" | tee -a ci-logs/summary.txt
+          $BIN_head/test-tiled-mulmat > ci-logs/ttm_head.log 2>&1; echo "test-tiled-mulmat head rc=$? pass=$(grep -c PASS ci-logs/ttm_head.log) fail=$(grep -c FAIL ci-logs/ttm_head.log)" | tee -a ci-logs/summary.txt
+          GGML_CPU_TILED_PAIR=4 $BIN_head/test-tiled-mulmat --fuzz > ci-logs/ttm_head4f.log 2>&1; echo "test-tiled-mulmat --fuzz head PAIR=4 rc=$? pass=$(grep -c PASS ci-logs/ttm_head4f.log) fail=$(grep -c FAIL ci-logs/ttm_head4f.log)" | tee -a ci-logs/summary.txt
+
+      - name: Kernel bench (5 interleaved rounds)
+        run: |
+          set +e
+          mkdir -p ci-logs/kbench
+          for r in 1 2 3 4 5; do
+            for arm in base head aa head0 head4; do
+              case $arm in base|aa) B=$BIN_base; E=;; head) B=$BIN_head; E=;; head0) B=$BIN_head; E=0;; head4) B=$BIN_head; E=4;; esac
+              GGML_CPU_TILED_PAIR=$E $B/test-tiled-mmid-window --set bench --threads $NT --reps 10 > ci-logs/kbench/$arm.r$r.txt 2>/dev/null
+              echo "kbench r$r $arm rc=$? $(date +%T)" | tee -a ci-logs/summary.txt
+            done
+          done
+
+      - name: Models
+        if: matrix.model == 1
+        run: |
+          mkdir -p models
+          curl -sSfL --retry 5 -o models/moe.gguf "$M_MOE_URL"
+
+      - name: pp8192 (5 interleaved rounds)
+        if: matrix.model == 1
+        run: |
+          set +e
+          mkdir -p ci-logs/ttft
+          for r in 1 2 3 4 5; do
+            for arm in base head aa head0; do
+              case $arm in base|aa) B=$BIN_base; E=;; head) B=$BIN_head; E=;; head0) B=$BIN_head; E=0;; esac
+              GGML_CPU_TILED_PAIR=$E $B/llama-bench -m models/moe.gguf -p 8192 -n 0 -b 8192 -ub 512 -t $NT -r 1 -o csv > ci-logs/ttft/$arm.r$r.csv 2> ci-logs/ttft/$arm.r$r.log
+              echo "pp8192 r$r $arm rc=$? $(tail -1 ci-logs/ttft/$arm.r$r.csv | awk -F, '{print $(NF-1), $NF}')" | tee -a ci-logs/summary.txt
+            done
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          cat ci-logs/summary.txt
+          cat ci-logs/summary.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.leg }}
+          path: ci-logs/
+          retention-days: 30
