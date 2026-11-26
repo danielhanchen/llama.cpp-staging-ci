@@ -1770,7 +1770,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     n_rows += std::max<int32_t>(block_size, params.n_max + 1);
                 }
             }
-            if (n_rows > (int64_t) llama_n_ubatch(ctx_dft)) {
+            if (n_rows > (int64_t) std::min(llama_n_batch(ctx_dft), llama_n_ubatch(ctx_dft))) {
                 full_block_fits = false;
             }
         }
