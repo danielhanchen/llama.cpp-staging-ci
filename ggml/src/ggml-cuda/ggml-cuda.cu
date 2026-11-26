@@ -1786,6 +1786,13 @@ static size_t ggml_backend_cuda_buffer_move(ggml_backend_buffer_t buffer, size_t
 #endif
 }
 
+bool ggml_cuda_buffer_is_lazy(const ggml_backend_buffer * buf) {
+    if (buf == nullptr || !ggml_backend_buffer_is_cuda(const_cast<ggml_backend_buffer_t>(buf))) {
+        return false;
+    }
+    return ((const ggml_backend_cuda_buffer_context *) buf->context)->lazy;
+}
+
 bool ggml_cuda_buffer_has_host_chunks(const ggml_backend_buffer * buf) {
     if (buf == nullptr || !ggml_backend_buffer_is_cuda(const_cast<ggml_backend_buffer_t>(buf))) {
         return false;

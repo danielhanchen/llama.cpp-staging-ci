@@ -23,6 +23,9 @@ void ggml_cuda_kv_sel_stats(uint64_t * out);
 // true if the buffer is a lazy buffer with any chunk backed by host memory
 bool ggml_cuda_buffer_has_host_chunks(const ggml_backend_buffer * buf);
 
+// true if the buffer is a lazy buffer (its chunks may be backed by host memory later)
+bool ggml_cuda_buffer_is_lazy(const ggml_backend_buffer * buf);
+
 // sparse flash attention over K / V cells partly in host memory (LLAMA_KV_SEL_STAGE=0: off): copy the K and V rows and the mask values
 // of every listed cell (indices: per query tile, n_kv_max entries, counts[tile] of them live) into compact device staging in list order
 // and rewrite the lists to the staging rows, so the kernel loads the same values in the same order from device memory. A gather kernel
