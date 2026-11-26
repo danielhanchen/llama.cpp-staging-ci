@@ -89,15 +89,23 @@ static bool run_case(ggml_type tu, ggml_type tg, int64_t n_embd, int64_t n_ff, i
     ggml_cgraph * g2a = ggml_new_graph(ctx);
     ggml_build_forward_expand(g2a, up_r);
     ggml_build_forward_expand(g2a, gate_r);
-    ggml_tensor * out_r = ggml_swiglu_split(ctx, gate_r, up_r);
+    // the SwiGLU reads copies of the products: expanding it over up_r / gate_r would put the products back into its graph and
+    // re-form the fused pattern
+    ggml_tensor * up_c   = ggml_dup_tensor(ctx, up_r);
+    ggml_tensor * gate_c = ggml_dup_tensor(ctx, gate_r);
+    ggml_tensor * out_r = ggml_swiglu_split(ctx, gate_c, up_c);
     ggml_cgraph * g2b = ggml_new_graph(ctx);
     ggml_build_forward_expand(g2b, out_r);
 
     const int logs0 = n_fused_logs;
     ggml_graph_compute_with_ctx(ctx, g1, n_threads);
     const bool engaged = n_fused_logs > logs0;
+    const int logs1 = n_fused_logs;
     ggml_graph_compute_with_ctx(ctx, g2a, n_threads);
+    memcpy(up_c->data,   up_r->data,   ggml_nbytes(up_r));
+    memcpy(gate_c->data, gate_r->data, ggml_nbytes(gate_r));
     ggml_graph_compute_with_ctx(ctx, g2b, n_threads);
+    const bool ref_fused = n_fused_logs > logs1;
 
     const bool same = memcmp(out->data, out_r->data, ggml_nbytes(out)) == 0;
     int64_t n_diff = 0;
@@ -110,8 +118,11 @@ static bool run_case(ggml_type tu, ggml_type tg, int64_t n_embd, int64_t n_ff, i
     if (!engaged) {
         printf("  the fused path did not run\n");
     }
+    if (ref_fused) {
+        printf("  the reference ran the fused path\n");
+    }
     ggml_free(ctx);
-    return same && engaged;
+    return same && engaged && !ref_fused;
 }
 
 int main() {
