@@ -2104,7 +2104,12 @@ static __global__ void moe_mailbox_publish_rows(const int32_t * hid, const int n
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
+#if __CUDA_ARCH__ >= 600
         last = atomicAdd_system(&ctl->pub_done, 1u) == (unsigned) gridDim.x - 1;
+#else
+        // no system-scope atomics before compute capability 6.0; ctl is device memory and only the blocks of this grid count on it
+        last = atomicAdd(&ctl->pub_done, 1u) == (unsigned) gridDim.x - 1;
+#endif // __CUDA_ARCH__ >= 600
     }
     __syncthreads();
     if (!last || threadIdx.x != 0) {
