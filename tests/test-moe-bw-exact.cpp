@@ -397,6 +397,9 @@ static std::vector<moe_case> make_cases() {
     const moe_shape shapes[] = {
         { "iq3s_gu",  GGML_TYPE_IQ3_S,  2560,  640, 24, 10, true  },
         { "iq4xs_gu", GGML_TYPE_IQ4_XS, 2560,  640, 24, 10, true  },
+        { "iq3xxs_gu", GGML_TYPE_IQ3_XXS, 2560, 640, 24, 10, true  },   // Qwen3.8-Flash-Next UD-IQ4_XS gate / up
+        { "iq2s_gu",  GGML_TYPE_IQ2_S,  2560,  640, 24, 10, true  },   // its IQ2_S gate / up layers
+        { "q5_0_dn",  GGML_TYPE_Q5_0,    640, 2560, 24, 10, false },   // its Q5_0 downs
         { "iq4nl_dn", GGML_TYPE_IQ4_NL,  640, 2560, 24, 10, false },
         { "q8_0_dn",  GGML_TYPE_Q8_0,    640, 2560, 24, 10, false },
         { "q8_0_gu",  GGML_TYPE_Q8_0,   2560,  640, 24, 10, true  },
@@ -571,15 +574,32 @@ int main(int argc, char ** argv) {
         { "vl16_4",      self, { off }, { "GGML_CUDA_MOE_VL=16,4 MOE_BW_LOG_MATCH=vl16,4" } },
         { "vl16_2",      self, { off }, { "GGML_CUDA_MOE_VL=16,2 MOE_BW_LOG_MATCH=vl16,2" } },
         { "reassoc0_vl", self, { off, "GGML_CUDA_VERIFY_REASSOC=0" }, { "GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MOE_VL=8,4" }, false, -1 },
+        // the IQ3_XXS gate / up on that kernel at its auto shape (GGML_CUDA_MOE_VL_IQ3XXS=1: on any arch that has it), only its launches counted
+        { "vl_iq3xxs",   self, { off }, { "GGML_CUDA_MOE_VL_IQ3XXS=1 MOE_BW_LOG_MATCH=iq3_xxs" } },
     };
-    if (const char * b = getenv("MOE_BW_BASE_EXE")) {   // the base build (no such switches there): its default vs this build's
-        modes.push_back({ "xbin_default",  b, {}, {}, false, -1 });   // the defaults of this GPU vs the base build
-        modes.push_back({ "xbin_bw1",      b, {}, { "GGML_CUDA_MOE_BW=1" } });
-        modes.push_back({ "xbin_vl8_4",    b, {}, { "GGML_CUDA_MOE_VL=8,4 MOE_BW_LOG_MATCH=vl8,4" } });
-        modes.push_back({ "xbin_vl16_2",   b, {}, { "GGML_CUDA_MOE_VL=16,2 MOE_BW_LOG_MATCH=vl16,2" } });
-        modes.push_back({ "xbin_off",      b, {}, { off }, false, 0 });
-        modes.push_back({ "xbin_reassoc0", b, { "GGML_CUDA_VERIFY_REASSOC=0" }, { "GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MOE_BW=1" } });
-        modes.push_back({ "xbin_group0",   b, { "GGML_CUDA_MMVQ_MOE_GROUP=0" }, { "GGML_CUDA_MMVQ_MOE_GROUP=0 GGML_CUDA_MOE_RPB=4 GGML_CUDA_MOE_BW=0" } });
+    // MOE_BW_BASE_LIBS=<dir>: the base build's ggml libraries under this executable (LD_LIBRARY_PATH; the same case list as the head
+    // child, which a base executable without the newer shapes does not have), as the base side of the xbin modes
+    std::vector<std::string> base_env;
+    const char * base_libs = getenv("MOE_BW_BASE_LIBS");
+    if (base_libs) {
+        base_env.push_back(std::string("LD_LIBRARY_PATH=") + base_libs);
+    }
+    const char * base_exe = getenv("MOE_BW_BASE_EXE");
+    if (base_libs && !base_exe) {
+        base_exe = argv[0];
+    }
+    if (const char * b = base_exe) {   // the base build (no such switches there): its default vs this build's
+        const auto with_base = [&](std::vector<std::string> e) { e.insert(e.begin(), base_env.begin(), base_env.end()); return e; };
+        modes.push_back({ "xbin_default",  b, with_base({}), {}, false, -1 });   // the defaults of this GPU vs the base build
+        // the Q5_0 / every type at 8 rows per warp block and the IQ3_XXS four-entries kernel forced, vs the base build's default
+        modes.push_back({ "xbin_rpb8",     b, with_base({}), { "GGML_CUDA_MOE_RPB=8" }, false, -1 });
+        modes.push_back({ "xbin_vl_iq3xxs", b, with_base({}), { "GGML_CUDA_MOE_VL_IQ3XXS=1 MOE_BW_LOG_MATCH=iq3_xxs" } });
+        modes.push_back({ "xbin_bw1",      b, with_base({}), { "GGML_CUDA_MOE_BW=1" } });
+        modes.push_back({ "xbin_vl8_4",    b, with_base({}), { "GGML_CUDA_MOE_VL=8,4 MOE_BW_LOG_MATCH=vl8,4" } });
+        modes.push_back({ "xbin_vl16_2",   b, with_base({}), { "GGML_CUDA_MOE_VL=16,2 MOE_BW_LOG_MATCH=vl16,2" } });
+        modes.push_back({ "xbin_off",      b, with_base({}), { off }, false, 0 });
+        modes.push_back({ "xbin_reassoc0", b, with_base({ "GGML_CUDA_VERIFY_REASSOC=0" }), { "GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MOE_BW=1" } });
+        modes.push_back({ "xbin_group0",   b, with_base({ "GGML_CUDA_MMVQ_MOE_GROUP=0" }), { "GGML_CUDA_MMVQ_MOE_GROUP=0 GGML_CUDA_MOE_RPB=4 GGML_CUDA_MOE_BW=0" } });
     }
     if (const char * m = getenv("MOE_BW_EXACT_MODES")) {   // a subset, e.g. "default,reassoc0"
         std::vector<mode> sel;
@@ -609,7 +629,9 @@ int main(int argc, char ** argv) {
         md5_ctx m1; md5_init(m1); md5_update(m1, db.data(), db.size());
         md5_ctx m2; md5_init(m2); md5_update(m2, dh.data(), dh.size());
         const bool same = rb == 0 && rh == 0 && !db.empty() && db.size() == dh.size();
-        const bool ok   = md.neg ? same && ndiff > 0 && lb == 0 : same && ndiff == 0 && lb == 0 && (md.logs < 0 || (md.logs ? lh > 0 : lh == 0));
+        // the base build's child of an xbin mode logs the kernels of its own defaults: only its bytes count
+        const bool base_quiet = lb == 0 || strncmp(md.name, "xbin_", 5) == 0;
+        const bool ok   = md.neg ? same && ndiff > 0 && lb == 0 : same && ndiff == 0 && base_quiet && (md.logs < 0 || (md.logs ? lh > 0 : lh == 0));
         printf("%s %-14s base rc %d logs %d md5 %s | head rc %d logs %d md5 %s | %zu bytes, %zu floats differ\n", ok ? "OK  " : "FAIL",
             md.name, rb, lb, md5_final(m1).substr(0, 12).c_str(), rh, lh, md5_final(m2).substr(0, 12).c_str(), db.size(), ndiff);
         n_fail += !ok;

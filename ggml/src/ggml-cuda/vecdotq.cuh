@@ -103,6 +103,86 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 
+// GGML_CUDA_IQ_SIGN_MUL=0 at compile time: the __vcmpne4 / __vsub4 sign code below instead of the multiply form (mat-vec kernels).
+// GGML_CUDA_IQ_SIGN_MUL_MMQ (unset = sm_80 device code only, 0 = nowhere, 1 = every arch): the multiply form in the MMQ tile loaders,
+// with GGML_CUDA_Q5_0_HMUL_MMQ the same for the Q5_0 loader. Flash-Next 8k prompts: A100 full card 25..30 ms faster with them,
+// RTX PRO 6000 15..25 ms slower
+#ifndef GGML_CUDA_IQ_SIGN_MUL
+#define GGML_CUDA_IQ_SIGN_MUL 1
+#endif
+#if defined(GGML_CUDA_IQ_SIGN_MUL_MMQ)
+#define GGML_CUDA_IQ_SIGN_MUL_MMQ_ON GGML_CUDA_IQ_SIGN_MUL_MMQ
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 800
+#define GGML_CUDA_IQ_SIGN_MUL_MMQ_ON 1
+#else
+#define GGML_CUDA_IQ_SIGN_MUL_MMQ_ON 0
+#endif
+
+// the 4 grid bytes g with the signs of the low 4 bits of s4 applied (bit k negates byte k). Every byte of g must be nonzero (the
+// iq2s / iq3xxs grids: 0x08 / 0x19 / 0x2b and 4..62): then bit k -> 0x01 in byte k by one multiply (the partial products do not
+// overlap), and -g = (g ^ 0xFF) + 1 in each such byte carries into no other byte, so the int is that of __vsub4(g ^ m, m) with the
+// __vcmpne4 byte masks m, in fewer instructions
+template <bool mul = GGML_CUDA_IQ_SIGN_MUL>
+static __device__ __forceinline__ int iq_apply_signs4(const int g, const uint32_t s4) {
+    if constexpr (mul) {
+        const int sb = (int) (((s4 & 0x0F) * 0x00204081u) & 0x01010101u);
+        return (g ^ (sb * 0xFF)) + sb;
+    } else {
+        const int m = __vcmpne4(((s4 & 0x03) << 7) | ((s4 & 0x0C) << 21), 0x00000000);
+        return __vsub4(g ^ m, m);
+    }
+}
+
+// the 8 signs of a 7-bit ksigns value v (the 8th = the parity of the 7, as unpack_ksigns) applied to the 8 nonzero grid bytes gl / gh
+template <bool mul = GGML_CUDA_IQ_SIGN_MUL>
+static __device__ __forceinline__ void iq_apply_ksigns(const uint8_t v, const int gl, const int gh, int & l, int & h) {
+    if constexpr (mul) {
+        const uint32_t s = v ^ (__popc(v) & 1) << 7;
+        l = iq_apply_signs4<true>(gl, s);
+        h = iq_apply_signs4<true>(gh, s >> 4);
+    } else {
+        const uint32_t signs = unpack_ksigns(v);
+        const int m0 = __vcmpne4(signs & 0x08040201, 0);
+        const int m1 = __vcmpne4(signs & 0x80402010, 0);
+        l = __vsub4(gl ^ m0, m0);
+        h = __vsub4(gh ^ m1, m1);
+    }
+}
+
+// GGML_CUDA_Q5_0_HMUL=0 at compile time: the per-bit shift / and / or high-bit expansion below instead of the multiply form (mat-vec
+// kernels); GGML_CUDA_Q5_0_HMUL_MMQ: the multiply form in the MMQ tile loader (unset = sm_80 device code only, as GGML_CUDA_IQ_SIGN_MUL_MMQ)
+#ifndef GGML_CUDA_Q5_0_HMUL
+#define GGML_CUDA_Q5_0_HMUL 1
+#endif
+#if defined(GGML_CUDA_Q5_0_HMUL_MMQ)
+#define GGML_CUDA_Q5_0_HMUL_MMQ_ON GGML_CUDA_Q5_0_HMUL_MMQ
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 800
+#define GGML_CUDA_Q5_0_HMUL_MMQ_ON 1
+#else
+#define GGML_CUDA_Q5_0_HMUL_MMQ_ON 0
+#endif
+
+// Q5_0 5th bits: bit k (k = 0..3) of qh moved to bit 4 of byte k. The 4 partial products of the nibble with 0x02040810 land on
+// distinct single bits (no carries), so after the mask the int is that of the four shift / and / or terms, in fewer instructions
+template <bool mul = GGML_CUDA_Q5_0_HMUL>
+static __device__ __forceinline__ int q5_0_hbits_lo(const int qh) {
+    if constexpr (mul) {
+        return (int) (((uint32_t) qh & 0x0Fu) * 0x02040810u) & 0x10101010;
+    } else {
+        return ((qh << 4) & 0x00000010) | ((qh << 11) & 0x00001000) | ((qh << 18) & 0x00100000) | ((qh << 25) & 0x10000000);
+    }
+}
+
+// the same for bits 16..19 of qh
+template <bool mul = GGML_CUDA_Q5_0_HMUL>
+static __device__ __forceinline__ int q5_0_hbits_hi(const int qh) {
+    if constexpr (mul) {
+        return (int) ((((uint32_t) qh >> 16) & 0x0Fu) * 0x02040810u) & 0x10101010;
+    } else {
+        return ((qh >> 12) & 0x00000010) | ((qh >> 5) & 0x00001000) | ((qh << 2) & 0x00100000) | ((qh << 9) & 0x10000000);
+    }
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -179,18 +259,12 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_imp
 
 #pragma unroll
     for (int i = 0; i < vdr; ++i) {
-        int vi0 = (vl[i] >>  0) & 0x0F0F0F0F; // lower 4 qs bits, still need qh as 5th bits
-        vi0    |= (vh[i] <<  4) & 0x00000010; // 0 ->  4
-        vi0    |= (vh[i] << 11) & 0x00001000; // 1 -> 12
-        vi0    |= (vh[i] << 18) & 0x00100000; // 2 -> 20
-        vi0    |= (vh[i] << 25) & 0x10000000; // 3 -> 28
+        // lower 4 qs bits with qh bits 0..3 as 5th bits
+        const int vi0 = ((vl[i] >>  0) & 0x0F0F0F0F) | q5_0_hbits_lo(vh[i]);
         sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi); // SIMD dot product of quantized values
 
-        int vi1 = (vl[i] >>  4) & 0x0F0F0F0F; // upper 4 qs bits, still need qh as 5th bits
-        vi1    |= (vh[i] >> 12) & 0x00000010; // 16 ->  4
-        vi1    |= (vh[i] >>  5) & 0x00001000; // 17 -> 12
-        vi1    |= (vh[i] <<  2) & 0x00100000; // 18 -> 20
-        vi1    |= (vh[i] <<  9) & 0x10000000; // 19 -> 28
+        // upper 4 qs bits with qh bits 16..19 as 5th bits
+        const int vi1 = ((vl[i] >>  4) & 0x0F0F0F0F) | q5_0_hbits_hi(vh[i]);
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
     }
 
@@ -1206,11 +1280,8 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-
-        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+        const int grid_l = iq_apply_signs4(grid_pos[0], signs_packed_8[l0/2]);
+        const int grid_h = iq_apply_signs4(grid_pos[1], signs_packed_8[l0/2] >> 4);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1245,16 +1316,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        int grid_l;
+        int grid_h;
+        iq_apply_ksigns(aux32 >> (7*l0/2), grid_pos.x, grid_pos.y, grid_l, grid_h);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
-
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);

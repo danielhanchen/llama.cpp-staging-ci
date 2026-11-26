@@ -921,22 +921,30 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 typedef void (*ggml_cuda_mmq_vec_dot_live_t)(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_max);
 
-// the types with the live (dead-column skip) and K-tail forms: the q8_0 mma vec_dot of the exact-product types, NVIDIA only
+// the types with the live (dead-column skip) form: the q8_0 mma vec_dot of the exact-product types, NVIDIA only. The skip acts on
+// the 8-column groups of the y tile, whatever the block size of the weights: also the types without 32-value blocks that take that
+// vec_dot (IQ2_XXS / IQ3_XXS / IQ3_S / IQ4_XS, Q2_0; their host flag is opt-in, GGML_CUDA_MMQ_DEAD_SKIP_QK)
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
-static constexpr __device__ bool ggml_cuda_mmq_pad_type() {
+static constexpr __device__ bool ggml_cuda_mmq_dead_type() {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     return ggml_cuda_mmq_exact_cvt_type(type) && prec_src1 == GGML_PREC_Q8 &&
         ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).use_mma_data_layout() &&
-        ggml_cuda_type_traits<type>::qk == QK8_0 && ggml_cuda_mmq_get_K_vram(type, J, fallback, prec_src1) == 2*4*QK8_1;
+        ggml_cuda_mmq_get_K_vram(type, J, fallback, prec_src1) == 2*4*QK8_1;
 #else
     return false;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// the types with the K-tail form: those of the dead-column skip with 32-value blocks (a K tail of at most 128 values only exists there)
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+static constexpr __device__ bool ggml_cuda_mmq_pad_type() {
+    return ggml_cuda_mmq_dead_type<type, J, fallback, prec_src1>() && ggml_cuda_type_traits<type>::qk == QK8_0;
+}
+
 // conv: the vec_dot with the conversion instruction (MMQ_FLAG_CVT), else the one of vec_dot (the exact product where built)
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool conv>
 static constexpr __device__ ggml_cuda_mmq_vec_dot_live_t ggml_cuda_mmq_get_vec_dot_live() {
-    if constexpr (ggml_cuda_mmq_pad_type<type, J, fallback, prec_src1>()) {
+    if constexpr (ggml_cuda_mmq_dead_type<type, J, fallback, prec_src1>()) {
         constexpr mmq_q8_1_ds_layout ds_layout = type == GGML_TYPE_Q4_0 ? MMQ_Q8_1_DS_LAYOUT_DS4 : MMQ_Q8_1_DS_LAYOUT_D4;
         return ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_live<type, J, fallback, ds_layout, conv ? false : ggml_cuda_mmq_exact_cvt_build>;
     } else {
@@ -2355,21 +2363,34 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         }
     }
     if (ggml_cuda_mmq_exact_cvt_build && ggml_cuda_mmq_exact_cvt_type(type) && config.use_mma_data_layout(cc) && GGML_CUDA_CC_IS_NVIDIA(cc) &&
-            prec_src1 == GGML_PREC_Q8 && ggml_cuda_type_traits<type>::qk == QK8_0 &&
-            ggml_cuda_mmq_get_K_vram(type, J, fallback, cc, prec_src1) == 2*4*QK8_1) {
+            prec_src1 == GGML_PREC_Q8 && ggml_cuda_mmq_get_K_vram(type, J, fallback, cc, prec_src1) == 2*4*QK8_1) {
         static const bool dead_on  = mmq_pad_env("GGML_CUDA_MMQ_DEAD_SKIP");
         static const bool ktail_on = mmq_pad_env("GGML_CUDA_MMQ_KTAIL");
+        // GGML_CUDA_MMQ_DEAD_SKIP_QK (unset = compute capability 8.0 only, 0 = off, 1 = on): the dead-column skip also for the types
+        // whose blocks are not 32 values (ggml_cuda_mmq_dead_type: IQ2_XXS / IQ3_XXS / IQ3_S / IQ4_XS, Q2_0). Bit-identical; Flash-Next
+        // 8k prompts: A100 full card ~30 ms faster with it, RTX PRO 6000 7..9 ms slower
+        static const int dead_qk_env = [] {
+            const char * e = getenv("GGML_CUDA_MMQ_DEAD_SKIP_QK");
+            return e == nullptr ? -1 : atoi(e);
+        }();
+        const bool dead_qk_on = dead_qk_env >= 0 ? dead_qk_env != 0 : cc == GGML_CUDA_CC_AMPERE;
         static std::atomic<int64_t> n_dead{0};
+        static std::atomic<int64_t> n_dead_qk{0};
         static std::atomic<int64_t> n_ktail{0};
+        constexpr bool qk32 = ggml_cuda_type_traits<type>::qk == QK8_0;
         // set only where they can act (else the base kernel runs): a MoE product (per-expert last tiles), a dense product whose
         // last column tile has a dead 8-column group, a K whose last 256-value iteration holds at most 128 values
         const int64_t jrem = args.ncols_dst % J;
-        if (dead_on && (args.ids_dst != nullptr || (jrem != 0 && jrem <= J - 8))) {
+        if (dead_on && (qk32 || dead_qk_on) && (args.ids_dst != nullptr || (jrem != 0 && jrem <= J - 8))) {
             flags |= MMQ_FLAG_DEAD;
-            mmq_pad_count(n_dead, "dead-column skip", "GGML_CUDA_MMQ_DEAD_SKIP", type, args.ncols_x);
+            if (qk32) {
+                mmq_pad_count(n_dead, "dead-column skip", "GGML_CUDA_MMQ_DEAD_SKIP", type, args.ncols_x);
+            } else {
+                mmq_pad_count(n_dead_qk, "dead-column skip of a type without 32-value blocks", "GGML_CUDA_MMQ_DEAD_SKIP_QK", type, args.ncols_x);
+            }
         }
         const int64_t krem = args.ncols_x % (2*4*QK8_1);
-        if (ktail_on && krem > 0 && krem <= 4*QK8_1) {
+        if (qk32 && ktail_on && krem > 0 && krem <= 4*QK8_1) {
             flags |= MMQ_FLAG_KTAIL;
             mmq_pad_count(n_ktail, "K tail", "GGML_CUDA_MMQ_KTAIL", type, args.ncols_x);
         }

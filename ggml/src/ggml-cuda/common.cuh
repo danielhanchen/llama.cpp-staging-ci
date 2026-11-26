@@ -1672,7 +1672,7 @@ struct ggml_cuda_src1_memo {
     bool                share_next = false; // set per node: the next compute node is a MUL_MAT reading the same src1
     const ggml_tensor * node_dst   = nullptr; // the graph node being computed unfused: only its own product may use the memo
     bool                held       = false;
-    int                 kind       = 0;     // 1 = MMQ q8_1, 2 = cuBLAS F16 / BF16
+    int                 kind       = 0;     // 1 = MMQ q8_1, 2 = cuBLAS F16 / BF16, 3 = few-row MMQ packed q8_1
     const ggml_tensor * src1       = nullptr;
     int64_t             key[n_key] = {};
     void *              ptr        = nullptr;

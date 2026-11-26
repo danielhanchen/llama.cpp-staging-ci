@@ -780,16 +780,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_grid(const uint32_t
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        int grid_l;
+        int grid_h;
+        iq_apply_ksigns(aux32 >> (7*l0/2), grid_pos.x, grid_pos.y, grid_l, grid_h);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
-
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
@@ -887,11 +883,8 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_tab(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = tab[qs[l0/2] | ((qh << (8-l0)) & 0x300)];
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-
-        const int grid_l = __vsub4((int) grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4((int) grid_pos.y ^ signs1, signs1);
+        const int grid_l = iq_apply_signs4((int) grid_pos.x, signs_packed_8[l0/2]);
+        const int grid_h = iq_apply_signs4((int) grid_pos.y, signs_packed_8[l0/2] >> 4);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1701,6 +1694,47 @@ struct mmvq_moe_wdec<GGML_TYPE_IQ3_S, true> {
     }
 };
 
+// vec_dot_iq3_xxs_q8_1
+template <>
+struct mmvq_moe_wdec<GGML_TYPE_IQ3_XXS, true> {
+    int   grid[8];
+    int   ls;
+    float d;
+    int   iqs;
+    __device__ __forceinline__ void load(const void * vbq, const int kbx, const int iqs_) {
+        const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+        iqs = iqs_;
+
+        const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
+        const uint8_t * q3 = (const uint8_t *) &q3_packed;
+        const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+            iq_apply_ksigns(aux32 >> (7*l0/2), grid_pos.x, grid_pos.y, grid[l0 + 0], grid[l0 + 1]);
+        }
+
+        ls = aux32 >> 28;
+        d  = __half2float(bq3->d);
+    }
+    __device__ __forceinline__ float apply(const block_q8_1 * bq8_1) const {
+        int sumi = 0;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+            const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+            sumi = ggml_cuda_dp4a(grid[l0 + 0], u0, sumi);
+            sumi = ggml_cuda_dp4a(grid[l0 + 1], u1, sumi);
+        }
+
+        sumi = (ls*sumi + sumi/2)/2;
+        const float dd = d * __low2float(bq8_1[iqs/2].ds);
+        return dd * sumi;
+    }
+};
+
 // vec_dot_iq4_nl_q8_1
 template <>
 struct mmvq_moe_wdec<GGML_TYPE_IQ4_NL, true> {
@@ -2272,7 +2306,7 @@ static __global__ void mul_mat_vec_q_moe_vl(
     constexpr int lpb       = qi/vdr;               // virtual lanes per weight block
     constexpr int bpi       = vdr*warp_size/qi;     // weight blocks per K iteration of a virtual lane
     constexpr int c_vl      = warp_size/c_tpr;      // virtual lanes per thread = rows per warp
-    constexpr bool c_dec    = type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL;
+    constexpr bool c_dec    = type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ3_XXS;
     static_assert(warp_size % c_tpr == 0 && c_tpr >= 1, "threads per row");
 
     bool use_gate = false;
@@ -2565,6 +2599,22 @@ static constexpr bool mmvq_moe_unroll_type(const ggml_type type) {
     }
 }
 
+// GGML_CUDA_MOE_Q5_0_RPB (default 1; 0 = off): the Q5_0 experts (the Flash-Next downs) also take the 4 / 8 rows per warp block rules of
+// mul_mat_vec_q_moe_launch, on sm_80 only (mmvq_moe_ampere: elsewhere the old 2-row blocks); a row's sum is its own there (the same
+// lanes, K order and reduction), so every output keeps its bytes
+static bool mmvq_moe_q5_0_rpb_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MOE_Q5_0_RPB");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// the types with the 4 / 8 rows per warp block instances of mul_mat_vec_q_moe
+static constexpr bool mmvq_moe_rpb_type(const ggml_type type) {
+    return mmvq_moe_unroll_type(type) || type == GGML_TYPE_Q5_0;
+}
+
 // GGML_CUDA_MOE_AMPERE (default 1; 0 = the Blackwell-tuned shapes there too): on sm_80 (A100; measured there only, sm_86 /
 // sm_87 keep the old rules) the multi-token MoE mat-vecs pick other shapes of the same kernels, every one bitwise the kernel it replaces
 // (test-moe-bw-exact on A100: rpb8_g0 / bw1 / vl16_4 0 floats differ). A100 microbench (test-moe-bw-exact --bench, Flash-Next shapes,
@@ -2656,24 +2706,35 @@ static void mul_mat_vec_q_moe_launch(
         return e == nullptr ? 0 : atoi(e);
     }();
     int rpb_moe = rpb_env;
-    if constexpr (mmvq_moe_unroll_type(type)) {
+    if constexpr (mmvq_moe_rpb_type(type)) {
         if (rpb_moe == 0) {
             constexpr int qk  = ggml_cuda_type_traits<type>::qk;
             constexpr int qi  = ggml_cuda_type_traits<type>::qi;
             constexpr int vdr = get_vdr_mmvq(type);
             const int bpi   = vdr * warp_size / qi;
             const int iters = (ncols_x / qk + bpi - 1) / bpi;
-            rpb_moe = !has_fusion && iters <= 2 && ncols_dst >= 2 && ncols_dst <= 4 ? 4 : 2;
-            // sm_80, 5..8 tokens: 8 rows per warp block
             const int cc_rpb = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            if (!has_fusion && iters <= 2 && ncols_dst >= 5 && ncols_dst <= 8 && mmvq_moe_ampere(cc_rpb) && nrows_x % 8 == 0 &&
+            // Q5_0: the rules below on sm_80 only
+            const bool rules = mmvq_moe_unroll_type(type) || (mmvq_moe_q5_0_rpb_on() && mmvq_moe_ampere(cc_rpb));
+            rpb_moe = rules && !has_fusion && iters <= 2 && ncols_dst >= 2 && ncols_dst <= 4 ? 4 : 2;
+            // sm_80, 5..8 tokens: 8 rows per warp block
+            if (rules && !has_fusion && iters <= 2 && ncols_dst >= 5 && ncols_dst <= 8 && mmvq_moe_ampere(cc_rpb) && nrows_x % 8 == 0 &&
                     fusion.shared_up == nullptr) {
                 rpb_moe = 8;
                 mmvq_moe_ampere_log("8 rows per warp block", type, (int) ncols_dst);
             }
+            if constexpr (type == GGML_TYPE_Q5_0) {
+                if (rpb_moe != 2) {
+                    static std::once_flag once_q5;
+                    std::call_once(once_q5, [&] {
+                        GGML_LOG_INFO("MoE mat-vec: Q5_0 experts in %d-row warp blocks engaged (first: %d tokens; GGML_CUDA_MOE_Q5_0_RPB=0 off)\n",
+                            rpb_moe, (int) ncols_dst);
+                    });
+                }
+            }
         }
     }
-    if constexpr (mmvq_moe_unroll_type(type)) {
+    if constexpr (mmvq_moe_rpb_type(type)) {
         if ((rpb_moe == 4 || rpb_moe == 8) && nrows_x % rpb_moe == 0 && fusion.shared_up == nullptr) {
             const dim3 block_nums_r(nrows_x / rpb_moe, nchannels_dst);
             const ggml_cuda_kernel_launch_params launch_params_r = ggml_cuda_kernel_launch_params(block_nums_r, block_dims, 0, stream);
@@ -2999,7 +3060,11 @@ static bool mul_mat_vec_q_moe_bw_launch(
 // same values; NVIDIA Turing and newer (not GB10), no shared expert, at most 128 entries. Auto: Ampere and newer at 3..8 tokens,
 // 16 threads per row, 2 entries per decode up to 5 tokens and 4 above (Flash-Next on the RTX PRO 6000, the time of the grouped / staged kernels it
 // replaces: 0.92 / 0.90 / 0.88 / 0.90 / 0.90 / 0.91 at 3..8 tokens). The IQ4_NL / Q8_0 downs and the IQ4_XS gate / up measured slower
-// with it at every width (1.04-1.25x), so it has no instances for them
+// with it at every width (1.04-1.25x), so it has no instances for them.
+// IQ3_XXS experts with a fused gate (Qwen3.8-Flash-Next UD-IQ4_XS gate / up) take the same kernel on compute capability 8.0 with the
+// IQ3_S shape there (16 threads per row, 4 entries per decode: their decode is the same kind, grid lookups and signs, done once per
+// expert); on 12.0 it was level or slower in real passes, other archs not measured: off.
+// GGML_CUDA_MOE_VL_IQ3XXS=0: off on 8.0 too, =1: on wherever IQ3_S takes it
 struct mmvq_moe_vl_cfg {
     int tpr = 0;
     int g   = 0;
@@ -3020,8 +3085,14 @@ static mmvq_moe_vl_cfg mmvq_moe_vl_config(const ggml_type type, const bool fused
     if (env.tpr >= 0) {
         return env;
     }
+    static const int iq3xxs_env = [] {
+        const char * e = getenv("GGML_CUDA_MOE_VL_IQ3XXS");
+        return e == nullptr ? -1 : atoi(e);
+    }();
+    const bool iq3xxs = type == GGML_TYPE_IQ3_XXS &&
+        (iq3xxs_env >= 0 ? iq3xxs_env != 0 : mmvq_moe_ampere(cc));
     mmvq_moe_vl_cfg c;
-    if (cc >= GGML_CUDA_CC_AMPERE && type == GGML_TYPE_IQ3_S && fused && ntok >= 3) {
+    if (cc >= GGML_CUDA_CC_AMPERE && (type == GGML_TYPE_IQ3_S || iq3xxs) && fused && ntok >= 3) {
         c.tpr = 16;
         c.g   = ntok <= 5 ? 2 : 4;
         // sm_80, 4 entries per decode from 3 tokens
@@ -3060,8 +3131,8 @@ static bool mul_mat_vec_q_moe_vl_launch(
         stride_channel_x, stride_channel_y, stride_channel_dst, ntok, ids_stride, nchannels_dst, cc, warp_size, stream);
     return false;
 #else
-    constexpr bool c_fused = true;   // the instances: the IQ3_S gate / up with a fused gate
-    if constexpr (type != GGML_TYPE_IQ3_S) {
+    constexpr bool c_fused = true;   // the instances: the IQ3_S / IQ3_XXS gate / up with a fused gate
+    if constexpr (type != GGML_TYPE_IQ3_S && type != GGML_TYPE_IQ3_XXS) {
         GGML_UNUSED_VARS(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst, ntok, ids_stride, nchannels_dst, cc, warp_size, stream);
         return false;
