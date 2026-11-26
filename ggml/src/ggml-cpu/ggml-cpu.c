@@ -3609,7 +3609,8 @@ static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
 static void clear_numa_thread_affinity(void) {}
 #endif
 
-// GET_ROWS with at least this many rows runs on all threads (GGML_CPU_GET_ROWS_MT_MIN, 0 = always one thread)
+// GET_ROWS with at least this many rows runs on all threads (GGML_CPU_GET_ROWS_MT_MIN, 0 = never; a smaller gather from a very large
+// table still follows ggml_cpu_get_rows_big_threads, GGML_CPU_GET_ROWS_BIG=0 turns that off)
 static int64_t ggml_cpu_get_rows_mt_min(void) {
     static int64_t v = -1;
     if (v < 0) {

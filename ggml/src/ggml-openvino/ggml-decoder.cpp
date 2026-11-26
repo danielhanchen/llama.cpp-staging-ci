@@ -1031,7 +1031,9 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
                 compute_params.rs_writebacks[get_tensor_ov_name(cgraph, node)] = writeback;
             }
             if ((is_conv || is_gdn) && !is_full_single_slot_writeback(node)) {
-                compute_params.s_copy_active_slot_len = (int) dest_view->ne[1];
+                // slot rows in the destination: a conv-state view may be 3D ([kernel - 1, channels, slots]), so count rows by bytes
+                compute_params.s_copy_active_slot_len =
+                    is_conv && row_bytes > 0 ? (int) (ggml_nbytes(dest_view) / row_bytes) : (int) dest_view->ne[1];
             }
         }
     }
