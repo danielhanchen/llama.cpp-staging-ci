@@ -2708,7 +2708,12 @@ static int ggml_cuda_dense_tc_min(const int cc) {
     if (n_env >= 0) {
         return n_env;
     }
+#ifdef GGML_CUDA_FORCE_MMQ
+    GGML_UNUSED(cc);
+    return 0; // a build that forces MMQ keeps it unless the variable asks for the route
+#else
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE ? ggml_cuda_dense_tc_min_default_cc8 : 0;
+#endif // GGML_CUDA_FORCE_MMQ
 }
 
 static bool ggml_cuda_dense_tc_route(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
@@ -3216,7 +3221,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // GGML_CUDA_DENSE_CUBLAS_MIN=N (opt-in, 0 = off): quantized dense products of at least N columns are dequantized to FP16 and
+    // GGML_CUDA_DENSE_CUBLAS_MIN=N (0 = off; unset: see ggml_cuda_dense_tc_min): quantized dense products of at least N columns are dequantized to FP16 and
     // multiplied by cuBLAS instead of MMQ. Other rounding (KLD-gated)
     // the route dequantizes the weight into a pool scratch buffer (no second copy kept) and runs a tensor-core GEMM with FP32
     // accumulation and FP32 output; GGML_CUDA_DENSE_CUBLAS_ACC=f16 restores the earlier FP16-accumulate path, =bf16 uses BF16 inputs
