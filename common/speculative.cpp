@@ -1762,6 +1762,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 full_block_fits = false;
             }
         }
+        // the blocks of every drafting sequence are decoded in one non-causal ubatch: a split would cut a block
+        if (full_block_fits) {
+            int64_t n_rows = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    n_rows += std::max<int32_t>(block_size, params.n_max + 1);
+                }
+            }
+            if (n_rows > (int64_t) llama_n_ubatch(ctx_dft)) {
+                full_block_fits = false;
+            }
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -2047,7 +2059,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         (eva_sm80 || !common_all_gpus_cc80())));
                 // the fixed-table window of compute capability 12.x (common_dflash_ev_cc12_cost) where the 0.35 cut or the measured
                 // EV window would run by default
-                const bool use_evd_full   = p_cum_def > 0.0f && p_cum_min < 0.0f && common_dflash_ev_cc12_mode() >= 1;
+                // LLAMA_DFLASH_EV_AUTO=1 forces the measured window, so the table does not replace it then
+                const bool use_evd_full   = p_cum_def > 0.0f && p_cum_min < 0.0f && common_dflash_ev_cc12_mode() >= 1 && eva_mode() != 1;
                 const bool use_evd_cached = use_eva && !df2_meas && eva_mode() == 2 && common_dflash_ev_cc12_mode() == 2;
                 const bool use_evd = is_dflash2 && !use_ev && !use_df2w && (use_evd_full || use_evd_cached);
                 if (use_evd) {
