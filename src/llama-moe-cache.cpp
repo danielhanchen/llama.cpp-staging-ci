@@ -1299,6 +1299,14 @@ struct llama_moe_cache::impl {
         const uint64_t n_nodst0 = pk.n_nodst;
         int64_t lo0 = -1;
         int64_t j = 0;
+        // (LLAMA_MOE_SEED_PARK_REACH=N >= 0): only slots expected to be evicted by the seeds of the pass, up to N layers of seeds past
+        // its last one; the others would be restored after the pass (default -1: any slot)
+        static const double reach = getenv("LLAMA_MOE_SEED_PARK_REACH") != nullptr ? atof(getenv("LLAMA_MOE_SEED_PARK_REACH")) : -1.0;
+        int64_t j_end = (int64_t) pk.order.size();
+        if (reach >= 0.0) {
+            const int64_t n_left = std::count_if(g.layers.begin(), g.layers.end(), [&](int32_t l) { return l > il; });
+            j_end = std::min<int64_t>(j_end, pk.n_pass_fills + (int64_t) (rate*(n_left + reach)));
+        }
         for (auto & c : pk.cand) {
             const int32_t kl = c.key / n_expert;
             const int64_t lo = pk.n_pass_fills + (int64_t) (rate*std::max(0.0, kl - il - 1 + pk_margin()));
@@ -1306,7 +1314,7 @@ struct llama_moe_cache::impl {
                 lo0 = lo;
             }
             j = std::max(j, lo);
-            while (j < (int64_t) pk.order.size()) {
+            while (j < j_end) {
                 const int32_t s = pk.order[j];
                 const int32_t k = g.lru.key_of[s];
                 if (k >= 0 && k / n_expert < il && s >= g.lru.n_core && s < lim && pk.vic[s] < 0) {
@@ -1314,7 +1322,7 @@ struct llama_moe_cache::impl {
                 }
                 j++;
             }
-            if (j >= (int64_t) pk.order.size()) {
+            if (j >= j_end) {
                 pk.n_nodst++;
                 continue;
             }
