@@ -800,25 +800,41 @@ static int64_t common_fit_dflash_head_bytes(const char * path) {
 //   Qwen3.6-35B-A3B at 4 bits +8 MiB, Flash-Next at 4 bits +16 MiB (largest need 70 MiB, expert src1 56 MiB: 14 MiB here)
 // A margin above that costs the MoE cache for nothing: Flash-Next on the A100 80 GB at 48 GB with a flat 262 MiB margin had 46 fewer cache
 // slots (of 6840) and chat decode -9.5% (3 launches each, same text). LLAMA_FIT_DENSE_TC_SLACK_MIB (0) adds to a nonzero need.
-// The embedding tables (row gathers) and the output head (prompt ubatches compute only the requested rows) are left out.
+// The embedding tables (row gathers) are left out. The output head (output.weight, else a tied token_embd.weight) multiplies only the
+// requested rows, at most min(n_ubatch, n_outputs_max) per ubatch (n_outputs_max 0 = n_batch, as llama_context reads it): it is counted only
+// where that bound reaches the route's minimum (perplexity, imatrix, all-output embeddings at -ub >= the minimum). A context capped to
+// few outputs (the server, the drafters) can never send the head there, so its reserve is unchanged. LLAMA_FIT_DENSE_TC_HEAD=0: never counted
+static int64_t common_fit_dense_tc_head_cols(const llama_context_params * cp) {
+    const char * e = getenv("LLAMA_FIT_DENSE_TC_HEAD");
+    if (cp == nullptr || (e != nullptr && atoi(e) == 0)) {
+        return 0;
+    }
+    const int64_t n_out = cp->n_outputs_max == 0 ? (int64_t) cp->n_batch : (int64_t) cp->n_outputs_max;
+    return std::min<int64_t>(cp->n_ubatch, n_out);
+}
+
 static int64_t common_fit_dense_tc_min_cols() {
     // as ggml_cuda_dense_tc_min: a negative value is the per-architecture default
     const char * e = getenv("GGML_CUDA_DENSE_CUBLAS_MIN");
     return e != nullptr && atoi(e) >= 0 ? atoi(e) : 1024;
 }
 
-static int64_t common_fit_dense_tc_model_bytes(const char * path, int64_t n_ubatch) {
+static int64_t common_fit_dense_tc_model_bytes(const char * path, int64_t n_ubatch, int64_t n_head_cols) {
     static std::string last_path;
     static int64_t     last_ub = -1;
+    static int64_t     last_hc = -1;
     static int64_t     last_b  = 0;
     const int64_t n_min = common_fit_dense_tc_min_cols();
     if (path == nullptr || n_min <= 0 || n_ubatch < n_min) {
         return 0;
     }
-    if (last_path == path && last_ub == n_ubatch) {
+    n_head_cols = n_head_cols >= n_min ? std::min(n_head_cols, n_ubatch) : 0;
+    if (last_path == path && last_ub == n_ubatch && last_hc == n_head_cols) {
         return last_b;
     }
     int64_t b   = 0;
+    int64_t b_out  = -1; // the head's need: output.weight
+    int64_t b_tied = -1; // a quantized token_embd.weight (the head where output.weight is absent)
     int64_t moe = 0; // bytes of the q8_1 src1 copy of one ubatch's expert rows
     std::string fname = path;
     int n_split = 1;
@@ -845,9 +861,16 @@ static int64_t common_fit_dense_tc_model_bytes(const char * path, int64_t n_ubat
             }
         }
         for (ggml_tensor * t = ggml_get_first_tensor(meta); t != nullptr; t = ggml_get_next_tensor(meta, t)) {
+            if (strcmp(t->name, "output.weight") == 0) {
+                b_out = ggml_is_quantized(t->type) && t->ne[1] > 1 && t->ne[2] == 1 && t->ne[3] == 1 ?
+                    2*t->ne[0]*t->ne[1] + 2*t->ne[0]*n_head_cols : 0;
+                continue;
+            }
+            if (strcmp(t->name, "token_embd.weight") == 0 && ggml_is_quantized(t->type) && t->ne[1] > 1 && t->ne[2] == 1 && t->ne[3] == 1) {
+                b_tied = 2*t->ne[0]*t->ne[1] + 2*t->ne[0]*n_head_cols;
+            }
             if (!ggml_is_quantized(t->type) || t->ne[1] <= 1 || t->ne[2] != 1 || t->ne[3] != 1 ||
-                    strstr(t->name, "token_embd") != nullptr || strstr(t->name, "per_layer_") != nullptr ||
-                    strcmp(t->name, "output.weight") == 0) {
+                    strstr(t->name, "token_embd") != nullptr || strstr(t->name, "per_layer_") != nullptr) {
                 continue;
             }
             b = std::max(b, 2*t->ne[0]*t->ne[1] + 2*t->ne[0]*n_ubatch);
@@ -862,6 +885,9 @@ static int64_t common_fit_dense_tc_model_bytes(const char * path, int64_t n_ubat
             fname = next;
         }
     }
+    if (n_head_cols > 0) {
+        b = std::max(b, b_out >= 0 ? b_out : std::max<int64_t>(0, b_tied));
+    }
     b = std::max<int64_t>(0, b - moe);
     if (b > 0) {
         const char * es = getenv("LLAMA_FIT_DENSE_TC_SLACK_MIB");
@@ -869,6 +895,7 @@ static int64_t common_fit_dense_tc_model_bytes(const char * path, int64_t n_ubat
     }
     last_path = path;
     last_ub   = n_ubatch;
+    last_hc   = n_head_cols;
     last_b    = b;
     return b;
 }
@@ -1212,9 +1239,9 @@ static void common_params_fit_impl(
     // the dense tensor-core route's pool scratch (common_fit_dense_tc_model_bytes): the main model's, plus the draft context's (a context
     // has a pool of its own on the same device; an MTP context that shares the model runs its prompt rows through the same matrix shapes)
     {
-        int64_t tc = common_fit_dense_tc_model_bytes(path_model, cparams->n_ubatch);
+        int64_t tc = common_fit_dense_tc_model_bytes(path_model, cparams->n_ubatch, common_fit_dense_tc_head_cols(cparams));
         if (extra != nullptr && extra->path_model != nullptr && extra->cparams != nullptr) {
-            tc += common_fit_dense_tc_model_bytes(extra->path_model, extra->cparams->n_ubatch);
+            tc += common_fit_dense_tc_model_bytes(extra->path_model, extra->cparams->n_ubatch, common_fit_dense_tc_head_cols(extra->cparams));
         }
         // the scratch is charged to the run-time half of the device's margin first (the margin exists for such run-time buffers); only
         // what does not fit there widens it (LLAMA_FIT_DENSE_TC=2: the whole scratch on top). Qwen3.8-27B at 4 bits + MTP, A100 at 16 GB
