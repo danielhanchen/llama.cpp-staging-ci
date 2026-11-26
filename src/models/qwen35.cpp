@@ -1,5 +1,8 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "models.h"
+#include "llama-impl.h"
+
+#include <atomic>
 #include "llama-memory-recurrent.h"
 #include "llama-kv-cache.h"
 
@@ -238,6 +241,34 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     res->t_logits = cur;
 }
 
+// the products of one input enter the graph next to each other in prompt batches (GDN qkv and z; attention q, k and v), so the
+// q8_1 copy of the input that the norm writes (or the first product makes) is shared by all of them, as in the MoE variant of this
+// model. The same ops, only the node order changes; decode-size batches (8 tokens or fewer) keep the old order. Not in the MTP
+// head's graph (graph_mtp builds its own). LLAMA_QWEN35_DENSE_PROJ_ADJACENT=0 or LLAMA_QWEN35_PROJ_ADJACENT=0: the old order
+static bool qwen35_proj_adjacent(int64_t n_tokens) {
+    static const bool on = [] {
+        const char * a = getenv("LLAMA_QWEN35_PROJ_ADJACENT");
+        const char * d = getenv("LLAMA_QWEN35_DENSE_PROJ_ADJACENT");
+        return (a == nullptr || atoi(a) != 0) && (d == nullptr || atoi(d) != 0);
+    }();
+    return on && n_tokens > 8;
+}
+
+// engagement: prompt graphs built with the adjacent order, logged at 1, 2, 3, 4, then 10, 100, ... (the first builds can fall in
+// a phase that does not log)
+static void qwen35_proj_adjacent_count() {
+    static std::atomic<int64_t> n{0};
+    const int64_t c = n.fetch_add(1) + 1;
+    int64_t p = 1;
+    while (p < c) {
+        p *= 10;
+    }
+    if (p == c || c <= 4) {
+        LLAMA_LOG_INFO("qwen35: dense adjacent projections in prompt graphs: %lld graphs built (LLAMA_QWEN35_DENSE_PROJ_ADJACENT=0: off)\n",
+            (long long) c);
+    }
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
@@ -245,10 +276,19 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    if (qwen35_proj_adjacent(n_tokens)) {
+        ggml_build_forward_expand(gf, qkv_mixed);
+        if (il == 0) {
+            qwen35_proj_adjacent_count();
+        }
+    }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    if (qwen35_proj_adjacent(n_tokens)) {
+        ggml_build_forward_expand(gf, z);
+    }
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -282,6 +322,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
             n_embd_head,     n_head_kv,
             n_embd_head,     n_head_kv,
             il, false);
+    if (qwen35_proj_adjacent(n_tokens)) {
+        ggml_build_forward_expand(gf, Qcur_full);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+    }
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);

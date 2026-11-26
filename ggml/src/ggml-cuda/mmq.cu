@@ -271,11 +271,15 @@ void ggml_cuda_mul_mat_q(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
 
+        // src1 is a dense SWIGLU this product computes in its quantize (ggml_cuda_mmq_dense_swiglu_ok)
+        const bool swiglu_dense = ctx.mmq_swiglu_src1 != nullptr && ctx.mmq_swiglu_src1 == src1;
+        GGML_ASSERT(!swiglu_dense || (!use_native_fp4 && ne12 == 1 && ne13 == 1));
+
         // the q8_1 copy of src1 shared with the next MUL_MAT of the graph (see ggml_cuda_src1_memo)
         ggml_cuda_src1_memo & memo = ctx.src1_memo;
         const char * memo_q8_1 = nullptr;
         bool memo_quantized = false;
-        if (!use_native_fp4 && memo.top(dst)) {
+        if (!use_native_fp4 && !swiglu_dense && memo.top(dst)) {
             const int64_t key[ggml_cuda_src1_memo::n_key] = {
                 (int64_t) mmq_get_q8_1_ds_layout(src0->type), ne10, ne11, ne12, ne13,
                 (int64_t) src1->nb[1], (int64_t) src1->nb[2], (int64_t) src1->nb[3], ne10_padded, 0 };
@@ -316,6 +320,11 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1_ptr, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if (swiglu_dense) {
+                const ggml_tensor * g = src1->src[0];
+                const ggml_tensor * u = src1->src[1];
+                swiglu_quantize_mmq_q8_1_dense_cuda((const float *) g->data, (const float *) u->data, src1_q8_1_ptr, src0->type, ne10,
+                    g->nb[1] / sizeof(float), u->nb[1] / sizeof(float), ne10_padded, ne11, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -555,6 +564,41 @@ bool ggml_cuda_mmq_id_swiglu_ok(const ggml_tensor * src0, const ggml_tensor * gl
         if (t->ne[0] != ne10 || t->ne[1] != n_expert_used || t->ne[2] != n_tokens || t->ne[3] != 1 || !ggml_cuda_is_aligned(t, 16) ||
                 (t->nb[1] / sizeof(float)) % 4 != 0 || (t->nb[2] / sizeof(float)) % 4 != 0 || t->nb[1] % sizeof(float) != 0 ||
                 t->nb[2] % sizeof(float) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// whether the dense MMQ path of dst (a MUL_MAT with src0, src1 = glu) can compute glu (SWIGLU of two F32 tensors) in its quantize
+// (swiglu_quantize_mmq_q8_1, dense): q8_1 activations, glu one 2D contiguous F32 block whose gate / up rows are float4-aligned. The
+// caller checks that the product takes the MMQ path.
+bool ggml_cuda_mmq_dense_swiglu_ok(const ggml_tensor * src0, const ggml_tensor * glu, const ggml_tensor * dst, int cc) {
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * g = glu->src[0];
+    const ggml_tensor * u = glu->src[1];
+    for (const ggml_tensor * t : { g, u, glu, dst }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || t->data == nullptr) {
+            return false;
+        }
+    }
+    if (ggml_cuda_mmq_get_prec_src1(src0, dst, cc) == GGML_PREC_Q4 || src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) {
+        return false;
+    }
+    const mmq_q8_1_ds_layout layout = mmq_get_q8_1_ds_layout(src0->type);
+    if (layout != MMQ_Q8_1_DS_LAYOUT_D4 && layout != MMQ_Q8_1_DS_LAYOUT_DS4 && layout != MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        return false;
+    }
+    const int64_t ne10 = glu->ne[0];
+    if (!ggml_is_contiguous(glu) || glu->ne[2] != 1 || glu->ne[3] != 1 || ne10 % 4 != 0 || ne10 != src0->ne[0] ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || dst->ne[1] != glu->ne[1] || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    for (const ggml_tensor * t : { g, u }) {
+        if (t->ne[0] != ne10 || t->ne[1] != glu->ne[1] || t->ne[2] != 1 || t->ne[3] != 1 || !ggml_cuda_is_aligned(t, 16) ||
+                t->nb[1] % (4*sizeof(float)) != 0) {
             return false;
         }
     }

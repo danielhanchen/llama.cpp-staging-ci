@@ -3231,6 +3231,32 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// whether ggml_cuda_mul_mat(ctx, src0, src1, dst) of a quantized src0 ends in ggml_cuda_mul_mat_q with no ids (the same checks in
+// the same order, for the quantized src0 / F32 src1 / F32 dst products it handles)
+static bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * dst) {
+    if (!ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ggml_cuda_op_mul_mat_use_fwht(dst)) {
+        return false;
+    }
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    const int64_t ne11 = src1->ne[1];
+    if (bad_padding_clear || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) || ne11 <= MMVQ_MAX_BATCH_SIZE ||
+            src0->ne[1] == 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1) {
+        return false;
+    }
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11) ||
+            (!ggml_cuda_mmf_loses_to_cublas(src0, src1, cc, ne11) &&
+             ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) ||
+            ggml_cuda_should_use_mmq_few(src0, src1, cc) || ggml_cuda_should_use_mmvq(src0->type, cc, ne11) ||
+            ggml_cuda_dense_tc_route(src0, src1, dst, cc)) {
+        return false;
+    }
+    return ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -9134,6 +9160,55 @@ static int ggml_cuda_try_fuse_swiglu_mmid(ggml_backend_cuda_context * cuda_ctx, 
     return j - i;
 }
 
+// The dense sibling of F3: SWIGLU (split gate / up) -> MUL_MAT (the down product of a dense FFN) on the MMQ path, prompt batches:
+// the product's quantize computes the SWIGLU itself (swiglu_quantize_mmq_q8_1, dense: the same values and the same q8_1 bytes as
+// SWIGLU + quantize_mmq_q8_1), so the SWIGLU kernel, its f32 output and its re-read do not run. Returns the extra nodes covered (0 = not
+// taken). GGML_CUDA_SWIGLU_MMQ_DENSE=0 turns it off (also GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID=1); engagement: fused launches logged at
+// 1, 10, 100, ...
+static int ggml_cuda_try_fuse_swiglu_mmq_dense(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID") ||
+        (getenv("GGML_CUDA_SWIGLU_MMQ_DENSE") != nullptr && atoi(getenv("GGML_CUDA_SWIGLU_MMQ_DENSE")) == 0);
+    ggml_tensor * glu = cgraph->nodes[i];
+    if (disabled || glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr ||
+            (glu->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_node_has_n_uses(cgraph, i, 1) || cuda_ctx->curr_stream_no != 0 ||
+            !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[j];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != glu || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return 0;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    if (!ggml_cuda_mul_mat_takes_mmq(*cuda_ctx, src0, glu, mm) || !ggml_cuda_mmq_dense_swiglu_ok(src0, glu, mm, cc)) {
+        return 0;
+    }
+    if (ggml_cuda_tensors_overlap(mm, glu->src[0]) || ggml_cuda_tensors_overlap(mm, glu->src[1])) {
+        return 0;
+    }
+    cuda_ctx->mmq_swiglu_src1 = glu;
+    ggml_cuda_mul_mat(*cuda_ctx, src0, glu, mm);
+    cuda_ctx->mmq_swiglu_src1 = nullptr;
+    static std::atomic<int64_t> n_fused{0};
+    const int64_t n = n_fused.fetch_add(1) + 1;
+    int64_t p = 1;
+    while (p < n) {
+        p *= 10;
+    }
+    if (p == n) {
+        GGML_LOG_INFO("%s: dense SWIGLU computed in the down product's MMQ quantize: %" PRId64 " launches (GGML_CUDA_SWIGLU_MMQ_DENSE=0: off)\n",
+            __func__, n);
+    }
+    return j - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -9150,6 +9225,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_GLU) {
         if (const int n = ggml_cuda_try_fuse_swiglu_mmid(cuda_ctx, cgraph, i)) {
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_swiglu_mmq_dense(cuda_ctx, cgraph, i)) {
             return n;
         }
     }

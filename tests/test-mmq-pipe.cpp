@@ -103,7 +103,7 @@ static std::string md5_hex(md5_ctx m) {
 struct mm_case {
     std::string name;
     ggml_type   type;
-    int64_t     K, N, E, topk; // topk 0: a dense MUL_MAT of [K, N] by [K, tokens] (E 1)
+    int64_t     K, N, E, topk; // topk 0: a dense MUL_MAT of [K, N] by [K, tokens] (E 1); -1: the same of SWIGLU(gate, up) (a dense FFN down)
     bool        bcast;     // src1 [K, 1, T] (gate / up) instead of [K, topk, T] (down)
     int64_t     tokens;
     int32_t     op2;       // op param 2 (> 0: an in-place MoE cache bank, the skip_empty / stream-k launch)
@@ -118,12 +118,15 @@ static void run_case(ggml_backend_t backend, const mm_case & c, const int reps) 
 
     ggml_init_params ip = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    const bool dense = c.topk == 0;
+    const bool swiglu = c.topk < 0;
+    const bool dense  = c.topk <= 0;
     ggml_tensor * w   = ggml_new_tensor_3d(ctx, c.type, c.K, c.N, c.E);
     ggml_tensor * x   = dense ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.K, c.tokens) :
                                 ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.K, c.bcast ? 1 : c.topk, c.tokens);
+    ggml_tensor * up  = swiglu ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.K, c.tokens) : nullptr;
     ggml_tensor * ids = dense ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.topk, c.tokens);
-    ggml_tensor * out = dense ? ggml_mul_mat(ctx, w, x) : ggml_mul_mat_id(ctx, w, x, ids);
+    ggml_tensor * out = swiglu ? ggml_mul_mat(ctx, w, ggml_swiglu_split(ctx, x, up)) :
+                        dense  ? ggml_mul_mat(ctx, w, x) : ggml_mul_mat_id(ctx, w, x, ids);
     if (!dense) {
         ((int32_t *) out->op_params)[2] = c.op2;
     }
@@ -155,6 +158,12 @@ static void run_case(ggml_backend_t backend, const mm_case & c, const int reps) 
             v = ud(rng);
         }
         ggml_backend_tensor_set(x, f.data(), 0, f.size()*sizeof(float));
+        if (up != nullptr) {
+            for (auto & v : f) {
+                v = 4.0f*ud(rng);
+            }
+            ggml_backend_tensor_set(up, f.data(), 0, f.size()*sizeof(float));
+        }
     }
     if (!dense) {
         std::vector<int32_t> id(c.topk*c.tokens);
@@ -274,6 +283,15 @@ int main(int argc, char ** argv) {
     cs.push_back({ "pad_dense_shdown_q5_0_t", GGML_TYPE_Q5_0,   640,  2560, 1, 0, false, 2037, 0,  0.0f,  0.0f, 19 });
     cs.push_back({ "pad_moe_k320_q8_0",      GGML_TYPE_Q8_0,    320,  640,  64, 8, false,  509, 0,  0.0f,  0.0f, 20 });
     cs.push_back({ "pad_moe_k640_iq4nl_skew", GGML_TYPE_IQ4_NL, 640, 2560, 512, 10, false, 1229, 0,  0.05f, 1.0f, 21 });
+
+    // a dense FFN down product of SWIGLU(gate, up) (GGML_CUDA_SWIGLU_MMQ_DENSE): Qwen3.8-27B class, n_embd 5120, n_ff 17408, the down
+    // types of its 4-bit quants, prompt ubatches of 512 / 2048 tokens and a 2044 / 100 token tail
+    cs.push_back({ "q38_down_swiglu_q4k_2048",  GGML_TYPE_Q4_K, 17408, 5120, 1, -1, false, 2048, 0, 0.0f, 0.0f, 22 });
+    cs.push_back({ "q38_down_swiglu_q5k_512",   GGML_TYPE_Q5_K, 17408, 5120, 1, -1, false,  512, 0, 0.0f, 0.0f, 23 });
+    cs.push_back({ "q38_down_swiglu_q6k_2044",  GGML_TYPE_Q6_K, 17408, 5120, 1, -1, false, 2044, 0, 0.0f, 0.0f, 24 });
+    cs.push_back({ "q38_down_swiglu_q8_0_100",  GGML_TYPE_Q8_0, 17408, 5120, 1, -1, false,  100, 0, 0.0f, 0.0f, 25 });
+    cs.push_back({ "q38_down_swiglu_iq4xs_512", GGML_TYPE_IQ4_XS, 17408, 5120, 1, -1, false, 512, 0, 0.0f, 0.0f, 26 });
+    cs.push_back({ "q38_down_swiglu_q2k_512",   GGML_TYPE_Q2_K, 17408, 5120, 1, -1, false,  512, 0, 0.0f, 0.0f, 27 });
 
     for (const auto & c : cs) {
         if (only && c.name.find(only) == std::string::npos) {
