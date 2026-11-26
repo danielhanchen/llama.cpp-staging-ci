@@ -15023,7 +15023,10 @@ struct llama_moe_cache::impl {
         // parked victims (see seed_park): a copy of a layer before the last one copied starts another pass, and a copy never reads a
         // slot holding another expert's bytes; both restore what is parked first (expected never)
         if (pk_active(layers[b.il].ig)) {
-            const bool foreign = slots != nullptr && slots[e] >= 0 && pk_ckey(layers[b.il].ig, slots[e], b.ip) >= 0;
+            bool foreign = false;
+            for (int64_t x = e; slots != nullptr && x <= last && slots[x] >= 0 && !foreign; ++x) {
+                foreign = pk_ckey(layers[b.il].ig, slots[x], b.ip) >= 0;
+            }
             if ((b.il < pk.copy_il && !pk.dirty.empty()) || foreign) {
                 pk.n_late++;
                 pk_restore_now(groups[pk.ig]);
