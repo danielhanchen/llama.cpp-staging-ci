@@ -18,6 +18,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #define MOE_MAILBOX_OK 1 // single-graph host misses (ggml_moe_mailbox_publish)
 #define MOE_STG_OK     1 // staged prefetch through the copy engine (see moe_stg_pick)
@@ -1684,6 +1688,28 @@ static moe_stg_dev         moe_stg_devs[GGML_CUDA_MAX_DEVICES];
 static std::atomic<bool>   moe_stg_stop{false};
 static std::atomic<unsigned long long> moe_stg_lost{0};
 
+// acquire / release accesses of the words the copy thread shares with the device and with the pick ops: the GCC / Clang builtins,
+// on MSVC (no __atomic_* / __builtin_ia32_pause) the interlocked intrinsics (full barriers) and _mm_pause
+#if defined(_MSC_VER) && !defined(__clang__)
+static inline int32_t moe_stg_msvc_load(const int32_t * p) {
+    return (int32_t) _InterlockedCompareExchange((volatile long *) p, 0, 0);
+}
+static inline const char * moe_stg_msvc_load(const char * const * p) {
+    return (const char *) _InterlockedCompareExchangePointer((void * volatile *) p, nullptr, nullptr);
+}
+static inline void moe_stg_msvc_store(int32_t * p, const int32_t v) {
+    _InterlockedExchange((volatile long *) p, (long) v);
+}
+static inline void moe_stg_msvc_store(const char ** p, const char * v) {
+    _InterlockedExchangePointer((void * volatile *) p, (void *) v);
+}
+#define MOE_STG_LOAD(p, order)     moe_stg_msvc_load(p)
+#define MOE_STG_STORE(p, v, order) moe_stg_msvc_store(p, v)
+#else
+#define MOE_STG_LOAD(p, order)     __atomic_load_n(p, order)
+#define MOE_STG_STORE(p, v, order) __atomic_store_n(p, v, order)
+#endif
+
 // the copy thread of a device: queues the copies of each request in ring order, then the done word, then the acknowledgement
 static void moe_stg_thread(const int device) {
     ggml_cuda_set_device(device);
@@ -1692,14 +1718,16 @@ static void moe_stg_thread(const int device) {
     auto last = std::chrono::steady_clock::now();
     while (!moe_stg_stop.load(std::memory_order_relaxed)) {
         moe_stg_req * r = d.h->req + (uint32_t) (next - 1) % MOE_STG_RING;
-        const int32_t sq = __atomic_load_n(&r->seq, __ATOMIC_ACQUIRE);
+        const int32_t sq = MOE_STG_LOAD(&r->seq, __ATOMIC_ACQUIRE);
         if (sq - next < 0) {
             // nothing new: spin while requests are recent (decode windows come every few ms), sleep when idle
             const auto now = std::chrono::steady_clock::now();
             if (now - last > std::chrono::milliseconds(20)) {
                 std::this_thread::sleep_for(std::chrono::microseconds(now - last > std::chrono::seconds(1) ? 1000 : 50));
             } else {
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+                _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
                 __builtin_ia32_pause();
 #else
                 std::this_thread::yield();
@@ -1712,9 +1740,9 @@ static void moe_stg_thread(const int device) {
             moe_stg_lost.fetch_add((unsigned long long) (sq - next), std::memory_order_relaxed);
             next = sq;
         }
-        const int     reg = __atomic_load_n(&r->reg, __ATOMIC_RELAXED);
-        const int     s   = __atomic_load_n(&r->s, __ATOMIC_RELAXED);
-        const int32_t k   = __atomic_load_n(&r->key, __ATOMIC_RELAXED);
+        const int     reg = MOE_STG_LOAD(&r->reg, __ATOMIC_RELAXED);
+        const int     s   = MOE_STG_LOAD(&r->s, __ATOMIC_RELAXED);
+        const int32_t k   = MOE_STG_LOAD(&r->key, __ATOMIC_RELAXED);
         last = std::chrono::steady_clock::now();
         if (reg >= 0 && reg < moe_stg_n_groups.load(std::memory_order_acquire) && s >= 0 && s < moe_stg_groups[reg].n_stg) {
             const moe_stg_group & g = moe_stg_groups[reg];
@@ -1723,7 +1751,7 @@ static void moe_stg_thread(const int device) {
             bool ok = il >= 0 && il < g.n_layer && il < MOE_STG_MAX_LAYERS;
             const char * hp[4] = {nullptr, nullptr, nullptr, nullptr};
             for (int b = 0; ok && b < g.n_banks; ++b) {
-                hp[b] = __atomic_load_n(&g.host[il][b], __ATOMIC_ACQUIRE);
+                hp[b] = MOE_STG_LOAD(&g.host[il][b], __ATOMIC_ACQUIRE);
                 ok = hp[b] != nullptr;
             }
             if (ok) {
@@ -1737,7 +1765,7 @@ static void moe_stg_thread(const int device) {
                 ok = ok && cudaGetLastError() == cudaSuccess;
             }
             if (ok) {
-                __atomic_store_n(&d.h->ack[reg][s], next, __ATOMIC_RELEASE);
+                MOE_STG_STORE(&d.h->ack[reg][s], next, __ATOMIC_RELEASE);
             } else {
                 (void) cudaGetLastError();
             }
@@ -1867,7 +1895,7 @@ static int moe_stg_register(ggml_backend_cuda_context & ctx, const ggml_tensor *
     for (int b = 0; b < n_banks; ++b) {
         const char * hp = nullptr;
         memcpy(&hp, (const int32_t *) dst->op_params + 2 + 2*b, sizeof(void *));
-        __atomic_store_n(&g.host[il][b], hp, __ATOMIC_RELEASE);
+        MOE_STG_STORE(&g.host[il][b], hp, __ATOMIC_RELEASE);
     }
     return reg;
 }
