@@ -444,7 +444,7 @@ int ggml_cuda_flash_attn_ext_mma_kvq_inplace(const int device, const ggml_tensor
 // softcap, not two-source (dst->src[6]), not batch invariant, not read in place by the q8_0 / q4_0 kernels
 // (ggml_cuda_flash_attn_ext_mma_kvq_inplace: few rows), K not partly in host memory (every query tile would read those cells over the
 // bus; the staged copy reads them once), rows 4 byte aligned (pipelined loads: 16 byte at head size 256, 8 byte at 128). The graph
-// allocation is unchanged (the f16 copy of K stays reserved behind the output; unused by these launches)
+// allocation reserves no f16 copy of K for the nodes whose every launch takes this kernel (ggml_cuda_flash_attn_ext_i8_no_f16_K)
 bool ggml_cuda_flash_attn_ext_mma_i8(const int device, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(device, dst);
@@ -1484,6 +1484,76 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+struct ggml_cuda_fattn_live_node {
+    ggml_tensor K, V, M, dst;
+};
+
+static void ggml_cuda_fattn_make_live(const ggml_tensor * dst, const int64_t n_kv, ggml_cuda_fattn_live_node & ln) {
+    ln.K = *dst->src[1];
+    ln.K.ne[1] = n_kv;
+    ln.V = *dst->src[2];
+    ln.V.ne[1] = n_kv;
+    ln.dst = *dst;
+    ln.dst.src[1] = &ln.K;
+    ln.dst.src[2] = &ln.V;
+    ln.dst.src[5] = nullptr;
+    if (dst->src[3]) {
+        ln.M = *dst->src[3];
+        ln.M.ne[0] = n_kv;
+        ln.dst.src[3] = &ln.M;
+    }
+}
+
+thread_local ggml_cuda_fattn_mma_cfg * ggml_cuda_fattn_mma_cfg_cur = nullptr;
+
+// the tile config the MMA dispatch picks for this node on this device runs the INT8 Q*K^T kernel (a dry run of the dispatch that
+// returns at the config, ggml_cuda_fattn_mma_cfg: the same functions pick it as for the launch)
+static bool ggml_cuda_fattn_mma_cfg_i8(const int device, const ggml_tensor * dst) {
+    // a context per device for the dry run only (the dispatch passes it on; the dry run returns before using it), never freed
+    static ggml_backend_cuda_context ** ctxs = [] {
+        const int n = ggml_cuda_info().device_count;
+        ggml_backend_cuda_context ** p = new ggml_backend_cuda_context *[n];
+        for (int i = 0; i < n; ++i) {
+            p[i] = new ggml_backend_cuda_context(i);
+        }
+        return p;
+    }();
+    ggml_cuda_fattn_mma_cfg cfg;
+    ggml_cuda_fattn_mma_cfg * prev = ggml_cuda_fattn_mma_cfg_cur;
+    const int prev_device = ggml_cuda_get_device();
+    ggml_cuda_set_device(device);
+    ggml_cuda_fattn_mma_cfg_cur = &cfg;
+    ggml_cuda_flash_attn_ext_mma_f16(*ctxs[device], const_cast<ggml_tensor *>(dst));
+    ggml_cuda_fattn_mma_cfg_cur = prev;
+    ggml_cuda_set_device(prev_device);
+    return cfg.done && cfg.i8;
+}
+
+// no f16 copy of K behind the output (ggml_cuda_flash_attn_ext_get_alloc_size): every launch of the node takes the INT8 Q*K^T kernel
+// over the q8_0 K cache in place (ggml_cuda_flash_attn_ext_mma_i8 and the tile config, as the launch decides them), so none stages K.
+// A node with a KV length (dst->src[5]) launches at its live length: the config there is that of the node (a live length of whole
+// 256-cell tiles) or of the node at one cell less (the GQA packing off), with the sparse pick only less likely at fewer cells; both
+// must take the kernel. K in a lazy buffer keeps the copy (host chunks, which the kernel does not read, may appear later).
+// launch_fattn asserts that a launch staging K was not given this answer. GGML_CUDA_FATTN_I8_ALLOC=0: the copy stays reserved
+bool ggml_cuda_flash_attn_ext_i8_no_f16_K(const int device, const ggml_tensor * dst) {
+    static const bool enabled = getenv("GGML_CUDA_FATTN_I8_ALLOC") == nullptr || atoi(getenv("GGML_CUDA_FATTN_I8_ALLOC")) != 0;
+    if (!enabled || dst->op != GGML_OP_FLASH_ATTN_EXT || !ggml_cuda_flash_attn_ext_mma_i8(device, dst) ||
+            ggml_cuda_buffer_is_lazy(dst->src[1]->buffer) || ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_MMA_F16 ||
+            !ggml_cuda_fattn_mma_cfg_i8(device, dst)) {
+        return false;
+    }
+    const int64_t n_pad = dst->src[1]->ne[1];
+    if (dst->src[5] != nullptr && n_pad > 1 && n_pad % FATTN_KQ_STRIDE == 0) {
+        ggml_cuda_fattn_live_node ln;
+        ggml_cuda_fattn_make_live(dst, n_pad - 1, ln);
+        if (!ggml_cuda_flash_attn_ext_mma_i8(device, &ln.dst) || ggml_cuda_get_best_fattn_kernel(device, &ln.dst) != BEST_FATTN_KERNEL_MMA_F16 ||
+                !ggml_cuda_fattn_mma_cfg_i8(device, &ln.dst)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -1510,6 +1580,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = dst->src[6] != nullptr ? ggml_cuda_flash_attn_ext_src2_codes(device, dst, true) == 0 :
                 ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, true) == 0;
             need_f16_V = need_f16_K;
+            // INT8 Q*K^T over the q8_0 K cache in place: V only
+            if (need_f16_K && ggml_cuda_flash_attn_ext_i8_no_f16_K(device, dst)) {
+                need_f16_K = false;
+            }
             // INT8 Q*K^T over an f16 K: the int8 rows of Q and K behind the output
             i8_f16 = ggml_cuda_flash_attn_ext_mma_i8_f16(device, dst) != 0;
             break;
@@ -1554,31 +1628,11 @@ struct ggml_cuda_fattn_kvl_plan {
     int64_t sig  = 0;
 };
 
-struct ggml_cuda_fattn_live_node {
-    ggml_tensor K, V, M, dst;
-};
-
 static int64_t ggml_cuda_fattn_kv_len_host(const ggml_tensor * dst) {
     const ggml_tensor * kvl = dst->src[5];
     const int64_t n_pad = dst->src[1]->ne[1];
     const int64_t n     = ggml_get_op_params_i32(kvl, 0);
     return n > 0 && n < n_pad ? n : n_pad;
-}
-
-static void ggml_cuda_fattn_make_live(const ggml_tensor * dst, const int64_t n_kv, ggml_cuda_fattn_live_node & ln) {
-    ln.K = *dst->src[1];
-    ln.K.ne[1] = n_kv;
-    ln.V = *dst->src[2];
-    ln.V.ne[1] = n_kv;
-    ln.dst = *dst;
-    ln.dst.src[1] = &ln.K;
-    ln.dst.src[2] = &ln.V;
-    ln.dst.src[5] = nullptr;
-    if (dst->src[3]) {
-        ln.M = *dst->src[3];
-        ln.M.ne[0] = n_kv;
-        ln.dst.src[3] = &ln.M;
-    }
 }
 
 // the kernel reads the length through a plain device pointer: only from this device's memory (a length left in host memory by

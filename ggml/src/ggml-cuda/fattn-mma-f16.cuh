@@ -3020,6 +3020,13 @@ bool ggml_cuda_flash_attn_ext_mma_i8(const int device, const ggml_tensor * dst);
 // (GGML_CUDA_FATTN_I8_F16): 0 no, else 1 + the rotation mode of Q and K (Walsh-Hadamard) before the quantisation (0 never, 1 always,
 // 2 per KV head whose rows have outliers); fattn.cu
 int ggml_cuda_flash_attn_ext_mma_i8_f16(const int device, const ggml_tensor * dst);
+// a dry run of the MMA dispatch up to the tile config of the launch (no CUDA call, no launch): whether that config runs the INT8
+// Q*K^T kernel over a q8_0 K cache (where ggml_cuda_flash_attn_ext_mma_i8 holds). See ggml_cuda_flash_attn_ext_i8_no_f16_K (fattn.cu)
+struct ggml_cuda_fattn_mma_cfg {
+    bool done = false;
+    bool i8   = false;
+};
+extern thread_local ggml_cuda_fattn_mma_cfg * ggml_cuda_fattn_mma_cfg_cur;
 static inline bool ggml_cuda_fattn_q8_no_data(const ggml_tensor * t) {
     return ggml_cuda_fattn_probe_cur != nullptr || t->data == nullptr;
 }
@@ -3067,6 +3074,22 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
+    // the sparse / dense pick of this config, and whether it can run the INT8 Q*K^T kernel over a q8_0 K cache (the launch below and
+    // the graph allocation, ggml_cuda_fattn_mma_cfg, take the same answer)
+    bool sparse_pick = false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
+        sparse_pick = logit_softcap == 0.0f && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2);
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const bool i8_cfg = ggml_cuda_flash_attn_ext_mma_i8_compiled(DKQ, DV, ncols1, ncols2) && logit_softcap == 0.0f && !sparse_pick &&
+        Q_in_reg && cols_per_warp == 16;
+    if (ggml_cuda_fattn_mma_cfg_cur != nullptr) {
+        ggml_cuda_fattn_mma_cfg_cur->done = true;
+        ggml_cuda_fattn_mma_cfg_cur->i8   = i8_cfg;
+        return;
+    }
+
 #if defined(GGML_USE_HIP)
     using fattn_kernel_ptr_t = const void*;
 #else
@@ -3078,7 +3101,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         constexpr bool use_logit_softcap = false;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
-            if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2)) {
+            if (sparse_pick) {
                 constexpr bool use_sparse_kernel = true;
                 fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel, 0>;
                 use_sparse = true;
@@ -3343,7 +3366,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                  nullptr, 1, 1, false, nullptr, 0, i8_f16);
             return;
         }
-        if (logit_softcap == 0.0f && !use_sparse && Q_in_reg && cols_per_warp == 16 && ggml_cuda_flash_attn_ext_mma_i8(id, dst)) {
+        GGML_ASSERT(i8_cfg == (logit_softcap == 0.0f && !use_sparse && Q_in_reg && cols_per_warp == 16));
+        if (i8_cfg && ggml_cuda_flash_attn_ext_mma_i8(id, dst)) {
             const ggml_tensor * K = dst->src[1];
             const int align = nstages > 1 ? (DKQ == 256 ? 16 : 8) : 4; // rows of raw cp.async copies: 16 / 8 byte chunks
             GGML_ASSERT(ggml_cuda_fattn_q8_no_data(K) || (uintptr_t) K->data % align == 0);

@@ -1243,6 +1243,8 @@ struct ggml_cuda_fattn_probe {
 };
 extern thread_local const ggml_cuda_fattn_kv_len_ctx * ggml_cuda_fattn_kv_len_cur;
 extern thread_local ggml_cuda_fattn_probe *            ggml_cuda_fattn_probe_cur;
+// the graph allocation reserved no f16 copy of this node's K (the INT8 Q*K^T kernel reads the q8_0 K cache in place); fattn.cu
+bool ggml_cuda_flash_attn_ext_i8_no_f16_K(const int device, const ggml_tensor * dst);
 
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
@@ -1376,6 +1378,8 @@ void launch_fattn(
     }
 
     if (need_f16_K && K->type != GGML_TYPE_F16 && !probe) {
+        // the copy goes behind the output of the graph node, where the allocation reserved it
+        GGML_ASSERT(!ggml_cuda_flash_attn_ext_i8_no_f16_K(id, node) && "flash attention stages K to f16, but the graph reserved no copy");
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
