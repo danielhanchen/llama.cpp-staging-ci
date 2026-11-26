@@ -1157,9 +1157,28 @@ struct llama_moe_cache::impl {
         uint64_t n_passes = 0, n_late = 0, n_seeds = 0, n_overwr = 0;
         bool logged = false;
     } pk;
+    // LLAMA_MOE_SEED_PARK: 0 off, 1 on, unset: on for CUDA devices of compute capability 8.0 .. 8.8 only, where the prompt's uploads
+    // bound the merged pass (A100 80 GB at 48 GB, ~12 GB/s link: 8k -26 ms); where the pass is bound by compute (RTX PRO 6000, compute
+    // capability 12.0) the parking copies and restores cost without saving (8k +10 ms)
+    static int pk_mode() {
+        static const int m = getenv("LLAMA_MOE_SEED_PARK") == nullptr ? -1 : atoi(getenv("LLAMA_MOE_SEED_PARK")) != 0 ? 1 : 0;
+        return m;
+    }
     static bool pk_on() {
-        static const bool on = getenv("LLAMA_MOE_SEED_PARK") == nullptr || atoi(getenv("LLAMA_MOE_SEED_PARK")) != 0;
-        return on;
+        return pk_mode() != 0;
+    }
+    mutable int pk_dev_cc = -2; // the compute capability the default was decided for (-2: not yet)
+    bool pk_default_on(const group & g) const {
+        if (pk_mode() >= 0) {
+            return pk_mode() == 1;
+        }
+        if (pk_dev_cc == -2) {
+            pk_dev_cc = pf_backend_cc(devices[g.id].backend);
+            const bool on = pk_dev_cc >= 800 && pk_dev_cc < 890;
+            LLAMA_LOG_INFO("llama_moe_cache: seed park: %s by default (compute capability %d; LLAMA_MOE_SEED_PARK=1 / 0 to force)\n",
+                on ? "on" : "off", pk_dev_cc);
+        }
+        return pk_dev_cc >= 800 && pk_dev_cc < 890;
     }
     static double pk_margin() {
         static const double m = getenv("LLAMA_MOE_SEED_PARK_MARGIN") != nullptr ? atof(getenv("LLAMA_MOE_SEED_PARK_MARGIN")) : 0.5;
@@ -1193,6 +1212,9 @@ struct llama_moe_cache::impl {
     }
     bool pk_allowed(const group & g, int32_t ig) const {
         if (!pk_on() || !lm_merged || g.lru.n_lent <= 0 || g.dev_newer || g.banks.empty() || g.banks.size() > 32) {
+            return false;
+        }
+        if (!pk_default_on(g)) {
             return false;
         }
         if (host && ((size_t) ig >= host_group.size() || host_group[ig] || host->exclusive())) {
