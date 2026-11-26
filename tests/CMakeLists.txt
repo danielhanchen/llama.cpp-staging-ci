@@ -753,6 +753,7 @@ llama_build(test-graph-src-type.cpp LINK ggml) # a CUDA graph is not replayed fo
 llama_build(test-gdn-replay.cpp LINK ggml) # ggml_gated_delta_net_replay vs the unfused replay path, bitwise
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
+llama_build(test-tiled-mmid-window.cpp LINK ggml) # tiled MUL_MAT_ID output hash per case + timing, compared across builds / GGML_CPU_TILED_PAIR
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

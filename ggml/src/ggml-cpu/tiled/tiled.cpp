@@ -719,6 +719,21 @@ static void tiled_store_window(const float * buf, int n_src0, int n_src1, int bu
 // src0 rows per g group; finer than the TILED_TILE_K kernel tile so all threads stay busy at small ne01
 #define TILED_MMID_GROUP 64
 
+// GGML_CPU_TILED_PAIR: how many adjacent row groups of one thread share a window (and one src1
+// panel pack per K slab). Default 2; 0 or 1 = one group per window; 4 = up to 256 rows
+static int64_t ggml_tiled_mmid_win_groups(void) {
+    static int64_t groups = 2;
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        const char * env = getenv("GGML_CPU_TILED_PAIR");
+        if (env != NULL) {
+            const int v = atoi(env);
+            groups = v >= 4 ? 4 : (v >= 2 ? 2 : 1);
+        }
+    });
+    return groups;
+}
+
 // like tiled_store_window, but the dst columns are not contiguous: col_ptrs[j] points at the
 // start of dst column j, whose rows are contiguous (dim 0, nb0 == 4 bytes).
 static void tiled_store_window_scatter(const float * buf, int n_src0, int n_src1, int buf_stride,
@@ -759,20 +774,23 @@ static void tiled_store_window_scatter(const float * buf, int n_src0, int n_src1
 // rows points at this k window's routed src1 rows, row r at its base block
 template <typename B, int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
 static void tiled_mmid_gemm_window(struct ggml_tensor * dst, const struct ggml_tensor * src0,
-                                   const char * src0_cur, int64_t r, int64_t k, int64_t nrows,
+                                   const char * src0_cur, int64_t r, int64_t win_rows, int64_t k, int64_t nrows,
                                    const int32_t * expert_rows,
                                    const block_q8_K * const * rows,
                                    tiled_ws * ws) {
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
 
-    const int64_t r_end = MIN(r + TILED_MMID_GROUP, ne01);
+    // win_rows is a whole number of TILED_MMID_GROUP groups (at most TILED_TILE_ROWS); each output
+    // row sees the same K slabs in the same order whatever the window height, so the result
+    // does not depend on it, only how often the src1 panel is unpacked and repacked
+    const int64_t r_end = MIN(r + win_rows, ne01);
     const int n_src0 = (int) (r_end - r);
 
     const size_t src0_bs = ggml_type_size(src0->type);
     const int64_t src0_stride = src0->nb[1] / src0_bs;
 
-    // the window is at most TILED_MMID_GROUP x TILED_TILE_K, so zero only that region of acc
+    // the window is at most win_rows x TILED_TILE_K, so zero only that region of acc
     for (int64_t i = 0; i < n_src0; i++) {
         memset(&ws->acc[i * TILED_TILE_ROWS], 0, nrows * sizeof(float));
     }
@@ -873,6 +891,8 @@ static void ggml_compute_forward_mul_mat_id_tiled_one_expert(
         return;
     }
 
+    const int64_t win_groups = ggml_tiled_mmid_win_groups();
+
     // MUL_MAT_ID scatters the src1 rows per routed row: point each k window's rows
     // at the routed src1 rows, then sweep the row windows
     for (int64_t k = 0; k < cne1; k += TILED_TILE_K) {
@@ -885,10 +905,14 @@ static void ggml_compute_forward_mul_mat_id_tiled_one_expert(
             rows[i] = (const block_q8_K *) ((const char *) wdata + (i11 + i12 * ne11) * nbw1);
         }
 
-        for (int64_t g = g0; g < g1; g++) {
-            const int64_t r = g * TILED_MMID_GROUP;
+        // adjacent groups owned by this thread share one window, so the routed src1 panel is
+        // unpacked and repacked once per K slab for all of them
+        for (int64_t g = g0; g < g1; ) {
+            const int64_t ng = MIN(win_groups, g1 - g);
+            const int64_t r  = g * TILED_MMID_GROUP;
 
-            tiled_mmid_gemm_window<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(dst, src0, src0_cur, r, k, nrows, expert_rows, rows, ws);
+            tiled_mmid_gemm_window<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(dst, src0, src0_cur, r, ng * TILED_MMID_GROUP, k, nrows, expert_rows, rows, ws);
+            g += ng;
         }
     }
 }
