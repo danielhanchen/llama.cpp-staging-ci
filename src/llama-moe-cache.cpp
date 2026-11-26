@@ -999,6 +999,7 @@ struct llama_moe_cache::impl {
     } rsc;
     bool rsc_after_large = false;
     std::vector<std::pair<int32_t, int32_t>> rsr_vict; // (key, slot) of the victims ahead of one seed
+    std::vector<std::pair<int32_t, int32_t>> pk_vk;    // (key, slot) of those the ring does not keep (see seed_park)
 
     // (LLAMA_MOE_SEED_RESCUE=0 off): a prompt seed evicts experts of layers the same pass has not copied yet, which then upload
     // them again from the host. Before the seed overwrites such a slot, its bytes are copied on the device into a small holding ring
@@ -1085,7 +1086,8 @@ struct llama_moe_cache::impl {
     // layer before il, which the pass has copied); else the held one whose layer comes last, if after kl (each victim is read once, when the
     // pass copies its layer: keeping the ones read soonest keeps the most); else none (-1). Layer il itself is not done: its other
     // expert tensors may be copied after this seed
-    int32_t rsr_take(int64_t key, uint32_t all_ip, int32_t il, int32_t n_expert) {
+    // (displace = false: only a free entry; the victims it cannot take are parked instead, see seed_park)
+    int32_t rsr_take(int64_t key, uint32_t all_ip, int32_t il, int32_t n_expert, bool displace = true) {
         const int32_t kl = (int32_t) (key / n_expert);
         int32_t e = -1;
         int32_t far = -1;
@@ -1101,7 +1103,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (e < 0) {
-            if (far < 0) {
+            if (far < 0 || !displace) {
                 return -1;
             }
             e = far;
@@ -1115,6 +1117,474 @@ struct llama_moe_cache::impl {
         rsr.read[e]    = 0;
         rsr.where[key] = e;
         return e;
+    }
+
+    // (LLAMA_MOE_SEED_PARK=0 off): the victims of layers ahead that the ring above does not keep are parked in bank slots whose own
+    // experts belong to layers the pass has already copied (no copy of the same pass reads those again). A parked slot keeps its own
+    // expert in the slot map, the LRU order and the scores, so the cache state is the one without parking; only its bytes hold the
+    // victim, and a copy that misses the victim reads it from there instead of the host. The slots are picked in the order the later
+    // seeds are expected to evict them (lowest counter, then LRU order, as moe_cache_lru::plan), at the place those seeds reach after the
+    // victim's layer is copied, so most of them are overwritten by those seeds anyway. A seed that takes a slot holding an unread victim
+    // first moves the victim on. Every slot that still maps its own expert when the pass ends gets it back (an upload, see pk_collect)
+    // before anything reads it. Only in a merged layer-major graph with lent slots, without the RAM tier; every parking copy is a device
+    // copy on the stream that issues the seeds, in host order (LLAMA_MOE_SEED_PARK_MARGIN, 0.5: the place, in layers of seeds past the
+    // victim's copy)
+    struct seed_park {
+        int32_t ig      = -1;          // the group of the pass
+        int32_t nb      = 0;           // banks
+        int32_t n_slots = 0;
+        int32_t seed_il = INT32_MAX;   // the layer of the last seed of the pass (a pass starts where the layers stop increasing)
+        int32_t copy_il = -1;          // the layer of the last copy of the pass
+        std::vector<int32_t>  ckey;    // [n_slots*nb] the key whose bytes the bank slot holds instead of its own expert's, -1 its own
+        std::vector<int32_t>  own;     // [n_slots] the slot's own key when a victim was parked in it
+        std::vector<int32_t>  vic;     // [n_slots] the victim parked in it that not every bank has read yet, -1 none
+        std::vector<uint32_t> rd;      // [n_slots] the banks of vic read
+        std::vector<int32_t>  order;   // the slots of the list in their predicted eviction order, at the first seed of the pass
+        std::vector<int64_t>  pos;     // [n_slots] the slot's place in the sequence order + back, -1 none
+        std::vector<int32_t>  back;    // the slots the seeds of the pass used (hits and fills), in use order: they go to the end
+        std::unordered_map<int32_t, int32_t> where; // victim key -> slot
+        std::vector<int32_t>  dirty;   // slots with a bank holding another key (may repeat)
+        int64_t front = -1;            // the largest order index a seed of the pass filled (diagnostic)
+        int64_t n_pass_fills = 0;      // the slots the seeds of the pass filled: the place the eviction order has reached
+        int32_t n_pass_seeds = 0;
+        struct mv { int32_t key, src, dst; bool moved; };
+        std::vector<mv> pend;          // the parking copies of the seed being issued (one layer)
+        std::vector<mv> cand;
+        std::vector<std::pair<int64_t, int32_t>> sk;
+        std::vector<ggml_backend_copy_region> regions;
+        std::vector<std::vector<moe_cache_lru::fill>> rs; // [n_layer] the restores collected at the end of the pass
+        uint64_t n_parked = 0, n_moved = 0, n_hits = 0, b_hits = 0, n_nodst = 0, n_unread = 0, n_restored = 0, b_restored = 0;
+        uint64_t n_passes = 0, n_late = 0, n_seeds = 0, n_overwr = 0;
+        bool logged = false;
+    } pk;
+    // LLAMA_MOE_SEED_PARK: 0 off, 1 on, unset: on for CUDA devices of compute capability 8.0 .. 8.8 only, where the prompt's uploads
+    // bound the merged pass (A100 80 GB at 48 GB, ~12 GB/s link: 8k -26 ms); where the pass is bound by compute (RTX PRO 6000, compute
+    // capability 12.0) the parking copies and restores cost without saving (8k +10 ms)
+    static int pk_mode() {
+        static const int m = getenv("LLAMA_MOE_SEED_PARK") == nullptr ? -1 : atoi(getenv("LLAMA_MOE_SEED_PARK")) != 0 ? 1 : 0;
+        return m;
+    }
+    static bool pk_on() {
+        return pk_mode() != 0;
+    }
+    mutable int pk_dev_cc = -2; // the compute capability the default was decided for (-2: not yet)
+    bool pk_default_on(const group & g) const {
+        if (pk_mode() >= 0) {
+            return pk_mode() == 1;
+        }
+        if (pk_dev_cc == -2) {
+            pk_dev_cc = pf_backend_cc(devices[g.id].backend);
+            const bool on = pk_dev_cc >= 800 && pk_dev_cc < 890;
+            LLAMA_LOG_INFO("llama_moe_cache: seed park: %s by default (compute capability %d; LLAMA_MOE_SEED_PARK=1 / 0 to force)\n",
+                on ? "on" : "off", pk_dev_cc);
+        }
+        return pk_dev_cc >= 800 && pk_dev_cc < 890;
+    }
+    static double pk_margin() {
+        static const double m = getenv("LLAMA_MOE_SEED_PARK_MARGIN") != nullptr ? atof(getenv("LLAMA_MOE_SEED_PARK_MARGIN")) : 0.5;
+        return m;
+    }
+    bool pk_active(int32_t ig) const {
+        return pk.ig == ig && !pk.ckey.empty();
+    }
+    int32_t pk_ckey(int32_t ig, int32_t s, size_t ip) const {
+        return pk_active(ig) && s >= 0 && s < pk.n_slots && (int32_t) ip < pk.nb ? pk.ckey[(size_t) s*pk.nb + ip] : -1;
+    }
+    // the slot holds its own expert's bytes again in every bank (written by an upload or a seed)
+    void pk_clean(int32_t s) {
+        if (s < 0 || s >= pk.n_slots) {
+            return;
+        }
+        for (int32_t ip = 0; ip < pk.nb; ++ip) {
+            pk.ckey[(size_t) s*pk.nb + ip] = -1;
+        }
+        pk_drop(s);
+    }
+    void pk_drop(int32_t s) {
+        const int32_t x = pk.vic[s];
+        if (x >= 0) {
+            const auto it = pk.where.find(x);
+            if (it != pk.where.end() && it->second == s) {
+                pk.where.erase(it);
+            }
+            pk.vic[s] = -1;
+        }
+    }
+    bool pk_allowed(const group & g, int32_t ig) const {
+        if (!pk_on() || !lm_merged || g.lru.n_lent <= 0 || g.dev_newer || g.banks.empty() || g.banks.size() > 32) {
+            return false;
+        }
+        if (!pk_default_on(g)) {
+            return false;
+        }
+        if (host && ((size_t) ig >= host_group.size() || host_group[ig] || host->exclusive())) {
+            return false;
+        }
+        return ggml_backend_tensor_copy_regions_async(devices[g.id].backend, nullptr, 0);
+    }
+    // a new pass of group ig: what an earlier pass left parked goes back first, then the predicted eviction order
+    void pk_begin(group & g, int32_t ig) {
+        if (!pk.dirty.empty() && pk.ig >= 0) {
+            pk.n_late++;
+            pk_restore_now(groups[pk.ig]);
+        }
+        const int32_t nb = (int32_t) g.banks.size();
+        if (pk.n_slots != g.n_slots || pk.nb != nb) {
+            pk.n_slots = g.n_slots;
+            pk.nb      = nb;
+            pk.ckey.assign((size_t) g.n_slots*nb, -1);
+            pk.own.assign(g.n_slots, -1);
+            pk.vic.assign(g.n_slots, -1);
+            pk.rd.assign(g.n_slots, 0);
+            pk.pos.assign(g.n_slots, -1);
+            pk.back.clear();
+        } else {
+            std::fill(pk.vic.begin(), pk.vic.end(), -1);
+            std::fill(pk.pos.begin(), pk.pos.end(), -1);
+        }
+        pk.back.clear();
+        pk.where.clear();
+        pk.ig = ig;
+        pk.copy_il = -1;
+        pk.front = -1;
+        pk.n_pass_fills = 0;
+        pk.n_pass_seeds = 0;
+        pk.n_passes++;
+        const moe_cache_lru & lru = g.lru;
+        pk.sk.clear();
+        int64_t p = 0;
+        for (int32_t s = lru.head; s >= 0; s = lru.next[s], ++p) {
+            const int64_t v = lru.grow_q16 > 0 && lru.key_of[s] >= 0 ? lru.scores[lru.key_of[s]] : -1;
+            pk.sk.push_back({ (v + 1) << 32 | p, s });
+        }
+        std::sort(pk.sk.begin(), pk.sk.end());
+        pk.order.resize(pk.sk.size());
+        for (size_t i = 0; i < pk.sk.size(); ++i) {
+            pk.order[i] = pk.sk[i].second;
+            pk.pos[pk.sk[i].second] = (int64_t) i;
+        }
+    }
+    // at the plan of a seed of layer il (fills planned, sd.old_key_of = the keys before): the unread victims in slots this seed takes
+    // move on, the victims of layers ahead that the ring does not keep (vk: key, slot) are parked; the copies are issued per bank (pk_issue)
+    void pk_plan(group & g, int32_t ig, int32_t il, const std::vector<moe_cache_lru::fill> & fills, const std::vector<std::pair<int32_t, int32_t>> & vk) {
+        pk.pend.clear();
+        const bool ok = pk_allowed(g, ig);
+        if (!ok) {
+            if (pk_active(ig)) {
+                // (the slots this seed overwrites are cleaned by its copies; an unread victim there is lost)
+                for (const auto & f : fills) {
+                    if (pk.vic[f.slot] >= 0) {
+                        pk.n_unread++;
+                        pk_drop(f.slot);
+                    }
+                }
+            }
+            return;
+        }
+        if (pk.ig != ig || il <= pk.seed_il) {
+            pk_begin(g, ig);
+        }
+        pk.seed_il = il;
+        pk.n_pass_seeds++;
+        pk.n_seeds++;
+        const int32_t n_expert = g.lru.n_expert;
+        for (const auto & f : fills) {
+            if (pk.pos[f.slot] > pk.front) {
+                pk.front = pk.pos[f.slot];
+            }
+        }
+        pk.n_pass_fills += (int64_t) fills.size();
+        // the slots this seed used go to the end of the eviction order: its hits (touched first by the plan), then its fills
+        {
+            const int32_t * sm = g.lru.slot_map[il];
+            for (int32_t e : seed_ids) {
+                const int32_t s = sm != nullptr && e >= 0 && e < n_expert ? sm[e] : -1;
+                if (s < 0 || s >= pk.n_slots) {
+                    continue;
+                }
+                bool fill = false;
+                for (const auto & f : fills) {
+                    fill = fill || f.slot == s;
+                }
+                if (!fill) {
+                    pk.pos[s] = (int64_t) (pk.order.size() + pk.back.size());
+                    pk.back.push_back(s);
+                }
+            }
+            for (const auto & f : fills) {
+                pk.pos[f.slot] = (int64_t) (pk.order.size() + pk.back.size());
+                pk.back.push_back(f.slot);
+            }
+        }
+        pk.cand.clear();
+        for (const auto & f : fills) {
+            const int32_t x = pk.vic[f.slot];
+            if (x < 0) {
+                continue;
+            }
+            const int32_t kl = x / n_expert;
+            if (kl == il) {
+                continue; // each bank is copied before this seed overwrites it
+            }
+            pk_drop(f.slot);
+            if (kl > il) {
+                pk.cand.push_back({ x, f.slot, -1, true });
+            } else {
+                pk.n_unread++;
+            }
+        }
+        for (const auto & [k, s] : vk) {
+            pk.cand.push_back({ k, s, -1, false });
+        }
+        if (pk.cand.empty()) {
+            return;
+        }
+        std::sort(pk.cand.begin(), pk.cand.end(), [](const seed_park::mv & a, const seed_park::mv & b) { return a.key < b.key; });
+        const double rate = (double) pk.n_pass_fills/std::max<int32_t>(1, pk.n_pass_seeds);
+        const int32_t lim = g.n_slots - g.lru.n_lent;
+        const size_t n_pend0 = pk.pend.size();
+        const uint64_t n_nodst0 = pk.n_nodst;
+        int64_t lo0 = -1;
+        int64_t j = 0;   // place in order + back
+        int64_t n_v = 0; // valid places before j (the evictions take the first valid places)
+        const int64_t n_seq = (int64_t) (pk.order.size() + pk.back.size());
+        auto seq_at = [&](int64_t x) -> int32_t {
+            return x < (int64_t) pk.order.size() ? pk.order[x] : pk.back[x - pk.order.size()];
+        };
+        // (LLAMA_MOE_SEED_PARK_REACH=N >= 0): only slots expected to be evicted by the seeds of the pass, up to N layers of seeds past
+        // its last one; the others would be restored after the pass (default -1: any slot)
+        static const double reach = getenv("LLAMA_MOE_SEED_PARK_REACH") != nullptr ? atof(getenv("LLAMA_MOE_SEED_PARK_REACH")) : -1.0;
+        int64_t v_end = INT64_MAX;
+        if (reach >= 0.0) {
+            const int64_t n_left = std::count_if(g.layers.begin(), g.layers.end(), [&](int32_t l) { return l > il; });
+            v_end = (int64_t) (rate*(n_left + reach));
+        }
+        for (auto & c : pk.cand) {
+            const int32_t kl = c.key / n_expert;
+            // the valid places the seeds before the victim's copy are expected to evict
+            const int64_t need = (int64_t) (rate*std::max(0.0, kl - il - 1 + pk_margin()));
+            if (lo0 < 0) {
+                lo0 = need;
+            }
+            int32_t d = -1;
+            while (j < n_seq && n_v < v_end) {
+                const int32_t s = seq_at(j);
+                if (pk.pos[s] != j) {
+                    j++;
+                    continue;
+                }
+                const int32_t k = g.lru.key_of[s];
+                const bool ok = n_v >= need && k >= 0 && k / n_expert < il && s >= g.lru.n_core && s < lim && pk.vic[s] < 0;
+                j++;
+                n_v++;
+                if (ok) {
+                    d = s;
+                    break;
+                }
+            }
+            if (d < 0) {
+                pk.n_nodst++;
+                continue;
+            }
+            c.dst = d;
+            pk.vic[d]  = c.key;
+            pk.rd[d]   = 0;
+            pk.own[d]  = g.lru.key_of[d];
+            pk.where[c.key] = d;
+            pk.pend.push_back(c);
+            if (c.moved) {
+                pk.n_moved++;
+            } else {
+                pk.n_parked++;
+            }
+        }
+        if (rsc_log_on() && (pk.n_pass_seeds <= 4 || pk.n_pass_seeds % 8 == 0)) {
+            int64_t n_el = 0, n_el_lo = 0, n_val = 0;
+            for (int64_t i = 0; i < n_seq; ++i) {
+                const int32_t s = seq_at(i);
+                if (pk.pos[s] != i) {
+                    continue;
+                }
+                const int32_t k = g.lru.key_of[s];
+                if (k >= 0 && k / n_expert < il && s >= g.lru.n_core && s < lim) {
+                    n_el++;
+                    n_el_lo += n_val >= lo0;
+                }
+                n_val++;
+            }
+            LLAMA_LOG_INFO("llama_moe_cache: seed park: seed %d layer %d: %zu fills, filled %" PRId64 " (largest place %" PRId64 "), %" PRId64 " places valid, "
+                "%zu candidates from valid place %" PRId64 ", %" PRId64 " slots of finished layers (%" PRId64 " from there), %zu parked, %" PRIu64 " without a slot\n",
+                pk.n_pass_seeds, il, fills.size(), pk.n_pass_fills, pk.front, n_val, pk.cand.size(), lo0, n_el, n_el_lo,
+                pk.pend.size() - n_pend0, pk.n_nodst - n_nodst0);
+        }
+    }
+    // the parking copies of bank ip of the seed being issued, before its seed copies overwrite their sources
+    void pk_issue(ggml_backend_t backend, const group & g, size_t ip) {
+        if (pk.pend.empty() || (int32_t) ip >= pk.nb) {
+            return;
+        }
+        ggml_tensor * bank = g.banks[ip];
+        const size_t sz = bank->nb[2];
+        const int32_t n_expert = g.lru.n_expert;
+        pk.regions.clear();
+        for (const auto & m : pk.pend) {
+            int32_t & src_k = pk.ckey[(size_t) m.src*pk.nb + ip];
+            const bool src_ok = m.moved ? src_k == m.key : (src_k < 0 && ua_readable(m.key / n_expert, (int32_t) ip));
+            if (!src_ok) {
+                continue;
+            }
+            int32_t & dst_k = pk.ckey[(size_t) m.dst*pk.nb + ip];
+            bool was_clean = true;
+            for (int32_t q = 0; q < pk.nb; ++q) {
+                was_clean = was_clean && pk.ckey[(size_t) m.dst*pk.nb + q] < 0;
+            }
+            if (was_clean) {
+                pk.dirty.push_back(m.dst);
+            }
+            dst_k = m.key;
+            if (!pk.regions.empty()) {
+                auto & r = pk.regions.back();
+                if (r.src_offset + r.size == (size_t) m.src*sz && r.dst_offset + r.size == (size_t) m.dst*sz) {
+                    r.size += sz;
+                    continue;
+                }
+            }
+            pk.regions.push_back({ bank, (size_t) m.src*sz, bank, (size_t) m.dst*sz, sz });
+        }
+        if (!pk.regions.empty() && !ggml_backend_tensor_copy_regions_async(backend, pk.regions.data(), pk.regions.size())) {
+            for (const auto & r : pk.regions) {
+                ggml_reset(ctx_views.get());
+                const int64_t n = (int64_t) (r.size/sz);
+                ggml_tensor * sv = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], r.src_offset);
+                ggml_tensor * dv = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], r.dst_offset);
+                ggml_backend_view_init(sv);
+                ggml_backend_view_init(dv);
+                ggml_backend_tensor_copy_async(backend, backend, sv, dv);
+            }
+        }
+    }
+    // copy_experts for a miss whose expert is parked: a run of experts in consecutive parked slots; 0 = not parked, < 0 = a short run
+    // left to the uploads
+    int64_t pk_copy(ggml_backend_t backend, const binding & b, const group & g, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last,
+            const int32_t * slots, std::vector<ggml_backend_copy_region> * regions) {
+        const int32_t n_expert = (int32_t) w->ne[2];
+        const int32_t lim = g.n_slots - g.lru.n_lent;
+        auto slot_of = [&](int64_t x) -> int32_t {
+            const int32_t k = b.il*n_expert + (int32_t) x;
+            const auto it = pk.where.find(k);
+            if (it == pk.where.end()) {
+                return -1;
+            }
+            const int32_t s = it->second;
+            return s < lim && pk.ckey[(size_t) s*pk.nb + b.ip] == k ? s : -1;
+        };
+        const int32_t s0 = slot_of(e);
+        if (s0 < 0) {
+            return 0;
+        }
+        int64_t n = 1;
+        while (e + n <= last && slots[e + n] < 0 && slot_of(e + n) == s0 + (int32_t) n) {
+            n++;
+        }
+        ggml_tensor * bank = g.banks[b.ip];
+        GGML_ASSERT(bank->nb[2] == dst->nb[2]);
+        if (regions == nullptr && n*w->nb[2] < min_copy_bytes && !host_layer(b.il)) {
+            return -n;
+        }
+        const uint32_t all = (1u << pk.nb) - 1;
+        for (int64_t i = 0; i < n; ++i) {
+            const int32_t s = s0 + (int32_t) i;
+            pk.rd[s] |= 1u << b.ip;
+            if ((pk.rd[s] & all) == all) {
+                pk_drop(s);
+            }
+        }
+        pk.n_hits += n;
+        pk.b_hits += (uint64_t) n*w->nb[2];
+        if (!pk.logged) {
+            pk.logged = true;
+            LLAMA_LOG_INFO("llama_moe_cache: seed park: a copy of layer %d read %" PRId64 " experts from slots of finished layers instead of the host "
+                "(LLAMA_MOE_SEED_PARK=0 to disable)\n", b.il, n);
+        }
+        if (regions != nullptr) {
+            regions->push_back({ bank, (size_t) s0*bank->nb[2], dst, (size_t) e*dst->nb[2], (size_t) n*bank->nb[2] });
+            return n;
+        }
+        ggml_reset(ctx_views.get());
+        ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], s0*bank->nb[2]);
+        ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
+        ggml_backend_view_init(src_view);
+        ggml_backend_view_init(dst_view);
+        ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+        return n;
+    }
+    // the end of the pass: the slots that still map their own expert get it back (pk.rs per layer, issued by pk_flush); the others (taken
+    // by a seed, emptied, lent) hold no parked bytes any more
+    void pk_collect(group & g) {
+        const int32_t ig = (int32_t) (&g - groups.data());
+        if (!pk_active(ig)) {
+            return;
+        }
+        const int32_t n_expert = g.lru.n_expert;
+        const int32_t lim = g.n_slots - g.lru.n_lent;
+        pk.rs.resize(layers.size());
+        for (const int32_t s : pk.dirty) {
+            bool any = false;
+            for (int32_t ip = 0; ip < pk.nb; ++ip) {
+                any = any || pk.ckey[(size_t) s*pk.nb + ip] >= 0;
+            }
+            if (!any) {
+                continue;
+            }
+            const int32_t k = g.lru.key_of[s];
+            if (k >= 0 && s < lim && k == pk.own[s]) {
+                pk.rs[k / n_expert].push_back({ k % n_expert, s });
+            } else {
+                pk.n_overwr++;
+            }
+            pk_clean(s);
+        }
+        pk.dirty.clear();
+        std::fill(pk.vic.begin(), pk.vic.end(), -1);
+        pk.where.clear();
+        if (rsc_log_on()) {
+            size_t n_rs = 0;
+            for (const auto & fl : pk.rs) {
+                n_rs += fl.size();
+            }
+            LLAMA_LOG_INFO("llama_moe_cache: seed park pass %" PRIu64 ": %d seeds, totals: parked %" PRIu64 ", moved %" PRIu64 ", no slot %" PRIu64
+                ", read %" PRIu64 " tensors (%.1f MiB); %zu slots to restore, %" PRIu64 " overwritten by the cache\n", pk.n_passes, pk.n_pass_seeds,
+                pk.n_parked, pk.n_moved, pk.n_nodst, pk.n_hits, pk.b_hits/1048576.0, n_rs, pk.n_overwr);
+        }
+        pk.ig = -1;
+        pk.seed_il = INT32_MAX;
+        pk.copy_il = -1;
+    }
+    // the restores of layer il (all layers: il < 0) on `be` (lo: the lowest slot written)
+    void pk_flush(ggml_backend_t be, int32_t il, int32_t * lo = nullptr) {
+        for (int32_t l = il < 0 ? 0 : il; l < (int32_t) pk.rs.size() && (il < 0 || l == il); ++l) {
+            std::vector<moe_cache_lru::fill> & fl = pk.rs[l];
+            if (fl.empty()) {
+                continue;
+            }
+            std::sort(fl.begin(), fl.end(), [](const moe_cache_lru::fill & a, const moe_cache_lru::fill & b) { return a.expert < b.expert; });
+            if (host_layer(l)) {
+                host->begin_call();
+            }
+            for (const auto & f : fl) {
+                if (lo != nullptr) {
+                    *lo = std::min(*lo, f.slot);
+                }
+            }
+            const size_t bytes = upload_fills(be, l, fl, nullptr);
+            pk.n_restored += fl.size();
+            pk.b_restored += bytes;
+            fl.clear();
+        }
+    }
+    void pk_restore_now(group & g) {
+        pk_collect(g);
+        pk_flush(devices[g.id].backend, -1);
     }
     static bool rsc_log_on() {
         static const bool on = getenv("LLAMA_MOE_SEED_RESCUE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_SEED_RESCUE_LOG")) != 0;
@@ -8533,6 +9003,11 @@ struct llama_moe_cache::impl {
     size_t upload_fills(ggml_backend_t backend, int32_t il, const std::vector<moe_cache_lru::fill> & fl, const std::vector<std::pair<int32_t, int32_t>> * ev) {
         const layer & l = layers[il];
         group & g = groups[l.ig];
+        if (pk_active(l.ig)) {
+            for (const auto & f : fl) {
+                pk_clean(f.slot); // (its own expert's bytes in every bank, see seed_park)
+            }
+        }
         if (backend != rf_backend(g.id)) {
             rf_join(g); // asynchronous refill (see rf_on): only this group's slots are being written
         }
@@ -12479,15 +12954,21 @@ struct llama_moe_cache::impl {
         std::vector<uint8_t> buf;
         size_t n_checked = 0;
         size_t n_bad = 0;
+        size_t n_parked_checked = 0;
         for (int32_t s = 0; s < g.n_slots; ++s) {
             const int32_t key = g.lru.key_of[s];
             if (key < 0) {
                 continue;
             }
-            const int32_t il = key / n_expert;
-            const int32_t e  = key % n_expert;
-            const layer & l = layers[il];
+            const int32_t ig = (int32_t) (&g - groups.data());
             for (size_t ip = 0; ip < g.banks.size(); ++ip) {
+                // a bank slot holding a parked victim (see seed_park) must hold the victim's bytes
+                const int32_t ck = pk_ckey(ig, s, ip);
+                const int32_t kk = ck >= 0 ? ck : key;
+                n_parked_checked += ck >= 0;
+                const int32_t il = kk / n_expert;
+                const int32_t e  = kk % n_expert;
+                const layer & l = layers[il];
                 const ggml_tensor * w = l.experts[ip];
                 const size_t sz = w->nb[2];
                 buf.resize(sz);
@@ -12507,6 +12988,9 @@ struct llama_moe_cache::impl {
             n_checked++;
         }
         LLAMA_LOG_INFO("%s: verify %s: %zu slots checked, %zu bank slots differ\n", __func__, tag, n_checked, n_bad);
+        if (n_parked_checked > 0) {
+            LLAMA_LOG_INFO("%s: verify %s: %zu bank slots checked against the victims parked in them\n", __func__, tag, n_parked_checked);
+        }
     }
 
     void download(group & g) {
@@ -12522,6 +13006,14 @@ struct llama_moe_cache::impl {
             ggml_backend_tensor_get(g.state, &w, 7*sizeof(int32_t), sizeof(int32_t));
         }
         g.lru.load(g.layers, buf.data(), buf.data() + g.n_slots, g.scores != nullptr ? sc.data() : nullptr, w);
+        if (pk_active((int32_t) (&g - groups.data()))) {
+            // a slot the device gave another expert holds its bytes (see seed_park)
+            for (const int32_t s : pk.dirty) {
+                if (g.lru.key_of[s] != pk.own[s]) {
+                    pk_clean(s);
+                }
+            }
+        }
         if (ua_mode > 0 && (ua_keep_dec || ua_dec_ref)) {
             g.ua_dec_key.assign(g.n_slots, -1);
             for (int32_t s = 0; s < g.n_slots; ++s) {
@@ -12557,6 +13049,12 @@ struct llama_moe_cache::impl {
     }
 
     void prepare(int64_t n_tokens) {
+        if (!pk.dirty.empty() && pk.ig >= 0) {
+            // victims still parked (see seed_park) when the next batch starts: their slots get their own experts back first (expected
+            // never: the pass ends with an unlend)
+            pk.n_late++;
+            pk_restore_now(groups[pk.ig]);
+        }
         // asynchronous refill (see rf_on): the compute stream waits for it from the ubatch after the graph it overlaps
         if (rf_any) {
             for (group & g : groups) {
@@ -13724,6 +14222,9 @@ struct llama_moe_cache::impl {
         if (verify_enabled) {
             verify(g, "while lent");
         }
+        // the slots of finished layers that hold parked victims get their own experts back: on the refill's stream before that
+        // layer's done flag, else here on the compute stream (see seed_park)
+        pk_collect(g);
         const int32_t n = g.lru.n_lent;
         for (ggml_tensor * bank : g.banks) {
             ggml_backend_tensor_memset(bank, 0, (size_t) (g.n_slots - n)*bank->nb[2], (size_t) (n + 1)*bank->nb[2]);
@@ -13792,9 +14293,11 @@ struct llama_moe_cache::impl {
                     refill[il].clear();
                 }
             }
+            pk_flush(backend, -1);
             return;
         }
         if (refill.empty() || g.dev_newer) {
+            pk_flush(backend, -1);
             return;
         }
         n_refill_routed += routed ? 1 : 0;
@@ -13816,6 +14319,7 @@ struct llama_moe_cache::impl {
         }
         const size_t bytes0 = stats_refill.bytes;
         for (int32_t il : g.layers) {
+            pk_flush(up != nullptr ? up : backend, il, &rf_lo);
             if ((size_t) il < refill.size() && !refill[il].empty()) {
                 std::vector<int32_t> & ids_il = refill[il];
                 const int32_t * slots = g.lru.slot_map[il];
@@ -13842,6 +14346,7 @@ struct llama_moe_cache::impl {
                 rf_done_fn(up, g.state, il, ep); // (the same checks as rf_need_fn: never fails after it succeeded)
             }
         }
+        pk_flush(up != nullptr ? up : backend, -1, &rf_lo);
         if (up != nullptr) {
             rf_done_fn(up, g.state, -1, ep); // the whole refill: the assigns stop checking layers
             ggml_backend_event_record(g.rf_ev1, up);
@@ -14610,6 +15115,20 @@ struct llama_moe_cache::impl {
         // large batches only read the cache, so the experts used in generation stay in it
         // while a layer is seeded, its slots are filled after its copies, so the copies read the slots it had before
         const int32_t * slots = b.il == g.sd.il ? g.sd.old_slots.data() : g.lru.slot_map[b.il];
+        // parked victims (see seed_park): a copy of a layer before the last one copied starts another pass, and a copy never reads a
+        // slot holding another expert's bytes; both restore what is parked first (expected never)
+        if (pk_active(layers[b.il].ig)) {
+            bool foreign = false;
+            for (int64_t x = e; slots != nullptr && x <= last && slots[x] >= 0 && !foreign; ++x) {
+                foreign = pk_ckey(layers[b.il].ig, slots[x], b.ip) >= 0;
+            }
+            if ((b.il < pk.copy_il && !pk.dirty.empty()) || foreign) {
+                pk.n_late++;
+                pk_restore_now(groups[pk.ig]);
+            } else {
+                pk.copy_il = std::max(pk.copy_il, b.il);
+            }
+        }
         if (rsc_log_on()) {
             if (b.il < rsc.last_copy_il) {
                 rsc_flush("next pass");
@@ -14623,6 +15142,12 @@ struct llama_moe_cache::impl {
             const int64_t n_rs = rsr_copy(backend, b, w, dst, e, last, slots, regions);
             if (n_rs != 0) {
                 return n_rs;
+            }
+        }
+        if (slots != nullptr && slots[e] < 0 && pk_active(layers[b.il].ig) && !pk.where.empty()) {
+            const int64_t n_pk = pk_copy(backend, b, g, w, dst, e, last, slots, regions);
+            if (n_pk != 0) {
+                return n_pk;
             }
         }
         if (slots == nullptr || slots[e] < 0) {
@@ -15371,7 +15896,10 @@ struct llama_moe_cache::impl {
                 }
             }
             rsr.pend.clear();
-            if (rsr_on() && !tiered && !sd.fills.empty() && rsr_alloc(g, layers[b.il].ig)) {
+            pk_vk.clear();
+            const bool ring = rsr_on() && !tiered && !sd.fills.empty() && rsr_alloc(g, layers[b.il].ig);
+            const bool park = !tiered && pk_allowed(g, layers[b.il].ig);
+            if (ring) {
                 // the victims of layers ahead, the nearest layers first (their copies come first)
                 rsr.n_seeds++;
                 rsr_vict.clear();
@@ -15390,14 +15918,26 @@ struct llama_moe_cache::impl {
                         rsr.read[w_it->second] = 0; // still held from an earlier eviction (expert weights do not change)
                         continue;
                     }
-                    const int32_t e = rsr_take(k, all_ip, b.il, n_expert);
+                    const int32_t e = rsr_take(k, all_ip, b.il, n_expert, !park);
                     if (e < 0) {
                         rsr.n_skip++;
+                        pk_vk.push_back({ k, slot }); // (parked instead, see seed_park)
                         continue;
                     }
                     rsr.pend.push_back({ e, slot });
                     rsr.n_kept++;
                 }
+            }
+            if (!tiered && pk_on()) {
+                if (!ring) {
+                    for (const auto & f : sd.fills) {
+                        const int32_t k = sd.old_key_of[f.slot];
+                        if (k >= 0 && k / n_expert > b.il && !(host_layer(k / n_expert) && host->exclusive())) {
+                            pk_vk.push_back({ k, f.slot });
+                        }
+                    }
+                }
+                pk_plan(g, layers[b.il].ig, b.il, sd.fills, pk_vk);
             }
             if (tiered) {
                 // exclusive: the experts the seed evicts move to RAM before any of their device slots is overwritten
@@ -15461,6 +16001,17 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        // the victims parked in slots of finished layers (see seed_park), likewise before this tensor's seed copies
+        const int32_t ig_s = layers[b.il].ig;
+        pk_issue(backend, g, b.ip);
+        // the seed copies below write their slots' own experts into this bank
+        auto pk_written = [&]() {
+            if (pk_active(ig_s)) {
+                for (const auto & f : fills) {
+                    pk.ckey[(size_t) f.slot*pk.nb + b.ip] = -1;
+                }
+            }
+        };
 
         // batched: one call for the whole tensor
         seed_regions.clear();
@@ -15476,6 +16027,7 @@ struct llama_moe_cache::impl {
             for (const auto & r : seed_regions) {
                 stats_seed.bytes += r.size;
             }
+            pk_written();
             sd.done |= 1u << b.ip;
             return;
         }
@@ -15494,6 +16046,7 @@ struct llama_moe_cache::impl {
             stats_seed.bytes += ggml_nbytes(src_view);
             i += n;
         }
+        pk_written();
         sd.done |= 1u << b.ip;
     }
 
@@ -15587,9 +16140,13 @@ struct llama_moe_cache::impl {
             n_checked++;
             const size_t size = r.w->nb[2];
             GGML_ASSERT(r.bank->nb[2] == size && r.w->data != nullptr);
+            // (a victim parked in the slot since, see seed_park: its bytes)
+            const int32_t ck = pk_ckey(layers[b.il].ig, r.slot, b.ip);
+            const uint8_t * ref = ck >= 0 ? (const uint8_t *) layers[ck / g.lru.n_expert].experts[b.ip]->data + (size_t) (ck % g.lru.n_expert)*size
+                                          : (const uint8_t *) r.w->data + (size_t) r.expert*size;
             buf.resize(size);
             ggml_backend_tensor_get(r.bank, buf.data(), (size_t) r.slot*r.bank->nb[2], size);
-            if (memcmp(buf.data(), (const uint8_t *) r.w->data + (size_t) r.expert*size, size) != 0) {
+            if (memcmp(buf.data(), ref, size) != 0) {
                 n_bad++;
             }
         }
@@ -16027,6 +16584,13 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache%s: seed rescue: %" PRIu64 " seeds kept %" PRIu64 " victims of layers ahead in the ring (%" PRIu64 " past its size, "
                 "%" PRIu64 " overwritten unread), copies read %" PRIu64 " expert tensors from it, %.2f MiB not uploaded\n", tag, rsr.n_seeds, rsr.n_kept,
                 rsr.n_skip, rsr.n_lost, rsr.n_hits, rsr.b_hits/1048576.0);
+        }
+        if (pk.n_parked + pk.n_moved + pk.n_nodst > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: seed park: %" PRIu64 " passes, %" PRIu64 " seeds: %" PRIu64 " victims of layers ahead parked in slots of finished "
+                "layers (%" PRIu64 " moved on, %" PRIu64 " without a slot, %" PRIu64 " overwritten unread), copies read %" PRIu64 " expert tensors from them, "
+                "%.2f MiB not uploaded; %" PRIu64 " slots restored (%.2f MiB), %" PRIu64 " parked slots overwritten by the cache, %" PRIu64 " early restores\n",
+                tag, pk.n_passes, pk.n_seeds, pk.n_parked, pk.n_moved, pk.n_nodst, pk.n_unread, pk.n_hits, pk.b_hits/1048576.0, pk.n_restored,
+                pk.b_restored/1048576.0, pk.n_overwr, pk.n_late);
         }
         if (stats_seed.misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu experts admitted to the cache, %.2f MiB\n", tag, stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
