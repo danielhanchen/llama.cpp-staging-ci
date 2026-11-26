@@ -802,8 +802,9 @@ static int64_t common_fit_dflash_head_bytes(const char * path) {
 // slots (of 6840) and chat decode -9.5% (3 launches each, same text). LLAMA_FIT_DENSE_TC_SLACK_MIB (0) adds to a nonzero need.
 // The embedding tables (row gathers) and the output head (prompt ubatches compute only the requested rows) are left out.
 static int64_t common_fit_dense_tc_min_cols() {
+    // as ggml_cuda_dense_tc_min: a negative value is the per-architecture default
     const char * e = getenv("GGML_CUDA_DENSE_CUBLAS_MIN");
-    return e != nullptr ? std::max(0, atoi(e)) : 1024;
+    return e != nullptr && atoi(e) >= 0 ? atoi(e) : 1024;
 }
 
 static int64_t common_fit_dense_tc_model_bytes(const char * path, int64_t n_ubatch) {
@@ -888,7 +889,8 @@ static bool common_fit_dense_tc_dev(ggml_backend_dev_t dev) {
     if (cc < 0 || cc >= 0x1000000) {
         return false; // not NVIDIA (the HIP / MUSA builds report offset values)
     }
-    return getenv("GGML_CUDA_DENSE_CUBLAS_MIN") != nullptr || cc == 800;
+    const char * e = getenv("GGML_CUDA_DENSE_CUBLAS_MIN");
+    return (e != nullptr && atoi(e) >= 0) || cc == 800;
 }
 
 static void common_params_fit_impl(
